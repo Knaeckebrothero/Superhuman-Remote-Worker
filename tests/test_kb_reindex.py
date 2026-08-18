@@ -323,6 +323,147 @@ class TestNoteFields:
         assert f["priority"] == 1  # falls through to the default, not a fluke
 
 
+# index_single_note — the shared per-note unit behind the sweep and the
+# materialisation endpoint. The ordering (embed -> adopt -> upsert UNSTAMPED ->
+# chunks -> links -> stamp) is the durability contract, so it is asserted here
+# rather than only through reindex_kb.
+
+from orchestrator.services.kb_reindex import (  # noqa: E402
+    NoteIndexError,
+    index_single_note,
+)
+
+
+def _index_store() -> AsyncMock:
+    store = AsyncMock()
+    store.upsert_kb_note.return_value = uuid.uuid4()
+    store.adopt_legacy_row.return_value = None
+    return store
+
+
+def _embedder(dims: int = 3) -> AsyncMock:
+    svc = AsyncMock()
+    svc.embed_batch.side_effect = lambda texts: [[0.1] * dims for _ in texts]
+    return svc
+
+
+class TestIndexSingleNote:
+    def test_indexes_a_note_and_stamps_it_last(self):
+        store = _index_store()
+        kb_id = uuid.uuid4()
+        calls = []
+        for name in (
+            "adopt_legacy_row",
+            "upsert_kb_note",
+            "replace_note_chunks",
+            "replace_note_links",
+            "stamp_note_indexed",
+        ):
+            getattr(store, name).side_effect = lambda *a, _n=name, **k: calls.append(
+                _n
+            ) or (uuid.uuid4() if _n == "upsert_kb_note" else None)
+
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=kb_id,
+                path="knowledge/chose-jwt.md",
+                text=_note_md("chose-jwt"),
+                blob_sha="deadbeef",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+
+        assert outcome.status == "indexed"
+        assert outcome.note_id == "chose-jwt"
+        assert outcome.chunks == 1
+        assert calls == [
+            "adopt_legacy_row",
+            "upsert_kb_note",
+            "replace_note_chunks",
+            "replace_note_links",
+            "stamp_note_indexed",
+        ]
+
+    def test_upserts_unstamped_then_stamps_the_blob_sha(self):
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="cafe1234",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        upsert_kwargs = store.upsert_kb_note.await_args.kwargs
+        assert upsert_kwargs["blob_sha"] is None
+        assert upsert_kwargs["embedding_version"] is None
+        stamp_args = store.stamp_note_indexed.await_args.args
+        assert stamp_args[1] == "cafe1234"
+        assert stamp_args[2] == EMBEDDING_VERSION
+
+    def test_malformed_frontmatter_returns_malformed_and_writes_nothing(self):
+        store = _index_store()
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/bad.md",
+                text="---\nid: [unclosed\n---\n# Bad\n",
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        assert outcome.status == "malformed"
+        assert outcome.detail
+        store.upsert_kb_note.assert_not_awaited()
+        store.stamp_note_indexed.assert_not_awaited()
+
+    def test_a_store_failure_raises_note_index_error_carrying_the_okf_id(self):
+        store = _index_store()
+        boom = RuntimeError("value too long for type character varying(100)")
+        store.replace_note_links.side_effect = boom
+
+        with pytest.raises(NoteIndexError) as excinfo:
+            asyncio.run(
+                index_single_note(
+                    store=store,
+                    embedding_service=_embedder(),
+                    kb_id=uuid.uuid4(),
+                    path="knowledge/wedged.md",
+                    text=_note_md("wedged"),
+                    blob_sha="sha",
+                    embedding_stamp=EMBEDDING_VERSION,
+                )
+            )
+        assert excinfo.value.note_id == "wedged"
+        assert excinfo.value.cause is boom
+        store.stamp_note_indexed.assert_not_awaited()
+
+    def test_passes_movable_paths_to_adoption(self):
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+                movable_paths=["knowledge/old.md"],
+            )
+        )
+        assert store.adopt_legacy_row.await_args.kwargs["movable_paths"] == [
+            "knowledge/old.md"
+        ]
+
+
 # =============================================================================
 # note_fields — created (frontmatter) -> created_at (project-backlog-pipeline
 # fix wave, finding B3)

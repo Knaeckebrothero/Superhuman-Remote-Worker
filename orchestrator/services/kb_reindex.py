@@ -367,6 +367,133 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     }
 
 
+@dataclass
+class NoteIndexOutcome:
+    """What one note's index attempt did.
+
+    ``status`` is ``indexed`` (chunks + links durable, note stamped) or
+    ``malformed`` (unparseable frontmatter — lint's problem, not the
+    indexer's; the caller removes any prior indexed version of the path).
+    """
+
+    status: str
+    note_id: Optional[str] = None
+    chunks: int = 0
+    detail: Optional[str] = None
+
+
+class NoteIndexError(Exception):
+    """A note failed to index.
+
+    Carries the parsed OKF id so the caller can run the duplicate-id
+    diagnostic, which needs the id from the frontmatter rather than a guess
+    from the filename — they differ in exactly the cases that hit the
+    ``uq_knowledge_project_note`` constraint.
+    """
+
+    def __init__(self, cause: Exception, note_id: Optional[str]) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.note_id = note_id
+
+
+async def index_single_note(
+    *,
+    store: Any,
+    embedding_service: Any,
+    kb_id: uuid.UUID,
+    path: str,
+    text: str,
+    blob_sha: str,
+    embedding_stamp: str,
+    movable_paths: Optional[List[str]] = None,
+) -> NoteIndexOutcome:
+    """Index ONE note into the disposable chunk index.
+
+    The shared unit behind both writers: the sweep calls it once per changed
+    path, and the materialisation endpoint calls it once, inline, for the note
+    it has just committed. Both must agree, which is why the order lives here
+    and not at either call site.
+
+    That order — embed, adopt, upsert UNSTAMPED, chunks, links, stamp — is the
+    durability contract. The stamp means "chunks and links are durable for this
+    git blob", so any failure before it leaves ``blob_sha`` stale or NULL and
+    the note stays in the next tree diff. A stamped-but-chunkless note would
+    read as up-to-date forever (the live 2026-07-05 zero-chunks gap).
+
+    Never advances the watermark, never deletes, never reconciles: those are
+    whole-sweep concerns and an inline caller has no business with them.
+
+    Raises ``NoteIndexError`` for a genuine failure; returns a ``malformed``
+    outcome for unparseable frontmatter, which is not an error here.
+    """
+    try:
+        fm, body = parse_note_md(text)
+    except ValueError as exc:
+        return NoteIndexOutcome(status="malformed", detail=str(exc))
+
+    fields = note_fields(path, fm, body)
+    note_id = fields["note_id"]
+
+    try:
+        # Embed BEFORE writing: a failed embed leaves the stale blob_sha in
+        # place, so the next run retries this note.
+        chunk_rows, _ = await embed_note_chunks(
+            body,
+            title=fields["title"],
+            note_type=fields["note_type"],
+            tags=fields["tags"],
+            embedding_service=embedding_service,
+        )
+        # Claim a pre-slice-3 row or move the stable OKF id on a Git rename,
+        # so the path-keyed upsert cannot collide with the old row's
+        # uq_knowledge_project_note identity.
+        await store.adopt_legacy_row(
+            kb_id,
+            note_id,
+            path,
+            movable_paths=movable_paths,
+        )
+        note_row = await store.upsert_kb_note(
+            kb_id=kb_id,
+            note_id=note_id,
+            path=path,
+            title=fields["title"],
+            note_type=fields["note_type"],
+            content=body,
+            blob_sha=None,
+            embedding_version=None,
+            status=fields["status"],
+            confidence=fields["confidence"],
+            tags=fields["tags"],
+            keywords=fields["keywords"],
+            superseded_by=fields["superseded_by"],
+            priority=fields["priority"],
+            created_at=fields["created_at"],
+            ready_at=fields["ready_at"],
+        )
+        await store.replace_note_chunks(
+            note_row=note_row,
+            kb_id=kb_id,
+            chunks=chunk_rows,
+            embedding_version=embedding_stamp,
+        )
+        await store.replace_note_links(
+            source_note_row=note_row,
+            kb_id=kb_id,
+            source_id=note_id,
+            targets=(_internal_link_targets(body) + frontmatter_link_targets(fm)),
+        )
+        centroid = note_centroid([c["embedding"] for c in chunk_rows])
+        await store.stamp_note_indexed(
+            note_row, blob_sha, embedding_stamp, centroid=centroid
+        )
+    except Exception as exc:
+        raise NoteIndexError(exc, note_id) from exc
+
+    return NoteIndexOutcome(status="indexed", note_id=note_id, chunks=len(chunk_rows))
+
+
 # The project-scoped identity constraint on knowledge_index. A violation here
 # is never a transient fault: it means one OKF note id exists at two paths in
 # the same vault, and neither adopt_legacy_row (which only claims a pathless or
@@ -949,107 +1076,55 @@ async def _reindex_snapshot(
     upserted = skipped = errors = 0
     invalid_paths: List[str] = []
     for path in upsert_paths:
-        # Set once the frontmatter is parsed, so the duplicate-id diagnostic
-        # below can name the OKF id rather than guessing it from the filename
-        # (they differ exactly in the cases that hit the constraint).
-        note_id: Optional[str] = None
         try:
             text = await snapshot.get_file(path)
             if text is None:
                 logger.warning("kb_reindex[%s]: fetch failed for %s", kb_id, path)
                 errors += 1
                 continue
-            try:
-                fm, body = parse_note_md(text)
-            except ValueError as exc:
-                # Malformed frontmatter — lint's problem, not the reindexer's.
-                # Remove any prior indexed version of this path: serving stale
-                # content after the canonical file became invalid would be less
-                # honest than omitting it until a later commit repairs the note.
-                logger.warning("kb_reindex[%s]: skipping %s: %s", kb_id, path, exc)
-                invalid_paths.append(path)
-                skipped += 1
-                continue
-            fields = note_fields(path, fm, body)
-            note_id = fields["note_id"]
-            # Embed BEFORE writing: a failed embed leaves the stale blob_sha in
-            # place, so the next run retries this note.
-            chunk_rows, _ = await embed_note_chunks(
-                body,
-                title=fields["title"],
-                note_type=fields["note_type"],
-                tags=fields["tags"],
+            outcome = await index_single_note(
+                store=store,
                 embedding_service=embedding_service,
-            )
-            # Claim a pre-slice-3 row or move the stable OKF id on a Git rename,
-            # so the path-keyed upsert cannot collide with the old row's
-            # uq_knowledge_project_note identity.
-            await store.adopt_legacy_row(
-                kb_id,
-                fields["note_id"],
-                path,
+                kb_id=kb_id,
+                path=path,
+                text=text,
+                blob_sha=current_map[path],
+                embedding_stamp=embedding_stamp,
                 movable_paths=delete_paths,
             )
-            # Upsert UNSTAMPED (blob_sha/embedding_version NULL): the stamp
-            # means "chunks durable" and lands only after replace_note_chunks,
-            # so a chunk-write failure keeps the note in the next run's diff.
-            note_row = await store.upsert_kb_note(
-                kb_id=kb_id,
-                note_id=fields["note_id"],
-                path=path,
-                title=fields["title"],
-                note_type=fields["note_type"],
-                content=body,
-                blob_sha=None,
-                embedding_version=None,
-                status=fields["status"],
-                confidence=fields["confidence"],
-                tags=fields["tags"],
-                keywords=fields["keywords"],
-                superseded_by=fields["superseded_by"],
-                priority=fields["priority"],
-                created_at=fields["created_at"],
-                ready_at=fields["ready_at"],
-            )
-            await store.replace_note_chunks(
-                note_row=note_row,
-                kb_id=kb_id,
-                chunks=chunk_rows,
-                embedding_version=embedding_stamp,
-            )
-            # Rewrite the note's outbound link edges (the kg-less kb_related
-            # backend). Before the stamp, so a link-write failure keeps the note
-            # in the next run's diff — same durable-then-stamp invariant as chunks.
-            await store.replace_note_links(
-                source_note_row=note_row,
-                kb_id=kb_id,
-                source_id=fields["note_id"],
-                # Body links (markdown + [[wikilinks]]) plus the `related:`
-                # frontmatter declaration — in an Obsidian vault the latter
-                # carries a large share of the edges.
-                targets=(_internal_link_targets(body) + frontmatter_link_targets(fm)),
-            )
-            # Whole-note centroid (PR4d): the mean of this note's chunk vectors,
-            # written back onto the note row atomically with the stamp so
-            # find_near_duplicate_pairs (which filters embedding IS NOT NULL) sees
-            # reindexed notes again.
-            centroid = note_centroid([c["embedding"] for c in chunk_rows])
-            await store.stamp_note_indexed(
-                note_row, current_map[path], embedding_stamp, centroid=centroid
-            )
-            upserted += 1
-            # Throttled determinate-progress bump (best-effort).
-            if upserted % _PROGRESS_BUMP_EVERY == 0:
-                try:
-                    await store.update_index_progress(kb_id, upserted)
-                except Exception as exc:
-                    logger.debug(
-                        "kb_reindex[%s]: progress bump skipped: %s", kb_id, exc
-                    )
-        except Exception as exc:
-            if not await _log_duplicate_note_id(store, kb_id, path, note_id, exc):
-                logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
+        except NoteIndexError as err:
+            if not await _log_duplicate_note_id(
+                store, kb_id, path, err.note_id, err.cause
+            ):
+                logger.warning(
+                    "kb_reindex[%s]: error on %s: %s", kb_id, path, err.cause
+                )
             errors += 1
+            continue
+        except Exception as exc:
+            logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
+            errors += 1
+            continue
+
+        if outcome.status == "malformed":
+            # Malformed frontmatter — lint's problem, not the reindexer's.
+            # Remove any prior indexed version of this path: serving stale
+            # content after the canonical file became invalid would be less
+            # honest than omitting it until a later commit repairs the note.
+            logger.warning(
+                "kb_reindex[%s]: skipping %s: %s", kb_id, path, outcome.detail
+            )
+            invalid_paths.append(path)
+            skipped += 1
+            continue
+
+        upserted += 1
+        # Throttled determinate-progress bump (best-effort).
+        if upserted % _PROGRESS_BUMP_EVERY == 0:
+            try:
+                await store.update_index_progress(kb_id, upserted)
+            except Exception as exc:
+                logger.debug("kb_reindex[%s]: progress bump skipped: %s", kb_id, exc)
 
     deleted = 0
     for path in sorted(set(delete_paths + invalid_paths)):
