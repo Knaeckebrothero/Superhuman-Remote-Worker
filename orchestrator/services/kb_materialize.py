@@ -517,6 +517,7 @@ async def _index_note_inline(
     slug: str,
     content: str,
     intent_id: Optional[str],
+    retrieval_messages: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Index a just-committed note so it is searchable when the write returns.
 
@@ -527,6 +528,10 @@ async def _index_note_inline(
     Deliberately narrow: one note, no deletes, no reconcile, and never a
     watermark write. The blob SHA stamped here is the one we just committed,
     so the next sweep's tree diff skips this note instead of re-embedding it.
+
+    ``retrieval_messages`` forwards straight to :func:`index_single_note`;
+    ``None`` leaves whatever is already stored alone (see that function and
+    ``KnowledgeStore.upsert_kb_note``).
 
     Never raises. Every failure degrades to "committed but not yet indexed",
     which is exactly the state the sweep already knows how to heal.
@@ -561,6 +566,7 @@ async def _index_note_inline(
                 blob_sha=blob_sha,
                 embedding_stamp=embedding_stamp,
                 max_chunks=_INLINE_MAX_CHUNKS,
+                retrieval_messages=retrieval_messages,
             )
     except Exception as e:  # noqa: BLE001 — non-fatal by contract
         logger.error(
@@ -674,6 +680,7 @@ async def materialize_knowledge_note(
     job_id: Optional[str] = None,
     store: Any = None,
     embedding_service: Any = None,
+    retrieval_messages: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Commit one note and, when an indexer is supplied, index it inline.
 
@@ -686,6 +693,9 @@ async def materialize_knowledge_note(
     without a vector DB, and so a deployment with no resolvable embedding
     service degrades to the pre-Slice-A behaviour (commit now, sweep indexes
     later) instead of failing the write.
+
+    ``retrieval_messages`` forwards to the inline index call (``None`` leaves
+    any already-stored value alone) — see :func:`_index_note_inline`.
     """
     result = await _materialize_note_canonical(
         postgres_db=postgres_db,
@@ -706,6 +716,7 @@ async def materialize_knowledge_note(
         project_id=project_id,
         slug=slug,
         content=str(content or ""),
+        retrieval_messages=retrieval_messages,
         intent_id=result.get("intent_id"),
     )
     return {**result, **index_state}

@@ -10208,6 +10208,14 @@ class KnowledgeMaterializeRequest(BaseModel):
     job_id: str | None = Field(
         None, description="Writing job UUID, for per-job commit attribution"
     )
+    retrieval_messages: list[str] | None = Field(
+        None,
+        description=(
+            "Synthetic retrieval queries for this note. Omitted/None leaves "
+            "any already-indexed value alone — OKF frontmatter carries no "
+            "such field, so only an explicit caller has an opinion."
+        ),
+    )
 
 
 class KnowledgeProjectionRequest(BaseModel):
@@ -54841,6 +54849,7 @@ async def materialize_knowledge_note(
         job_id=body.job_id,
         store=store,
         embedding_service=svc,
+        retrieval_messages=body.retrieval_messages,
     )
 
 
