@@ -307,11 +307,16 @@ def _delivery_ref(job: dict[str, Any], delivery_status: str) -> str | None:
 async def fetch_job_knowledge_note_ids(
     vector_db: Any, job: dict[str, Any]
 ) -> list[str]:
-    """Note ids this job wrote, verified against ``knowledge_index``.
+    """Note ids this job wrote LAST, verified against ``knowledge_index``.
 
     Reuses the orchestrator's existing DB path for "which notes did job X
     write" — the ``knowledge_index.job_id`` scan the loop notifier and the
-    loop-plan existence check already use (orchestrator/main.py). Scoped to
+    loop-plan existence check already use (orchestrator/main.py). Note that
+    the column records the job that *last wrote* the row, not the one that
+    authored the note: every canonical write stamps it, so a job that merely
+    edited someone else's note now appears here for that note, and the
+    original author stops appearing for it. Restoring author provenance is a
+    separate, already-filed follow-up. Scoped to
     the job's project when it has one. Best-effort: a down/absent vector
     store returns ``[]`` (KB failures are non-fatal by convention) — the
     record then simply carries no knowledge entry rather than a false claim.

@@ -78,7 +78,40 @@ _STATUS_FAILED = "failed"
 # 227 — so cap=64 defers only the pathological tail (17/665 notes, 2.6%; the
 # 127 KB curator dump that chunks to ~95) rather than the majority of writes
 # a lower cap deferred. Over it the note commits and the sweep indexes it.
-_INLINE_MAX_CHUNKS = int(os.getenv("KB_INLINE_INDEX_MAX_CHUNKS", "64"))
+_INLINE_MAX_CHUNKS_DEFAULT = 64
+
+
+def _inline_max_chunks() -> int:
+    """The chunk cap from the environment, never a boot failure.
+
+    This runs at import. A typo in the Helm value (``"64 "``, ``"sixty-four"``,
+    an accidental quote) would otherwise raise ``ValueError`` during module
+    import and crash-loop the orchestrator — in the one module whose entire
+    premise is that an index failure never fails a write. A bad value costs
+    the deployment a tuned cap, which is a log line; it must not cost it a
+    boot.
+
+    Only an unparseable value falls back. A parseable but odd one (0, a
+    negative) is left alone on purpose: it is expressible, its effect is
+    "defer every write to the sweep", and overriding it here would take away
+    an operator's kill switch on inline indexing.
+    """
+    raw = os.getenv("KB_INLINE_INDEX_MAX_CHUNKS")
+    if raw is None or not str(raw).strip():
+        return _INLINE_MAX_CHUNKS_DEFAULT
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "kb-materialize: KB_INLINE_INDEX_MAX_CHUNKS=%r is not an integer "
+            "— falling back to %d",
+            raw,
+            _INLINE_MAX_CHUNKS_DEFAULT,
+        )
+        return _INLINE_MAX_CHUNKS_DEFAULT
+
+
+_INLINE_MAX_CHUNKS = _inline_max_chunks()
 
 
 def note_repo_path(slug: str) -> str:
@@ -499,7 +532,22 @@ async def _attempt_content_intent(
 
 
 def _is_canonical(result: dict[str, Any]) -> bool:
-    """Whether the bytes are proven to be on the canonical branch."""
+    """Whether the bytes are proven to be on the canonical branch.
+
+    The two ``skipped`` reasons are in here **deliberately**, and narrowing
+    this to ``committed`` alone would be a regression, not a tightening. They
+    are the retry-heals-a-deferred-index path: when a write commits but its
+    inline index defers (lock held, oversized, index error), the note is
+    canonical and unsearchable, and the natural repair is to write it again.
+    That second write finds the identical bytes already on the branch
+    (``skipped/unchanged``) or the intent already settled
+    (``skipped/already-canonical``) — so if either were treated as
+    non-canonical the retry would answer ``not-canonical`` and skip indexing,
+    leaving the note invisible until the next sweep, which is exactly the
+    900-second gap this slice exists to close. "Nothing was written" and
+    "nothing needed to be written" are different facts; only the first is a
+    reason to withhold the index.
+    """
     if result.get("canonical_state") == "canonical":
         return True
     return result.get("status") == _STATUS_COMMITTED or (
@@ -569,10 +617,14 @@ async def _index_note_inline(
         # note in the pass that is already running.
         async with store.try_reindex_lock(kb_id) as claimed:
             if not claimed:
+                # The reason token is interpolated verbatim so an operator can
+                # grep the logs for the exact string the tool put in the
+                # transcript (`indexed=deferred:reindex-running`).
                 logger.info(
-                    "kb-materialize: %s committed but deferred — KB %s index "
-                    "lock held (sweep or concurrent write)",
+                    "kb-materialize: %s committed but deferred:%s — KB %s "
+                    "index lock held (sweep or concurrent write)",
                     path,
+                    "reindex-running",
                     kb_id,
                 )
                 return {"indexed": False, "index_reason": "reindex-running"}
@@ -590,9 +642,10 @@ async def _index_note_inline(
             )
     except Exception as e:  # noqa: BLE001 — non-fatal by contract
         logger.error(
-            "kb-materialize: inline index of %s failed: %r — committed but not "
-            "searchable until the next sweep",
+            "kb-materialize: inline index of %s failed — deferred:%s: %r — "
+            "committed but not searchable until the next sweep",
             path,
+            "index-error",
             e,
             exc_info=True,
         )
@@ -600,7 +653,8 @@ async def _index_note_inline(
 
     if outcome.status != "indexed":
         logger.warning(
-            "kb-materialize: %s committed but not indexed inline (%s, %d chunks)",
+            "kb-materialize: %s committed but deferred:%s — not indexed "
+            "inline (%d chunks)",
             path,
             outcome.status,
             outcome.chunks,

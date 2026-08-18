@@ -21357,7 +21357,7 @@ async def _notify_loop_user_questions(
     durable: bool = False,
     authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
-    """Surface ``user-question``-tagged KB notes a completed loop job filed.
+    """Surface ``user-question``-tagged KB notes a completed loop job wrote.
 
     The loop's constitution tells agents that human-gated concerns (legal
     review, budgets, third-party access) become `user-question` notes instead
@@ -21365,6 +21365,15 @@ async def _notify_loop_user_questions(
     per note (capped) so the operator sees the question without KB
     archaeology. Best-effort; a missing/down vector store is silent
     (KB failures are non-fatal by convention).
+
+    The scan is on ``knowledge_index.job_id``, which records the job that
+    *last wrote* the row, not the one that authored the note: every canonical
+    write stamps it. So this can fire for a note THIS job merely edited —
+    a question another job filed, still open, re-surfaced by an edit — and
+    will not fire for a question this job filed that a later job has since
+    rewritten. The dedup key below covers a replay of ONE turn, not a second
+    job re-surfacing the same note later. Restoring author provenance is a
+    separate, already-filed follow-up.
     """
     project_id = loop.get("project_id")
     if not project_id or vector_db is None:
@@ -54830,6 +54839,18 @@ async def materialize_knowledge_note(
             from src.services.knowledge_store import KnowledgeStore
 
             store = KnowledgeStore(db=vector_db, embedding_service=svc)
+        else:
+            # INFO, not WARNING: a deployment with no system embedding is a
+            # valid degraded configuration, not a fault. But it silently
+            # disables inline indexing for EVERY write in the deployment, so
+            # it needs one log line an operator can find — without it the
+            # only evidence is `indexed=deferred:no-indexer` in a transcript.
+            logger.info(
+                "kb-materialize: no embedding service resolvable for project "
+                "%s — the note will commit and be indexed by the next sweep "
+                "(check the system embedding in Admin → Models)",
+                project_id,
+            )
     except Exception:
         logger.warning(
             "kb-materialize: no inline indexer for project %s — the note will "

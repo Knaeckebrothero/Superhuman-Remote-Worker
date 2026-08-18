@@ -1882,9 +1882,13 @@ class TestKbWriteMaterialization:
         ]
 
     def test_a_note_without_retrieval_messages_forwards_none(self):
-        # None, not [] — the endpoint reads None as "leave the stored value
-        # alone", so an ordinary rewrite must not blank an earlier note's
-        # messages.
+        # None, not [] — the better-typed way to say "no opinion", the
+        # endpoint reading it as "leave the stored value alone". It is NOT
+        # what stops a rewrite blanking an earlier note's messages: [] would
+        # not blank them either, because `_post_vault_file` drops an empty
+        # list from the payload exactly as it drops None. That guard is the
+        # protection, and test_omits_retrieval_messages_entirely_... is what
+        # holds it.
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "n1"
         tools, _ = _make_tools(ctx)
@@ -2006,6 +2010,10 @@ class TestKbWriteDoesNotWriteTheRow:
         result = kb_tools["kb_write"](
             type="learning", title="A finding", content="the body"
         )
+        # The success prefix is load-bearing, not decoration: the graph-failure
+        # return carries the same `indexed=` suffix, so without this the test
+        # would stay green if kb_write started answering with an error.
+        assert result.startswith("Created knowledge note:")
         assert "indexed=yes" in result
 
     def test_a_deferred_index_is_reported_not_hidden(self, kb_tools, materializer):
@@ -2161,9 +2169,13 @@ class TestKbUpdateForwardsRetrievalMessages:
         assert calls[0]["retrieval_messages"] == ["why did we pick JWT?"]
 
     def test_a_note_without_messages_forwards_the_leave_alone_sentinel(self):
-        # None, not [] — the endpoint reads None as "leave the stored value
-        # alone", so an ordinary edit must not blank an earlier write's
-        # messages. `existing.get(...) or []` would have done exactly that.
+        # None, not [] — the better-typed way to say "no opinion", the
+        # endpoint reading it as "leave the stored value alone". Note what
+        # this does NOT prove: `existing.get(...) or []` would still not blank
+        # an earlier write's messages, because `_post_vault_file` drops an
+        # empty list from the payload exactly as it drops None. That guard is
+        # where the protection lives — see
+        # test_omits_retrieval_messages_entirely_when_there_are_none.
         calls = self._update(_graph_existing(retrieval_messages=None))
         assert calls[0]["retrieval_messages"] is None
 
@@ -2685,10 +2697,10 @@ class TestKbWriteErrorPathsDoNotOverclaim:
             )
         assert result.startswith("Error:")
         assert "SUPERSEDE disposition did not converge" in result
-        # Only kb_write's own clause is in scope: the retire failures quoted
-        # after the colon are kb_update's message, and kb_update still writes
-        # its own row, so "canonical and searchable" is true there until the
-        # task that deletes that write changes it too.
+        # Only kb_write's own clause is in scope. The retire failures quoted
+        # after the colon are kb_update's message, and kb_update no longer
+        # writes its own row either — it routes through the same canonical
+        # write, so its wording is that path's to state, not this test's.
         own_clause, _, quoted_failures = result.partition("did not converge:")
         assert "searchable" not in own_clause
         assert quoted_failures  # the failures really were quoted, not empty

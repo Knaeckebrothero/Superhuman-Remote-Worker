@@ -1634,7 +1634,12 @@ def create_kb_tools(
                 updated_note,
                 # None means "leave the stored value alone". get_note_by_slug
                 # does not read the column, so this tier never has messages of
-                # its own to forward — and must not send [] instead.
+                # its own to forward. None is the better-typed way to say
+                # that, but it is NOT what protects the stored value: the
+                # protection is `_post_vault_file`'s `if retrieval_messages:`
+                # guard, which drops [] from the payload exactly as it drops
+                # None. Simplify that guard away and BOTH become blanking
+                # writes (see test_omits_retrieval_messages_entirely_...).
                 existing.get("retrieval_messages"),
             )
             if not _canonical_materialization_succeeded(materialization):
@@ -1788,8 +1793,13 @@ def create_kb_tools(
                 note,
                 desired,
                 # Carried across the rewrite: the markdown has nowhere to put
-                # them, and None (never []) is the "leave the stored value
-                # alone" sentinel the endpoint COALESCEs against.
+                # them, and None is the "leave the stored value alone"
+                # sentinel the endpoint COALESCEs against. Passing [] here
+                # would NOT blank them — `_post_vault_file`'s
+                # `if retrieval_messages:` guard omits an empty list from the
+                # payload exactly as it omits None. That guard is where the
+                # protection lives; None is only the better-typed way to say
+                # "no opinion" (see test_omits_retrieval_messages_entirely_...).
                 existing.get("retrieval_messages"),
             )
             if not _canonical_materialization_succeeded(materialization):
@@ -1866,9 +1876,9 @@ def create_kb_tools(
     ) -> str:
         """Create a new knowledge note in the project knowledge base.
 
-        Write-through: creates the note in Neo4j (source of truth), upserts into
-        the pgvector search index, AND materializes the note as an OKF markdown
-        file at ``knowledge/<slug>.md`` in the project's knowledge repository —
+        Write-through: creates the note in Neo4j (source of truth) AND
+        materializes the note as an OKF markdown file at
+        ``knowledge/<slug>.md`` in the project's knowledge repository —
         committed server-side, so it needs neither a workspace nor git.
 
         The note is committed to the knowledge repository and, in the normal
@@ -2036,8 +2046,13 @@ def create_kb_tools(
             # from this frontmatter line, so a note that omits it stores NULL
             # forever — which sorts every agent-filed ticket to the bottom of
             # its backlog band (project_backlog.py's `created_at ASC NULLS
-            # LAST`) and ranks it last on the search recency arm. One stamp
-            # for both: a note is not modified after the write that created it.
+            # LAST`) and, via modified_at, distorts the search recency arm:
+            # that arm is a bare `ORDER BY ki.modified_at DESC`
+            # (vector_schema_current.sql) with no NULLS LAST, and Postgres
+            # sorts NULLs FIRST under DESC — so an unstamped note does not
+            # rank last there, it monopolises the top of the arm's window.
+            # One stamp for both: a note is not modified after the write that
+            # created it.
             stamped_at = datetime.now(timezone.utc).isoformat()
             new_note = {
                 "id": slug,
@@ -2327,7 +2342,10 @@ def create_kb_tools(
             type: Filter by note type (goal, plan, decision, learning, code, source, question, state, retrospective)
             tag: Filter by tag name
             status: Filter by status (active, resolved, superseded, archived). Default: all
-            job_id: Filter by creating job UUID
+            job_id: Filter by the job that LAST WROTE the note (UUID) — not
+                necessarily the one that created it. ``knowledge_index.job_id``
+                is stamped by every canonical write, so a note another job
+                later edited answers to the editor's id, not the author's.
             kb: Optional selected knowledge-base alias or UUID
 
         Returns:

@@ -302,10 +302,17 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     itself, so its own ``created:`` line is the only thing standing between a
     new note and a NULL creation time.
 
-    ``modified`` maps to ``modified_at`` for the same reason and one more:
-    it orders the search function's recency arm (``ORDER BY modified_at DESC
-    NULLS LAST``), which contributes to the RRF score, so a NULL there
-    degrades ranking silently rather than failing anything.
+    ``modified`` maps to ``modified_at`` for the same reason and one more: it
+    orders the search function's recency arm, which contributes to the RRF
+    score, so a NULL there degrades ranking silently rather than failing
+    anything. The arm is a bare ``ORDER BY ki.modified_at DESC``
+    (vector_schema_current.sql) — no ``NULLS LAST`` — and Postgres sorts NULLs
+    FIRST under ``DESC``, so an unmapped ``modified_at`` did not push those
+    rows to the bottom of the arm: it let every legacy row with a NULL there
+    occupy the TOP of the recency window and crowd out genuinely recent
+    notes. Mapping the field is what makes the arm mean anything once those
+    rows are backfilled. (Adding ``NULLS LAST`` to the SQL needs a migration
+    and is a separate change.)
     """
     fm = fm or {}
 
@@ -370,9 +377,12 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         "superseded_by": str(superseded_by)[:_NOTE_ID_MAX] if superseded_by else None,
         "created_at": _parse_created_at(fm.get("created")),
         # `modified` is the ordering key of the search function's recency arm
-        # (ORDER BY modified_at DESC NULLS LAST), which carries a real share
-        # of the RRF score. Unmapped, every note the file path indexed ranked
-        # last on that arm — a silent quality loss, never an error.
+        # (a bare ORDER BY ki.modified_at DESC — no NULLS LAST), which carries
+        # a real share of the RRF score. Postgres sorts NULLs FIRST under
+        # DESC, so unmapped this did not rank notes last: every NULL-stamped
+        # row the file path indexed sat at the TOP of that arm's window,
+        # crowding out genuinely recent notes. A silent quality loss, never
+        # an error.
         "modified_at": _parse_created_at(fm.get("modified")),
         # Absent means "this file carries no opinion, leave the stored value
         # alone" — the same sentinel as priority. A replay is not an
@@ -467,10 +477,15 @@ async def index_single_note(
     except ValueError as exc:
         return NoteIndexOutcome(status="malformed", detail=str(exc))
 
-    fields = note_fields(path, fm, body)
-    note_id = fields["note_id"]
-
+    # ``note_fields`` is inside the wrapping try, not before it: it is the
+    # step that derives ``note_id``, and a raise from it used to escape as a
+    # raw exception while the docstring promised ``NoteIndexError``. Seeded
+    # None first so the handler can still name the note it could not parse.
+    note_id: Optional[str] = None
     try:
+        fields = note_fields(path, fm, body)
+        note_id = fields["note_id"]
+
         if max_chunks is not None:
             # Count before embedding, so an oversized note costs one cheap
             # structural pass and no embedding round-trip. Under the cap the

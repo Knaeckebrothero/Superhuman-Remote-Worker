@@ -678,9 +678,11 @@ class TestNoteFieldsCreatedAt:
 
     def test_frontmatter_modified_maps_to_modified_at(self):
         """`modified_at` is the ordering key of the search function's recency
-        arm (`ORDER BY modified_at DESC NULLS LAST`), which feeds the RRF
-        score. A NULL there does not fail anything — it just quietly ranks
-        every agent-written note last on that arm."""
+        arm — a bare `ORDER BY ki.modified_at DESC`, with no NULLS LAST —
+        which feeds the RRF score. A NULL there does not fail anything, and
+        it does not rank a note last either: Postgres sorts NULLs FIRST under
+        DESC, so every unstamped note quietly occupied the TOP of that arm's
+        window instead."""
         from datetime import datetime, timezone
 
         fm, body = parse_note_md(
