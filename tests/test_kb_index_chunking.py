@@ -566,8 +566,14 @@ class TestUpsertKbNoteSeedsTtl:
             embedding_version=None,
         )
         query, *params = mock_db.fetchval.call_args[0]
-        assert "remaining_cycles" in query
-        assert 2 in params
+        # Fix round: pin the column list AND the bound value's own ordinal
+        # ($23, params[22]) -- "remaining_cycles" in query / "2 in params"
+        # would each pass even if the value landed at the wrong position
+        # (swapped with a neighbour) or the identifier only appeared in a
+        # comment. The $21/$22 tests above constrain renumbering below this
+        # point; this is the tripwire for $23 itself.
+        assert "priority, ready_at, remaining_cycles)" in query
+        assert params[22] == 2
 
     @pytest.mark.asyncio
     async def test_a_durable_note_type_stays_null(self):
@@ -586,8 +592,14 @@ class TestUpsertKbNoteSeedsTtl:
             embedding_version=None,
         )
         _query, *params = mock_db.fetchval.call_args[0]
-        assert 2 not in params
-        assert 3 not in params
+        # Fix round: `2 not in params` / `3 not in params` waved through the
+        # most dangerous coercion -- None becoming 0. Per
+        # 0007_knowledge_index_ttl.sql:42-46 the expiry sweep is
+        # `WHERE remaining_cycles <= 0 AND status = 'active'`, so a stray 0
+        # here would mark every durable note in the vault as already
+        # expired. Pin the exact ordinal ($23 / params[22]) to its exact
+        # expected value instead of merely excluding two unrelated numbers.
+        assert params[22] is None
 
     @pytest.mark.asyncio
     async def test_on_conflict_never_touches_remaining_cycles(self):
