@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.services.knowledge_store import (
+    NOTE_ID_MAX,
     KbWatermark,
     KnowledgeChunk,
     KnowledgeStore,
@@ -852,6 +853,69 @@ class TestReplaceNoteLinks:
             if "INSERT INTO knowledge_links" in c[0][0]
         ][0][0]
         assert "references" in insert
+
+    @pytest.mark.asyncio
+    async def test_over_long_target_is_clamped_to_the_column_bound(self):
+        """Live wedge: 17 archive notes could never finish indexing.
+
+        source_id/target_id are VARCHAR(100). An unclamped long `[[wikilink]]`
+        raised "value too long for type character varying(100)" here, and since
+        links are written before stamp_note_indexed the note stayed unstamped —
+        so every later sweep retried it and failed the same way, pinning the
+        whole KB at `partial`.
+        """
+        store, mock_db, _ = _make_store()
+        long_target = "x" * 250
+        n = await store.replace_note_links(
+            source_note_row=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            source_id="y" * 250,
+            targets=[long_target],
+        )
+        assert n == 1
+        insert = [
+            c
+            for c in mock_db.execute.call_args_list
+            if "INSERT INTO knowledge_links" in c[0][0]
+        ][0][0]
+        source_id, target_id = insert[3], insert[4]
+        assert len(target_id) == NOTE_ID_MAX
+        assert target_id == long_target[:NOTE_ID_MAX]
+        assert len(source_id) == NOTE_ID_MAX
+
+    @pytest.mark.asyncio
+    async def test_targets_differing_past_the_bound_collapse_to_one_edge(self):
+        """Clamp before dedupe, not after.
+
+        Both of these resolve to the same note, so writing two edges would be
+        redundant — and the dedupe is the only thing keeping them apart.
+        """
+        store, mock_db, _ = _make_store()
+        prefix = "z" * NOTE_ID_MAX
+        n = await store.replace_note_links(
+            source_note_row=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            source_id="a",
+            targets=[prefix + "-one", prefix + "-two"],
+        )
+        assert n == 1
+
+    @pytest.mark.asyncio
+    async def test_target_at_the_bound_is_untouched(self):
+        store, mock_db, _ = _make_store()
+        exact = "q" * NOTE_ID_MAX
+        await store.replace_note_links(
+            source_note_row=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            source_id="a",
+            targets=[exact],
+        )
+        insert = [
+            c
+            for c in mock_db.execute.call_args_list
+            if "INSERT INTO knowledge_links" in c[0][0]
+        ][0][0]
+        assert insert[4] == exact
 
 
 # =============================================================================
