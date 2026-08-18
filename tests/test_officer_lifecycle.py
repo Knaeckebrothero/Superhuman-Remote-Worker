@@ -1618,8 +1618,9 @@ class TestSpendToday:
         ledger.query_usage = AsyncMock(
             return_value={
                 "by_category": [
-                    {"unit": "tokens", "quantity": 1_200_000},
-                    {"unit": "tokens", "quantity": 300_000},
+                    {"unit": "prompt-token", "quantity": 1_200_000},
+                    {"unit": "cached-prompt-token", "quantity": 250_000},
+                    {"unit": "completion-token", "quantity": 50_000},
                     {"unit": "requests", "quantity": 999},
                 ]
             }

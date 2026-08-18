@@ -64,6 +64,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from services.session_lifecycle import probe_ready
+from services.usage_ledger import llm_tokens_from_rows
 
 logger = logging.getLogger(__name__)
 
@@ -871,11 +872,7 @@ async def _officer_ceiling_deferral(
         usage = await usage_ledger.query_usage(
             from_ts=day_start, to_ts=now, ref_id=str(thread["id"])
         )
-        tokens = sum(
-            item.get("quantity") or 0
-            for item in usage.get("by_category") or []
-            if item.get("unit") == "tokens"
-        )
+        tokens = llm_tokens_from_rows(usage.get("by_category") or [])
         if tokens >= ceiling:
             return _next_utc_midnight(now)
     except Exception:

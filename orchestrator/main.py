@@ -351,6 +351,7 @@ from services.usage_ledger import (  # noqa: E402
     UsageLedger,
     UsageRates,
     cache_hit_ratio_from_rows,
+    llm_tokens_from_rows,
 )
 from services.usage_rollup import UsageRollup, usage_rollup_loop  # noqa: E402
 from services.virtual_workspace import (  # noqa: E402
@@ -35498,7 +35499,7 @@ async def _officer_spend_today(thread_id: str | None, ceiling: int) -> dict[str,
     vacant post (nothing metered), None when metering is unavailable — the
     card can render an honest dash instead of a fake zero.
     """
-    tokens: int | None = 0
+    tokens: float | None = 0
     if thread_id:
         tokens = None
         try:
@@ -35508,11 +35509,7 @@ async def _officer_spend_today(thread_id: str | None, ceiling: int) -> dict[str,
                 usage = await usage_ledger.query_usage(
                     from_ts=day_start, to_ts=now, ref_id=str(thread_id)
                 )
-                tokens = sum(
-                    item.get("quantity") or 0
-                    for item in usage.get("by_category") or []
-                    if item.get("unit") == "tokens"
-                )
+                tokens = llm_tokens_from_rows(usage.get("by_category") or [])
         except Exception:
             logger.warning(
                 "officer spend: usage query failed (non-fatal)", exc_info=True
