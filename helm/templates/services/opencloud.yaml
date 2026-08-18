@@ -226,7 +226,7 @@ spec:
             # upload on the local PVC; expired sessions don't auto-purge
             # without the companion cleanup CronJob (see opencloud-cleanup.yaml).
             # Short TTL bounds the worst-case staging working set when a sync
-            # client misbehaves. See docs/issues for the runaway-upload incident.
+            # client misbehaves. See knowledge-base/knowledge/issues for the runaway-upload incident.
             - name: STORAGE_USERS_UPLOAD_EXPIRATION
               value: {{ .Values.opencloud.uploadExpiration | quote }}
           volumeMounts:

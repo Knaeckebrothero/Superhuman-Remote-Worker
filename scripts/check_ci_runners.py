@@ -23,7 +23,7 @@ this script cannot stop a fork PR that deletes it from RUNNING, and the hook
 cannot stop a bad routing change from being MERGED. Check 8 below is what keeps
 the two halves tied together.
 
-See docs/ci_self_hosted_runners.md.
+See policy/ci_self_hosted_runners.md.
 
     python scripts/check_ci_runners.py     # 0 = policy holds, 1 = violated
 """
@@ -39,7 +39,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
-RUNNER_DOC = REPO_ROOT / "docs" / "ci_self_hosted_runners.md"
+RUNNER_DOC = REPO_ROOT / "policy" / "ci_self_hosted_runners.md"
 
 # Strings the runner-image contract is recorded under. See check 8 for why this
 # is a documentation check rather than a file check.
@@ -336,7 +336,7 @@ def check() -> list[str]:
     #    documented contract too, and CI notices.
     if not RUNNER_DOC.is_file():
         r.add(
-            "docs/ci_self_hosted_runners.md is missing — it records the runner "
+            "policy/ci_self_hosted_runners.md is missing — it records the runner "
             "image contract (the fork guard, its allowlist variable, and where "
             "the image is built). It is the only trace of that contract in this "
             "repository."
@@ -346,7 +346,7 @@ def check() -> list[str]:
         for needle in RUNNER_CONTRACT:
             if needle not in doc:
                 r.add(
-                    f"docs/ci_self_hosted_runners.md no longer mentions {needle!r} "
+                    f"policy/ci_self_hosted_runners.md no longer mentions {needle!r} "
                     f"— the runner-image contract has drifted. If the image moved "
                     f"or the guard changed, update the doc and RUNNER_CONTRACT in "
                     f"this script together."
@@ -366,7 +366,7 @@ def main() -> int:
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         print(
-            "\nBackground: docs/ci_self_hosted_runners.md. This repository is "
+            "\nBackground: policy/ci_self_hosted_runners.md. This repository is "
             "public and its CI runs on self-hosted runners; a pull_request routed "
             "to one executes a stranger's code inside the cluster.",
             file=sys.stderr,

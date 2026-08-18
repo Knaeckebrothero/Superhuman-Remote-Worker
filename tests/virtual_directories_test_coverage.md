@@ -37,7 +37,7 @@ provider ships.
 Suite totals at the time of writing: 117 tests across the six files above, plus
 the instruction/seed cases in `tests/test_workspace_phase0_seed.py`. Full suite
 12146 passed / 3 failed — all three failures pre-existing and branch-independent
-(two need a local Postgres; one is the stale `docs/security/endpoint_inventory.txt`
+(two need a local Postgres; one is the stale `policy/endpoint_inventory.txt`
 manifest, red since a pre-branch commit).
 
 ### 1.2 Live gate — dev, 2026-08-01

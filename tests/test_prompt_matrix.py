@@ -477,7 +477,7 @@ class TestDefaultResolution:
 # =============================================================================
 # render_placeholders: literal braces in trusted prose must survive render
 # (regression: product-qa tactical.txt `{py,sh,md}` hard-failed jobs via
-#  str.format KeyError at phase render — docs/issues brace-format crash)
+#  str.format KeyError at phase render — vault issues/ brace-format crash)
 # =============================================================================
 
 

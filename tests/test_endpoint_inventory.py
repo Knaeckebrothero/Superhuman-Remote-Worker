@@ -2,7 +2,7 @@
 
 Re-runs ``scripts/check_endpoint_auth.py`` against the live ``orchestrator/main.py``
 and asserts the result matches the committed manifest at
-``docs/security/endpoint_inventory.txt``.
+``policy/endpoint_inventory.txt``.
 
 When a new endpoint is added (or an existing endpoint's gate changes), this
 test fails until either:
@@ -26,7 +26,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check_endpoint_auth.py"
-MANIFEST = REPO_ROOT / "docs" / "security" / "endpoint_inventory.txt"
+MANIFEST = REPO_ROOT / "policy" / "endpoint_inventory.txt"
 
 
 def _load_script():

@@ -4217,7 +4217,7 @@ def load_phase_component(
 # hint, a JSON example — is literal prose and must survive untouched. We render
 # these keys explicitly instead of ``str.format`` because ``str.format`` treats
 # EVERY ``{...}`` as a field and raises KeyError on the first literal brace,
-# which hard-fails the job at phase render (docs/issues, product-qa 'py,sh,md').
+# which hard-fails the job at phase render (vault issues/, product-qa 'py,sh,md').
 _PROMPT_PLACEHOLDER_RE = re.compile(
     r"\{(phase_number|agent_display_name|expert_identity|available_skills|prompt_content)\}"
 )

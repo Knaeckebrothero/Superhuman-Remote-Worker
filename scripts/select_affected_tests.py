@@ -75,7 +75,7 @@ FULL_SUITE_TRIGGERS = (
 #: string does not wire a test to the entire source tree.
 DATA_PREFIXES = (
     "config",
-    "docs",
+    "policy",
     "helm",
     "helm-vm-cluster",
     "cockpit",

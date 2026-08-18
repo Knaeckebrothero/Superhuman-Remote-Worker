@@ -204,7 +204,7 @@ class KnowledgeGraphDB:
         # Check for slug collision and append a suffix if needed. The suffix is
         # a deterministic content hash (not a random token) so identical
         # re-writes converge to the same slug instead of forking a fresh note
-        # every time — the run-8 twin-file problem (docs/features §11.1).
+        # every time — the run-8 twin-file problem (vault features/ §11.1).
         existing = self._db.execute_query(
             "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
             {"pid": project_id, "id": slug},
