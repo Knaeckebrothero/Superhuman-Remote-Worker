@@ -1157,6 +1157,97 @@ class TestInlineIndexOnMaterialize:
         assert indexed["max_chunks"] is not None
         db.finish_knowledge_projection.assert_awaited_once()
 
+    def test_the_writing_job_reaches_the_indexed_row(self):
+        # The endpoint already had job_id (it names the commit); this carries
+        # it the last hop onto knowledge_index.job_id, which backs
+        # kb_list(job_id=...). Parsed to a UUID here because the request body
+        # carries it as a string and the column is UUID.
+        db = _ledger_db()
+        gitea = _make_gitea(change_results=[True])
+        job = "6f1d5a2e-0b3c-4d5e-8a9b-1c2d3e4f5a6b"
+        indexed = {}
+
+        async def _fake_index(**kwargs):
+            indexed.update(kwargs)
+            return NoteIndexOutcome(status="indexed", note_id=SLUG, chunks=1)
+
+        with (
+            _patch_resolve(_ref()),
+            patch("services.kb_materialize.index_single_note", _fake_index),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=db,
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    job_id=job,
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+
+        assert result["indexed"] is True
+        assert indexed["job_id"] == uuid.UUID(job)
+
+    def test_a_note_written_without_a_job_forwards_none(self):
+        # Persistent sessions have no job. None is the sentinel meaning "leave
+        # the stored value alone" — never a zero UUID, never a string.
+        gitea = _make_gitea(change_results=[True])
+        indexed = {}
+
+        async def _fake_index(**kwargs):
+            indexed.update(kwargs)
+            return NoteIndexOutcome(status="indexed", note_id=SLUG, chunks=1)
+
+        with (
+            _patch_resolve(_ref()),
+            patch("services.kb_materialize.index_single_note", _fake_index),
+        ):
+            asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=_ledger_db(),
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+        assert indexed["job_id"] is None
+
+    def test_an_unparseable_job_id_still_indexes_the_note(self):
+        # Provenance is not worth losing the index over: the commit has
+        # already happened, so a malformed id degrades to no provenance
+        # rather than to a note nobody can find.
+        gitea = _make_gitea(change_results=[True])
+        indexed = {}
+
+        async def _fake_index(**kwargs):
+            indexed.update(kwargs)
+            return NoteIndexOutcome(status="indexed", note_id=SLUG, chunks=1)
+
+        with (
+            _patch_resolve(_ref()),
+            patch("services.kb_materialize.index_single_note", _fake_index),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=_ledger_db(),
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    job_id="not-a-uuid",
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+        assert result["indexed"] is True
+        assert indexed["job_id"] is None
+
     def test_without_a_store_the_note_commits_and_defers(self):
         gitea = _make_gitea(change_results=[True])
         with _patch_resolve(_ref()):

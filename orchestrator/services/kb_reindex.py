@@ -413,6 +413,7 @@ async def index_single_note(
     movable_paths: Optional[List[str]] = None,
     max_chunks: Optional[int] = None,
     retrieval_messages: Optional[List[str]] = None,
+    job_id: Optional[uuid.UUID] = None,
 ) -> NoteIndexOutcome:
     """Index ONE note into the disposable chunk index.
 
@@ -439,6 +440,11 @@ async def index_single_note(
     ``None`` (the sweep's every call, since OKF frontmatter carries no such
     field) means "leave the stored value alone" — only an inline materialize
     call that was actually given messages has an opinion to write.
+
+    ``job_id`` is the same shape and the same contract: it is the writing job
+    for ``knowledge_index.job_id``, the provenance behind
+    ``kb_list(job_id=...)``, and the file cannot carry it either. The sweep
+    passes ``None`` because it re-indexes notes it did not write.
 
     Raises ``NoteIndexError`` for a genuine failure; returns a ``malformed``
     outcome for unparseable frontmatter, which is not an error here.
@@ -496,6 +502,7 @@ async def index_single_note(
             keywords=fields["keywords"],
             retrieval_messages=retrieval_messages,
             superseded_by=fields["superseded_by"],
+            job_id=job_id,
             priority=fields["priority"],
             created_at=fields["created_at"],
             ready_at=fields["ready_at"],
