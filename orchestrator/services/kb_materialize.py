@@ -69,11 +69,16 @@ _STATUS_COMMITTED = "committed"
 _STATUS_SKIPPED = "skipped"
 _STATUS_FAILED = "failed"
 
-# Chunks a note may have and still be indexed inside the write request. Over
-# it the note commits and the sweep indexes it: a 127 KB curator dump chunks
-# into ~95, and the embedding backend caps a batch at 64 inputs, so inlining
-# one would put several round-trips in the caller's request.
-_INLINE_MAX_CHUNKS = int(os.getenv("KB_INLINE_INDEX_MAX_CHUNKS", "8"))
+# Chunks a note may have and still be indexed inside the write request.
+# 64 = DEFAULT_MAX_EMBED_BATCH (src/tools/knowledge/chunker.py): at or under
+# it, embed_note_chunks sends exactly one embedding request, so the cap means
+# "index inline costs one round-trip" — the real boundary this guard exists
+# to hold. Measured against this repo's own 665-note OKF vault with the real
+# chunker: median 11 chunks, mean 16.2, p75 21, p90 36, p95 47, p99 80, max
+# 227 — so cap=64 defers only the pathological tail (17/665 notes, 2.6%; the
+# 127 KB curator dump that chunks to ~95) rather than the majority of writes
+# a lower cap deferred. Over it the note commits and the sweep indexes it.
+_INLINE_MAX_CHUNKS = int(os.getenv("KB_INLINE_INDEX_MAX_CHUNKS", "64"))
 
 
 def note_repo_path(slug: str) -> str:
@@ -540,6 +545,12 @@ async def _index_note_inline(
         # note in the pass that is already running.
         async with store.try_reindex_lock(kb_id) as claimed:
             if not claimed:
+                logger.info(
+                    "kb-materialize: %s committed but deferred — KB %s index "
+                    "lock held (sweep or concurrent write)",
+                    path,
+                    kb_id,
+                )
                 return {"indexed": False, "index_reason": "reindex-running"}
             outcome = await index_single_note(
                 store=store,

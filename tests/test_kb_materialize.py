@@ -1104,6 +1104,7 @@ class TestKnowledgeMutationEndpoint:
 # next 900s sweep.
 
 import asyncio  # noqa: E402
+import logging  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 
 from orchestrator.services.kb_reindex import NoteIndexOutcome  # noqa: E402
@@ -1172,8 +1173,9 @@ class TestInlineIndexOnMaterialize:
         assert result["indexed"] is False
         assert result["index_reason"] == "no-indexer"
 
-    def test_a_held_reindex_lock_defers_instead_of_blocking(self):
+    def test_a_held_reindex_lock_defers_instead_of_blocking(self, caplog):
         gitea = _make_gitea(change_results=[True])
+        caplog.set_level(logging.INFO)
         with (
             _patch_resolve(_ref()),
             patch(
@@ -1197,6 +1199,13 @@ class TestInlineIndexOnMaterialize:
         assert result["status"] == "committed"
         assert result["indexed"] is False
         assert result["index_reason"] == "reindex-running"
+        # The refusal must not be silent (review finding): the note is
+        # canonical but unsearchable until the sweep heals it, and the holder
+        # may be a concurrent inline write to this same project, not only the
+        # sweep — the message must not blame the sweep alone.
+        assert PATH in caplog.text
+        assert "index lock held" in caplog.text
+        assert "sweep or concurrent write" in caplog.text
 
     def test_an_index_failure_leaves_the_note_canonical_and_deferred(self):
         db = _ledger_db()
