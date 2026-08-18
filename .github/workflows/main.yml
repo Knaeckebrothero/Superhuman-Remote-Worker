@@ -394,9 +394,23 @@ jobs:
   test-cockpit:
     needs: [lint]
     runs-on: ubuntu-latest
+    # The engines and every system library they need are baked into this image
+    # at /ms-playwright. The step this replaces (`playwright install --with-deps
+    # chromium firefox webkit`) pulled 181 apt packages / 114 MB from
+    # azure.archive.ubuntu.com on every run. That normally cost ~35 s, but a
+    # degraded mirror on 2026-08-18 stretched it to 18m40s and killed the job on
+    # its wall clock. On main that blocks resolve-version and every image build,
+    # so keep the engines off apt entirely.
+    # PLAYWRIGHT_VERSION must match this tag; the guard step below enforces it.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.0-noble
+    env:
+      PLAYWRIGHT_VERSION: 1.59.0
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # The image ships Node 24; pin to 22 so unit tests, the production build,
+      # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -405,20 +419,35 @@ jobs:
       - name: Install dependencies
         working-directory: cockpit
         run: npm ci
+      # Engines come from the image, so a @playwright/test bump that forgets the
+      # container tag would otherwise surface minutes later as a confusing
+      # "Executable doesn't exist". Bump the tag and PLAYWRIGHT_VERSION together.
+      - name: Verify Playwright matches the container image
+        working-directory: cockpit
+        run: |
+          HAVE=$(node -p "require('@playwright/test/package.json').version")
+          if [ "$HAVE" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::@playwright/test is $HAVE but this job runs mcr.microsoft.com/playwright:v$PLAYWRIGHT_VERSION-noble."
+            echo "::error::Bump the container image tag and PLAYWRIGHT_VERSION in this workflow to v$HAVE-noble."
+            exit 1
+          fi
+          echo "Playwright $HAVE matches the container image."
       - name: Check i18n parity
         working-directory: cockpit
         run: npm run i18n:check
+      # Step-level caps so a hung step names itself instead of silently eating
+      # the job budget. Healthy times are ~70 s / ~25 s / ~75 s.
       - name: Run tests
         working-directory: cockpit
+        timeout-minutes: 10
         run: npm test
-      - name: Install Canvas browser engines
-        working-directory: cockpit
-        run: npx playwright install --with-deps chromium firefox webkit
       - name: Build production Cockpit
         working-directory: cockpit
+        timeout-minutes: 10
         run: npm run build
       - name: Run Dynamic Canvas browser conformance
         working-directory: cockpit
+        timeout-minutes: 10
         run: npm run test:e2e:canvas:no-build
       - name: Upload Dynamic Canvas browser report
         if: failure()

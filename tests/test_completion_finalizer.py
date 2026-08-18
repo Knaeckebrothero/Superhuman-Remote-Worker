@@ -220,6 +220,7 @@ class _StatefulConnection:
                 "job_id": command["job_id"],
                 "report_seq": command["report_seq"],
                 "accepted_job_status": command.get("accepted_job_status"),
+                "payload": command.get("payload"),
                 "s1_state": s1.get("state") if s1 else None,
                 "s1_detail": dict(s1.get("detail") or {}) if s1 else None,
                 "predecessor_report_seq": (
@@ -264,7 +265,7 @@ class _StatefulConnection:
             }
 
         if normalized.startswith(
-            "select id, job_id, report_seq, accepted_job_status "
+            "select id, job_id, report_seq, accepted_job_status, payload "
             "from job_completion_commands"
         ):
             command_id, job_id, owner = args
@@ -284,6 +285,7 @@ class _StatefulConnection:
                     "job_id",
                     "report_seq",
                     "accepted_job_status",
+                    "payload",
                 )
             }
 
@@ -543,6 +545,19 @@ class _StatefulConnection:
             return dict(command)
 
         if normalized.startswith("update job_completion_commands set state = 'parked'"):
+            if "completion_decision_authority_unresolved" in normalized:
+                command_id, owner = args
+                command_id = UUID(str(command_id))
+                command = self.commands[command_id]
+                if not self._command_term_live(command_id, owner):
+                    return None
+                command.update(
+                    state="parked",
+                    error_code="completion_decision_authority_unresolved",
+                    finalizing_by=None,
+                    lease_expires_at=None,
+                )
+                return dict(command)
             if "effect_group_attempts_exhausted" in normalized:
                 command_id, owner = args
                 command_id = UUID(str(command_id))
@@ -665,6 +680,17 @@ class _StatefulConnection:
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         normalized = self._record("fetchval", sql, args)
+
+        if normalized.startswith("select min(report_seq)"):
+            job_id, report_seq = args
+            higher = [
+                int(command["report_seq"])
+                for command in self.commands.values()
+                if command["job_id"] == UUID(str(job_id))
+                and int(command["report_seq"]) > int(report_seq)
+                and command["state"] != "superseded"
+            ]
+            return min(higher) if higher else None
 
         if normalized.startswith("update jobs set context = jsonb_set"):
             (
@@ -820,6 +846,20 @@ class _StatefulConnection:
 
     async def execute(self, sql: str, *args: Any) -> str:
         normalized = self._record("execute", sql, args)
+
+        if normalized.startswith(
+            "update jobs set context = coalesce(context, '{}'::jsonb)"
+        ):
+            _job_id, expected_status, tool_call_id = args
+            decision = self.job_context.get("completion_decision")
+            if (
+                self.job_status == expected_status
+                and isinstance(decision, dict)
+                and decision.get("tool_call_id") == tool_call_id
+            ):
+                self.job_context.pop("completion_decision", None)
+                return "UPDATE 1"
+            return "UPDATE 0"
 
         if normalized.startswith("update completion_effects as effect"):
             command_id, owner, name, error_code = args
@@ -1621,6 +1661,7 @@ async def test_entry_status_race_supersedes_whole_command_before_workflow() -> N
         "expected_entry_statuses": ["processing"],
         "observed_status": "cancelled",
         "winning_report_seq": None,
+        "completion_decision_disposition": "not_applicable",
         "abandoned_effects": [],
     }
     command = conn.commands[COMMAND_ID]
@@ -1653,6 +1694,57 @@ async def test_unproven_legacy_null_entry_status_supersedes_fail_closed() -> Non
 
 
 @pytest.mark.asyncio
+async def test_newest_supersede_voids_only_its_exact_live_decision() -> None:
+    command = _command()
+    command["payload"] = {
+        "should_stop": True,
+        "_accepted_completion_decision": {"tool_call_id": "accepted-tool"},
+    }
+    conn = _StatefulConnection(
+        command,
+        job_status="paused",
+        job_context={
+            "completion_decision": {
+                "tool_call_id": "accepted-tool",
+                "summary": "durable completion",
+            }
+        },
+    )
+
+    result = await CompletionFinalizer(conn).finalize_command(str(COMMAND_ID))
+
+    assert result.disposition == "superseded"
+    assert result.outcome is not None
+    assert (
+        result.outcome["completion_decision_disposition"] == "voided_exact_acceptance"
+    )
+    assert "completion_decision" not in conn.job_context
+
+
+@pytest.mark.asyncio
+async def test_newest_supersede_parks_when_live_decision_identity_is_unproven() -> None:
+    conn = _StatefulConnection(
+        _command(),
+        job_status="paused",
+        job_context={
+            "completion_decision": {
+                "tool_call_id": "newer-unproven-tool",
+                "summary": "must not be discarded",
+            }
+        },
+    )
+
+    result = await CompletionFinalizer(conn).finalize_command(str(COMMAND_ID))
+
+    assert result.disposition == "parked"
+    assert result.error_code == "completion_decision_authority_unresolved"
+    assert conn.commands[COMMAND_ID]["state"] == "parked"
+    assert conn.job_context["completion_decision"]["tool_call_id"] == (
+        "newer-unproven-tool"
+    )
+
+
+@pytest.mark.asyncio
 async def test_successor_adopts_immediate_done_predecessor_status_in_order() -> None:
     predecessor = _command(state="done")
     predecessor.update(
@@ -1679,7 +1771,7 @@ async def test_successor_adopts_immediate_done_predecessor_status_in_order() -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("predecessor_state", ["superseded", "force_resolved"])
-async def test_successor_does_not_adopt_operator_or_superseded_predecessor(
+async def test_successor_uses_own_unchanged_accept_snapshot_after_predecessor(
     predecessor_state: str,
 ) -> None:
     predecessor = _command(state=predecessor_state)
@@ -1693,9 +1785,8 @@ async def test_successor_does_not_adopt_operator_or_superseded_predecessor(
         ),
     )
     successor = _command(SECOND_COMMAND_ID, report_seq=2)
-    # Even returning to the successor's original accept status cannot bless a
-    # report whose immediate predecessor did not produce an ordinary done
-    # disposition. The lower terminal row is now the ordering authority.
+    # The predecessor is not sequential authority, but admission's own locked
+    # snapshot is: the jobs row has not moved since this successor was accepted.
     conn = _StatefulConnection(predecessor, successor, job_status="processing")
     workflow_called = False
 
@@ -1708,11 +1799,49 @@ async def test_successor_does_not_adopt_operator_or_superseded_predecessor(
         str(SECOND_COMMAND_ID)
     )
 
-    assert result.disposition == "superseded"
-    assert workflow_called is False
-    assert result.outcome is not None
-    assert result.outcome["expected_entry_statuses"] == ["processing"]
-    assert result.outcome["observed_status"] == "processing"
+    assert result.disposition == "done"
+    assert workflow_called is True
+
+
+@pytest.mark.asyncio
+async def test_feedback_round_uses_own_accept_snapshot_not_completed_predecessor() -> (
+    None
+):
+    predecessor = _command(state="done")
+    predecessor.update(
+        outcome={"status": "handled", "new_status": "reviewing"},
+        finalized_at=NOW,
+    )
+    successor = _command(SECOND_COMMAND_ID, report_seq=2)
+    successor["payload"] = {
+        "should_stop": True,
+        "_accepted_completion_decision": {"tool_call_id": "round-2-tool"},
+    }
+    conn = _StatefulConnection(
+        predecessor,
+        successor,
+        job_status="processing",
+        job_context={
+            "completion_decision": {
+                "tool_call_id": "round-2-tool",
+                "summary": "round 2 complete",
+            }
+        },
+    )
+
+    async def workflow(runner: CompletionEffectRunner) -> dict[str, Any]:
+        assert runner.command["resolved_entry_status"] == "processing"
+        conn.job_status = "completed"
+        conn.job_context.pop("completion_decision", None)
+        return {"status": "handled", "new_status": "completed"}
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(SECOND_COMMAND_ID)
+    )
+
+    assert result.disposition == "done"
+    assert conn.job_status == "completed"
+    assert "completion_decision" not in conn.job_context
 
 
 @pytest.mark.asyncio

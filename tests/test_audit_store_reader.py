@@ -239,6 +239,16 @@ async def test_logical_row_stitch(seeded):
         await s.disconnect()
 
 
+async def test_strict_audit_counts_report_authoritative_pre_rows(seeded):
+    s = await _store(seeded["dsn"])
+    try:
+        missing = str(uuid4())
+        counts = await s.get_audit_counts_strict([seeded["job"], missing])
+        assert counts == {seeded["job"]: 3, missing: 0}
+    finally:
+        await s.disconnect()
+
+
 async def test_lean_projection_drops_metadata_and_heavy_subkeys(seeded):
     # Seed fat rows: boot metadata + heavy tool `arguments`/`state`, and a long
     # error traceback. The lean projection must strip all of these.

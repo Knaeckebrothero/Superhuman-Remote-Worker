@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from unittest.mock import AsyncMock
 
-from orchestrator.database.postgres import PostgresDB
+from orchestrator.database.postgres import LeaseRecoveryBatch, PostgresDB
 
 
 VIEW = "job_completion_sweep_exclusions"
@@ -37,21 +37,23 @@ async def test_orphan_recovery_all_four_arms_share_completion_exclusion(enabled)
     db = _db_with_connection(conn)
 
     assert await db.recover_orphaned_jobs(completion_commands_enabled=enabled) == 10
-    sql = "\n".join(call.args[0] for call in conn.execute.await_args_list)
+    statements = [call.args[0] for call in conn.execute.await_args_list]
+    sql = "\n".join(statements)
     _assert_view_mode(sql, enabled=enabled, count=4)
+    assert "lease_expires_at IS NULL" in statements[0]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_expired_lease_recovery_uses_completion_exclusion(enabled):
-    job_id = uuid4()
     conn = AsyncMock()
-    conn.fetch = AsyncMock(return_value=[{"id": job_id}])
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_connection(conn)
 
-    assert await db.recover_expired_lease_jobs(completion_commands_enabled=enabled) == [
-        str(job_id)
-    ]
+    assert (
+        await db.recover_expired_lease_jobs(completion_commands_enabled=enabled)
+        == LeaseRecoveryBatch()
+    )
     _assert_view_mode(conn.fetch.await_args.args[0], enabled=enabled)
 
 
@@ -120,4 +122,5 @@ async def test_same_host_registration_pause_uses_completion_exclusion(enabled):
     assert result["agent_id"] == str(agent_id)
     pause_sql = conn.execute.await_args_list[0].args[0]
     assert "UPDATE jobs" in pause_sql
+    assert "lease_expires_at IS NULL" in pause_sql
     _assert_view_mode(pause_sql, enabled=enabled)

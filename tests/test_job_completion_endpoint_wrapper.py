@@ -205,6 +205,7 @@ class _RouteDB:
         self.job = job
         self.execute_count = 0
         self.status_write_count = 0
+        self.status_writes: list[dict[str, object]] = []
 
     async def get_job(self, _job_id: str) -> dict:
         return copy.deepcopy(self.job)
@@ -230,6 +231,7 @@ class _RouteDB:
         if expected is not None and self.job["status"] != expected:
             return False
         self.status_write_count += 1
+        self.status_writes.append(copy.deepcopy(updates))
         self.job["status"] = updates["status"]
         if updates["status"] == "completed":
             self.job["completed_at"] = "set"
@@ -562,6 +564,9 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
 ) -> None:
     database = _RouteDB(_route_job())
     runner = _RecordingRunner()
+    runner.command["payload"] = {
+        "_accepted_completion_decision": {"tool_call_id": "round-2-tool"}
+    }
     terminal_effects = AsyncMock(return_value={"actions": ["terminal durable"]})
     workspace_cleanup = AsyncMock(return_value=["workspace archived"])
     wake = AsyncMock()
@@ -638,6 +643,9 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
         "teardown_disposition": "completed",
     }
     assert database.status_write_count == 1
+    assert database.status_writes[0]["consume_completion_decision_tool_call_id"] == (
+        "round-2-tool"
+    )
     assert database.job["status"] == "completed"
     terminal_effects.assert_awaited_once()
     workspace_cleanup.assert_awaited_once_with(JOB_ID)

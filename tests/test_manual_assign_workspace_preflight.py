@@ -259,3 +259,21 @@ class TestPinnedDispatchDefenseInDepth:
         job = _job("paused", workspace_status="ready")
         job["execution_lane"] = "stateless"
         assert await main._resume_job_on_agent(job, _agent()) is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_helper_refuses_redispatch_circuit_trip_before_network(self):
+        job = _job("paused", workspace_status="ready")
+        job["context"]["_lease_recovery"] = {
+            "state": "tripped",
+            "unchanged_recoveries": 3,
+        }
+        assert await main._dispatch_job_to_agent(job, _agent()) is False
+
+    @pytest.mark.asyncio
+    async def test_resume_helper_refuses_redispatch_circuit_trip_before_network(self):
+        job = _job("paused", workspace_status="ready")
+        job["context"]["_lease_recovery"] = {
+            "state": "tripped",
+            "unchanged_recoveries": 3,
+        }
+        assert await main._resume_job_on_agent(job, _agent()) is False

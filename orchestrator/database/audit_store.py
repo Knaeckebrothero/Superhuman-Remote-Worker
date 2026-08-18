@@ -445,6 +445,41 @@ class AuditStore:
             logger.warning(f"get_audit_counts failed: {e}")
             return result
 
+    async def get_audit_counts_strict(self, job_ids: Sequence[str]) -> Dict[str, int]:
+        """Per-job audit counts without converting storage failure to zero.
+
+        Liveness containment uses absence of count movement as authoritative
+        evidence.  The ordinary Cockpit enricher intentionally degrades a read
+        failure to zeros, but doing that here would make an audit outage look
+        like real movement and reset the redispatch circuit.  Keep this narrow
+        strict seam for recovery policy while preserving the existing UI/API
+        behavior of :meth:`get_audit_counts`.
+        """
+
+        if not self._available or self._pool is None:
+            raise RuntimeError("audit store is unavailable")
+        result = {str(job_id): 0 for job_id in job_ids}
+        if not job_ids:
+            return result
+        uuids: List[uuid.UUID] = []
+        for job_id in job_ids:
+            try:
+                uuids.append(uuid.UUID(str(job_id)))
+            except (ValueError, AttributeError, TypeError):
+                pass
+        if not uuids:
+            return result
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT job_id, count(*) AS n FROM agent_audit "
+                "WHERE job_id = ANY($1::uuid[]) AND event_phase='pre' "
+                "GROUP BY job_id",
+                uuids,
+            )
+        for row in rows:
+            result[str(row["job_id"])] = row["n"]
+        return result
+
     async def get_audit_time_range(self, job_id: str) -> Optional[Dict[str, str]]:
         if not self._available or self._pool is None:
             return None

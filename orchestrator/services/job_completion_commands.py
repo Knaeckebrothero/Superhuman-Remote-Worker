@@ -46,6 +46,13 @@ COMPLETION_INLINE_GRACE_SECONDS = 2.0
 # jobs row is locked and therefore cannot be used to identify an HTTP retry.
 _FALLBACK_REPORT_NAMESPACE = UUID("7072cfbc-d685-4d52-9942-d954f2914652")
 
+# Server-owned acceptance evidence.  This is deliberately stored beside the
+# immutable report instead of in a new mutable jobs.context field: a replay
+# must retain the identity of the exact journaled decision that existed while
+# admission held the jobs-row lock.  It is excluded from the caller payload
+# digest and stripped before reconstructing JobCompleteRequest.
+ACCEPTED_COMPLETION_DECISION_KEY = "_accepted_completion_decision"
+
 
 class CompletionCommandError(RuntimeError):
     """Base class for accept failures with an HTTP-level retry policy."""
@@ -135,7 +142,13 @@ def canonical_completion_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         str(key): value
         for key, value in payload.items()
-        if key not in {"lease_token", "agent_id", "client_report_id"}
+        if key
+        not in {
+            "lease_token",
+            "agent_id",
+            "client_report_id",
+            ACCEPTED_COMPLETION_DECISION_KEY,
+        }
     }
 
 
@@ -173,6 +186,18 @@ def _json_object(value: Any) -> dict[str, Any] | None:
         parsed = json.loads(value)
         return dict(parsed) if isinstance(parsed, dict) else None
     return dict(value) if isinstance(value, Mapping) else None
+
+
+def accepted_completion_decision_tool_call_id(
+    payload: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the server-captured completion-decision identity, if proven."""
+
+    marker = (payload or {}).get(ACCEPTED_COMPLETION_DECISION_KEY)
+    if not isinstance(marker, Mapping):
+        return None
+    tool_call_id = str(marker.get("tool_call_id") or "").strip()
+    return tool_call_id or None
 
 
 def _str_tuple(value: Any) -> tuple[str, ...]:
@@ -291,7 +316,6 @@ async def accept_completion_command(
 
     job_uuid = UUID(str(job_id))
     canonical_payload = canonical_completion_payload(payload)
-    payload_json = _canonical_json(canonical_payload)
     digest = completion_payload_digest(str(job_uuid), canonical_payload)
     supplied_report_uuid = UUID(str(client_report_id)) if client_report_id else None
     required_code_version = (
@@ -449,6 +473,25 @@ async def accept_completion_command(
                 fallback_client_report_id(str(job_uuid), report_seq)
             )
 
+            # Capture the exact durable job_complete decision observed by
+            # admission.  A later whole-command supersede may clear that
+            # decision only when this identity still matches; a different or
+            # unproven decision is parked for an operator instead of being
+            # discarded.  The marker is server evidence, not caller input,
+            # and therefore is not part of the idempotency digest above.
+            stored_payload = dict(canonical_payload)
+            job_context = _json_object(job.get("context")) or {}
+            completion_decision = job_context.get("completion_decision")
+            if isinstance(completion_decision, Mapping):
+                tool_call_id = str(
+                    completion_decision.get("tool_call_id") or ""
+                ).strip()
+                if tool_call_id:
+                    stored_payload[ACCEPTED_COMPLETION_DECISION_KEY] = {
+                        "tool_call_id": tool_call_id,
+                    }
+            payload_json = _canonical_json(stored_payload)
+
             # FIRST database write of the handler.  Cursor and queue writes
             # follow only after the immutable command is present.
             command = await conn.fetchrow(
@@ -520,6 +563,7 @@ async def accept_completion_command(
 
 
 __all__ = [
+    "ACCEPTED_COMPLETION_DECISION_KEY",
     "COMPLETION_CODE_VERSION",
     "COMPLETION_STATUS_REORDER_CODE_VERSION",
     "COMPLETION_SUPPORTED_CODE_VERSIONS",
@@ -533,6 +577,7 @@ __all__ = [
     "CompletionPayloadMismatch",
     "CompletionTeardownInProgress",
     "accept_completion_command",
+    "accepted_completion_decision_tool_call_id",
     "canonical_completion_payload",
     "completion_payload_digest",
     "fallback_client_report_id",

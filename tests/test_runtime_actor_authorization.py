@@ -98,6 +98,20 @@ async def test_bad_actor_credentials_fail_closed_and_are_audited(headers, code):
     db.record_security_event.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_generic_internal_caller_cannot_acknowledge_without_runtime_actor():
+    db = _audit_db()
+    with pytest.raises(HTTPException) as exc:
+        await service.authorize_runtime_actor_request(
+            db,
+            _request(),
+            action="redispatch_livelock_ack",
+            project_id=PROJECT_A,
+        )
+    assert exc.value.detail["code"] == "missing_credential"
+    db.record_security_event.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     ("values", "code"),
     [
@@ -132,7 +146,15 @@ async def test_expired_actor_credential_fails_closed_and_audits_actor():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["officer_message", "machine_tags", "charter"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        "officer_message",
+        "redispatch_livelock_ack",
+        "machine_tags",
+        "charter",
+    ],
+)
 async def test_project_a_credential_cannot_act_on_project_b(action):
     db = _audit_db()
     actor = _actor(project_id=PROJECT_A)
@@ -211,6 +233,48 @@ def test_named_human_policy_constant_documents_safe_default():
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["worker", "human", "conference"])
+async def test_only_current_officer_runtime_may_acknowledge_redispatch_trip(kind):
+    db = _audit_db()
+    actor = _actor(
+        kind=kind,
+        thread_id=None if kind == "worker" else OFFICER_THREAD,
+        incarnation=None,
+    )
+    with (
+        patch.object(service, "_actor_for_access", AsyncMock(return_value=actor)),
+        patch.object(service, "_current_actor", AsyncMock(return_value=actor)),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await service.authorize_runtime_actor_request(
+                db,
+                _request(ACCESS_TOKEN),
+                action="redispatch_livelock_ack",
+                project_id=PROJECT_A,
+            )
+    assert exc.value.detail["code"] == "officer_required"
+    db.record_security_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_current_officer_runtime_may_acknowledge_redispatch_trip():
+    db = _audit_db()
+    actor = _actor()
+    with (
+        patch.object(service, "_actor_for_access", AsyncMock(return_value=actor)),
+        patch.object(service, "_current_actor", AsyncMock(return_value=actor)),
+    ):
+        result = await service.authorize_runtime_actor_request(
+            db,
+            _request(ACCESS_TOKEN),
+            action="redispatch_livelock_ack",
+            project_id=PROJECT_A,
+        )
+    assert result is actor
+    db.record_security_event.assert_not_awaited()
+
+
 class _CurrentStateDB:
     def __init__(self) -> None:
         self.post = {
@@ -269,7 +333,7 @@ async def test_recommission_invalidates_old_incarnation_immediately():
             await service.authorize_runtime_actor_request(
                 db,
                 _request(ACCESS_TOKEN),
-                action="machine_tags",
+                action="redispatch_livelock_ack",
                 project_id=PROJECT_A,
             )
     assert denied.value.detail["code"] == "runtime_not_current"

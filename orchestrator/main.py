@@ -1770,7 +1770,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                         _suspend_thread_resources(thread_id),
                     )
 
-            # 4. Propagate: jobs assigned to offline agents → paused
+            # 4. Legacy compatibility: pre-lease pinned jobs assigned to
+            # offline/non-working agents -> paused. The database predicate
+            # excludes every non-NULL lease; ordering cannot steal a leased
+            # row from the authoritative expiry circuit below.
             recovered = await _step(
                 "orphaned_job_recovery",
                 postgres_db.recover_orphaned_jobs(
@@ -1800,23 +1803,38 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
 
             # 4b. Job execution lease: expired lease == orphaned, decided
             # purely by the DB clock — no agents-table join, no dependency on
-            # step 1 having run. Primary recovery going forward; step 4 stays
-            # as belt-and-suspenders during the soak
-            # (knowledge-base/knowledge/features/job_execution_lease.md).
-            expired = await _step(
+            # step 1 having run. This is the sole automatic
+            # infrastructure-loss authority for leased pinned rows; step 4 is
+            # constrained to genuine pre-lease NULL-lease compatibility rows.
+            lease_recovery_kwargs: dict[str, Any] = {
+                "completion_commands_enabled": COMPLETION_COMMANDS_ENABLED,
+            }
+            if getattr(audit_reader, "is_available", False):
+                lease_recovery_kwargs["audit_fingerprint_provider"] = (
+                    audit_reader.get_audit_counts_strict
+                )
+            lease_recovery = await _step(
                 "lease_expiry_recovery",
-                postgres_db.recover_expired_lease_jobs(
-                    completion_commands_enabled=COMPLETION_COMMANDS_ENABLED
-                ),
+                postgres_db.recover_expired_lease_jobs(**lease_recovery_kwargs),
             )
-            for _job_id in expired or []:
+            recovered_lease_ids = (
+                lease_recovery.recovered_job_ids if lease_recovery is not None else ()
+            )
+            circuit_trips = (
+                lease_recovery.circuit_trips if lease_recovery is not None else ()
+            )
+            for _job_id in recovered_lease_ids:
                 logger.warning(
                     "Job %s recovered by lease expiry — its agent stopped "
                     "renewing (pod died, wedged, or a failed dispatch handoff); "
                     "re-queued for dispatch",
                     _job_id,
                 )
-            if expired:
+            if recovered_lease_ids:
+                # Recoveries below the containment threshold retain the
+                # established fleet-capacity signal.  The circuit-trip event
+                # below is different: it is actionable only by the owning
+                # project's Officer and is inserted transactionally there.
                 await _step(
                     "officer_fleet_leases",
                     notify_all_officers(
@@ -1825,13 +1843,33 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                         dedup_key="fleet:lease_recovered",
                         payload={
                             "summary": (
-                                f"{len(expired)} job(s) recovered by lease "
-                                f"expiry: " + ", ".join(str(j)[:8] for j in expired[:5])
+                                f"{len(recovered_lease_ids)} job(s) recovered by "
+                                "lease expiry: "
+                                + ", ".join(
+                                    str(job_id)[:8]
+                                    for job_id in recovered_lease_ids[:5]
+                                )
                             )
                         },
                     ),
                 )
                 _kick_officer_event_drain(postgres_db)
+            for trip in circuit_trips:
+                logger.error(
+                    "Job %s parked by redispatch circuit after %s unchanged "
+                    "lease recoveries (project=%s, officer_route=%s, queued=%s)",
+                    trip.job_id,
+                    trip.unchanged_recoveries,
+                    trip.project_id,
+                    trip.officer_destination,
+                    trip.notification_queued,
+                )
+            if circuit_trips:
+                # The recovery transaction already inserted the owning
+                # project's durable outbox row. This is only a fast drain kick;
+                # vacant posts retain the same incident in their durable ledger.
+                _kick_officer_event_drain(postgres_db)
+            if recovered_lease_ids:
                 _trigger_dispatch()
 
             # 5. GC: drop offline agent rows older than 24h
@@ -4340,6 +4378,21 @@ async def _build_job_start_request(
         reset_log_context(_log_token)
 
 
+def _redispatch_livelock_trip(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return the hidden active lease-recovery trip, if this row has one."""
+
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    recovery = context.get("_lease_recovery") if isinstance(context, Mapping) else None
+    if isinstance(recovery, Mapping) and recovery.get("state") == "tripped":
+        return recovery
+    return None
+
+
 async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
     """Build and push a fresh job to a registered pinned agent."""
     job_id = str(job["id"])
@@ -4352,6 +4405,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         logger.warning(
             "Dispatch: refusing pinned start for %s job %s",
             job.get("execution_lane"),
+            job_id,
+        )
+        return False
+    if _redispatch_livelock_trip(job) is not None:
+        logger.error(
+            "Dispatch: refusing circuit-tripped redispatch-livelock job %s",
             job_id,
         )
         return False
@@ -4435,6 +4494,13 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         logger.warning(
             "Resume dispatch: refusing pinned resume for %s job %s",
             job.get("execution_lane"),
+            job_id,
+        )
+        return False
+
+    if _redispatch_livelock_trip(job) is not None:
+        logger.error(
+            "Resume dispatch: refusing circuit-tripped redispatch-livelock job %s",
             job_id,
         )
         return False
@@ -14224,20 +14290,37 @@ async def agent_release_job(
     — requires ``X-Internal-Key``. Ingress strips this path.
 
     Called by an agent that is shutting down or otherwise releasing a job
-    it was working on.  Unlike the regular pause endpoint, this does NOT
-    try to contact the agent pod (since the caller *is* the agent).
-    It simply sets the job to 'paused' and clears the agent assignment
-    so the dispatcher can reassign it.
+    it was working on. Unlike the regular pause endpoint, this does NOT try to
+    contact the agent pod (since the caller *is* the agent). A leased pinned
+    job is handed to the authoritative expiry sweep, which advances durable
+    redispatch accounting; only a genuine pre-lease NULL-lease row is paused
+    here directly. Stateless work retains its queue-token release contract.
     """
     await require_internal(request)
     try:
-        if not COMPLETION_COMMANDS_ENABLED:
+        job = await postgres_db.get_job(job_id)
+        lease_recovery_pending = False
+        if not job:
+            success = False
+        elif (
+            job.get("execution_lane", "pinned") == "pinned"
+            and job.get("lease_expires_at") is not None
+        ):
+            if COMPLETION_COMMANDS_ENABLED and agent_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Agent release does not identify the assigned agent",
+                )
+            success = await postgres_db.route_pinned_agent_release_to_lease_recovery(
+                job_id,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+                expected_agent_id=agent_id,
+            )
+            lease_recovery_pending = success
+        elif not COMPLETION_COMMANDS_ENABLED:
             success = await postgres_db.pause_job(job_id)
         else:
-            job = await postgres_db.get_job(job_id)
-            if not job:
-                success = False
-            elif job.get("execution_lane") == "stateless":
+            if job.get("execution_lane") == "stateless":
                 if lease_token is None:
                     raise HTTPException(
                         status_code=409,
@@ -14283,6 +14366,12 @@ async def agent_release_job(
                 status_code=400,
                 detail="Job cannot be paused (not found or status changed)",
             )
+        if lease_recovery_pending:
+            logger.info(
+                "Agent released leased job %s — lease expiry recovery pending",
+                job_id,
+            )
+            return {"status": "lease_recovery_pending", "job_id": job_id}
         logger.info(f"Agent released job {job_id} — paused for reassignment")
         _trigger_dispatch()
         return {"status": "paused", "job_id": job_id}
@@ -16897,9 +16986,36 @@ async def resume_job(
     Returns:
         Status message indicating resume result
     """
-    _, job = await require_internal_or_job_access(req, postgres_db, job_id)
+    user, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobResumeRequest()
+    recovery_trip = _redispatch_livelock_trip(job)
+    trip_ack_actor: dict[str, Any] | None = None
+    if recovery_trip is not None:
+        if user is not None:
+            # The existing job-access guard remains the human authorization
+            # policy. This payload is server-derived audit context only.
+            trip_ack_actor = {
+                "caller_kind": "human",
+                "user_id": str(user.get("id")) if user.get("id") else None,
+            }
+        else:
+            project_id = str(job["project_id"]) if job.get("project_id") else None
+            if project_id is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "A project-less redispatch circuit may only be "
+                        "acknowledged by an authorized human user."
+                    ),
+                )
+            actor = await authorize_runtime_actor_request(
+                postgres_db,
+                req,
+                action="redispatch_livelock_ack",
+                project_id=project_id,
+            )
+            trip_ack_actor = actor.audit_payload()
     await _guard_completion_control(job_id, source="public_resume")
 
     # Resume PEP (decision 9, B3): re-check the runner's CURRENT grants against the
@@ -17032,6 +17148,55 @@ async def resume_job(
             if job["status"] in ("pending_review", "reviewing")
             else "An operator explicitly resumed this job with the feedback below."
         )
+
+        if recovery_trip is not None:
+            generation = str(recovery_trip.get("generation") or "")
+            if not generation:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This redispatch circuit predates supported "
+                        "acknowledgement; an operator must inspect it before retry."
+                    ),
+                )
+            feedback = request.feedback if request else None
+            context_merge = (
+                {
+                    "queued_feedback": feedback,
+                    "queued_feedback_reason": feedback_reason,
+                }
+                if feedback
+                else None
+            )
+            if trip_ack_actor is None:  # pragma: no cover - authorization invariant
+                raise RuntimeError("redispatch circuit actor was not authorized")
+            acknowledged = await postgres_db.acknowledge_lease_recovery_circuit(
+                job_id,
+                expected_status=str(job["status"]),
+                expected_generation=generation,
+                acknowledged_by=trip_ack_actor,
+                context_merge=context_merge,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            )
+            if not acknowledged:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The redispatch circuit changed or is under completion "
+                        "control; no acknowledgement was applied."
+                    ),
+                )
+            logger.warning(
+                "Redispatch-livelock circuit acknowledged for job %s by %s",
+                job_id,
+                trip_ack_actor,
+            )
+            _trigger_dispatch()
+            return {
+                "status": "acknowledged",
+                "message": "Redispatch circuit acknowledged; job queued for dispatch",
+                "job_id": job_id,
+            }
 
         async def _queue_for_dispatch(
             message: str,
@@ -17747,6 +17912,14 @@ async def _upgrade_job_to_vm_internal(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        if _redispatch_livelock_trip(job) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This job is parked by the redispatch-livelock circuit; "
+                    "use the explicit Resume action to acknowledge it first."
+                ),
+            )
         await _guard_completion_control(job_id, source="upgrade_to_vm")
 
         if job["status"] not in ("pending_review", "reviewing", "paused"):
@@ -17986,6 +18159,14 @@ async def _resume_job_without_vm_internal(
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if _redispatch_livelock_trip(job) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This job is parked by the redispatch-livelock circuit; "
+                "use the explicit Resume action to acknowledge it first."
+            ),
+        )
     if (completion_owner_command_id is None) != (completion_owner is None):
         raise ValueError(
             "completion owner command id and owner must be supplied together"
@@ -19582,6 +19763,10 @@ async def _materialize_critic_verdict_transactional(
                     new_status = str(transition["new_status"])
                     result = await conn.execute(
                         "UPDATE jobs SET status=$2::text, "
+                        "context=CASE WHEN $2::text IN "
+                        "('completed','failed','cancelled') "
+                        "THEN COALESCE(context, '{}'::jsonb) "
+                        "- 'completion_decision' ELSE context END, "
                         "completed_at=CASE WHEN $2::text='completed' "
                         "THEN COALESCE(completed_at, CURRENT_TIMESTAMP) "
                         "ELSE completed_at END, "
@@ -23552,6 +23737,9 @@ async def _run_persisted_completion_workflow(effect_runner: Any) -> dict[str, An
 
     command = effect_runner.command
     payload = dict(command.get("payload") or {})
+    from services.job_completion_commands import ACCEPTED_COMPLETION_DECISION_KEY
+
+    payload.pop(ACCEPTED_COMPLETION_DECISION_KEY, None)
     payload.update(
         {
             "lease_token": command.get("accepted_lease_token"),
@@ -25874,6 +26062,18 @@ async def _complete_job_legacy(
             if _effect_runner is not None:
                 kwargs["completion_command_id"] = _effect_runner.command_id
                 kwargs["completion_finalizing_by"] = _effect_runner.owner
+                if new_status in {"completed", "failed", "cancelled"}:
+                    from services.job_completion_commands import (
+                        accepted_completion_decision_tool_call_id,
+                    )
+
+                    accepted_decision_id = accepted_completion_decision_tool_call_id(
+                        _effect_runner.command.get("payload")
+                    )
+                    if accepted_decision_id is not None:
+                        kwargs["consume_completion_decision_tool_call_id"] = (
+                            accepted_decision_id
+                        )
                 if delivery_control_claim_id is not None:
                     kwargs["completion_control_claim_id"] = delivery_control_claim_id
 

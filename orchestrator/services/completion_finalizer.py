@@ -39,6 +39,7 @@ from services.job_completion_commands import (
     COMPLETION_CODE_VERSION,
     COMPLETION_STATUS_REORDER_CODE_VERSION,
     COMPLETION_SUPPORTED_CODE_VERSIONS,
+    accepted_completion_decision_tool_call_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -1915,6 +1916,96 @@ class CompletionFinalizer:
         """Terminalize one whole command while its jobs row is locked."""
 
         command_id = str(command["id"])
+        job_id = str(command["job_id"])
+        job = await conn.fetchrow(
+            """
+            SELECT status::text AS status, context
+            FROM jobs
+            WHERE id = $1::uuid
+            """,
+            UUID(job_id),
+        )
+        if job is None:
+            raise CompletionLeaseLost(
+                f"completion command {command_id} lost its jobs row"
+            )
+        higher_report_seq = await conn.fetchval(
+            """
+            SELECT MIN(report_seq)
+            FROM job_completion_commands
+            WHERE job_id = $1::uuid
+              AND report_seq > $2::bigint
+              AND state <> 'superseded'
+            """,
+            UUID(job_id),
+            int(command["report_seq"]),
+        )
+        job_context = _json_object(_row_value(job, "context")) or {}
+        live_decision = job_context.get("completion_decision")
+        current_status = str(_row_value(job, "status", "") or "")
+        accepted_decision_id = accepted_completion_decision_tool_call_id(
+            _json_object(command.get("payload")) or {}
+        )
+        decision_disposition = "not_applicable"
+        if (
+            higher_report_seq is None
+            and current_status not in {"completed", "failed", "cancelled"}
+            and isinstance(live_decision, Mapping)
+        ):
+            live_decision_id = str(live_decision.get("tool_call_id") or "").strip()
+            if accepted_decision_id and live_decision_id == accepted_decision_id:
+                cleared = await conn.execute(
+                    """
+                    UPDATE jobs
+                    SET context = COALESCE(context, '{}'::jsonb)
+                                  - 'completion_decision',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1::uuid
+                      AND status::text = $2::text
+                      AND context #>> '{completion_decision,tool_call_id}' = $3::text
+                    """,
+                    UUID(job_id),
+                    current_status,
+                    accepted_decision_id,
+                )
+                if cleared != "UPDATE 1":
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its decision-void term"
+                    )
+                decision_disposition = "voided_exact_acceptance"
+            else:
+                # A live decision that cannot be tied to this command may be a
+                # newer legitimate completion.  Parking preserves both the
+                # command and decision and leaves the existing completion
+                # monitor/operator path in charge; guessing here would discard
+                # the only durable statement of completed work.
+                parked = await conn.fetchrow(
+                    """
+                    UPDATE job_completion_commands
+                    SET state = 'parked',
+                        error_code = 'completion_decision_authority_unresolved',
+                        finalizing_by = NULL, lease_expires_at = NULL
+                    WHERE id = $1::uuid
+                      AND state = 'finalizing'
+                      AND finalizing_by = $2::text
+                      AND lease_expires_at > now()
+                      AND deadline_at > now()
+                    RETURNING *
+                    """,
+                    UUID(command_id),
+                    owner,
+                )
+                if parked is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its decision-park term"
+                    )
+                return FinalizationResult(
+                    command_id=command_id,
+                    state="parked",
+                    disposition="parked",
+                    error_code="completion_decision_authority_unresolved",
+                )
+
         abandoned_rows = await conn.fetch(
             """
             SELECT effect_name, state, detail
@@ -1949,7 +2040,10 @@ class CompletionFinalizer:
             "accepted_job_status": command.get("accepted_job_status"),
             "expected_entry_statuses": list(signal.expected_statuses),
             "observed_status": signal.observed_status,
-            "winning_report_seq": None,
+            "winning_report_seq": (
+                int(higher_report_seq) if higher_report_seq is not None else None
+            ),
+            "completion_decision_disposition": decision_disposition,
             "abandoned_effects": abandoned_effects,
         }
         outcome_json = json.dumps(
@@ -2023,7 +2117,7 @@ class CompletionFinalizer:
                 authority = await conn.fetchrow(
                     """
                     SELECT command.id, command.job_id, command.report_seq,
-                           command.accepted_job_status,
+                           command.accepted_job_status, command.payload,
                            s1.state AS s1_state, s1.detail AS s1_detail,
                            predecessor.report_seq AS predecessor_report_seq,
                            predecessor.state AS predecessor_state,
@@ -2088,14 +2182,21 @@ class CompletionFinalizer:
                 predecessor_exists = (
                     _row_value(authority, "predecessor_report_seq") is not None
                 )
+                if accepted_status and current_status == accepted_status:
+                    # Admission captured this command's own status while the
+                    # jobs row was locked.  That proof remains authoritative
+                    # when the job still has the same status, including the
+                    # feedback-round topology where a completed predecessor
+                    # legitimately returned the job to processing before this
+                    # report was accepted.
+                    return accepted_status
                 if predecessor_exists:
-                    # Once a lower report exists, acceptance may have happened
-                    # before that report finalized. Its output, not the stale
-                    # accept snapshot, is the only sequential authority.
+                    # If this command's own snapshot no longer matches,
+                    # acceptance may have happened before the lower report
+                    # finalized. A proven predecessor output can then supply
+                    # sequential authority; an unproved output cannot.
                     if predecessor_proved and current_status == predecessor_status:
                         return predecessor_status
-                elif accepted_status and current_status == accepted_status:
-                    return accepted_status
 
                 expected_statuses = [accepted_status]
                 if predecessor_proved:
@@ -2109,6 +2210,7 @@ class CompletionFinalizer:
                     "job_id": str(authority["job_id"]),
                     "report_seq": int(authority["report_seq"]),
                     "accepted_job_status": _row_value(authority, "accepted_job_status"),
+                    "payload": _json_object(_row_value(authority, "payload")) or {},
                 }
                 return await self._supersede_locked(
                     conn,
@@ -2144,7 +2246,7 @@ class CompletionFinalizer:
                     )
                 exact = await conn.fetchrow(
                     """
-                    SELECT id, job_id, report_seq, accepted_job_status
+                    SELECT id, job_id, report_seq, accepted_job_status, payload
                     FROM job_completion_commands
                     WHERE id = $1::uuid
                       AND job_id = $2::uuid

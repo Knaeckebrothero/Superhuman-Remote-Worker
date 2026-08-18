@@ -604,7 +604,7 @@ async def authorize_runtime_actor_request(
                 actor=actor,
             )
         await _current_actor(db, actor)
-        if action == "officer_message":
+        if action in {"officer_message", "redispatch_livelock_ack"}:
             if actor.caller_kind != "officer":
                 raise RuntimeActorCredentialError(
                     "officer_required",

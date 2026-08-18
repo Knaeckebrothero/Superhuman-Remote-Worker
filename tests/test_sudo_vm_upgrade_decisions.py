@@ -297,6 +297,30 @@ def _db_with_execute(job: dict):
 
 class TestResumeWithoutVm:
     @pytest.mark.asyncio
+    async def test_circuit_trip_refuses_before_any_resume_write(self, tmp_path):
+        job = _frozen_job()
+        job["context"] = {
+            "_lease_recovery": {
+                "state": "tripped",
+                "generation": "incident-1",
+            }
+        }
+        db, conn = _db_with_execute(job)
+        ws = MagicMock()
+        ws.base_path = tmp_path
+        with (
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "workspace_service", ws),
+            patch.object(orch_main, "_trigger_dispatch", MagicMock()) as trigger,
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main._resume_job_without_vm_internal(JOB_ID)
+
+        assert exc.value.status_code == 409
+        conn.execute.assert_not_awaited()
+        trigger.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_deny_writes_sticky_denial_and_requeues(self, tmp_path):
         db, conn = _db_with_execute(_frozen_job())
         ws = MagicMock()

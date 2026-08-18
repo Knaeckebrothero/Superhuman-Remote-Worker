@@ -490,7 +490,9 @@ async def test_m1_m3_collision_matrix_has_exactly_one_owner(pg, monkeypatch):
     live_route = await router.enqueue_job(live_job, source="m1-live")
     assert live_route.disposition == "stand_down"
     assert live_route.route == "stand_down"
-    assert await db.recover_expired_lease_jobs(completion_commands_enabled=True) == []
+    assert not (
+        await db.recover_expired_lease_jobs(completion_commands_enabled=True)
+    ).changed
 
     expired_routes = await asyncio.gather(
         router.enqueue_job(expired_job, source="m1-expired-a"),

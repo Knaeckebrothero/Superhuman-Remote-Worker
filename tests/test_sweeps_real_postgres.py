@@ -168,7 +168,7 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
     NULL-lease (pre-deploy) rows are left to the legacy sweep."""
     import asyncpg
 
-    from orchestrator.database.postgres import PostgresDB
+    from orchestrator.database.postgres import LeaseRecoveryBatch, PostgresDB
 
     test_db_name = f"srw_lease_{uuid4().hex[:12]}"
     admin = await asyncpg.connect(SWEEP_TEST_PG_DSN)
@@ -226,7 +226,7 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
         assert lease is not None
 
         # Fresh lease: the sweep must NOT touch it.
-        assert await db.recover_expired_lease_jobs() == []
+        assert await db.recover_expired_lease_jobs() == LeaseRecoveryBatch()
 
         # Expired lease: recovered to paused/unassigned.
         async with db.acquire() as conn:
@@ -236,7 +236,7 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 job_id,
             )
         recovered = await db.recover_expired_lease_jobs()
-        assert recovered == [str(job_id)]
+        assert recovered == LeaseRecoveryBatch(recovered_job_ids=(str(job_id),))
         async with db.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT status, assigned_agent_id, lease_expires_at "
@@ -271,7 +271,7 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 "RETURNING id",
                 '{"freeze_type": "batch_boundary", "reason": "test"}',
             )
-        assert await db.recover_expired_lease_jobs() == []
+        assert await db.recover_expired_lease_jobs() == LeaseRecoveryBatch()
 
         # The belt-and-suspenders orphan sweep has four mutation arms. Seed
         # one stateless row for every arm and prove all four remain untouched.

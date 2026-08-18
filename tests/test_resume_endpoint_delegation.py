@@ -22,7 +22,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -362,6 +362,12 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     monkeypatch.setattr(main.postgres_db, "merge_job_context", AsyncMock())
     queue_for_resume = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", queue_for_resume)
+    acknowledge_circuit = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "acknowledge_lease_recovery_circuit",
+        acknowledge_circuit,
+    )
     queue_stateless = AsyncMock(return_value=True)
     monkeypatch.setattr(
         main.postgres_db, "queue_stateless_job_for_resume", queue_stateless
@@ -382,6 +388,7 @@ def endpoint_collaborators(monkeypatch, fake_conn):
         delegate=delegate,
         conn=fake_conn,
         queue_for_resume=queue_for_resume,
+        acknowledge_circuit=acknowledge_circuit,
         queue_stateless=queue_stateless,
         prepare_stateless=prepare_stateless,
     )
@@ -485,6 +492,126 @@ class TestResumeEndpointDelegation:
             None,
             expected_status="paused",
         )
+
+
+class TestRedispatchCircuitAcknowledgement:
+    @staticmethod
+    def _trip(job: dict) -> None:
+        job.update(project_id=PROJECT_ID, status="paused")
+        job["context"] = {
+            "_lease_recovery": {
+                "version": 1,
+                "generation": "incident-1",
+                "state": "tripped",
+                "unchanged_recoveries": 3,
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_authorized_human_acknowledges_atomically(
+        self, endpoint_collaborators
+    ):
+        self._trip(endpoint_collaborators.job)
+        main.require_internal_or_job_access.return_value = (
+            {"id": "00000000-0000-0000-0000-0000000000cc"},
+            endpoint_collaborators.job,
+        )
+
+        result = await main.resume_job(
+            MagicMock(), JOB_ID, main.JobResumeRequest(feedback="retry deliberately")
+        )
+
+        assert result["status"] == "acknowledged"
+        endpoint_collaborators.acknowledge_circuit.assert_awaited_once_with(
+            JOB_ID,
+            expected_status="paused",
+            expected_generation="incident-1",
+            acknowledged_by={
+                "caller_kind": "human",
+                "user_id": "00000000-0000-0000-0000-0000000000cc",
+            },
+            context_merge={
+                "queued_feedback": "retry deliberately",
+                "queued_feedback_reason": (
+                    "An operator explicitly resumed this job with the feedback below."
+                ),
+            },
+            completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+        )
+        endpoint_collaborators.delegate.assert_not_awaited()
+        endpoint_collaborators.queue_for_resume.assert_not_awaited()
+        main._trigger_dispatch.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_current_officer_may_acknowledge_own_project(
+        self, endpoint_collaborators, monkeypatch
+    ):
+        self._trip(endpoint_collaborators.job)
+        actor = RuntimeActorContext(
+            caller_kind="officer",
+            project_id=PROJECT_ID,
+            project_role="owner",
+            thread_id="00000000-0000-0000-0000-0000000000dd",
+            officer_incarnation=4,
+        )
+        authorize = AsyncMock(return_value=actor)
+        monkeypatch.setattr(main, "authorize_runtime_actor_request", authorize)
+
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result["status"] == "acknowledged"
+        authorize.assert_awaited_once_with(
+            main.postgres_db,
+            ANY,
+            action="redispatch_livelock_ack",
+            project_id=PROJECT_ID,
+        )
+        assert (
+            endpoint_collaborators.acknowledge_circuit.await_args.kwargs[
+                "acknowledged_by"
+            ]
+            == actor.audit_payload()
+        )
+
+    @pytest.mark.asyncio
+    async def test_worker_stale_or_foreign_runtime_cannot_acknowledge(
+        self, endpoint_collaborators, monkeypatch
+    ):
+        self._trip(endpoint_collaborators.job)
+        authorize = AsyncMock(
+            side_effect=HTTPException(
+                status_code=403,
+                detail={"code": "runtime_not_current"},
+            )
+        )
+        monkeypatch.setattr(main, "authorize_runtime_actor_request", authorize)
+
+        with pytest.raises(HTTPException) as exc:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert exc.value.status_code == 403
+        endpoint_collaborators.acknowledge_circuit.assert_not_awaited()
+        endpoint_collaborators.delegate.assert_not_awaited()
+        main._trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_acknowledgement_race_reports_no_false_success(
+        self, endpoint_collaborators
+    ):
+        self._trip(endpoint_collaborators.job)
+        main.require_internal_or_job_access.return_value = (
+            {"id": "00000000-0000-0000-0000-0000000000cc"},
+            endpoint_collaborators.job,
+        )
+        endpoint_collaborators.acknowledge_circuit.return_value = False
+
+        with pytest.raises(HTTPException) as exc:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert exc.value.status_code == 409
+        endpoint_collaborators.delegate.assert_not_awaited()
+        endpoint_collaborators.queue_for_resume.assert_not_awaited()
+        main._trigger_dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator.main as main
+from orchestrator.database.postgres import (
+    LeaseRecoveryBatch,
+    LeaseRecoveryCircuitTrip,
+)
 
 
 def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
@@ -29,7 +33,7 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     db.mark_orphaned_threads_ended = AsyncMock(return_value=[])
     db.mark_orphaned_threads_suspended = AsyncMock(return_value=[])
     db.recover_orphaned_jobs = AsyncMock(return_value=0)
-    db.recover_expired_lease_jobs = AsyncMock(return_value=[])
+    db.recover_expired_lease_jobs = AsyncMock(return_value=LeaseRecoveryBatch())
     db.gc_offline_agents = AsyncMock(return_value=0)
     return db
 
@@ -126,11 +130,15 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     agents-table sweeps (knowledge-base/knowledge/features/job_execution_lease.md)."""
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)
-    db.recover_expired_lease_jobs = AsyncMock(return_value=["job-a", "job-b"])
+    db.recover_expired_lease_jobs = AsyncMock(
+        return_value=LeaseRecoveryBatch(recovered_job_ids=("job-a", "job-b"))
+    )
 
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
+        patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "_release_thread_resources", AsyncMock()),
         patch.object(main, "_suspend_thread_resources", AsyncMock()),
     ):
@@ -139,7 +147,70 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     db.recover_expired_lease_jobs.assert_awaited_once_with(
         completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
     )
+    notify_all.assert_awaited_once_with(
+        db,
+        source="fleet",
+        dedup_key="fleet:lease_recovered",
+        payload={"summary": "2 job(s) recovered by lease expiry: job-a, job-b"},
+    )
+    kick_wake_drain.assert_called_once_with(db)
     trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_recovery_uses_strict_audit_fingerprint_reader():
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    strict_counts = AsyncMock(return_value={})
+    reader = MagicMock(is_available=True, get_audit_counts_strict=strict_counts)
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "audit_reader", reader),
+        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    db.recover_expired_lease_jobs.assert_awaited_once_with(
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+        audit_fingerprint_provider=strict_counts,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_circuit_trip_kicks_only_durable_wake_drain_not_dispatch():
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_expired_lease_jobs = AsyncMock(
+        return_value=LeaseRecoveryBatch(
+            circuit_trips=(
+                LeaseRecoveryCircuitTrip(
+                    job_id="job-a",
+                    project_id="project-a",
+                    unchanged_recoveries=3,
+                    officer_destination="wake",
+                    officer_thread_id="thread-a",
+                    notification_queued=True,
+                ),
+            )
+        )
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch") as trigger_dispatch,
+        patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    trigger_dispatch.assert_not_called()
+    kick_wake_drain.assert_called_once_with(db)
+    notify_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
