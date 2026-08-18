@@ -4,7 +4,7 @@
 --                and finish the legacy job-datasource association migration.
 --                Originally authored as 0082; renumbered on merge after
 --                0082_usage_cloud_rate_cards.sql landed on the same number
---                from a parallel branch (knowledge-base/knowledge/db_migration.md
+--                from a parallel branch (docs/db_migration.md
 --                §Conflict resolution: the second to merge renumbers).
 --                The two CHECK constraints land NOT VALID here and are
 --                validated by 0084 in its own transaction; the partial

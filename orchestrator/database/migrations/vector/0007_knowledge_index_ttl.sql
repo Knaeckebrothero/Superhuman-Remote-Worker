@@ -1,5 +1,5 @@
 -- migration:     0007_knowledge_index_ttl.sql
--- description:   KB convergence (knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md)
+-- description:   KB convergence (docs/features/kb_convergence_ttl_reverification.md)
 --                — give knowledge_index the TTL lifecycle the `memories` table
 --                already has (0006). Adds a per-note cycle counter so stale
 --                governance notes can be re-verified (refresh/supersede/merge/

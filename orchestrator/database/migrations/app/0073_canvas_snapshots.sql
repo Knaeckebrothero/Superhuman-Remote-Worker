@@ -1,7 +1,7 @@
 -- migration:     0073_canvas_snapshots.sql
 -- description:   Durable last-published copy of a file Canvas, so a presentation
 --                survives its workspace. Design + signed-off architectural
---                departure: knowledge-base/knowledge/features/canvas_durable_presentation.md.
+--                departure: docs/features/canvas_durable_presentation.md.
 --
 --                Until now a Canvas was strictly a pointer: `canvases` stored
 --                the logical selection and every read re-materialized the bytes

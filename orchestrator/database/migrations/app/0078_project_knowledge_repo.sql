@@ -1,7 +1,7 @@
 -- migration:     0078_project_knowledge_repo.sql
 -- description:   Admit role='knowledge' in project_repositories and enforce at
 --                most one knowledge repo per project. Step 1 of
---                knowledge-base/knowledge/features/knowledge_base_repo_separation.md §4: the KB
+--                docs/features/knowledge_base_repo_separation.md §4: the KB
 --                vault moves out of the agent's workspace checkout into a
 --                dedicated Gitea repo, so a project needs somewhere to name
 --                that repo.

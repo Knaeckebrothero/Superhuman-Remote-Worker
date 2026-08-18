@@ -14,7 +14,7 @@
 --                CAVEAT: on admin DEMOTION these become live grants for the
 --                ex-admin (restrict-only meet still applies) — review the
 --                user's rows when demoting.
---                knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md
+--                docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md
 --                (fix 5.2), following 0030's idempotent backfill precedent.
 -- depends-on:    0030_capability_grants.sql
 -- expected:      < 1s (a handful of admin rows).

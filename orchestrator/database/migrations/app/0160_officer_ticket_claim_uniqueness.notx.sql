@@ -20,7 +20,7 @@
 --                    NOT by this index. A ticket the officer reviews and
 --                    re-readies legitimately gets a second job; what must never
 --                    exist is two claims IN FLIGHT at once.
---                knowledge-base/knowledge/features/officer_backlog_pools.md §5.3 (B3).
+--                docs/features/officer_backlog_pools.md §5.3 (B3).
 -- depends-on:    0159_job_message_routes.sql
 -- expected:      seconds; CONCURRENTLY build over the jobs table, and the
 --                partial predicate keeps the index to claim-bearing rows only

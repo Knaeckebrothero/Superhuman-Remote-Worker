@@ -2,7 +2,7 @@
 -- description:   Add intents JSONB column to agents table.
 --
 --                Phase 1 of the unified instance lifecycle redesign
---                (knowledge-base/knowledge/features/unified_instance_lifecycle.md). Intents are
+--                (docs/features/unified_instance_lifecycle.md). Intents are
 --                orchestrator-set hints the agent reads from heartbeat
 --                responses and reacts to (drain, version upgrade, etc.).
 --                The column exists so the heartbeat handler can write to

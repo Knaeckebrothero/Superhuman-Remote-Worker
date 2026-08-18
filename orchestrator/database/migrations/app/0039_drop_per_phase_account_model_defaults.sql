@@ -15,7 +15,7 @@
 --                code; this strips the now-dead keys for hygiene. The single
 --                top-level default_model preference is kept.
 --
---                See knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
+--                See docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
 --                (Layer 1).
 --
 --                Idempotent: the jsonb `-` operator is a no-op for absent keys,

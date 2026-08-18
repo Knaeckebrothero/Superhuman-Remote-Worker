@@ -1,5 +1,5 @@
--- Officer (centurion) wake event outbox — knowledge-base/knowledge/features/centurion.md §4,
--- build plan in knowledge-base/knowledge/features/centurion_implementation_notes.md (S3).
+-- Officer (centurion) wake event outbox — docs/features/centurion.md §4,
+-- build plan in docs/features/centurion_implementation_notes.md (S3).
 --
 -- The existing session-wake outbox is a set of columns ON the jobs row
 -- (wake_state/…), keyed to jobs.created_by_thread_id and four terminal
@@ -37,7 +37,7 @@ CREATE TABLE session_wake_events (
 );
 
 COMMENT ON TABLE session_wake_events IS
-    'Durable wake outbox for officer (centurion) sessions: events + sleep timers. See knowledge-base/knowledge/features/centurion.md §4.';
+    'Durable wake outbox for officer (centurion) sessions: events + sleep timers. See docs/features/centurion.md §4.';
 COMMENT ON COLUMN session_wake_events.fire_at IS
     'NULL = deliver on next drain. Future timestamp = durable timer; the drain claims the row only once due. source=timer rows are upserted (fire_at replaced) rather than coalesced.';
 

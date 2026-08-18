@@ -1,6 +1,6 @@
 -- migration:     0037_processed_inbound_emails.sql
 -- description:   IMAP inbound-email dedup claim table (HA / M1 leader election,
---                knowledge-base/knowledge/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md
+--                docs/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md
 --                Task 5).
 --
 --                The imap poller is a singleton loop gated to the elected

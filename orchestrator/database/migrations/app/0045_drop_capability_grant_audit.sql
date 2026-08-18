@@ -7,7 +7,7 @@
 --                removed in the same change. capability_grants itself (live
 --                grant state) is unaffected. Re-add as a read-backed feature
 --                if a compliance ask materializes. QW-6 / gate G1, decided
---                2026-07-02 — knowledge-base/knowledge/features/database_roadmap.md.
+--                2026-07-02 — docs/features/database_roadmap.md.
 -- depends-on:    0030_capability_grants.sql
 -- expected:      < 1s.
 -- locks:         ACCESS EXCLUSIVE on capability_grant_audit only (drops its

@@ -4,7 +4,7 @@
 --                attention-sleep watchdog and magic-link extend window.
 --
 --                Phase 5 of headless persistent sessions
---                (knowledge-base/knowledge/features/headless_persistent_sessions.md). State
+--                (docs/features/headless_persistent_sessions.md). State
 --                machine:
 --                  active ──→ awaiting_user ──→ suspended
 --                       ▲          │

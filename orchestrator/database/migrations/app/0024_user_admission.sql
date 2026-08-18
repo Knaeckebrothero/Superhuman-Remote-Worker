@@ -8,7 +8,7 @@
 --                trail, and instant suspension (a per-request DB flag flips
 --                immediately, unlike a realm role that only takes effect at
 --                the next token refresh). See
---                knowledge-base/knowledge/features/app_side_admission.md.
+--                docs/features/app_side_admission.md.
 --
 --                Columns:
 --                  - is_approved       BOOLEAN NOT NULL DEFAULT FALSE — the
@@ -78,7 +78,7 @@ WHERE is_admin = TRUE AND is_approved = FALSE;
 COMMENT ON COLUMN users.is_approved IS
     'App-side admission flag. Checked per request by require_approved_user. '
     'Owned by the orchestrator, not the Keycloak realm role. See '
-    'knowledge-base/knowledge/features/app_side_admission.md.';
+    'docs/features/app_side_admission.md.';
 COMMENT ON COLUMN users.approved_by IS
     'Admin who approved this user. NULL + approved_at set = migrated from '
     'Keycloak role / system; a real UUID = a human clicked approve.';

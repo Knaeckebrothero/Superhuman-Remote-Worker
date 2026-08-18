@@ -10,7 +10,7 @@
 --                (turn_number, created_at) can't do this: one turn is many
 --                messages and parallel tool calls share a created_at.
 --
---                Phase 1 of knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
+--                Phase 1 of docs/issues/persistent_session_midturn_message_loss.md.
 --                This migration only adds the column + index; the boundary_seq
 --                write and seq-resume read land in later phases.
 --

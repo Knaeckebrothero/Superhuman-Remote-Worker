@@ -4,7 +4,7 @@
 --                0012 recreated the same index under a new name (its header
 --                assumed the table shipped without one). Redundant index on
 --                one of the two hottest write tables. QW-3,
---                knowledge-base/knowledge/features/database_roadmap.md Phase 1. Verified
+--                docs/features/database_roadmap.md Phase 1. Verified
 --                2026-07-01: no code references either index by name.
 -- depends-on:    0012_threads_user_id_index.notx.sql
 -- expected:      < 1s. DROP INDEX CONCURRENTLY waits out in-flight queries.

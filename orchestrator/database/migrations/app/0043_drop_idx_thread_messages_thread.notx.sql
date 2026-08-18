@@ -6,7 +6,7 @@
 --                either composite for thread_id-only lookups. Redundant
 --                index on the hottest write table (every persisted session
 --                message maintains it). QW-3,
---                knowledge-base/knowledge/features/database_roadmap.md Phase 1.
+--                docs/features/database_roadmap.md Phase 1.
 -- depends-on:    0020_thread_messages_window_index.notx.sql,
 --                0023_thread_messages_seq.sql
 -- expected:      < 1s on dev. CONCURRENTLY waits out in-flight queries.

@@ -8,7 +8,7 @@
 --                test-only dead code, deleted in the same change. The
 --                email_verified read in security/auth.py is the OIDC token
 --                CLAIM, not this column. QW-5,
---                knowledge-base/knowledge/features/database_roadmap.md Phase 1.
+--                docs/features/database_roadmap.md Phase 1.
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s (metadata-only column drops; no table rewrite).
 -- locks:         ACCESS EXCLUSIVE on users, briefly.

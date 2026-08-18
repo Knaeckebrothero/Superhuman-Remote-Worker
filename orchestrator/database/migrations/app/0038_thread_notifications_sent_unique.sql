@@ -1,7 +1,7 @@
 -- migration:     0038_thread_notifications_sent_unique.sql
 -- description:   Partial unique index for headless permission-email dedup
 --                (HA / M1 leader election,
---                knowledge-base/knowledge/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md
+--                docs/superpowers/plans/2026-06-25-orchestrator-m1-leader-election.md
 --                Task 5).
 --
 --                thread_permission_notify_sweeper is leader-gated, but leader

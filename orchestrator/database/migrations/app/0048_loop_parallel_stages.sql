@@ -6,7 +6,7 @@
 --                [["scholar","product-qa"], "critic"] runs scholar ∥ product-qa,
 --                then a single critic triages both streams). Single-role stages
 --                are unchanged: they keep using current_job_id and leave this
---                '[]'. knowledge-base/knowledge/features/loop_parallel_stages.md (Phase 1).
+--                '[]'. docs/features/loop_parallel_stages.md (Phase 1).
 -- depends-on:    0035_project_loops.sql
 -- expected:      < 1s (one ADD COLUMN with a constant default; metadata-only,
 --                no table rewrite on PG11+).
@@ -23,7 +23,7 @@
 --     for the stage's life (drained in one shot, never shrunk incrementally), so
 --     the torn-advance recovery has exactly one signature to reason about:
 --     current_job_id IS NULL AND current_stage_jobs = '[]' (same as the
---     single-role tear — see knowledge-base/knowledge/issues/loop_advance_nonatomic_wedges_loop.md).
+--     single-role tear — see docs/issues/loop_advance_nonatomic_wedges_loop.md).
 --   * Kept as JSONB (not uuid[]) to mirror role_sequence's JSONB encoding and
 --     reuse the existing update_project_loop JSONB path; the barrier query casts
 --     elements to uuid where it needs to join jobs.
@@ -40,4 +40,4 @@ COMMENT ON COLUMN project_loops.current_stage_jobs IS
     'In-flight members of a parallel (fan-out) role_sequence stage — the jobs '
     'the loop barriers on before rotating. Empty for single-role stages, which '
     'use current_job_id instead. Populated by the advance/start spawn; drained '
-    'to [] by the atomic last-member barrier. knowledge-base/knowledge/features/loop_parallel_stages.md.';
+    'to [] by the atomic last-member barrier. docs/features/loop_parallel_stages.md.';

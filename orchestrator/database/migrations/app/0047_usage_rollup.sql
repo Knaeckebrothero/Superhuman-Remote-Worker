@@ -9,7 +9,7 @@
 --                full-replace upserts here, advancing the watermark in the SAME
 --                app-DB transaction (the cross-DB exactly-once trick — audit rows
 --                are read, never locked; only the app write is atomic).
---                knowledge-base/knowledge/features/database_roadmap.md Phase 6 (D-1).
+--                docs/features/database_roadmap.md Phase 6 (D-1).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s (two empty CREATE TABLEs on a fresh DB).
 -- locks:         Brief ACCESS EXCLUSIVE per CREATE TABLE (brand-new objects).
