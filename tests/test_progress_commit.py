@@ -382,7 +382,7 @@ class TestTodoToolWiring:
 
         assert first.notes == ["PASS: all requested outputs verified"]
 
-    def test_oversized_completion_note_does_not_complete_todo(self, git, clock):
+    def test_oversized_completion_note_is_truncated_and_accepted(self, git, clock):
         from src.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
 
         committer = make(git, clock)
@@ -390,16 +390,35 @@ class TestTodoToolWiring:
         tool = self._tool(self._context(mgr, committer))
 
         first = mgr.list_all()[0]
+        original_len = MAX_COMPLETION_NOTE_CHARS + 387
         result = tool.invoke(
             {
                 "todo_id": first.id,
-                "completion_note": "x" * (MAX_COMPLETION_NOTE_CHARS + 1),
+                "completion_note": "x" * original_len,
             }
         )
 
-        assert "completion_note is too long" in result
-        assert first.status.value == "pending"
-        assert git.commits == []
+        assert first.status.value == "completed"
+        (stored,) = first.notes
+        assert len(stored) <= MAX_COMPLETION_NOTE_CHARS
+        assert stored.endswith(f"…[truncated from {original_len} chars]")
+        assert "was truncated" in result
+        assert git.commits == [f"{first.id}: {first.content}"]
+
+    def test_completion_note_at_cap_is_stored_untouched(self, git, clock):
+        from src.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
+
+        committer = make(git, clock)
+        mgr = self._todo_manager()
+        tool = self._tool(self._context(mgr, committer))
+
+        first = mgr.list_all()[0]
+        note = "x" * MAX_COMPLETION_NOTE_CHARS
+        result = tool.invoke({"todo_id": first.id, "completion_note": note})
+
+        assert first.status.value == "completed"
+        assert first.notes == [note]
+        assert "truncated" not in result
 
     def test_no_committer_configured_is_harmless(self, git):
         """Persistent sessions leave progress_committer unset."""

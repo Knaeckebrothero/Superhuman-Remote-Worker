@@ -170,7 +170,8 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                      (in_progress first, then highest-priority pending).
             completion_note: Optional concise outcome that later todos must retain,
                              such as a verification verdict beginning with
-                             ``PASS:`` or ``GAPS:``. Limited to 1000 characters.
+                             ``PASS:`` or ``GAPS:``. Notes longer than 1000
+                             characters are truncated to fit.
 
         This is the primary rhythm of work:
         1. Work on the current task
@@ -197,13 +198,12 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         """
         try:
             completion_note = completion_note.strip()
+            note_truncated_from = 0
             if len(completion_note) > MAX_COMPLETION_NOTE_CHARS:
-                return (
-                    "Error: completion_note is too long "
-                    f"({len(completion_note)} characters; maximum "
-                    f"{MAX_COMPLETION_NOTE_CHARS}). Record only the concise outcome "
-                    "needed by the next todo."
-                )
+                note_truncated_from = len(completion_note)
+                marker = f" …[truncated from {note_truncated_from} chars]"
+                keep = MAX_COMPLETION_NOTE_CHARS - len(marker)
+                completion_note = completion_note[:keep].rstrip() + marker
             completion_notes = [completion_note] if completion_note else None
 
             # Set by whichever completion path runs below; drives the progress
@@ -290,6 +290,13 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
             if completion_note and completed_id:
                 message += f"\n\nRecorded completion note: {completion_note}"
+                if note_truncated_from:
+                    message += (
+                        f"\nNote: completion_note was truncated from "
+                        f"{note_truncated_from} chars to fit the "
+                        f"{MAX_COMPLETION_NOTE_CHARS}-char limit. Record only the "
+                        "concise outcome needed by the next todo."
+                    )
 
             # Make the finished work durable. A completed todo is a real unit of
             # progress, so it is the honest place to commit — and the commit is
