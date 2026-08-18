@@ -40,6 +40,9 @@ async def db(pg_dsn):
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 assigned_agent_id uuid,
                 lease_expires_at timestamptz,
+                -- A tripped lease-recovery circuit fences the claim: the job
+                -- stays parked until the trip is acknowledged.
+                context jsonb,
                 -- A frozen job is not dispatchable (idx_jobs_dispatchable's
                 -- partial predicate), so the CAS fences on it too.
                 freeze_data jsonb,
@@ -113,3 +116,30 @@ async def test_claim_rejects_non_pinned_execution_lane(db, lane):
             "UPDATE jobs SET execution_lane=$2 WHERE id = $1", UUID(JOB), lane
         )
     assert await db.claim_job_for_agent(JOB, AGENT_1) is False
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_a_tripped_lease_recovery_circuit(db):
+    """A job whose lease-recovery circuit tripped must not be re-dispatched.
+
+    Repeated recovery of the same pinned lease trips the circuit and parks the
+    job for a human/officer acknowledgement. Without the guard on the claim,
+    the dispatcher would immediately hand the job back out and the containment
+    would be a no-op.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            UUID(JOB),
+            '{"_lease_recovery": {"state": "tripped", "generation": "1"}}',
+        )
+    assert await db.claim_job_for_agent(JOB, AGENT_1) is False
+
+    # An untripped recovery record leaves the job claimable.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            UUID(JOB),
+            '{"_lease_recovery": {"state": "recovering", "generation": "1"}}',
+        )
+    assert await db.claim_job_for_agent(JOB, AGENT_1) is True
