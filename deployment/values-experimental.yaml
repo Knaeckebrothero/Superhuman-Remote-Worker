@@ -63,9 +63,9 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-9dcfe99
+    tag: sha-e60b880
   agent:
-    tag: sha-9dcfe99
+    tag: sha-e60b880
   cockpit:
     tag: sha-8a8c445
   mcp:
@@ -76,14 +76,14 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-9dcfe99aab1251a63496f4d235e91b501cf20966"
+  releaseVersion: "0.0.0-dev.sha-e60b880a75bd8c8c8a7a0845260c92387c964919"
   components:
     orchestrator:
-      sourceRevision: 9dcfe99aab1251a63496f4d235e91b501cf20966
-      releaseVersion: "0.0.0-dev.sha-9dcfe99aab1251a63496f4d235e91b501cf20966"
+      sourceRevision: e60b880a75bd8c8c8a7a0845260c92387c964919
+      releaseVersion: "0.0.0-dev.sha-e60b880a75bd8c8c8a7a0845260c92387c964919"
     agent:
-      sourceRevision: 9dcfe99aab1251a63496f4d235e91b501cf20966
-      releaseVersion: "0.0.0-dev.sha-9dcfe99aab1251a63496f4d235e91b501cf20966"
+      sourceRevision: e60b880a75bd8c8c8a7a0845260c92387c964919
+      releaseVersion: "0.0.0-dev.sha-e60b880a75bd8c8c8a7a0845260c92387c964919"
     cockpit:
       sourceRevision: 8a8c4454649827038d697b43515b0bda545f89cb
       releaseVersion: "0.0.0-dev.sha-8a8c4454649827038d697b43515b0bda545f89cb"
