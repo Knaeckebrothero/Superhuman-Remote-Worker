@@ -7,9 +7,10 @@ bug would be:
 * A terminal job still holds its ticket (one-shot claims). The original design
   released the claim on terminal, which re-dispatched every completed ticket a
   minute later and re-burned every failing one at breaker cadence, forever.
-* Capacity and claim predicates agree, and both count paused/pending-review
-  jobs. A paused executor that stopped occupying its slot lets a second
-  executor start on the story it is halfway through.
+* Claim predicates count paused/pending-review jobs; capacity does NOT count
+  paused (owner ruling 2026-08-18: a paused job keeps its ticket but vacates
+  its slot — two paused zombies starved a whole kit on that date). A resume
+  briefly overlapping a fresh dispatch is the accepted cost.
 * Honest failure reports never open a breaker; only job failures do.
 * A `ready` tag with no `ready_at` fails closed.
 """
@@ -1106,28 +1107,35 @@ class TestExecutorSerialization:
         db.create_job.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_PAUSED_executor_still_holds_the_singleton(self):
-        # The predicate that matters: if a paused job released its slot, its
-        # redispatch would race a second executor into the same story.
+    async def test_a_paused_executor_frees_the_singleton(self):
+        # Owner ruling 2026-08-18: a paused job occupies no slot — nothing is
+        # running, so the lane is free. Its later resume may briefly overlap a
+        # fresh dispatch; that is accepted over a paused zombie starving the
+        # executor lane. The mock returns the paused claim on the LIVE read,
+        # so the tick's own status filter is what must free the lane here.
         row = _officer_row()
         row["metadata"]["config_override"]["officer"]["slots"] = {
             "executors": {"count": 2, "category": EXECUTOR}
         }
-        db = _db(
-            slot_claims=[
-                {
-                    "id": str(uuid.uuid4()),
-                    "status": "paused",
-                    "work_category": EXECUTOR,
-                    "ticket_note_id": "feature-old",
-                    "updated_at": NOW,
-                    "created_at": NOW,
-                }
-            ]
-        )
+        paused = {
+            "id": str(uuid.uuid4()),
+            "status": "paused",
+            "work_category": EXECUTOR,
+            "ticket_note_id": "feature-old",
+            "updated_at": NOW,
+            "created_at": NOW,
+        }
+        db = _db()
+
+        async def _claims(_lineage, **kwargs):
+            return [] if kwargs.get("terminal_only") else [paused]
+
+        db.list_officer_slot_claims.side_effect = _claims
+
         rows = [_row("feature-a", tags=["ready", "category:executor"], ready_at=NOW)]
         counts = await tick_officer(db, _vector_db(rows), row, now=NOW)
-        assert counts["dispatched"] == 0
+        assert counts["dispatched"] == 1
+        db.create_job.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_an_undispositioned_previous_ticket_blocks_the_next_executor(self):

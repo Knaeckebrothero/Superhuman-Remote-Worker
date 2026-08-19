@@ -43,6 +43,7 @@ from services.datasource_policy import (
     default_datasource_selection,
 )
 from services.officer_admission import (
+    SLOT_VACATING_STATUSES,
     OfficerAdmissionConflict,
     SlotAdmissionError,
     admit_and_create_job,
@@ -588,7 +589,10 @@ async def _executor_blocked(
     1. **Singleton.** At most one executor claim in flight across all executor
        pools, unless the officer tagged this ticket ``parallel-safe``. Executors
        write to shared project state; two of them make conflicting implicit
-       decisions about the same surface.
+       decisions about the same surface. A paused executor is NOT in flight
+       (owner ruling 2026-08-18: paused occupies no slot — nothing is running);
+       a later resume may briefly overlap a new dispatch, and that is accepted
+       over a paused zombie holding the lane shut.
     2. **Disposition.** The previous executor's ticket must be *dispositioned*
        — closed, or explicitly re-readied — not merely terminal. The deliverable
        gate checks that files exist, never what is in them, so without this an
@@ -596,9 +600,13 @@ async def _executor_blocked(
        straight into the deliverable. If the officer stops reviewing, executors
        stop. That is the intended direction.
     """
-    live_executors = await db.list_officer_slot_claims(
-        list(capacity_lineage), work_category=EXECUTOR, limit=1
-    )
+    live_executors = [
+        claim
+        for claim in await db.list_officer_slot_claims(
+            list(capacity_lineage), work_category=EXECUTOR, limit=None
+        )
+        if str(claim.get("status")) not in SLOT_VACATING_STATUSES
+    ]
     if live_executors and not ticket_is_parallel_safe:
         return f"executor singleton held by job {str(live_executors[0]['id'])[:8]}"
 
