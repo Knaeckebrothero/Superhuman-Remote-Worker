@@ -227,8 +227,14 @@ class TestCodeGrants:
                 assert TOOL_REGISTRY[name].get("grant") == "code", name
 
     def test_code_granted_count_is_pinned(self):
-        """39 includes the reviewed repo_pr_status connector read."""
-        assert len(_classified("code")) == 39
+        """40 = the reviewed repo_pr_status read + the repo_checkout write.
+
+        Both joined by construction: a tool registered in a datasource
+        category is code-granted whether or not anyone remembers this pin.
+        Bump the number only after checking the new arrival really belongs to
+        a connector — the derived test above is what proves membership.
+        """
+        assert len(_classified("code")) == 40
 
     def test_no_shipped_config_names_a_code_granted_tool(self):
         """A config naming one is either dead text or a misunderstanding.
