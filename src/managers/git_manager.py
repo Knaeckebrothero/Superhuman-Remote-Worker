@@ -1334,9 +1334,10 @@ class GitManager:
     ) -> bool:
         """Push commits and optionally tags to remote.
 
-        Gracefully returns False if git is inactive or no remote is configured.
-        Both of those are *logged at WARNING* — they used to return silently,
-        which is how job bbce4bed lost a deliverable: every phase-boundary push
+        Gracefully returns False if git is inactive, no remote is configured,
+        or no branch was given while HEAD is detached. All of those are
+        *logged at WARNING* — the first two used to return silently, which is
+        how job bbce4bed lost a deliverable: every phase-boundary push
         returned False across 8 phases and left no trace anywhere, because five
         of the six call sites also discard the return value. See
         knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
@@ -1347,7 +1348,8 @@ class GitManager:
 
         Args:
             remote: Remote name (default: "origin")
-            branch: Branch to push (auto-detected if None)
+            branch: Branch to push (auto-detected if None; a detached HEAD
+                cannot be auto-detected and is refused)
             tags: Also push all tags (default: False)
 
         Returns:
@@ -1364,15 +1366,25 @@ class GitManager:
             return False
 
         try:
-            # Auto-detect branch. Fall back on an EMPTY result too, not just a
-            # non-zero exit: a detached HEAD reports success with no output, and
-            # `git push -u origin ""` fails with `invalid refspec`.
-            # has_unpushed_commits() has always guarded this; push() did not,
-            # which is the asymmetry that turned a parser bug into lost work.
+            # Auto-detect branch. Refuse on an EMPTY result too, not just a
+            # non-zero exit: a detached HEAD reports success with no output.
+            # This used to fall back to "main", which pushes a STALE main —
+            # reporting success while delivering none of the work at HEAD.
+            # No caller relies on the guess: the workspace repo is never
+            # deliberately detached (rewind restores via `checkout <sha> -- .`
+            # precisely to keep HEAD on its branch).
             if branch is None:
                 result = self._run_git(["branch", "--show-current"])
                 detected = result.stdout.strip() if result.returncode == 0 else ""
-                branch = detected or "main"
+                if not detected:
+                    logger.warning(
+                        "push refused — HEAD is detached (or the current "
+                        "branch could not be read) at "
+                        f"{self._remote_cwd or self._workspace_path} and no "
+                        "branch was given; refusing to guess 'main'"
+                    )
+                    return False
+                branch = detected
 
             # Push branch
             result = self._run_git(

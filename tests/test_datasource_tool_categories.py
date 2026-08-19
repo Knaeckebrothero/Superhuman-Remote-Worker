@@ -174,6 +174,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
     def test_loader_keeps_the_repo_category(self):
         config = self._config_for([_ds("repository")])
         assert config.tools.repo == [
+            "repo_checkout",
             "repo_commit",
             "repo_push",
             "repo_pull",
@@ -188,6 +189,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
         from src.core.loader import get_all_tool_names
 
         names = get_all_tool_names(self._config_for([_ds("repository")]))
+        assert "repo_checkout" in names
         assert "repo_commit" in names
         assert "repo_push" in names
         assert "repo_pull" in names
@@ -202,6 +204,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
         )
         assert "repo_pull" in names
         assert "repo_pr_status" in names
+        assert "repo_checkout" not in names
         assert "repo_commit" not in names
         assert "repo_push" not in names
         assert "repo_open_pr" not in names

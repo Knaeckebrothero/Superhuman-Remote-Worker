@@ -25,6 +25,13 @@ from ..context import ToolContext
 logger = logging.getLogger(__name__)
 
 REPO_TOOLS_METADATA = {
+    "repo_checkout": {
+        "category": "repo",
+        "description": (
+            "Switch an attached repository to a branch, optionally creating it."
+        ),
+        "short_description": "Switch (or create) a branch in an attached repository.",
+    },
     "repo_commit": {
         "category": "repo",
         "description": "Stage all changes and commit them in an attached repository.",
@@ -94,6 +101,38 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
                 "only repo_pull is available."
             )
         return None
+
+    @tool
+    async def repo_checkout(repo: str, branch: str, create: bool = False) -> str:
+        """Switch an attached repository to a branch, optionally creating it.
+
+        Args:
+            repo: Clone-directory name, as listed in datasources.md.
+            branch: Branch to check out.
+            create: Create the branch if it does not exist yet.
+        """
+        resolved = _resolve(repo)
+        if isinstance(resolved, str):
+            return resolved
+        git_mgr, meta = resolved
+        refusal = _refuse_write(meta, repo)
+        if refusal:
+            return refusal
+        existed = git_mgr.rev_parse(branch) is not None
+        if git_mgr.checkout_branch(branch, create=create):
+            landed = git_mgr.current_branch() or branch
+            if create and not existed:
+                return f"Created and switched {repo} to branch '{landed}'."
+            return f"Switched {repo} to branch '{landed}'."
+        if create:
+            return (
+                f"Could not create or switch to branch '{branch}' in {repo} "
+                "(invalid name, or conflicting local changes?)."
+            )
+        return (
+            f"Could not switch {repo} to branch '{branch}'. If it does not "
+            "exist yet, retry with create=True."
+        )
 
     @tool
     async def repo_commit(repo: str, message: str) -> str:
@@ -302,4 +341,11 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
             f"{result['state'].upper()}{refs}{link}"
         )
 
-    return [repo_commit, repo_push, repo_pull, repo_open_pr, repo_pr_status]
+    return [
+        repo_checkout,
+        repo_commit,
+        repo_push,
+        repo_pull,
+        repo_open_pr,
+        repo_pr_status,
+    ]

@@ -36,6 +36,62 @@ def get_tool(tools, name):
 
 
 @pytest.mark.asyncio
+async def test_repo_checkout_switches_to_an_existing_branch():
+    context, git_mgr = make_context()
+    git_mgr.rev_parse.return_value = "a" * 40  # branch exists locally
+    git_mgr.checkout_branch.return_value = True
+    git_mgr.current_branch.return_value = "feature/x"
+    tool = get_tool(create_repo_tools(context), "repo_checkout")
+
+    out = await tool.ainvoke({"repo": "widget", "branch": "feature/x"})
+
+    git_mgr.checkout_branch.assert_called_once_with("feature/x", create=False)
+    assert out == "Switched widget to branch 'feature/x'."
+
+
+@pytest.mark.asyncio
+async def test_repo_checkout_creates_a_missing_branch_when_asked():
+    context, git_mgr = make_context()
+    git_mgr.rev_parse.return_value = None  # branch does not exist yet
+    git_mgr.checkout_branch.return_value = True
+    git_mgr.current_branch.return_value = "job/new-branch"
+    tool = get_tool(create_repo_tools(context), "repo_checkout")
+
+    out = await tool.ainvoke(
+        {"repo": "widget", "branch": "job/new-branch", "create": True}
+    )
+
+    git_mgr.checkout_branch.assert_called_once_with("job/new-branch", create=True)
+    assert out == "Created and switched widget to branch 'job/new-branch'."
+
+
+@pytest.mark.asyncio
+async def test_repo_checkout_failure_points_at_create_flag():
+    """The trapped-worker case: a checkout of a missing branch must say how
+    to create it, not leave the agent guessing (job 12a0e92c)."""
+    context, git_mgr = make_context()
+    git_mgr.checkout_branch.return_value = False
+    tool = get_tool(create_repo_tools(context), "repo_checkout")
+
+    out = await tool.ainvoke({"repo": "widget", "branch": "gone"})
+
+    assert "create=True" in out
+    assert "'gone'" in out
+
+
+@pytest.mark.asyncio
+async def test_repo_checkout_create_failure_does_not_suggest_create_again():
+    context, git_mgr = make_context()
+    git_mgr.checkout_branch.return_value = False
+    tool = get_tool(create_repo_tools(context), "repo_checkout")
+
+    out = await tool.ainvoke({"repo": "widget", "branch": "bad..name", "create": True})
+
+    assert "create=True" not in out
+    assert "Could not create" in out
+
+
+@pytest.mark.asyncio
 async def test_repo_commit_commits_in_the_named_clone():
     context, git_mgr = make_context()
     tool = get_tool(create_repo_tools(context), "repo_commit")
@@ -156,9 +212,11 @@ async def test_write_tools_refuse_on_read_only_datasource():
     context, git_mgr = make_context(read_only=True)
     tools = create_repo_tools(context)
 
-    for name in ("repo_commit", "repo_push", "repo_open_pr"):
+    for name in ("repo_checkout", "repo_commit", "repo_push", "repo_open_pr"):
         tool = get_tool(tools, name)
         kwargs = {"repo": "widget"}
+        if name == "repo_checkout":
+            kwargs["branch"] = "b"
         if name == "repo_commit":
             kwargs["message"] = "m"
         if name == "repo_open_pr":
@@ -166,6 +224,7 @@ async def test_write_tools_refuse_on_read_only_datasource():
         out = await tool.ainvoke(kwargs)
         assert "read-only" in out.lower()
 
+    git_mgr.checkout_branch.assert_not_called()
     git_mgr.commit.assert_not_called()
     git_mgr.push.assert_not_called()
 
@@ -345,9 +404,11 @@ class TestMissingMetadataFailsClosed:
         context, git_mgr = make_context_without_metadata()
         tools = create_repo_tools(context)
 
-        for name in ("repo_commit", "repo_push", "repo_open_pr"):
+        for name in ("repo_checkout", "repo_commit", "repo_push", "repo_open_pr"):
             tool = get_tool(tools, name)
             kwargs = {"repo": "widget"}
+            if name == "repo_checkout":
+                kwargs["branch"] = "b"
             if name == "repo_commit":
                 kwargs["message"] = "m"
             if name == "repo_open_pr":
@@ -357,6 +418,7 @@ class TestMissingMetadataFailsClosed:
             # Must explain the situation, not just say "read-only".
             assert "metadata" in out.lower() or "recorded" in out.lower()
 
+        git_mgr.checkout_branch.assert_not_called()
         git_mgr.commit.assert_not_called()
         git_mgr.push.assert_not_called()
 
