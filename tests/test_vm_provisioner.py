@@ -912,6 +912,9 @@ class TestFreshProvisionReset:
         assert ctx["vm_uid"] is None
         assert ctx["rootdisk_pvc_uid"] is None
         assert ctx["golden_wait_started_at"] is None
+        # A stale teardown anchor would make the next incarnation read as
+        # instantly-stuck in 'deleting' and be recycled on sight.
+        assert ctx["deleting_started_at"] is None
         assert isinstance(ctx["provisioned_at"], float)
 
     @pytest.mark.asyncio

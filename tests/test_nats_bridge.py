@@ -563,9 +563,14 @@ class TestRequestVmDelete:
     async def test_delete_updates_vm_context(self, bridge_with_db, mock_db):
         await bridge_with_db.request_vm_delete(job_id="test-job-456")
 
-        mock_db.merge_vm_context.assert_awaited_once_with(
-            "test-job-456", {"status": "deleting"}
-        )
+        mock_db.merge_vm_context.assert_awaited_once()
+        job_id, ctx = mock_db.merge_vm_context.await_args.args
+        assert job_id == "test-job-456"
+        assert ctx["status"] == "deleting"
+        # The dispatcher needs this anchor to tell an in-flight teardown from a
+        # stuck one; without it a dropped NATS message strands the job forever
+        # (dispatch_guards.vm_provisioning_decision).
+        assert isinstance(ctx["deleting_started_at"], float)
 
     @pytest.mark.asyncio
     async def test_delete_returns_false_when_unavailable(self, disconnected_bridge):

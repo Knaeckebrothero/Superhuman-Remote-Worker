@@ -32,6 +32,7 @@ from collections.abc import Mapping
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from uuid import UUID, uuid4
@@ -418,19 +419,25 @@ class NatsBridge:
                 json.dumps(payload).encode(),
             )
             logger.info("Published %s for job %s", subject, job_id)
+            # Stamp when the teardown started. Delete requests and their answers
+            # are fire-and-forget core NATS, so a dropped message would otherwise
+            # strand the job in 'deleting' forever; the dispatcher uses this to
+            # tell an in-flight teardown from a stuck one
+            # (dispatch_guards.vm_provisioning_decision).
+            deleting_ctx = {"status": "deleting", "deleting_started_at": time.time()}
             if generation is not None:
                 if entity_type == "thread":
                     await self._set_thread_vm_context_if_generation(
-                        job_id, generation, {"status": "deleting"}
+                        job_id, generation, deleting_ctx
                     )
                 else:
                     await self._set_vm_context_if_generation(
-                        job_id, generation, {"status": "deleting"}
+                        job_id, generation, deleting_ctx
                     )
             elif entity_type == "thread":
-                await self._set_thread_vm_context(job_id, {"status": "deleting"})
+                await self._set_thread_vm_context(job_id, deleting_ctx)
             else:
-                await self._set_vm_context(job_id, {"status": "deleting"})
+                await self._set_vm_context(job_id, deleting_ctx)
             return True
         except Exception as e:
             logger.error("Failed to publish %s for job %s: %s", subject, job_id, e)
