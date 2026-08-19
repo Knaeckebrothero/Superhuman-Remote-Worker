@@ -397,6 +397,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
             )
         except Exception:
             pass
+        await _deregister_before_exit()
         os._exit(0)
     elif _pod_state == PodState.SESSION:
         # Dual pods host adopted sessions on persistent_app's module state
@@ -551,6 +552,39 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 
 
+_DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
+
+
+async def _deregister_before_exit() -> None:
+    """Best-effort deregistration ahead of os._exit.
+
+    os._exit bypasses the lifespan shutdown that normally deregisters, so
+    without this every clean exit leaves an agents row that the
+    orchestrator's 3-minute heartbeat sweep flips to offline and reports
+    as a fleet:agents_offline corpse. Bounded and non-raising — a slow or
+    failed deregister must never hold up or abort the exit (the stale-agent
+    sweep stays the backstop, exactly as for crashes).
+    """
+    client = _orchestrator_client
+    if client is None:
+        return
+    client.stop_heartbeat()
+    hb = _heartbeat_task
+    if hb is not None and not hb.done() and hb is not asyncio.current_task():
+        # A heartbeat landing mid-deregister would 404 and re-register,
+        # resurrecting the row this call is about to delete. Never
+        # self-cancel — the idle-drain exit runs inside the heartbeat task.
+        hb.cancel()
+    if not client.agent_id:
+        return
+    try:
+        await asyncio.wait_for(
+            client.deregister(), timeout=_DEREGISTER_ON_EXIT_TIMEOUT_S
+        )
+    except Exception as e:
+        logger.warning(f"Best-effort deregister before exit failed: {e}")
+
+
 def _schedule_exit(delay: float = 1.0) -> None:
     """Schedule process exit after a short delay (allows response to be sent)."""
     global _pending_exit_task
@@ -561,6 +595,7 @@ def _schedule_exit(delay: float = 1.0) -> None:
 
     async def _exit():
         await asyncio.sleep(delay)
+        await _deregister_before_exit()
         logger.info("Pod task complete — exiting process")
         # Use os._exit to bypass uvicorn's signal handling
         os._exit(0)

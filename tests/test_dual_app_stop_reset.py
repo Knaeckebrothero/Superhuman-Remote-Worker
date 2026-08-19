@@ -16,7 +16,8 @@ converges instead of flip-flopping between working and ready.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import contextlib
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -34,6 +35,8 @@ def _restore_dual_app_globals():
         "_stop_reason",
         "_agent",
         "_orchestrator_client",
+        "_pending_exit_task",
+        "_heartbeat_task",
     )
     saved = {name: getattr(dual_app, name) for name in names}
     stop_req, stop_done = (
@@ -57,6 +60,8 @@ def _reset_module(dual_app, *, pod_state=None):
     client.agent_id = "agent-1"
     client.heartbeat = AsyncMock(return_value={})
     client.report_completion = AsyncMock(return_value=None)
+    client.stop_heartbeat = MagicMock()
+    client.deregister = AsyncMock(return_value=True)
     dual_app._orchestrator_client = client
     return client
 
@@ -128,8 +133,10 @@ class TestProcessJobCooperativeStop:
         assert dual_app._stop_completed.is_set()
         # Cooperative stop must NOT schedule a pod exit (orchestrator may resume).
         sched.assert_not_called()
-        # It's a stop, not a completion — no completion report.
+        # It's a stop, not a completion — no completion report, and the
+        # agents row stays (the pod remains dispatchable).
         client.report_completion.assert_not_awaited()
+        client.deregister.assert_not_awaited()
 
 
 class TestProcessJobCompletionOrdering:
@@ -260,3 +267,107 @@ class TestFinalIdleStatusOnExit:
         )
 
         assert client.heartbeat.await_args.kwargs["status"] == "ready"
+
+
+class TestScheduleExitDeregisters:
+    """Every graceful exit through _schedule_exit deregisters the agent.
+
+    os._exit bypasses the lifespan shutdown, so without the in-path
+    deregister every clean completion/drain exit leaves an agents row the
+    3-minute heartbeat sweep flips to offline and reports as a
+    fleet:agents_offline corpse. Best-effort only: a hung or failing
+    deregister must never hold up or abort the exit.
+    """
+
+    async def _run_scheduled_exit(self, dual_app):
+        with patch("src.api.dual_app.os._exit") as fake_exit:
+            dual_app._schedule_exit(delay=0)
+            await asyncio.wait_for(dual_app._pending_exit_task, timeout=2.0)
+        return fake_exit
+
+    @pytest.mark.asyncio
+    async def test_deregisters_then_exits(self):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+
+        fake_exit = await self._run_scheduled_exit(dual_app)
+
+        client.deregister.assert_awaited_once()
+        client.stop_heartbeat.assert_called_once()
+        fake_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_proceeds_when_deregister_hangs(self, monkeypatch):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+
+        async def _hang():
+            await asyncio.sleep(60)
+
+        client.deregister = AsyncMock(side_effect=_hang)
+        monkeypatch.setattr(dual_app, "_DEREGISTER_ON_EXIT_TIMEOUT_S", 0.05)
+
+        fake_exit = await self._run_scheduled_exit(dual_app)
+
+        fake_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_proceeds_when_deregister_errors(self):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+        client.deregister = AsyncMock(side_effect=RuntimeError("orchestrator 500"))
+
+        fake_exit = await self._run_scheduled_exit(dual_app)
+
+        client.deregister.assert_awaited_once()
+        fake_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_exit_proceeds_without_client(self):
+        from src.api import dual_app
+
+        _reset_module(dual_app)
+        dual_app._orchestrator_client = None
+
+        fake_exit = await self._run_scheduled_exit(dual_app)
+
+        fake_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_task_cancelled_before_deregister(self):
+        # A heartbeat landing mid-deregister would 404 and re-register,
+        # resurrecting the row the exit just deleted.
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+        hb = asyncio.create_task(asyncio.sleep(60))
+        dual_app._heartbeat_task = hb
+        try:
+            fake_exit = await self._run_scheduled_exit(dual_app)
+
+            assert hb.cancelled() or hb.cancelling()
+            client.deregister.assert_awaited_once()
+            fake_exit.assert_called_once_with(0)
+        finally:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hb
+
+    @pytest.mark.asyncio
+    async def test_unregistered_client_skips_deregister_call(self):
+        # Never registered (agent_id unset) → nothing to delete, but the
+        # heartbeat loop must still be stopped so it can't register a row
+        # for a dying pod.
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+        client.agent_id = None
+
+        fake_exit = await self._run_scheduled_exit(dual_app)
+
+        client.deregister.assert_not_awaited()
+        client.stop_heartbeat.assert_called_once()
+        fake_exit.assert_called_once_with(0)

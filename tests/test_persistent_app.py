@@ -6031,6 +6031,86 @@ class TestExitWorkspaceNotReadyHelper:
         mock_exit.assert_called_once_with(0)
 
 
+class TestScheduleExitDeregisters:
+    """The _schedule_exit path (drain-suspend, watchdogs, session end)
+    deregisters before os._exit — which bypasses the lifespan shutdown —
+    so a clean exit doesn't become a missed-heartbeats corpse the sweep
+    reports as fleet:agents_offline. Best-effort: a hung or failing
+    deregister never holds up or aborts the exit.
+    """
+
+    def _client(self):
+        mock_client = MagicMock()
+        mock_client.agent_id = "agent-1"
+        mock_client.stop_heartbeat = MagicMock()
+        mock_client.deregister = AsyncMock(return_value=True)
+        return mock_client
+
+    async def _run_scheduled_exit(self, pa):
+        saved = pa._pending_exit_task
+        try:
+            with patch("os._exit") as mock_exit:
+                pa._schedule_exit(delay=0)
+                await asyncio.wait_for(pa._pending_exit_task, timeout=2.0)
+            return mock_exit
+        finally:
+            pa._pending_exit_task = saved
+
+    @pytest.mark.asyncio
+    async def test_scheduled_exit_deregisters_then_exits(self):
+        from src.api import persistent_app as pa
+
+        mock_client = self._client()
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                mock_exit = await self._run_scheduled_exit(pa)
+
+        mock_client.deregister.assert_awaited_once()
+        mock_client.stop_heartbeat.assert_called_once()
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_scheduled_exit_proceeds_when_deregister_hangs(self):
+        from src.api import persistent_app as pa
+
+        mock_client = self._client()
+
+        async def _hang():
+            await asyncio.sleep(60)
+
+        mock_client.deregister = AsyncMock(side_effect=_hang)
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                with patch.object(pa, "_DEREGISTER_ON_EXIT_TIMEOUT_S", 0.05):
+                    mock_exit = await self._run_scheduled_exit(pa)
+
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_scheduled_exit_proceeds_when_deregister_errors(self):
+        from src.api import persistent_app as pa
+
+        mock_client = self._client()
+        mock_client.deregister = AsyncMock(side_effect=RuntimeError("500"))
+
+        with patch.object(pa, "_orchestrator_client", mock_client):
+            with patch.object(pa, "_heartbeat_task", None):
+                mock_exit = await self._run_scheduled_exit(pa)
+
+        mock_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_scheduled_exit_without_client_still_exits(self):
+        from src.api import persistent_app as pa
+
+        with patch.object(pa, "_orchestrator_client", None):
+            with patch.object(pa, "_heartbeat_task", None):
+                mock_exit = await self._run_scheduled_exit(pa)
+
+        mock_exit.assert_called_once_with(0)
+
+
 # ---------------------------------------------------------------------------
 # _session_backend_is_lite() — lite-session boot detection
 # (no_workspace_agent_mode session boot gap; workspace_tier_upgrade.md smoke test)

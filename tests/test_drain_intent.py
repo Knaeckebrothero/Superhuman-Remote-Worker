@@ -402,8 +402,12 @@ class TestDualDrainHandler:
         dual_app._drain_intent_handled = False
         dual_app._current_job_id = None
         dual_app._pod_state = dual_app.PodState.IDLE
-        dual_app._orchestrator_client = AsyncMock()
-        dual_app._orchestrator_client.heartbeat = AsyncMock(return_value={})
+        client = AsyncMock()
+        client.agent_id = "agent-1"
+        client.heartbeat = AsyncMock(return_value={})
+        client.stop_heartbeat = MagicMock()
+        client.deregister = AsyncMock(return_value=True)
+        dual_app._orchestrator_client = client
 
     @pytest.mark.asyncio
     async def test_idle_worker_exits_on_drain(self):
@@ -416,9 +420,49 @@ class TestDualDrainHandler:
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
         fake_exit.assert_called_once_with(0)
-        # Drain heartbeat sent before exit (best-effort).
+        # Drain heartbeat sent before exit (best-effort), then the agents
+        # row is deleted so the offline sweep never reports a corpse.
         dual_app._orchestrator_client.heartbeat.assert_awaited_once()
+        dual_app._orchestrator_client.deregister.assert_awaited_once()
         assert dual_app._drain_intent_handled is True
+
+    @pytest.mark.asyncio
+    async def test_idle_drain_exits_even_when_deregister_fails(self):
+        from src.api import dual_app
+
+        self._reset(dual_app)
+        dual_app._orchestrator_client.deregister = AsyncMock(
+            side_effect=RuntimeError("orchestrator 500")
+        )
+
+        with patch("src.api.dual_app.os._exit") as fake_exit:
+            await dual_app._handle_heartbeat_intents(
+                {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
+            )
+        fake_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_idle_drain_never_cancels_its_own_heartbeat_task(self):
+        # The idle-drain exit runs INSIDE the heartbeat task (on_response
+        # callback). Self-cancelling it would abort the handler before
+        # os._exit and strand the pod forever.
+        import asyncio
+
+        from src.api import dual_app
+
+        self._reset(dual_app)
+        saved_task = dual_app._heartbeat_task
+        dual_app._heartbeat_task = asyncio.current_task()
+        try:
+            with patch("src.api.dual_app.os._exit") as fake_exit:
+                await dual_app._handle_heartbeat_intents(
+                    {"intents": {"should_drain": True}}
+                )
+            fake_exit.assert_called_once_with(0)
+            assert asyncio.current_task().cancelling() == 0
+            dual_app._orchestrator_client.deregister.assert_awaited_once()
+        finally:
+            dual_app._heartbeat_task = saved_task
 
     @pytest.mark.asyncio
     async def test_busy_worker_sets_flag_no_exit(self):
@@ -435,6 +479,8 @@ class TestDualDrainHandler:
         fake_exit.assert_not_called()
         assert dual_app._drain_intent_received is True
         assert dual_app.is_drain_requested() is True
+        # Still alive — the agents row must not be deleted.
+        dual_app._orchestrator_client.deregister.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_session_worker_sets_flag_no_exit(self):
