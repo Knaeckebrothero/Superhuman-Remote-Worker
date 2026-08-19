@@ -104,7 +104,7 @@ POST   /api/agents/threads/{thread_id}/suspend                                  
 POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    internal:require_internal
 POST   /api/agents/threads/{thread_id}/upgrade-to-workspace                             internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace                                        internal:require_internal
-DELETE /api/agents/{agent_id}                                                           admin:_require_admin
+DELETE /api/agents/{agent_id}                                                           internal:is_internal_call
 GET    /api/agents/{agent_id}                                                           admin:_require_admin
 POST   /api/agents/{agent_id}/heartbeat                                                 internal:require_internal
 POST   /api/agents/{agent_id}/runtime-actor/session                                     internal:require_internal
