@@ -1,4 +1,5 @@
 import { Component, inject, signal, OnInit, OnDestroy } from '@angular/core';
+import { TranslocoPipe } from '@jsverse/transloco';
 import { ApiService } from '../../core/services/api.service';
 import {
   JobStatistics,
@@ -13,6 +14,7 @@ import {
 @Component({
   selector: 'app-statistics',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="statistics-container">
       <div class="header-bar">
@@ -114,6 +116,20 @@ import {
         <div class="stats-section">
           <h3 class="section-title">
             Stuck Jobs
+            @if (stuckThresholdMinutes() !== null) {
+              <span class="policy-note">{{
+                'statistics.stuckPolicy'
+                  | transloco
+                    : {
+                        threshold: stuckThresholdMinutes(),
+                        source:
+                          ('statistics.thresholdSource.' + stuckThresholdSource()
+                            | transloco),
+                      }
+              }}</span>
+            } @else {
+              <span class="policy-note">{{ 'statistics.policyUnavailable' | transloco }}</span>
+            }
             @if (stuckJobs().length > 0) {
               <span class="alert-badge">{{ stuckJobs().length }}</span>
             }
@@ -130,7 +146,18 @@ import {
                   </div>
                   <div class="stuck-reason">{{ job.stuck_reason }}</div>
                   <div class="stuck-meta">
-                    Last update: {{ formatTimestamp(job.updated_at) }}
+                    {{
+                      'statistics.livenessState.' + (job.state ?? 'unavailable') | transloco
+                    }}
+                    ·
+                    @if (job.last_activity_at) {
+                      {{
+                        'statistics.lastActivity'
+                          | transloco: { time: formatTimestamp(job.last_activity_at) }
+                      }}
+                    } @else {
+                      {{ 'statistics.activityUnavailable' | transloco }}
+                    }
                   </div>
                 </div>
               }
@@ -222,6 +249,12 @@ import {
         color: var(--on-danger, var(--timeline-bg));
         font-size: 11px;
         font-weight: 600;
+      }
+
+      .policy-note {
+        color: var(--text-muted, var(--text-muted));
+        font-size: 10px;
+        font-weight: 400;
       }
 
       .loading-placeholder {
@@ -384,6 +417,10 @@ export class StatisticsComponent implements OnInit, OnDestroy {
   readonly agentStats = signal<AgentStatistics | null>(null);
   readonly dailyStats = signal<DailyStatistics[]>([]);
   readonly stuckJobs = signal<StuckJob[]>([]);
+  readonly stuckThresholdMinutes = signal<number | null>(null);
+  readonly stuckThresholdSource = signal<
+    'deployment_default' | 'request_override' | 'unavailable'
+  >('unavailable');
   readonly isLoading = signal(false);
 
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -418,8 +455,10 @@ export class StatisticsComponent implements OnInit, OnDestroy {
       this.dailyStats.set(stats);
     });
 
-    this.api.getStuckJobs(60).subscribe((jobs) => {
-      this.stuckJobs.set(jobs);
+    this.api.getStuckJobs().subscribe((result) => {
+      this.stuckJobs.set(result.jobs);
+      this.stuckThresholdMinutes.set(result.threshold_minutes);
+      this.stuckThresholdSource.set(result.threshold_source);
       this.isLoading.set(false);
     });
   }

@@ -1485,14 +1485,32 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
-    async def get_stuck_jobs(self, threshold_minutes: int = 30) -> list[dict[str, Any]]:
+    async def get_stuck_jobs(
+        self, threshold_minutes: int | None = None
+    ) -> dict[str, Any]:
         """Get jobs stuck in processing beyond a threshold."""
+        params = (
+            {"threshold_minutes": threshold_minutes}
+            if threshold_minutes is not None
+            else None
+        )
         resp = await self._client.get(
             "/api/stats/stuck",
-            params={"threshold_minutes": threshold_minutes},
+            params=params,
         )
         resp.raise_for_status()
-        return resp.json()
+        payload = resp.json()
+        # Rolling compatibility with a pre-OC-08 server. New servers always
+        # return the policy envelope, including for an empty result.
+        if isinstance(payload, list):
+            return {
+                "jobs": payload,
+                "threshold_minutes": threshold_minutes,
+                "threshold_source": (
+                    "request_override" if threshold_minutes is not None else "legacy"
+                ),
+            }
+        return payload
 
     @_create_retry_decorator()
     async def list_agents(

@@ -42,6 +42,7 @@ class _CapturingAsyncClient:
 
     last_init_headers: dict[str, str] | None = None
     last_post_json: dict | None = None
+    post_payloads: list[dict] = []
 
     def __init__(self, *args, **kwargs):
         type(self).last_init_headers = dict(kwargs.get("headers") or {})
@@ -54,6 +55,7 @@ class _CapturingAsyncClient:
 
     async def post(self, url, json=None, **kwargs):
         type(self).last_post_json = dict(json or {})
+        type(self).post_payloads.append(dict(json or {}))
         resp = MagicMock()
         resp.status_code = 200
         resp.json = MagicMock(
@@ -141,3 +143,37 @@ async def test_blocking_stateless_message_carries_exact_worker_token(monkeypatch
 
     assert _CapturingAsyncClient.last_post_json is not None
     assert _CapturingAsyncClient.last_post_json["lease_token"] == 17
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_reuses_the_same_hidden_routing_generation(monkeypatch):
+    class _RetryClient(_CapturingAsyncClient):
+        calls = 0
+
+        async def post(self, url, json=None, **kwargs):
+            type(self).calls += 1
+            type(self).post_payloads.append(dict(json or {}))
+            if type(self).calls == 1:
+                import httpx
+
+                raise httpx.ReadError("response lost")
+            return await super().post(url, json=json, **kwargs)
+
+    _RetryClient.calls = 0
+    _RetryClient.post_payloads = []
+    monkeypatch.setattr(
+        "src.tools.communication.messaging.httpx.AsyncClient", _RetryClient
+    )
+    send = _tool_by_name(
+        create_communication_tools(ToolContext(_job_id="job-1")), "send_message"
+    )
+    result = await send.ainvoke(
+        {"to": "user", "subject": "hi", "message": "hello", "mode": "async"}
+    )
+    assert "Message sent" in result
+    assert _RetryClient.calls == 2
+    assert len(_RetryClient.post_payloads) >= 2
+    generations = {
+        payload["routing_generation"] for payload in _RetryClient.post_payloads
+    }
+    assert len(generations) == 1

@@ -7054,6 +7054,10 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "delegation_timed_out",
     "git_remote_url",
     "graft_output_path",
+    # Completion finalization is the only writer. Accepting this manifest at
+    # creation turns the Gitea service into a confused deputy because its
+    # repository/revision coordinates would otherwise arrive in caller data.
+    "evidence_manifest",
     "lifecycle_marker",
     "loop_campaign_id",
     "loop_campaign_index",
@@ -7087,6 +7091,9 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
     "officer_thread_id",
     "officer_incarnation",
     "provisioning_preflight",
+}
+_SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
+    "evidence_manifest"
 }
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
     "lifecycle_marker",
@@ -7128,19 +7135,21 @@ def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
 
 
 def _strip_raw_officer_claim_context(job: "JobCreate") -> None:
-    """Remove claim identity/provenance from public and internal raw bodies.
+    """Remove server-owned context from public and internal raw bodies.
 
     ``ticket=`` is the sole caller-selectable claim input. The final Officer
     admission transaction writes these context keys after resolving the ticket
     and locking the post; internal transport authentication does not make a
-    model-authored context dictionary authoritative.
+    model-authored context dictionary authoritative. Completion finalization
+    similarly records ``evidence_manifest`` later via ``merge_job_context``;
+    no job-creation body can seed repository/revision authority.
     """
 
     if isinstance(job.context, dict):
         job.context = {
             key: value
             for key, value in job.context.items()
-            if key not in _SERVER_OWNED_OFFICER_CONTEXT_KEYS
+            if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
         }
 
 
@@ -9546,6 +9555,16 @@ class JobCreate(BaseModel):
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
+        # Earliest ingress fence for both public and internally authenticated
+        # HTTP bodies. Completion finalization alone may mint this object after
+        # resolving the job's actual repository and pinned revision. The route
+        # helper and Postgres funnel repeat the strip as independent defenses.
+        if isinstance(self.context, dict) and "evidence_manifest" in self.context:
+            self.context = {
+                key: value
+                for key, value in self.context.items()
+                if key != "evidence_manifest"
+            }
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
             raise ValueError("datasource_ids may be omitted or an array, not null")
         if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
@@ -14494,6 +14513,13 @@ class MessageSendRequest(BaseModel):
             "mode='blocking' stays the mechanical signal."
         ),
     )
+    routing_generation: UUID | None = Field(
+        None,
+        description=(
+            "Internal idempotency identity for this logical send. It conveys no "
+            "audience, quota, recipient, or routing authority."
+        ),
+    )
 
 
 class MessageReplyRequest(BaseModel):
@@ -14527,6 +14553,8 @@ async def _send_officer_routed_message(
     recipient_email: str,
     recipient_name: str,
     purpose: str | None,
+    routing_generation: str,
+    quota_intent: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Deliver one worker message through the officer chain (M2/M3).
 
@@ -14549,7 +14577,10 @@ async def _send_officer_routed_message(
     now = datetime.now(timezone.utc)
     state = "pending_officer" if applied_policy == "officer_first" else "pending_both"
     blocking = request.mode == "blocking"
-    route_id = str(uuid4())
+    # One server-owned generation is both the route identity and the quota
+    # charge identity.  Retries can therefore recover the same durable intent
+    # without inventing a second route or consuming a second bucket slot.
+    route_id = routing_generation
     snapshot = routing_svc.snapshot_for_route(
         routing, applied=applied_policy, purpose=purpose
     )
@@ -14590,16 +14621,6 @@ async def _send_officer_routed_message(
             },
         }
 
-    def _delivered_any(dispatch: dict[str, Any]) -> bool:
-        if dispatch.get("queued") is True:
-            # Quiet hours: queued for digest — a delivery commitment.
-            return True
-        return any(
-            value is True
-            for key, value in dispatch.items()
-            if key not in ("queued", "email_message_id", "error")
-        )
-
     async def _dispatch_user_leg() -> dict[str, Any]:
         return await notification_service.dispatch(
             user_id=user_id,
@@ -14611,6 +14632,33 @@ async def _send_officer_routed_message(
             thread_id=thread_id,
             recipient_email=recipient_email,
             recipient_name=recipient_name,
+        )
+
+    # Claim the non-idempotent side of this generation before creating a
+    # route. A concurrent retry can reserve the same quota row, but cannot
+    # create a second route or call a provider while this short attempt lease
+    # is live. Sticky acceptance makes later request retries read-only.
+    attempt = await routing_svc.begin_delivery_attempt(postgres_db, quota_intent)
+    if not attempt.get("delivery_claimed"):
+        if attempt.get("accepted"):
+            existing = await postgres_db.get_message_route(route_id)
+            return _response(
+                recipient=(
+                    "project officer"
+                    if applied_policy == "officer_first"
+                    else _mask_email(recipient_email)
+                ),
+                to_name=(
+                    "Project officer"
+                    if applied_policy == "officer_first"
+                    else recipient_name
+                ),
+                dispatch=None,
+                route_state=(str(existing.get("state")) if existing else state),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="This message generation already has a delivery attempt in progress",
         )
 
     if blocking:
@@ -14661,6 +14709,10 @@ async def _send_officer_routed_message(
             "officer_deadline": deadlines["officer_deadline"],
             "total_deadline": deadlines["total_deadline"],
             "transitions": transitions,
+            "routing_generation": routing_generation,
+            "effective_audience": (
+                "officer" if state == "pending_officer" else "officer_and_user"
+            ),
         }
         wake = {
             "thread_id": officer_tid,
@@ -14681,7 +14733,7 @@ async def _send_officer_routed_message(
             "recipient_email": recipient_email if state == "pending_both" else None,
             "subject": request.subject,
             "message": request.message,
-            "status": "sent",
+            "status": "sent" if state == "pending_officer" else "pending",
         }
         lane = str(job.get("execution_lane") or "pinned")
         try:
@@ -14697,6 +14749,13 @@ async def _send_officer_routed_message(
                 completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
             )
         except Exception:
+            await routing_svc.settle_delivery_attempt(
+                postgres_db,
+                quota_intent,
+                attempt,
+                accepted=False,
+                failure_class="route_commit_failed",
+            )
             logger.exception(
                 "Officer-routed blocking send failed for job %s — falling "
                 "back to direct user delivery (§5.1)",
@@ -14704,6 +14763,13 @@ async def _send_officer_routed_message(
             )
             return None
         if created is None:
+            await routing_svc.settle_delivery_attempt(
+                postgres_db,
+                quota_intent,
+                attempt,
+                accepted=False,
+                failure_class="route_guard_lost",
+            )
             raise HTTPException(
                 status_code=409,
                 detail="Job changed before blocking message was committed",
@@ -14711,18 +14777,32 @@ async def _send_officer_routed_message(
         # Latency: the wake row is durable; this just delivers it now.
         _kick_officer_event_drain(postgres_db)
 
+        if state == "pending_officer":
+            await routing_svc.settle_delivery_attempt(
+                postgres_db,
+                quota_intent,
+                attempt,
+                accepted=True,
+                detail="durable officer route and wake queued",
+            )
+
         dispatch: dict[str, Any] | None = None
         if state == "pending_both":
             try:
                 dispatch = await _dispatch_user_leg()
-                if dispatch.get("email_message_id"):
-                    await postgres_db.set_message_email_id(
-                        created["originating_message_id"],
-                        dispatch["email_message_id"],
-                    )
-                if _delivered_any(dispatch):
-                    await postgres_db.mark_route_user_delivery(route_id)
             except Exception:
+                await routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    quota_intent,
+                    attempt,
+                    accepted=False,
+                    failure_class="notifier_exception",
+                )
+                await postgres_db.settle_outbound_message_log(
+                    created["originating_message_id"],
+                    accepted=False,
+                    error_message="notifier exception",
+                )
                 # user_delivery_at stays NULL — the reconciler redelivers.
                 logger.warning(
                     "officer_and_user user leg failed for route %s "
@@ -14730,6 +14810,24 @@ async def _send_officer_routed_message(
                     route_id[:8],
                     exc_info=True,
                 )
+            else:
+                outcome = routing_svc.classify_dispatch(dispatch)
+                await routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    quota_intent,
+                    attempt,
+                    accepted=outcome.accepted,
+                    failure_class=(None if outcome.accepted else "provider_rejected"),
+                    detail=outcome.detail,
+                )
+                await postgres_db.settle_outbound_message_log(
+                    created["originating_message_id"],
+                    accepted=outcome.accepted,
+                    error_message=outcome.detail,
+                    email_message_id=dispatch.get("email_message_id"),
+                )
+                if outcome.accepted:
+                    await postgres_db.mark_route_user_delivery(route_id)
         if state == "pending_officer":
             return _response(
                 recipient="project officer",
@@ -14760,6 +14858,8 @@ async def _send_officer_routed_message(
                 message=request.message,
                 mode="async",
                 status="sent",
+                routing_generation=routing_generation,
+                effective_audience="officer",
             )
             created_route = await postgres_db.create_message_route(
                 {
@@ -14774,17 +14874,40 @@ async def _send_officer_routed_message(
                     "officer_thread_id": officer_tid,
                     "officer_incarnation": incarnation,
                     "transitions": transitions,
+                    "routing_generation": routing_generation,
+                    "effective_audience": "officer",
                 }
             )
             if not created_route:
+                await routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    quota_intent,
+                    attempt,
+                    accepted=False,
+                    failure_class="route_commit_failed",
+                )
                 return None
         except Exception:
+            await routing_svc.settle_delivery_attempt(
+                postgres_db,
+                quota_intent,
+                attempt,
+                accepted=False,
+                failure_class="route_commit_failed",
+            )
             logger.exception(
                 "Async officer_first route failed for job %s — falling back "
                 "to direct user delivery",
                 job_id[:8],
             )
             return None
+        await routing_svc.settle_delivery_attempt(
+            postgres_db,
+            quota_intent,
+            attempt,
+            accepted=True,
+            detail="durable officer route queued",
+        )
         return _response(
             recipient="project officer",
             to_name="Project officer",
@@ -14795,8 +14918,8 @@ async def _send_officer_routed_message(
     # officer_and_user, async: immediate delivery to both (ratified) — the
     # user leg is the unchanged notification path; the officer sees the open
     # route in his next inbox/SITREP.
-    dispatch = await _dispatch_user_leg()
-    email_sent = dispatch.get("email", False)
+    # Persist the Officer inbox route before invoking the user notifier. The
+    # reconciler can therefore repair a crash at every later fault point.
     log_row = await postgres_db.log_message(
         job_id=job_id,
         user_id=user_id,
@@ -14806,36 +14929,71 @@ async def _send_officer_routed_message(
         subject=request.subject,
         message=request.message,
         mode="async",
-        status="sent",
-        error_message=None if email_sent else "Email not configured or send failed",
-        email_message_id=dispatch.get("email_message_id"),
+        status="pending",
+        routing_generation=routing_generation,
+        effective_audience="officer_and_user",
     )
+    created_route = await postgres_db.create_message_route(
+        {
+            "route_id": route_id,
+            "job_id": job_id,
+            "project_id": project_id,
+            "thread_id": thread_id,
+            "originating_message_id": (log_row or {}).get("id"),
+            "policy_snapshot": snapshot,
+            "state": "pending_both",
+            "blocking": False,
+            "officer_thread_id": officer_tid,
+            "officer_incarnation": incarnation,
+            "transitions": transitions,
+            "routing_generation": routing_generation,
+            "effective_audience": "officer_and_user",
+        }
+    )
+    if not created_route:
+        await routing_svc.settle_delivery_attempt(
+            postgres_db,
+            quota_intent,
+            attempt,
+            accepted=False,
+            failure_class="route_commit_failed",
+        )
+        return None
     try:
-        await postgres_db.create_message_route(
-            {
-                "route_id": route_id,
-                "job_id": job_id,
-                "project_id": project_id,
-                "thread_id": thread_id,
-                "originating_message_id": (log_row or {}).get("id"),
-                "policy_snapshot": snapshot,
-                "state": "pending_both",
-                "blocking": False,
-                "officer_thread_id": officer_tid,
-                "officer_incarnation": incarnation,
-                "user_delivery_at": now if _delivered_any(dispatch) else None,
-                "transitions": transitions,
-            }
-        )
+        dispatch = await _dispatch_user_leg()
     except Exception:
-        # The user has the message — an officer-side bookkeeping failure
-        # must not fail the send.
-        logger.warning(
-            "officer_and_user async route insert failed for job %s (thread %s)",
-            job_id[:8],
-            thread_id,
-            exc_info=True,
+        await routing_svc.settle_delivery_attempt(
+            postgres_db,
+            quota_intent,
+            attempt,
+            accepted=False,
+            failure_class="notifier_exception",
         )
+        raise
+    outcome = routing_svc.classify_dispatch(dispatch)
+    await routing_svc.settle_delivery_attempt(
+        postgres_db,
+        quota_intent,
+        attempt,
+        accepted=outcome.accepted,
+        failure_class=(None if outcome.accepted else "provider_rejected"),
+        detail=outcome.detail,
+    )
+    if dispatch.get("email_message_id") and log_row:
+        await postgres_db.settle_outbound_message_log(
+            str(log_row["id"]),
+            accepted=outcome.accepted,
+            error_message=outcome.detail,
+            email_message_id=dispatch.get("email_message_id"),
+        )
+    elif log_row:
+        await postgres_db.settle_outbound_message_log(
+            str(log_row["id"]),
+            accepted=outcome.accepted,
+            error_message=outcome.detail,
+        )
+    if outcome.accepted:
+        await postgres_db.mark_route_user_delivery(route_id)
     return _response(
         recipient=_mask_email(recipient_email),
         to_name=recipient_name,
@@ -14963,58 +15121,6 @@ async def send_agent_message(
                 recipient_name = match.get("display_name", "User")
                 user_id = str(match["user_id"])
 
-        # Check rate limits
-        limits = await postgres_db.check_message_rate_limit(job_id, user_id)
-        if limits["job_hourly"] >= 5:
-            await postgres_db.log_message(
-                job_id=job_id,
-                thread_id=request.thread_id or "?",
-                direction="outbound",
-                subject=request.subject,
-                message=request.message,
-                status="rate_limited",
-                user_id=user_id,
-                mode=request.mode,
-                error_message="Rate limit: 5 per hour per job",
-            )
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "status": "rate_limited",
-                    "error": "Rate limit exceeded: 5 messages per hour per job",
-                    "retry_after_seconds": 3600,
-                },
-            )
-        if limits["job_daily"] >= 15:
-            await postgres_db.log_message(
-                job_id=job_id,
-                thread_id=request.thread_id or "?",
-                direction="outbound",
-                subject=request.subject,
-                message=request.message,
-                status="rate_limited",
-                user_id=user_id,
-                mode=request.mode,
-                error_message="Rate limit: 15 per day per job",
-            )
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "status": "rate_limited",
-                    "error": "Rate limit exceeded: 15 messages per 24 hours per job",
-                    "retry_after_seconds": 86400,
-                },
-            )
-        if limits["user_daily"] >= 30:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "status": "rate_limited",
-                    "error": "Rate limit exceeded: 30 messages per 24 hours per user",
-                    "retry_after_seconds": 86400,
-                },
-            )
-
         # Generate thread_id if not provided
         thread_id = request.thread_id or secrets.token_hex(3)
 
@@ -15060,7 +15166,68 @@ async def send_agent_message(
             applied_policy = "user_direct"
             applied_reason = "officer_held"
 
+        # OC-07: quota follows the server-resolved durable audience.  The
+        # generation is opaque idempotency only; it conveys no routing or
+        # quota authority and all audience selection above is server-owned.
+        from services import message_routing as _routing_svc
+
+        routing_generation = str(request.routing_generation or uuid4())
+        route_project_id = str(job["project_id"]) if job.get("project_id") else None
+
+        async def _reserve_delivery(
+            bucket: str,
+            audience: str,
+            reason: str,
+        ) -> dict[str, Any] | JSONResponse:
+            intent = await _routing_svc.reserve_quota_intent(
+                postgres_db,
+                routing_generation=routing_generation,
+                route_id=routing_generation,
+                bucket=bucket,
+                effective_audience=audience,
+                job_id=job_id,
+                project_id=route_project_id,
+                user_id=user_id if bucket == "human" else None,
+                reason=reason,
+            )
+            if intent.get("allowed"):
+                return intent
+            limit_name = str(intent.get("limit") or "message_quota")
+            retry_after = int(intent.get("retry_after_seconds") or 3600)
+            await postgres_db.log_message(
+                job_id=job_id,
+                thread_id=thread_id,
+                direction="outbound",
+                subject=request.subject,
+                message=request.message,
+                status="rate_limited",
+                user_id=user_id,
+                mode=request.mode,
+                error_message=f"Rate limit: {limit_name}",
+                routing_generation=routing_generation,
+                effective_audience=audience,
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "error": f"Rate limit exceeded: {limit_name}",
+                    "bucket": bucket,
+                    "retry_after_seconds": retry_after,
+                },
+            )
+
         if applied_policy in ("officer_first", "officer_and_user"):
+            audience = (
+                "officer" if applied_policy == "officer_first" else "officer_and_user"
+            )
+            quota_intent = await _reserve_delivery(
+                "officer_internal" if applied_policy == "officer_first" else "human",
+                audience,
+                applied_reason,
+            )
+            if isinstance(quota_intent, JSONResponse):
+                return quota_intent
             officer_result = await _send_officer_routed_message(
                 job=job,
                 job_id=job_id,
@@ -15073,6 +15240,8 @@ async def send_agent_message(
                 recipient_email=recipient_email,
                 recipient_name=recipient_name,
                 purpose=purpose,
+                routing_generation=routing_generation,
+                quota_intent=quota_intent,
             )
             if officer_result is not None:
                 return officer_result
@@ -15081,10 +15250,53 @@ async def send_agent_message(
             applied_policy = "user_direct"
             applied_reason = "officer_route_failed"
 
+        direct_audience = "human" if request.to == "user" else "explicit_recipient"
+        direct_intent = await _reserve_delivery(
+            "human", direct_audience, applied_reason
+        )
+        if isinstance(direct_intent, JSONResponse):
+            return direct_intent
+
+        direct_attempt = await _routing_svc.begin_delivery_attempt(
+            postgres_db, direct_intent
+        )
+        if not direct_attempt.get("delivery_claimed"):
+            if direct_attempt.get("accepted"):
+                return {
+                    "status": "sent",
+                    "thread_id": thread_id,
+                    "sequence": sequence,
+                    "file_path": f"messages/{thread_id}/{sequence:03d}_sent.md",
+                    "recipient": _mask_email(recipient_email),
+                    "to_name": recipient_name,
+                    "email_delivered": False,
+                    "channels": {},
+                    "routing": {
+                        "policy": (
+                            routing.get("requested") if routing else "user_direct"
+                        ),
+                        "applied": "user_direct",
+                        "reason": "idempotent_replay",
+                        "route_id": (
+                            routing_generation if request.mode == "blocking" else None
+                        ),
+                        "state": (
+                            "user_direct" if request.mode == "blocking" else None
+                        ),
+                    },
+                }
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This message generation already has a delivery attempt in progress"
+                ),
+            )
+
         route_id: str | None = None
         freeze_data: dict[str, Any] | None = None
+        direct_message_id: str | None = None
         if request.mode == "blocking":
-            route_id = str(uuid4())
+            route_id = routing_generation
             freeze_data = {
                 "status": "waiting_for_reply",
                 "freeze_type": "blocking_message",
@@ -15150,62 +15362,56 @@ async def send_agent_message(
                         note=f"created (user_direct: {applied_reason})",
                     )
                 ],
+                "routing_generation": routing_generation,
+                "effective_audience": direct_audience,
             }
-            direct_committed = await postgres_db.create_routed_blocking_freeze(
-                job_id,
-                freeze_data,
-                route=_direct_route,
-                message_entry={
-                    "user_id": user_id,
-                    "recipient_email": recipient_email,
-                    "subject": request.subject,
-                    "message": request.message,
-                    "status": "sent",
-                },
-                wake=None,
-                expected_lane=str(job.get("execution_lane") or "pinned"),
-                lease_token=request.lease_token,
-                agent_id=request.agent_id,
-                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
-            )
+            try:
+                direct_committed = await postgres_db.create_routed_blocking_freeze(
+                    job_id,
+                    freeze_data,
+                    route=_direct_route,
+                    message_entry={
+                        "user_id": user_id,
+                        "recipient_email": recipient_email,
+                        "subject": request.subject,
+                        "message": request.message,
+                        "status": "pending",
+                    },
+                    wake=None,
+                    expected_lane=str(job.get("execution_lane") or "pinned"),
+                    lease_token=request.lease_token,
+                    agent_id=request.agent_id,
+                    completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+                )
+            except Exception:
+                await _routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    direct_intent,
+                    direct_attempt,
+                    accepted=False,
+                    failure_class="route_commit_failed",
+                )
+                raise
             if direct_committed is None:
+                await _routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    direct_intent,
+                    direct_attempt,
+                    accepted=False,
+                    failure_class="route_guard_lost",
+                )
                 raise HTTPException(
                     status_code=409,
                     detail="Job changed before blocking message was committed",
                 )
-
-        # Dispatch to all configured notification channels
-        dispatch_results = await notification_service.dispatch(
-            user_id=user_id,
-            job_id=job_id,
-            subject=request.subject,
-            message_md=request.message,
-            job_description=job.get("description", "")[:100],
-            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
-            thread_id=thread_id,
-            recipient_email=recipient_email,
-            recipient_name=recipient_name,
-        )
-
-        email_sent = dispatch_results.get("email", False)
-        email_msg_id = dispatch_results.get("email_message_id")
-        status = "sent"  # Message logged even if delivery fails
-        error_msg = None if email_sent else "Email not configured or send failed"
-
-        # Log to message_log. A BLOCKING send already logged its message
-        # inside the freeze+route transaction above, so logging again here
-        # would duplicate the thread entry.
-        if request.mode == "blocking":
-            if email_msg_id:
-                await postgres_db.set_message_email_id(
-                    direct_committed["originating_message_id"], email_msg_id
-                )
-            from services import message_routing as _rsvc
-
-            if _rsvc.classify_dispatch(dispatch_results).accepted:
-                await postgres_db.mark_route_user_delivery(str(route_id))
+            direct_message_id = str(direct_committed["originating_message_id"])
         else:
-            await postgres_db.log_message(
+            # Async direct delivery has the same write-before-side-effect law as
+            # the blocking route transaction.  In particular, a provider that
+            # accepts the notification immediately before this process dies
+            # must not leave the durable ledger as the only operator-visible
+            # account of what was sent.
+            direct_message = await postgres_db.log_message(
                 job_id=job_id,
                 user_id=user_id,
                 thread_id=thread_id,
@@ -15214,10 +15420,82 @@ async def send_agent_message(
                 subject=request.subject,
                 message=request.message,
                 mode=request.mode,
-                status=status,
-                error_message=error_msg,
+                status="pending",
+                routing_generation=routing_generation,
+                effective_audience=direct_audience,
+            )
+            if not direct_message or not direct_message.get("id"):
+                await _routing_svc.settle_delivery_attempt(
+                    postgres_db,
+                    direct_intent,
+                    direct_attempt,
+                    accepted=False,
+                    failure_class="message_log_failed",
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Message delivery could not be durably recorded",
+                )
+            direct_message_id = str(direct_message["id"])
+
+        # Dispatch only after the durable intent (and, for blocking sends,
+        # the route/freeze unit) exists.  Attempt and settlement are separate
+        # durable facts so provider failure never masquerades as acceptance.
+        try:
+            dispatch_results = await notification_service.dispatch(
+                user_id=user_id,
+                job_id=job_id,
+                subject=request.subject,
+                message_md=request.message,
+                job_description=job.get("description", "")[:100],
+                config_name=canonical_config_name(
+                    job.get("config_name") or "worker_base"
+                ),
+                thread_id=thread_id,
+                recipient_email=recipient_email,
+                recipient_name=recipient_name,
+            )
+        except Exception:
+            await _routing_svc.settle_delivery_attempt(
+                postgres_db,
+                direct_intent,
+                direct_attempt,
+                accepted=False,
+                failure_class="notifier_exception",
+            )
+            if direct_message_id is not None:
+                await postgres_db.settle_outbound_message_log(
+                    direct_message_id,
+                    accepted=False,
+                    error_message="notification provider raised an exception",
+                )
+            raise
+
+        dispatch_outcome = _routing_svc.classify_dispatch(dispatch_results)
+        await _routing_svc.settle_delivery_attempt(
+            postgres_db,
+            direct_intent,
+            direct_attempt,
+            accepted=dispatch_outcome.accepted,
+            failure_class=(None if dispatch_outcome.accepted else "provider_rejected"),
+            detail=dispatch_outcome.detail,
+        )
+
+        email_sent = dispatch_results.get("email", False)
+        email_msg_id = dispatch_results.get("email_message_id")
+
+        # Both modes prelogged exactly one row before provider I/O. Settle that
+        # row instead of appending a second, outcome-only message.
+        if direct_message_id is not None:
+            await postgres_db.settle_outbound_message_log(
+                direct_message_id,
+                accepted=dispatch_outcome.accepted,
+                error_message=dispatch_outcome.detail,
                 email_message_id=email_msg_id,
             )
+        if request.mode == "blocking":
+            if dispatch_outcome.accepted:
+                await postgres_db.mark_route_user_delivery(str(route_id))
 
         file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
 
@@ -25727,13 +26005,15 @@ async def _complete_job_legacy(
                         "recorded": True,
                         "entry_count": len(manifest.get("entries") or []),
                     }
-                except Exception as exc:  # noqa: BLE001 — never block the seal
+                except Exception:  # noqa: BLE001 — never block the seal
                     logger.warning(
-                        "Evidence manifest recording failed for job %s: %s",
+                        "Evidence manifest recording failed safely for job %s",
                         job_id,
-                        exc,
                     )
-                    return {"recorded": False, "error": str(exc)[:300]}
+                    return {
+                        "recorded": False,
+                        "error": "evidence_manifest_record_failed",
+                    }
 
             evidence_effect = await _run_completion_effect(
                 _effect_runner,
@@ -27633,9 +27913,23 @@ async def read_job_evidence_route(
             detail=f"Evidence '{evidence_id}' not found for job '{job_id}'",
         )
     try:
-        return await read_evidence_entry(job, entry, offset=offset, gitea=gitea_client)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        return await read_evidence_entry(
+            job,
+            entry,
+            offset=offset,
+            db=postgres_db,
+            gitea=gitea_client,
+        )
+    except Exception:  # noqa: BLE001 -- never expose private object coordinates
+        logger.warning(
+            "Evidence read failed safely for job %s evidence %s",
+            str(job_id)[:8],
+            str(evidence_id)[:20],
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Evidence read failed without exposing private object details",
+        ) from None
 
 
 @app.get("/api/jobs/{job_id}/audit")
@@ -31014,8 +31308,8 @@ async def get_agent_statistics(request: Request) -> dict[str, Any]:
 @app.get("/api/stats/stuck")
 async def get_stuck_jobs(
     request: Request,
-    threshold_minutes: int = Query(default=60, ge=1, le=1440),
-) -> list[dict[str, Any]]:
+    threshold_minutes: int | None = Query(default=None, ge=1, le=1440),
+) -> dict[str, Any]:
     """Get jobs suspected stuck, scoped to the caller's visibility (G5).
 
     E3 (officer_supervision_surface §5): stuckness comes from the one shared
@@ -31029,15 +31323,16 @@ async def get_stuck_jobs(
     """
     user = await require_approved_user(request, postgres_db)
     vis = await _visibility_kwargs_for_stats(user)
-    from services.job_liveness import compute_jobs_liveness
+    from services.job_liveness import compute_jobs_liveness, get_liveness_policy
 
     try:
+        policy = get_liveness_policy(stall_override_minutes=threshold_minutes)
         processing = await postgres_db.get_processing_jobs(**vis)
         liveness_by_id = await compute_jobs_liveness(
             processing,
             audit_reader=audit_reader,
             db=postgres_db,
-            threshold_minutes=threshold_minutes,
+            policy=policy,
         )
         stuck: list[dict[str, Any]] = []
         for job in processing:
@@ -31055,7 +31350,10 @@ async def get_stuck_jobs(
             )
             row["stuck_component"] = "liveness"
             stuck.append(row)
-        return stuck
+        return {
+            "jobs": stuck,
+            **policy.stall.as_dict(),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -35634,6 +35932,9 @@ async def get_project_officer_summary(
         project_id
     )
     floor_wakes = await postgres_db.list_officer_floor_wake_outcomes(project_id)
+    from services.job_liveness import get_liveness_policy
+
+    stale_claim_policy = get_liveness_policy().stale_claim.as_dict()
     post_block: dict[str, Any] = {
         # OC-10: a safe capability derived from the same current membership
         # authority as the mutation endpoints.  It is refreshed with every
@@ -35659,6 +35960,7 @@ async def get_project_officer_summary(
             "auto_pull": bool(row_officer_cfg.get("auto_pull")),
             "breakers": {},
             "stale_claims": [],
+            "stale_claim_policy": stale_claim_policy,
             "worker_spend_ceiling_daily": row_officer_cfg.get(
                 "worker_spend_ceiling_daily"
             ),
@@ -35753,6 +36055,8 @@ async def get_project_officer_summary(
             if isinstance(entry, dict)
         },
         "stale_claims": officer_state.get("backlog_stale_claims") or [],
+        "stale_claim_policy": officer_state.get("backlog_stale_claim_policy")
+        or stale_claim_policy,
         "worker_spend_ceiling_daily": officer_meta.get("worker_spend_ceiling_daily"),
         "provisioning_preflights": provisioning_preflights,
         "knowledge_materialization": knowledge_materialization,

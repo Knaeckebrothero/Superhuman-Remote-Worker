@@ -86,9 +86,27 @@ class TestPublicPathStripsThreadId:
                 "officer_slot": "line",
             },
         )
+        # Preserve an independent route-level defense even if a validated
+        # request model is mutated before the handler consumes it.
+        job.context["evidence_manifest"] = {"source_repository": "victim-private-repo"}
         _strip_raw_officer_claim_context(job)
 
         assert job.context == {"ordinary": "preserved", "officer_slot": "line"}
+
+    def test_job_create_model_strips_evidence_manifest_at_raw_ingress(self):
+        from main import JobCreate
+
+        job = JobCreate(
+            description="d",
+            context={
+                "ordinary": "preserved",
+                "evidence_manifest": {
+                    "source_repository": "victim-private-repo",
+                    "source_revision": "f" * 40,
+                },
+            },
+        )
+        assert job.context == {"ordinary": "preserved"}
 
 
 # --------------------------------------------------------------------------
@@ -179,6 +197,7 @@ class TestLinkagePersistence:
                 thread_id=THREAD_ID,
                 context={
                     "ordinary": "preserved",
+                    "evidence_manifest": {"source_repository": "victim-private-repo"},
                     "ticket_note_id": "forged",
                     "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
                     "ticket_claim_source": "forged",
@@ -190,6 +209,7 @@ class TestLinkagePersistence:
         context = linkage_db.create_job.await_args.kwargs["context"]
         assert context["ordinary"] == "preserved"
         assert context["officer_slot"] == "line"
+        assert "evidence_manifest" not in context
         assert "ticket_note_id" not in context
         assert "officer_admission" not in context
         assert "ticket_claim_source" not in context
@@ -212,6 +232,9 @@ class TestLinkagePersistence:
                     description="public bypass",
                     context={
                         "ordinary": "preserved",
+                        "evidence_manifest": {
+                            "source_repository": "victim-private-repo"
+                        },
                         "ticket_note_id": "forged",
                         "officer_admission": {
                             "ticket_ready_at": "2099-01-01T00:00:00Z"
@@ -224,6 +247,7 @@ class TestLinkagePersistence:
 
         context = linkage_db.create_job.await_args.kwargs["context"]
         assert context["ordinary"] == "preserved"
+        assert "evidence_manifest" not in context
         assert "ticket_note_id" not in context
         assert "officer_admission" not in context
         assert "ready_generation_at" not in context

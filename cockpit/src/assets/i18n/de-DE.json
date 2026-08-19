@@ -3228,7 +3228,12 @@
       "on": "an — bereite Tickets werden freien Pool-Plätzen zugeteilt",
       "off": "aus — Pools bleiben untätig, bis er manuell entsendet",
       "stalled": "Festgefahren",
-      "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) ohne Fortschritt — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen."
+      "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) seit mehr als {{threshold}} Std. ohne Fortschritt ({{source}}) — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen.",
+      "thresholdSource": {
+        "deployment_default": "Deployment-Standard",
+        "request_override": "Anfrage-Überschreibung",
+        "unavailable": "Richtlinie nicht verfügbar"
+      }
     },
     "brain": {
       "actionsHint": "Harte Obergrenze für Werkzeugaufrufe pro Weckruf.",
@@ -3400,6 +3405,25 @@
       "overdueMinutes": "seit {{count}} Min. überfällig"
     },
     "workspace": {"sandbox": "Sandbox", "virtual": "virtuell", "none": "keiner", "vmRoot": "VM (Root)"}
+  },
+  "statistics": {
+    "stuckPolicy": "{{threshold}} Min. · {{source}}",
+    "policyUnavailable": "Liveness-Richtlinie nicht verfügbar",
+    "thresholdSource": {
+      "deployment_default": "Deployment-Standard",
+      "request_override": "Anfrage-Überschreibung",
+      "unavailable": "nicht verfügbar"
+    },
+    "livenessState": {
+      "active": "aktiv",
+      "waiting": "wartend",
+      "paused": "pausiert",
+      "suspected_stuck": "vermutlich festgefahren",
+      "unavailable": "Liveness nicht verfügbar",
+      "terminal": "beendet"
+    },
+    "lastActivity": "letzte maßgebliche Aktivität {{time}}",
+    "activityUnavailable": "kein maßgeblicher Aktivitätszeitpunkt"
   },
   "pwa": {
     "splash": "Legion wird formiert…",

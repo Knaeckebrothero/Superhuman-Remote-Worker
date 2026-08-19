@@ -865,6 +865,7 @@ describe('ApiService.getJobProgress (honest liveness, officer_supervision_surfac
       last_activity_at: '2026-08-14T11:19:00+00:00',
       observed_at: '2026-08-14T12:00:00+00:00',
       threshold_minutes: 30,
+      threshold_source: 'deployment_default',
       sources: [
         {name: 'control_db', status: 'fresh', as_of: '2026-08-14T12:00:00+00:00'},
         {name: 'audit_db', status: 'unavailable', reason: 'timeout'},
@@ -882,6 +883,7 @@ describe('ApiService.getJobProgress (honest liveness, officer_supervision_surfac
     expect(progress!.state).toBe('suspected_stuck');
     expect(progress!.reasons).toEqual(['no audit movement for 41 minutes']);
     expect(progress!.last_activity_at).toBe('2026-08-14T11:19:00+00:00');
+    expect(progress!.threshold_source).toBe('deployment_default');
     expect(progress!.progress_percent).toBeNull();
     expect(progress!.eta_seconds).toBeNull();
   });
@@ -893,6 +895,73 @@ describe('ApiService.getJobProgress (honest liveness, officer_supervision_surfac
       const request = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/progress'));
       request.flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
       await expect(pending).resolves.toBeNull();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+});
+
+describe('ApiService.getStuckJobs (server-owned OC-08 policy)', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('omits a caller default and preserves the deployment policy verdict', async () => {
+    const pending = firstValueFrom(api.getStuckJobs());
+    const request = httpMock.expectOne((r) => r.url.endsWith('/stats/stuck'));
+    expect(request.request.params.has('threshold_minutes')).toBe(false);
+    request.flush({
+      jobs: [{id: 'job-1', status: 'processing', stuck_reason: '41 minutes', stuck_component: 'job'}],
+      threshold_minutes: 30,
+      threshold_source: 'deployment_default',
+    });
+    await expect(pending).resolves.toMatchObject({
+      threshold_minutes: 30,
+      threshold_source: 'deployment_default',
+      jobs: [{id: 'job-1'}],
+    });
+  });
+
+  it('passes an explicit override and reports it without reclassification', async () => {
+    const pending = firstValueFrom(api.getStuckJobs(60));
+    const request = httpMock.expectOne((r) => r.url.endsWith('/stats/stuck'));
+    expect(request.request.params.get('threshold_minutes')).toBe('60');
+    request.flush({jobs: [], threshold_minutes: 60, threshold_source: 'request_override'});
+    await expect(pending).resolves.toEqual({
+      jobs: [],
+      threshold_minutes: 60,
+      threshold_source: 'request_override',
+    });
+  });
+
+  it('does not fabricate a deployment threshold when the server is unavailable', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const pending = firstValueFrom(api.getStuckJobs());
+      const request = httpMock.expectOne((r) => r.url.endsWith('/stats/stuck'));
+      request.flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
+      await expect(pending).resolves.toEqual({
+        jobs: [],
+        threshold_minutes: null,
+        threshold_source: 'unavailable',
+      });
     } finally {
       consoleError.mockRestore();
     }

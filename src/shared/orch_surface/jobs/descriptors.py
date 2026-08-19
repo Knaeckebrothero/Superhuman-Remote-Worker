@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import functools
 import inspect
 from typing import Any, Awaitable, Callable, Literal
@@ -20,7 +21,28 @@ JobGroup = Literal["job_control", "job_inspection"]
 JobPlane = Literal["job_control", "job_observability", "job_evidence", "job_workspace"]
 CallerKind = Literal["mcp", "session", "officer"]
 GrantKind = Literal["explicit"]
-JobHandler = Callable[..., Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolImageAttachment:
+    """One bounded image carried out-of-band from ordinary tool text."""
+
+    base64_data: str
+    media_type: str
+
+    def decoded(self) -> bytes:
+        return base64.b64decode(self.base64_data, validate=True)
+
+
+@dataclass(frozen=True, slots=True)
+class JobToolResult:
+    """Shared descriptor output with at most one optional image attachment."""
+
+    text: str
+    image: ToolImageAttachment | None = None
+
+
+JobHandler = Callable[..., Awaitable[str | JobToolResult]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +78,7 @@ class CallerCtx:
     resolve_job_id_prefixes: bool = False
     auth_failed: bool = False
     runtime_actor: RuntimeActorContext | None = None
+    supports_multimodal: bool | None = None
 
     @property
     def project_scope(self) -> str | None:
@@ -193,6 +216,7 @@ def make_bound_handler(
     *,
     client_provider: Callable[[], AsyncCockpitClient],
     caller_provider: Callable[[], CallerCtx],
+    result_adapter: Callable[[str | JobToolResult], Any] | None = None,
 ) -> JobHandler:
     """Bind hidden dependencies while retaining the reviewed public signature."""
 
@@ -229,7 +253,8 @@ def make_bound_handler(
             runtime_actor=caller.runtime_actor,
         ):
             if not caller.auth_failed:
-                return await item.handler(client, caller, *args, **kwargs)
+                outcome = await item.handler(client, caller, *args, **kwargs)
+                return result_adapter(outcome) if result_adapter else outcome
             # Fail closed: the request above carries no identity headers, so
             # the orchestrator 401s; surface that as an auth-context failure
             # rather than an anonymous-looking backend error.
@@ -237,7 +262,16 @@ def make_bound_handler(
                 outcome = await item.handler(client, caller, *args, **kwargs)
             except Exception as error:
                 outcome = f"{type(error).__name__}: {error}"
-            return f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome}"
+            if isinstance(outcome, JobToolResult):
+                # Authentication failure must never carry an attachment even
+                # if a doubled client returned one unexpectedly. This also
+                # keeps base64 out of the fallback string representation.
+                combined: str | JobToolResult = JobToolResult(
+                    text=f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome.text}"
+                )
+            else:
+                combined = f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome}"
+            return result_adapter(combined) if result_adapter else combined
 
     invoke.__name__ = item.name
     invoke.__qualname__ = item.name
@@ -250,8 +284,10 @@ __all__ = [
     "CallerCtx",
     "CallerKind",
     "JobDescriptor",
+    "JobToolResult",
     "JobGroup",
     "JobPlane",
+    "ToolImageAttachment",
     "caller_default_names",
     "descriptor",
     "get_descriptor",

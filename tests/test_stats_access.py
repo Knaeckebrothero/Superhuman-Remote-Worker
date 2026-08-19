@@ -177,6 +177,35 @@ class TestStatsStuck:
         kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert "owner_user_id" not in kwargs
 
+    @pytest.mark.asyncio
+    async def test_default_threshold_is_server_owned_and_reported(
+        self, user_a, fake_db, fake_request, monkeypatch
+    ):
+        from main import get_stuck_jobs
+
+        monkeypatch.setenv("JOB_LIVENESS_STALL_MINUTES", "47")
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await get_stuck_jobs(fake_request, threshold_minutes=None)
+        assert result == {
+            "jobs": [],
+            "threshold_minutes": 47,
+            "threshold_source": "deployment_default",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("threshold", [30, 60])
+    async def test_explicit_override_is_reported(
+        self, threshold, user_a, fake_db, fake_request
+    ):
+        from main import get_stuck_jobs
+
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await get_stuck_jobs(fake_request, threshold_minutes=threshold)
+        assert result["threshold_minutes"] == threshold
+        assert result["threshold_source"] == "request_override"
+
 
 # =============================================================================
 # /api/stats/agents + /api/snapshots/stats — admin only

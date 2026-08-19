@@ -363,6 +363,17 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     db.check_message_rate_limit = AsyncMock(
         return_value={"job_hourly": 0, "job_daily": 0, "user_daily": 0}
     )
+    db.reserve_message_delivery_intent = AsyncMock(
+        return_value={
+            "allowed": True,
+            "intent_id": str(uuid4()),
+            "accepted_at": None,
+        }
+    )
+    db.begin_message_delivery_attempt = AsyncMock(
+        return_value={"delivery_claimed": True, "attempt_number": 1}
+    )
+    db.settle_message_delivery_attempt = AsyncMock(return_value=True)
     db.get_message_sequence = AsyncMock(return_value=1)
     db.publish_blocking_message = AsyncMock(return_value=False)
     # OC-01: the blocking send is now one atomic message+route+freeze unit.

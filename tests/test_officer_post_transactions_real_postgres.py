@@ -1926,6 +1926,11 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
         project_id=seed["project_id"],
         created_by_thread_id=seed["thread_id"],
         context={
+            "evidence_manifest": {
+                "version": 1,
+                "job_id": "forged",
+                "source_repository": "victim-private-repo",
+            },
             "ticket_note_id": "forged-ticket",
             "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
             "ticket_ready_at": "2099-01-01T00:00:00Z",
@@ -1940,6 +1945,7 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
         )
     assert context["ordinary"] == "preserved"
     assert context["officer_slot"] == "line"
+    assert "evidence_manifest" not in context
     assert not set(context) & {
         "ticket_note_id",
         "officer_admission",
@@ -1975,6 +1981,11 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
         description=f"{('internal' if internal else 'public')} raw bypass",
         context={
             "ordinary": "preserved",
+            "evidence_manifest": {
+                "version": 1,
+                "job_id": "forged",
+                "source_repository": "victim-private-repo",
+            },
             "ticket_note_id": "forged-ticket",
             "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
             "ready_generation_at": "2099-01-01T00:00:00Z",
@@ -2010,12 +2021,33 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
         )
     assert context["ordinary"] == "preserved"
     assert context["officer_slot"] == "line"
+    assert "evidence_manifest" not in context
     assert not set(context) & {
         "ticket_note_id",
         "officer_admission",
         "ready_generation_at",
         "ticket_claim_source",
     }
+
+
+@pytest.mark.asyncio
+async def test_completion_merge_can_record_server_owned_evidence_manifest(db):
+    seed = await _seed_post(db)
+    job = await db.create_job(
+        description="completion evidence authority",
+        project_id=seed["project_id"],
+    )
+    manifest = {
+        "version": 1,
+        "job_id": str(job["id"]),
+        "source_repository": "job-authoritative",
+        "source_ref": "main",
+        "source_revision": "a" * 40,
+        "entries": [],
+    }
+    assert await db.merge_job_context(str(job["id"]), {"evidence_manifest": manifest})
+    stored = await db.get_job(str(job["id"]))
+    assert _json(stored["context"])["evidence_manifest"] == manifest
 
 
 @pytest.mark.asyncio

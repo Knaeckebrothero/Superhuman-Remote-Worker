@@ -254,16 +254,23 @@ class TestSteerErrorBody:
 
 class TestStuckThresholdDefaults:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("kind", "expected"),
-        [("mcp", 30), ("officer", 60), ("session", 60)],
-    )
-    async def test_lane_defaults(self, kind: str, expected: int):
-        observed: list[int] = []
+    @pytest.mark.parametrize("kind", ["mcp", "officer", "session"])
+    async def test_every_lane_omits_to_the_same_server_default(self, kind: str):
+        observed: list[int | None] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
-            observed.append(int(request.url.params["threshold_minutes"]))
-            return httpx.Response(200, json=[])
+            raw = request.url.params.get("threshold_minutes")
+            observed.append(int(raw) if raw is not None else None)
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [],
+                    "threshold_minutes": int(raw) if raw is not None else 47,
+                    "threshold_source": (
+                        "request_override" if raw is not None else "deployment_default"
+                    ),
+                },
+            )
 
         client = _client(handler)
         caller = CallerCtx(
@@ -288,7 +295,7 @@ class TestStuckThresholdDefaults:
         finally:
             await client.close()
 
-        assert observed == [expected, 15]
+        assert observed == [None, 15]
 
 
 # ---------------------------------------------------------------------------

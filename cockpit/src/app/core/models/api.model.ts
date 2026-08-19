@@ -1323,6 +1323,10 @@ export interface OfficerBacklogState {
   auto_pull: boolean;
   breakers: Record<string, OfficerPoolBreaker>;
   stale_claims: OfficerStaleClaim[];
+  stale_claim_policy?: {
+    threshold_minutes: number;
+    threshold_source: 'deployment_default' | 'request_override';
+  };
   worker_spend_ceiling_daily?: number | null;
   provisioning_preflights?: OfficerProvisioningPreflight[];
   knowledge_materialization?: OfficerKnowledgeMaterialization[];
@@ -2092,7 +2096,7 @@ export type JobLivenessState =
 /** Per-source availability in a truthful supervision read (E1). */
 export interface JobLivenessSource {
   name: string;
-  status: 'fresh' | 'degraded' | 'stale' | 'unavailable';
+  status: 'fresh' | 'empty' | 'degraded' | 'stale' | 'unavailable';
   as_of?: string | null;
   reason?: string;
 }
@@ -2118,6 +2122,8 @@ export interface JobProgress {
   observed_at: string;
   /** Stall threshold (minutes) the verdict was computed against. */
   threshold_minutes?: number;
+  /** Server authority for the threshold. */
+  threshold_source?: 'deployment_default' | 'request_override';
   /** Which sources were consulted and whether each was reachable. */
   sources?: JobLivenessSource[];
   /** Always null from the current producer; kept for shape compatibility. */
@@ -2181,6 +2187,18 @@ export interface StuckJob {
   updated_at: string;
   stuck_reason: string;
   stuck_component: string;
+  state?: JobLivenessState;
+  reasons?: string[];
+  last_activity_at?: string | null;
+  threshold_minutes?: number;
+  threshold_source?: 'deployment_default' | 'request_override';
+}
+
+/** Server-owned stuck-job result, including policy even when no rows match. */
+export interface StuckJobsResponse {
+  jobs: StuckJob[];
+  threshold_minutes: number | null;
+  threshold_source: 'deployment_default' | 'request_override' | 'unavailable';
 }
 
 // --- Capability grants (User-Defined Experts, Slice 2) ---
