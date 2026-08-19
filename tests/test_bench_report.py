@@ -21,12 +21,14 @@ def _request(
     input_tokens: int = 100,
     output_tokens: int = 10,
     latency_ms: int = 10,
+    cache_read_tokens: int = 0,
 ) -> dict:
     return {
         "ts": when,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "latency_ms": latency_ms,
+        "cache_read_tokens": cache_read_tokens,
     }
 
 
@@ -55,6 +57,73 @@ def test_final_strategic_wrap_and_tail_anomaly_are_attributed():
     assert row["input_tokens"] == 1000
     assert row["output_tokens"] == 100
     assert row["median_prompt_tokens"] == 100
+
+
+def test_cache_metrics_separate_a_warm_handoff_from_a_cold_one():
+    """Cold calls, not the hit ratio, are the load-bearing lane signal.
+
+    A rotation that dropped the provider prefix cache would re-pay full input
+    on the first call of each batch. Two jobs can post a similar hit ratio
+    while one of them went cold at a boundary, so the count is reported
+    alongside the ratio rather than folded into it.
+    """
+
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    warm = analyze_job_metrics(
+        job_id="warm",
+        status="completed",
+        requests=[
+            _request(
+                start + timedelta(seconds=i), input_tokens=100, cache_read_tokens=80
+            )
+            for i in range(4)
+        ],
+        phase_events=[],
+    )
+    assert warm["cache_read_tokens"] == 320
+    assert warm["cache_hit_pct"] == 80.0
+    assert warm["cold_calls"] == 0
+
+    cold_boundary = analyze_job_metrics(
+        job_id="cold",
+        status="completed",
+        requests=[
+            _request(start, input_tokens=100, cache_read_tokens=80),
+            _request(
+                start + timedelta(seconds=1), input_tokens=100, cache_read_tokens=0
+            ),
+            _request(
+                start + timedelta(seconds=2), input_tokens=100, cache_read_tokens=80
+            ),
+            _request(
+                start + timedelta(seconds=3), input_tokens=100, cache_read_tokens=80
+            ),
+        ],
+        phase_events=[],
+    )
+    assert cold_boundary["cold_calls"] == 1
+    assert cold_boundary["cache_hit_pct"] == 60.0
+
+
+def test_requests_without_input_tokens_are_not_counted_cold():
+    """A provider that omits cache detail must read as unknown, not as cold.
+
+    Otherwise every job on such a provider would report 100% cold calls and
+    look like a catastrophic cache regression that never happened.
+    """
+
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    row = analyze_job_metrics(
+        job_id="no-usage",
+        status="completed",
+        requests=[
+            _request(start, input_tokens=0, cache_read_tokens=0),
+            _request(start + timedelta(seconds=1), input_tokens=0, cache_read_tokens=0),
+        ],
+        phase_events=[],
+    )
+    assert row["cold_calls"] == 0
+    assert row["cache_hit_pct"] is None
 
 
 def test_exactly_fifteen_percent_tail_is_not_an_anomaly():
@@ -150,6 +219,12 @@ def test_aggregates_exclude_infra_and_tail_anomalies():
             "min": 35,
             "max": 35,
         },
+        # Job rows predating cache capture carry no cache keys, and they
+        # aggregate to unknown rather than to zero. Zero would read as "every
+        # call missed the cache" and turn a run against a provider that never
+        # reported cache detail into a phantom regression.
+        "cache_hit_pct": None,
+        "cold_calls": None,
     }
 
 
