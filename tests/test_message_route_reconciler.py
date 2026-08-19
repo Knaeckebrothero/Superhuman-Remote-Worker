@@ -26,6 +26,7 @@ NOW = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
 
 def _db(**overrides):
     db = MagicMock()
+    db.close_message_routes_for_terminal_jobs = AsyncMock(return_value=[])
     db.claim_officer_sla_escalations = AsyncMock(return_value=[])
     db.claim_total_timeout_routes = AsyncMock(return_value=[])
     db.list_timed_out_routes_still_frozen = AsyncMock(return_value=[])
@@ -70,6 +71,38 @@ def _frozen_job(route, **overrides):
     }
     job.update(overrides)
     return job
+
+
+class TestTerminalAutoCloseLeg:
+    @pytest.mark.asyncio
+    async def test_open_routes_of_terminal_jobs_are_closed(self):
+        """Leg 0: the backstop for terminal paths with no hook — direct
+        status writes (cascade cancels, sweepers) get their open routes
+        closed here one tick later."""
+        closed = _route(state="closed")
+        db = _db(
+            close_message_routes_for_terminal_jobs=AsyncMock(return_value=[closed])
+        )
+        counts = await reconciler.reconcile_message_routes_once(db, now=NOW)
+        assert counts["closed_terminal"] == 1
+        db.close_message_routes_for_terminal_jobs.assert_awaited_once_with(limit=20)
+
+    @pytest.mark.asyncio
+    async def test_close_sweep_failure_is_isolated(self):
+        """A failing close sweep must not cost the deadline legs their tick."""
+        route = _route()
+        db = _db(
+            close_message_routes_for_terminal_jobs=AsyncMock(
+                side_effect=RuntimeError("x")
+            ),
+            claim_officer_sla_escalations=AsyncMock(return_value=[route]),
+        )
+        with patch.object(
+            routing, "deliver_route_to_user", AsyncMock(return_value=True)
+        ):
+            counts = await reconciler.reconcile_message_routes_once(db, now=NOW)
+        assert counts["closed_terminal"] == 0
+        assert counts["sla_escalated"] == 1
 
 
 class TestOfficerSlaLeg:

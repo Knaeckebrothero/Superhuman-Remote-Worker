@@ -194,6 +194,7 @@ from services.session_wake import (  # noqa: E402
     maybe_wake_session,
     notify_all_officers,
     notify_officer,
+    notify_owning_officers,
     session_wake_sweeper_loop,
 )
 from services.session_state_snapshot import (  # noqa: E402
@@ -1650,30 +1651,66 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             # 1. Heartbeat-based: mark non-responsive agents offline
-            count = await _step(
+            offline_agents = await _step(
                 "offline_marking",
                 postgres_db.mark_stale_agents_offline(timeout_minutes=3),
             )
-            if count:
+            if offline_agents:
                 logger.info(
-                    f"Marked {count} agent(s) as offline due to missed heartbeats"
+                    f"Marked {len(offline_agents)} agent(s) as offline due to "
+                    "missed heartbeats"
                 )
-                # Fleet-scoped officer wake (centurion S4): agents dropping
-                # offline is capacity news every officer should judge. 10-min
-                # debounce on 'fleet' keeps a flapping node from spamming.
-                await _step(
-                    "officer_fleet_offline",
-                    notify_all_officers(
-                        postgres_db,
-                        source="fleet",
-                        dedup_key="fleet:agents_offline",
-                        payload={
-                            "summary": (
-                                f"{count} agent(s) marked offline (missed heartbeats)"
-                            )
-                        },
-                    ),
-                )
+                # Officer wake (centurion S4), scoped to the project each dead
+                # agent was serving (derived from its assigned/last job): a
+                # failing agent in one project is that officer's news, not the
+                # whole roster's (owner ruling, 2026-08). Agents with no
+                # derivable project keep the historical fleet-wide fan-out —
+                # a warm-pool agent dying genuinely is capacity news for every
+                # officer. 10-min debounce on 'fleet' keeps a flapping node
+                # from spamming.
+                offline_by_project: dict[str, int] = {}
+                unattributed_offline = 0
+                for agent_row in offline_agents:
+                    agent_project = agent_row.get("project_id")
+                    if agent_project:
+                        offline_by_project[str(agent_project)] = (
+                            offline_by_project.get(str(agent_project), 0) + 1
+                        )
+                    else:
+                        unattributed_offline += 1
+                if offline_by_project:
+                    await _step(
+                        "officer_fleet_offline",
+                        notify_owning_officers(
+                            postgres_db,
+                            {
+                                project_id: {
+                                    "summary": (
+                                        f"{n} agent(s) marked offline "
+                                        "(missed heartbeats)"
+                                    )
+                                }
+                                for project_id, n in offline_by_project.items()
+                            },
+                            source="fleet",
+                            dedup_key="fleet:agents_offline",
+                        ),
+                    )
+                if unattributed_offline:
+                    await _step(
+                        "officer_fleet_offline",
+                        notify_all_officers(
+                            postgres_db,
+                            source="fleet",
+                            dedup_key="fleet:agents_offline",
+                            payload={
+                                "summary": (
+                                    f"{unattributed_offline} agent(s) marked "
+                                    "offline (missed heartbeats)"
+                                )
+                            },
+                        ),
+                    )
                 _kick_officer_event_drain(postgres_db)
 
             # 2. Consistency-based: release slots held by zombie agents
@@ -1782,23 +1819,41 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             )
             if recovered:
                 logger.info(
-                    f"Recovered {recovered} orphaned job(s) from offline agents"
+                    f"Recovered {recovered.count} orphaned job(s) from offline agents"
                 )
-                await _step(
-                    "officer_fleet_orphans",
-                    notify_all_officers(
-                        postgres_db,
-                        source="fleet",
-                        dedup_key="fleet:orphans_recovered",
-                        payload={
-                            "summary": (
-                                f"{recovered} orphaned job(s) auto-paused for "
-                                "re-dispatch (agent offline)"
-                            )
-                        },
-                    ),
-                )
-                _kick_officer_event_drain(postgres_db)
+                # Scoped to each job's owning project officer (owner ruling,
+                # 2026-08): a recovered job is not fleet news. Jobs with no
+                # project — or projects with no commissioned officer — notify
+                # nobody.
+                orphans_by_project: dict[str, list[str]] = {}
+                for job in recovered.recovered_jobs:
+                    if job.project_id:
+                        orphans_by_project.setdefault(job.project_id, []).append(
+                            job.job_id
+                        )
+                if orphans_by_project:
+                    await _step(
+                        "officer_fleet_orphans",
+                        notify_owning_officers(
+                            postgres_db,
+                            {
+                                project_id: {
+                                    "summary": (
+                                        f"{len(job_ids)} orphaned job(s) "
+                                        "auto-paused for re-dispatch "
+                                        "(agent offline): "
+                                        + ", ".join(
+                                            str(job_id)[:8] for job_id in job_ids[:5]
+                                        )
+                                    )
+                                }
+                                for project_id, job_ids in orphans_by_project.items()
+                            },
+                            source="fleet",
+                            dedup_key="fleet:orphans_recovered",
+                        ),
+                    )
+                    _kick_officer_event_drain(postgres_db)
                 _trigger_dispatch()
 
             # 4b. Job execution lease: expired lease == orphaned, decided
@@ -1831,29 +1886,41 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     _job_id,
                 )
             if recovered_lease_ids:
-                # Recoveries below the containment threshold retain the
-                # established fleet-capacity signal.  The circuit-trip event
-                # below is different: it is actionable only by the owning
-                # project's Officer and is inserted transactionally there.
-                await _step(
-                    "officer_fleet_leases",
-                    notify_all_officers(
-                        postgres_db,
-                        source="fleet",
-                        dedup_key="fleet:lease_recovered",
-                        payload={
-                            "summary": (
-                                f"{len(recovered_lease_ids)} job(s) recovered by "
-                                "lease expiry: "
-                                + ", ".join(
-                                    str(job_id)[:8]
-                                    for job_id in recovered_lease_ids[:5]
-                                )
-                            )
-                        },
-                    ),
-                )
-                _kick_officer_event_drain(postgres_db)
+                # Recoveries below the containment threshold notify only each
+                # job's owning project officer (owner ruling, 2026-08: one
+                # livelocked job must not wake every officer each sweep —
+                # ~10-min all night, in one observed case). Jobs with no
+                # project, or projects with no commissioned officer, notify
+                # nobody. The circuit-trip event below is unchanged: it is
+                # inserted transactionally at the owning project's post.
+                leases_by_project: dict[str, list[str]] = {}
+                for job in lease_recovery.recovered_jobs:
+                    if job.project_id:
+                        leases_by_project.setdefault(job.project_id, []).append(
+                            job.job_id
+                        )
+                if leases_by_project:
+                    await _step(
+                        "officer_fleet_leases",
+                        notify_owning_officers(
+                            postgres_db,
+                            {
+                                project_id: {
+                                    "summary": (
+                                        f"{len(job_ids)} job(s) recovered by "
+                                        "lease expiry: "
+                                        + ", ".join(
+                                            str(job_id)[:8] for job_id in job_ids[:5]
+                                        )
+                                    )
+                                }
+                                for project_id, job_ids in leases_by_project.items()
+                            },
+                            source="fleet",
+                            dedup_key="fleet:lease_recovered",
+                        ),
+                    )
+                    _kick_officer_event_drain(postgres_db)
             for trip in circuit_trips:
                 logger.error(
                     "Job %s parked by redispatch circuit after %s unchanged "

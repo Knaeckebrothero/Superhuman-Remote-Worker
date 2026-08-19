@@ -1,8 +1,15 @@
 """Leader-gated reconciler for worker-message routes (M4).
 
 Implements officer_message_routing.md §5.2 — the two deadlines the config has
-always advertised and never enforced, plus delivery repair:
+always advertised and never enforced, plus delivery repair and the
+terminal-job auto-close backstop:
 
+0. **Terminal-job auto-close** — still-open routes whose job already reached
+   completed/failed/cancelled are CAS-closed with an audit stamp ("closed
+   automatically: job cancelled"). This is the backstop for the
+   ``maybe_wake_session`` hook: terminal paths that write status directly
+   (cascade cancels, dispatch-time failures, sweepers) close here one tick
+   later instead of haunting the officer sitrep as "open" forever.
 1. **Officer response SLA** — ``pending_officer`` blocking routes past
    ``officer_deadline`` are CAS-moved to ``escalated_to_user`` and the same
    thread is dispatched to the user, with the reason recorded on the route.
@@ -167,6 +174,7 @@ async def reconcile_message_routes_once(
     """
     now = now or datetime.now(timezone.utc)
     counts = {
+        "closed_terminal": 0,
         "sla_escalated": 0,
         "sla_delivered": 0,
         "redelivered": 0,
@@ -175,6 +183,26 @@ async def reconcile_message_routes_once(
         "repair_resumed": 0,
         "delivery_failed": 0,
     }
+
+    # ---- Leg 0: auto-close open routes of already-terminal jobs. ----
+    # The backstop for the maybe_wake_session hook: terminal transitions that
+    # write jobs.status directly (cascade cancels, dispatch-time failures,
+    # sweepers) never call the hook, and without this leg their routes stay
+    # "open" in every sitrep/inbox forever with no safe closure verb. The
+    # claim CAS stamps the audit transition and retires the routes' pending
+    # officer wake intents; closing escalates/resumes/delivers nothing.
+    try:
+        closed = await db.close_message_routes_for_terminal_jobs(limit=limit)
+    except Exception:
+        logger.exception("message routes: terminal-job close sweep failed")
+        closed = []
+    for route in closed:
+        counts["closed_terminal"] += 1
+        logger.info(
+            "message routes: closed route %s (job %s) — job already terminal",
+            str(route["route_id"])[:8],
+            str(route["job_id"])[:8],
+        )
 
     # ---- Leg 1: officer SLA expiry → escalate to the user (§5.2 #1). ----
     try:

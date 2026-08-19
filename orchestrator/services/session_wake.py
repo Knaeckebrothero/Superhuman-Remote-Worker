@@ -150,7 +150,25 @@ async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool
     Never raises: a completion path must not fail because a notification could
     not be enqueued.
     """
-    # Officer leg first: this function is already called from every covered
+    # Route auto-close first: a genuinely terminal job (not pending_review or
+    # paused — both can still resume and answer) closes its still-open
+    # worker-message routes, so the officer wake enqueued just below renders a
+    # sitrep that no longer lists the dead question as "open". Same choke-point
+    # rationale as the officer leg; terminal paths that never call this are
+    # swept by the message-route reconciler's backstop leg. Never raises.
+    if terminal_status in _TERMINAL_FOR_COUNTS:
+        try:
+            from services.message_routing import close_routes_for_terminal_job
+
+            await close_routes_for_terminal_job(db, job_id, terminal_status)
+        except Exception:
+            logger.exception(
+                "session wake: route auto-close failed for job %s (%s)",
+                str(job_id)[:8],
+                terminal_status,
+            )
+
+    # Officer leg: this function is already called from every covered
     # terminal path with the right status, which makes it the one choke point
     # that reaches the project's officer without touching eight call sites.
     # Independent of the jobs-outbox guard below — the officer hears about
@@ -1057,6 +1075,38 @@ async def notify_all_officers(
             enqueued += 1 if ok else 0
     except Exception:
         logger.exception("officer wake: fleet enqueue failed (%s)", source)
+    return enqueued
+
+
+async def notify_owning_officers(
+    db: Any,
+    payload_by_project: dict[str, dict[str, Any]],
+    *,
+    source: str,
+    dedup_key: str,
+) -> int:
+    """Enqueue a wake only on each owning project's officer. Never raises.
+
+    Scoped counterpart of :func:`notify_all_officers` for job-derived fleet
+    events: a recovery in one project is that project officer's news alone,
+    not a fleet broadcast — one livelocked job must not wake every officer on
+    the roster each sweep. Each project gets its own payload (its own jobs'
+    ids, its own counts). Projects without a commissioned officer are dropped
+    by :func:`notify_officer`'s no-op contract; nobody else is woken in their
+    place.
+    """
+    enqueued = 0
+    for project_id, payload in payload_by_project.items():
+        if not project_id:
+            continue
+        ok = await notify_officer(
+            db,
+            str(project_id),
+            source=source,
+            dedup_key=dedup_key,
+            payload=payload,
+        )
+        enqueued += 1 if ok else 0
     return enqueued
 
 

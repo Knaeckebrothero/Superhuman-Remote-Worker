@@ -723,3 +723,120 @@ async def test_no_blocking_freeze_exists_without_a_route_row(db):
             """
         )
     assert orphans == 0
+
+
+# =============================================================================
+# Terminal auto-close — a dead job's routes leave every "open" surface
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_auto_close_closes_stamps_and_drops_counts(db):
+    """The fd9cad regression shape: a blocking route escalated_to_user whose
+    job was then cancelled kept showing as an open worker message in every
+    sitrep (and its wake intent kept counting as a pending event) with no
+    safe closure verb. Auto-close must: stamp it closed, drop it from the
+    open listing and the pending wake count, keep the thread history, leave
+    settled routes untouched, and be idempotent."""
+    seed = await _seed(db, job_status="cancelled")
+    route = _route_dict(seed, state="escalated_to_user")
+    assert await db.create_message_route(route)
+    # The originating worker message — history that must survive the close.
+    assert await db.log_message(
+        job_id=seed["job_id"],
+        thread_id=route["thread_id"],
+        direction="outbound",
+        subject="[BLOCKER] refspec push REJECTED",
+        message="3rd strike — need a human decision",
+        status="sent",
+        mode="blocking",
+    )
+    # Still-undelivered officer wake intent for the question.
+    assert await db.enqueue_session_wake_event(
+        seed["officer_thread_id"],
+        source="worker_message",
+        dedup_key=f"route:{route['route_id']}",
+        payload={"route_id": route["route_id"]},
+        project_id=seed["project_id"],
+    )
+    # An already-settled route on the same job must stay exactly as it is.
+    settled = _route_dict(seed, state="resolved_by_user", thread_id="def456")
+    assert await db.create_message_route(settled)
+
+    closed = await db.close_message_routes_for_terminal_jobs(seed["job_id"])
+    assert [r["route_id"] for r in closed] == [route["route_id"]]
+    row = closed[0]
+    assert row["state"] == "closed"
+    assert row["resolved_by_kind"] == "system"
+    assert row["resolved_by_id"] == "job_cancelled"
+    assert row["resolved_at"] is not None
+    last = row["transitions"][-1]
+    assert last["from"] == "escalated_to_user"
+    assert last["to"] == "closed"
+    assert last["actor_kind"] == "system"
+    assert last["note"] == "closed automatically: job cancelled"
+
+    # Out of the officer inbox/sitrep listing ("Worker messages (N open)").
+    assert await db.list_open_worker_message_routes(seed["project_id"]) == []
+    # Out of the reply lane's open-route lookup (nothing left to act on).
+    assert (
+        await db.find_message_route_for_thread(
+            seed["job_id"], route["thread_id"], open_only=True
+        )
+        is None
+    )
+    # The pending wake intent is retired → officer pending-event count drops.
+    async with db.acquire() as conn:
+        pending = await conn.fetchval(
+            "SELECT COUNT(*) FROM session_wake_events "
+            "WHERE thread_id = $1::uuid AND state = 'pending'",
+            seed["officer_thread_id"],
+        )
+    assert pending == 0
+
+    # History is preserved: the ledger row (with its stamp) and the thread.
+    kept = await db.get_message_route(route["route_id"])
+    assert kept["state"] == "closed"
+    thread = await db.get_thread_messages(seed["job_id"], route["thread_id"])
+    assert thread is not None
+    assert thread["messages"][0]["message"].startswith("3rd strike")
+
+    # The settled route was never touched.
+    untouched = await db.get_message_route(settled["route_id"])
+    assert untouched["state"] == "resolved_by_user"
+    assert untouched["transitions"] == []
+
+    # Idempotent: a second terminalization is a no-op.
+    assert await db.close_message_routes_for_terminal_jobs(seed["job_id"]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed"])
+async def test_completed_and_failed_jobs_close_with_their_own_stamp(db, status):
+    seed = await _seed(db, job_status=status)
+    route = _route_dict(seed, state="pending_officer")
+    assert await db.create_message_route(route)
+    closed = await db.close_message_routes_for_terminal_jobs(seed["job_id"])
+    assert len(closed) == 1
+    assert closed[0]["resolved_by_id"] == f"job_{status}"
+    assert closed[0]["transitions"][-1]["note"] == (
+        f"closed automatically: job {status}"
+    )
+    assert await db.list_open_worker_message_routes(seed["project_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_backstop_sweep_spares_live_jobs(db):
+    """The reconciler's no-job-id sweep closes only terminal jobs' routes; a
+    processing job's open question must survive it."""
+    dead = await _seed(db, job_status="cancelled")
+    dead_route = _route_dict(dead, state="user_direct")
+    assert await db.create_message_route(dead_route)
+    live = await _seed(db)  # processing
+    live_route = _route_dict(live, state="pending_officer")
+    assert await db.create_message_route(live_route)
+
+    closed = await db.close_message_routes_for_terminal_jobs()
+    assert [r["route_id"] for r in closed] == [dead_route["route_id"]]
+    survivors = await db.list_open_worker_message_routes(live["project_id"])
+    assert [r["route_id"] for r in survivors] == [live_route["route_id"]]

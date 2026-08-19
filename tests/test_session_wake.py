@@ -122,6 +122,7 @@ def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
         get_thread_job_counts=AsyncMock(
             return_value={"total": 0, "finished": 0, "running": 0}
         ),
+        close_message_routes_for_terminal_jobs=AsyncMock(return_value=[]),
     )
 
 
@@ -163,6 +164,39 @@ async def test_maybe_wake_session_never_raises_into_the_completion_path():
     db = _db()
     db.mark_job_wake_pending = AsyncMock(side_effect=RuntimeError("db down"))
     assert await session_wake.maybe_wake_session(db, JOB_ID, "completed") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+async def test_terminal_transition_auto_closes_open_message_routes(status):
+    """The auto-close ruling: every hooked terminal path (this choke point)
+    closes the job's still-open worker-message routes so they stop showing
+    as "open" in sitreps/pending counts after the job is dead."""
+    db = _db()
+    assert await session_wake.maybe_wake_session(db, JOB_ID, status) is True
+    db.close_message_routes_for_terminal_jobs.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending_review", "paused", "processing"])
+async def test_non_final_statuses_do_not_close_message_routes(status):
+    """pending_review and paused jobs can still resume and answer their open
+    question — their routes must survive."""
+    db = _db()
+    await session_wake.maybe_wake_session(db, JOB_ID, status)
+    db.close_message_routes_for_terminal_jobs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_auto_close_failure_does_not_cost_the_wake():
+    """Fail-open: a broken close must neither raise into the completion path
+    nor swallow the session wake itself."""
+    db = _db()
+    db.close_message_routes_for_terminal_jobs = AsyncMock(
+        side_effect=RuntimeError("db down")
+    )
+    assert await session_wake.maybe_wake_session(db, JOB_ID, "cancelled") is True
+    db.mark_job_wake_pending.assert_awaited_once_with(JOB_ID, "cancelled")
 
 
 # --------------------------------------------------------------------------

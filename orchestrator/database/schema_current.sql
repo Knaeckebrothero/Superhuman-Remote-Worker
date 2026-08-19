@@ -5858,7 +5858,7 @@ CREATE TABLE public.job_message_routes (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT job_message_routes_policy_is_object CHECK ((jsonb_typeof(policy_snapshot) = 'object'::text)),
-    CONSTRAINT job_message_routes_state_check CHECK ((state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'user_direct'::text, 'escalated_to_user'::text, 'resolved_by_officer'::text, 'resolved_by_user'::text, 'timed_out'::text, 'delivery_failed'::text]))),
+    CONSTRAINT job_message_routes_state_check CHECK ((state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'user_direct'::text, 'escalated_to_user'::text, 'resolved_by_officer'::text, 'resolved_by_user'::text, 'timed_out'::text, 'delivery_failed'::text, 'closed'::text]))),
     CONSTRAINT job_message_routes_transitions_is_array CHECK ((jsonb_typeof(transitions) = 'array'::text))
 );
 
@@ -5888,7 +5888,7 @@ COMMENT ON COLUMN public.job_message_routes.policy_snapshot IS 'Routing policy f
 -- Name: COLUMN job_message_routes.state; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.job_message_routes.state IS 'pending_officer/pending_both/user_direct -> resolved_by_officer | resolved_by_user | escalated_to_user | timed_out; pre-delivery states may pass through delivery_failed. CAS-only transitions.';
+COMMENT ON COLUMN public.job_message_routes.state IS 'pending_officer/pending_both/user_direct -> resolved_by_officer | resolved_by_user | escalated_to_user | timed_out; pre-delivery states may pass through delivery_failed. Any open state -> closed when the job reaches a terminal status (auto-close; see the transitions audit for the stamp). CAS-only transitions.';
 
 
 --

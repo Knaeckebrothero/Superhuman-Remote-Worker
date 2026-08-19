@@ -1142,6 +1142,61 @@ class TestWakeAndToolPlumbing:
 
 
 # =============================================================================
+# Terminal auto-close (a dead job's open routes stop haunting the officer)
+# =============================================================================
+
+
+class TestTerminalRouteAutoClose:
+    """Ruling: when a job reaches a terminal status its still-open routes are
+    closed automatically — stamped, in history, out of every open count —
+    because no manual closure verb is safe (ack refuses blocking routes; a
+    human reply risks resuming the dead job)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+    async def test_terminal_status_closes_via_the_db_claim(self, status):
+        db = MagicMock()
+        db.close_message_routes_for_terminal_jobs = AsyncMock(
+            return_value=[{"route_id": str(uuid4()), "thread_id": "abc123"}]
+        )
+        job_id = str(uuid4())
+        closed = await routing.close_routes_for_terminal_job(db, job_id, status)
+        assert closed == 1
+        db.close_message_routes_for_terminal_jobs.assert_awaited_once_with(job_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending_review", "paused", "processing"])
+    async def test_non_terminal_status_is_a_no_op(self, status):
+        db = MagicMock()
+        db.close_message_routes_for_terminal_jobs = AsyncMock()
+        assert (
+            await routing.close_routes_for_terminal_job(db, str(uuid4()), status) == 0
+        )
+        db.close_message_routes_for_terminal_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_failure_never_raises(self):
+        """Fail-open discipline: a broken close must not break the terminal
+        transition that triggered it."""
+        db = MagicMock()
+        db.close_message_routes_for_terminal_jobs = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
+        assert (
+            await routing.close_routes_for_terminal_job(db, str(uuid4()), "cancelled")
+            == 0
+        )
+
+    def test_closed_is_terminal_and_never_an_open_state(self):
+        """The whole point: 'closed' must drop out of every open-state filter
+        (sitrep listing, reply-lane open_only lookup, reconciler scans) and
+        must never be officer-actionable."""
+        assert "closed" in routing.ROUTE_TERMINAL_STATES
+        assert "closed" not in routing.ROUTE_OPEN_STATES
+        assert "closed" not in routing.OFFICER_ACTIONABLE_STATES
+
+
+# =============================================================================
 # Audit repairs OC-05 (content redaction) and OC-06 (honest delivery stamps)
 # =============================================================================
 

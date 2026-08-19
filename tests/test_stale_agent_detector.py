@@ -9,6 +9,8 @@ import orchestrator.main as main
 from orchestrator.database.postgres import (
     LeaseRecoveryBatch,
     LeaseRecoveryCircuitTrip,
+    OrphanRecoveryBatch,
+    RecoveredJob,
 )
 
 
@@ -19,7 +21,7 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     def _stop(event):
         # Ensure the loop exits immediately after one full sweep.
         event.set()
-        return 0
+        return []
 
     db.mark_stale_agents_offline = AsyncMock(
         side_effect=lambda *args, **kwargs: _stop(shutdown_event)
@@ -32,7 +34,7 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     db.reap_orphaned_session_agents = AsyncMock(return_value=[])
     db.mark_orphaned_threads_ended = AsyncMock(return_value=[])
     db.mark_orphaned_threads_suspended = AsyncMock(return_value=[])
-    db.recover_orphaned_jobs = AsyncMock(return_value=0)
+    db.recover_orphaned_jobs = AsyncMock(return_value=OrphanRecoveryBatch())
     db.recover_expired_lease_jobs = AsyncMock(return_value=LeaseRecoveryBatch())
     db.gc_offline_agents = AsyncMock(return_value=0)
     return db
@@ -127,11 +129,17 @@ async def test_step_failure_does_not_block_downstream_recovery():
 @pytest.mark.asyncio
 async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     """Expired-lease jobs are recovered and re-dispatched, independent of the
-    agents-table sweeps (knowledge-base/knowledge/features/job_execution_lease.md)."""
+    agents-table sweeps (knowledge-base/knowledge/features/job_execution_lease.md).
+    The wake goes to the owning project's officer only — never the fleet."""
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)
     db.recover_expired_lease_jobs = AsyncMock(
-        return_value=LeaseRecoveryBatch(recovered_job_ids=("job-a", "job-b"))
+        return_value=LeaseRecoveryBatch(
+            recovered_jobs=(
+                RecoveredJob(job_id="job-a", project_id="proj-1"),
+                RecoveredJob(job_id="job-b", project_id="proj-1"),
+            )
+        )
     )
 
     with (
@@ -139,6 +147,7 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
         patch.object(main, "_release_thread_resources", AsyncMock()),
         patch.object(main, "_suspend_thread_resources", AsyncMock()),
     ):
@@ -147,14 +156,199 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     db.recover_expired_lease_jobs.assert_awaited_once_with(
         completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
     )
+    notify_owning.assert_awaited_once_with(
+        db,
+        {"proj-1": {"summary": "2 job(s) recovered by lease expiry: job-a, job-b"}},
+        source="fleet",
+        dedup_key="fleet:lease_recovered",
+    )
+    notify_all.assert_not_awaited()
+    kick_wake_drain.assert_called_once_with(db)
+    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_recovery_groups_wakes_per_owning_project():
+    """A batch spanning projects sends each officer only its own jobs' ids;
+    a job with no project notifies nobody (owner ruling: job-derived fleet
+    events are scoped, not broadcast)."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_expired_lease_jobs = AsyncMock(
+        return_value=LeaseRecoveryBatch(
+            recovered_jobs=(
+                RecoveredJob(job_id="job-a", project_id="proj-1"),
+                RecoveredJob(job_id="job-b", project_id="proj-2"),
+                RecoveredJob(job_id="job-c", project_id=None),
+            )
+        )
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch"),
+        patch.object(main, "_kick_officer_event_drain"),
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    notify_owning.assert_awaited_once_with(
+        db,
+        {
+            "proj-1": {"summary": "1 job(s) recovered by lease expiry: job-a"},
+            "proj-2": {"summary": "1 job(s) recovered by lease expiry: job-b"},
+        },
+        source="fleet",
+        dedup_key="fleet:lease_recovered",
+    )
+    notify_all.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lease_recovery_of_projectless_jobs_notifies_nobody():
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_expired_lease_jobs = AsyncMock(
+        return_value=LeaseRecoveryBatch(
+            recovered_jobs=(RecoveredJob(job_id="job-a", project_id=None),)
+        )
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch") as trigger_dispatch,
+        patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    notify_owning.assert_not_awaited()
+    notify_all.assert_not_awaited()
+    kick_wake_drain.assert_not_called()
+    # The job still goes back to the dispatcher — scoping affects wakes only.
+    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_wakes_only_the_owning_projects_officer():
+    """fleet:orphans_recovered is scoped: the owning project's officer hears
+    about its own jobs; projectless jobs notify nobody; the fleet fan-out is
+    never used for job-derived events."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_orphaned_jobs = AsyncMock(
+        return_value=OrphanRecoveryBatch(
+            count=3,
+            recovered_jobs=(
+                RecoveredJob(job_id="aaaa1111-dead-beef", project_id="proj-a"),
+                RecoveredJob(job_id="bbbb2222-dead-beef", project_id="proj-a"),
+                RecoveredJob(job_id="cccc3333-dead-beef", project_id=None),
+            ),
+        )
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch") as trigger_dispatch,
+        patch.object(main, "_kick_officer_event_drain"),
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    notify_owning.assert_awaited_once_with(
+        db,
+        {
+            "proj-a": {
+                "summary": (
+                    "2 orphaned job(s) auto-paused for re-dispatch "
+                    "(agent offline): aaaa1111, bbbb2222"
+                )
+            }
+        },
+        source="fleet",
+        dedup_key="fleet:orphans_recovered",
+    )
+    notify_all.assert_not_awaited()
+    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_agents_offline_scopes_to_derived_projects_and_falls_back_global():
+    """Dead agents whose project is derivable (from their assigned/last job)
+    wake that project's officer; only the underivable remainder keeps the
+    historical fleet-wide fan-out."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+
+    def _mark(*args, **kwargs):
+        shutdown_event.set()
+        return [
+            {"agent_id": "agent-1", "project_id": "proj-a"},
+            {"agent_id": "agent-2", "project_id": "proj-a"},
+            {"agent_id": "agent-3", "project_id": None},
+        ]
+
+    db.mark_stale_agents_offline = AsyncMock(side_effect=_mark)
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch"),
+        patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    notify_owning.assert_awaited_once_with(
+        db,
+        {"proj-a": {"summary": "2 agent(s) marked offline (missed heartbeats)"}},
+        source="fleet",
+        dedup_key="fleet:agents_offline",
+    )
     notify_all.assert_awaited_once_with(
         db,
         source="fleet",
-        dedup_key="fleet:lease_recovered",
-        payload={"summary": "2 job(s) recovered by lease expiry: job-a, job-b"},
+        dedup_key="fleet:agents_offline",
+        payload={"summary": "1 agent(s) marked offline (missed heartbeats)"},
     )
     kick_wake_drain.assert_called_once_with(db)
-    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_agents_offline_fully_derivable_skips_the_fleet_fanout():
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+
+    def _mark(*args, **kwargs):
+        shutdown_event.set()
+        return [{"agent_id": "agent-1", "project_id": "proj-a"}]
+
+    db.mark_stale_agents_offline = AsyncMock(side_effect=_mark)
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch"),
+        patch.object(main, "_kick_officer_event_drain"),
+        patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    notify_owning.assert_awaited_once()
+    notify_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
