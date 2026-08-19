@@ -954,6 +954,40 @@ async def _drain_suspend_session() -> None:
     _schedule_exit(delay=1.0)
 
 
+_DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
+
+
+async def _deregister_before_exit() -> None:
+    """Best-effort deregistration ahead of os._exit.
+
+    os._exit bypasses the lifespan shutdown that normally deregisters
+    (the startup-failure ``_exit_*`` helpers already deregister inline),
+    so without this every clean exit leaves an agents row that the
+    orchestrator's 3-minute heartbeat sweep flips to offline and reports
+    as a fleet:agents_offline corpse. Bounded and non-raising — a slow or
+    failed deregister must never hold up or abort the exit (the
+    stale-agent sweep stays the backstop, exactly as for crashes).
+    """
+    client = _orchestrator_client
+    if client is None:
+        return
+    client.stop_heartbeat()
+    hb = _heartbeat_task
+    if hb is not None and not hb.done() and hb is not asyncio.current_task():
+        # A heartbeat landing mid-deregister would 404 and re-register,
+        # resurrecting the row this call is about to delete. Never
+        # self-cancel — drain intents arrive inside the heartbeat task.
+        hb.cancel()
+    if not client.agent_id:
+        return
+    try:
+        await asyncio.wait_for(
+            client.deregister(), timeout=_DEREGISTER_ON_EXIT_TIMEOUT_S
+        )
+    except Exception as e:
+        logger.warning(f"Best-effort deregister before exit failed: {e}")
+
+
 def _schedule_exit(delay: float = 1.0) -> None:
     """Schedule process exit after a short delay (allows final I/O to flush)."""
     global _pending_exit_task
@@ -963,6 +997,7 @@ def _schedule_exit(delay: float = 1.0) -> None:
 
     async def _exit():
         await asyncio.sleep(delay)
+        await _deregister_before_exit()
         logger.info("Session complete — exiting process")
         os._exit(0)
 
