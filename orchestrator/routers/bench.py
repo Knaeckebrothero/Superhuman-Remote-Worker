@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -50,6 +50,18 @@ class BenchArmSpec(BaseModel):
     expert_id: UUID | None = None
     config_override: dict[str, Any] = Field(default_factory=dict)
     model: str = Field(..., min_length=1, max_length=300)
+    execution_lane: Literal["pinned", "stateless"] | None = Field(
+        None,
+        description=(
+            "Execution plane for this arm. The lane is a top-level JobCreate "
+            "field rather than config, so it cannot ride in config_override — "
+            "a lane A/B has to name it here. Omitted keeps the JobCreate "
+            "default (roots stay pinned). Requesting 'stateless' does not "
+            "bypass admission: create_job runs the same gate for the bench's "
+            "in-process call as for a user request, so a task whose workspace "
+            "needs a VM is pinned by capability whatever the arm asks for."
+        ),
+    )
 
     @model_validator(mode="after")
     def one_expert_source(self) -> "BenchArmSpec":
