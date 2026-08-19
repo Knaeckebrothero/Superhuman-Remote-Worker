@@ -7556,6 +7556,25 @@ async def _enforce_job_workspace_upgrade_grants(
     )
 
 
+def _vm_needs_release(vm_ctx: dict | None) -> bool:
+    """True when a VM context still owns cluster resources worth reclaiming.
+
+    Shared by the thread and job branches of ``_archive_and_cleanup_workspace``
+    so the two cannot drift apart again. They had: the job side used this
+    denylist, the thread side an allowlist of
+    ``("provisioning", "created", "ready")``. Every other status fell through on
+    the thread side, so ``release_thread_vm`` never ran and each suspended VM
+    leaked a 20 GiB rootdisk DataVolume plus its Headscale node — permanently,
+    since kept-disk GC is jobs-only and the controller orphan backstop ships
+    off. See knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-7.
+
+    A falsy context means the entity never had a VM, which must NOT count as
+    "needs release" — the absent status would otherwise pass the denylist and
+    fire a spurious teardown.
+    """
+    return bool(vm_ctx) and vm_ctx.get("status") not in ("deleted", "deleting")
+
+
 async def _archive_and_cleanup_workspace(
     entity_id: str,
     entity_type: str = "jobs",
@@ -7618,7 +7637,7 @@ async def _archive_and_cleanup_workspace(
                 )
 
         # VM cleanup (snapshot + delete)
-        if vm_ctx.get("status") in ("provisioning", "created", "ready"):
+        if _vm_needs_release(vm_ctx):
             if vm_provisioner.is_available:
                 await vm_provisioner.release_thread_vm(entity_id)
                 actions.append("thread vm released")
@@ -7631,7 +7650,7 @@ async def _archive_and_cleanup_workspace(
         vm_ctx = _get_vm_context(job)
 
         # VM cleanup (snapshot + delete)
-        if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+        if _vm_needs_release(vm_ctx):
             if vm_provisioner.is_available:
                 await vm_provisioner.release_vm(entity_id)
                 actions.append("vm released")
