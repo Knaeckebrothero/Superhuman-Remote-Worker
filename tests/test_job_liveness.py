@@ -20,6 +20,7 @@ from services.job_liveness import (
     STALL_THRESHOLD_MINUTES,
     compute_job_liveness,
     compute_jobs_liveness,
+    get_liveness_policy,
 )
 from services import sitrep
 from src.shared.orch_surface import formatters as fmt
@@ -123,7 +124,13 @@ class TestSingleFixtureEverySurface:
         row = {**_stalled_job(), **verdict}
         row["created_at"] = row["created_at"].isoformat()
         row["updated_at"] = row["updated_at"].isoformat()
-        stuck_text = fmt.format_stuck_jobs([row], 30)
+        stuck_text = fmt.format_stuck_jobs(
+            {
+                "jobs": [row],
+                "threshold_minutes": 30,
+                "threshold_source": "request_override",
+            }
+        )
         assert "Liveness: suspected_stuck" in stuck_text
         assert EXPECTED_REASON in stuck_text
 
@@ -177,6 +184,12 @@ class TestHonestUnavailability:
         )
         assert verdict["state"] == "suspected_stuck"
         assert any("heartbeat stale" in r for r in verdict["reasons"])
+        heartbeat_source = next(
+            source
+            for source in verdict["sources"]
+            if source["name"] == "agent_heartbeat"
+        )
+        assert heartbeat_source["status"] == "stale"
 
 
 class TestControlPlaneAuthority:
@@ -238,6 +251,56 @@ class TestThresholdAndBatch:
     def test_one_threshold_module_default(self):
         # The single knob every surface shares (env-tunable, default 30).
         assert STALL_THRESHOLD_MINUTES == 30
+
+    def test_deployment_default_and_override_report_their_authority(self, monkeypatch):
+        monkeypatch.setenv("JOB_LIVENESS_STALL_MINUTES", "47")
+        monkeypatch.setenv("JOB_LIVENESS_STALE_CLAIM_MINUTES", "305")
+        deployment = get_liveness_policy()
+        assert deployment.stall.as_dict() == {
+            "threshold_minutes": 47,
+            "threshold_source": "deployment_default",
+        }
+        assert deployment.stale_claim.as_dict() == {
+            "threshold_minutes": 305,
+            "threshold_source": "deployment_default",
+        }
+        assert get_liveness_policy(stall_override_minutes=60).stall.as_dict() == {
+            "threshold_minutes": 60,
+            "threshold_source": "request_override",
+        }
+
+    @pytest.mark.asyncio
+    async def test_changed_deployment_default_reaches_computation_and_sitrep(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("JOB_LIVENESS_STALL_MINUTES", "47")
+        verdict = await compute_job_liveness(
+            _stalled_job(),
+            audit_reader=_audit_reader(end=NOW - timedelta(minutes=48)),
+            db=_db(heartbeat=NOW - timedelta(seconds=30)),
+            now=NOW,
+        )
+        assert verdict["threshold_minutes"] == 47
+        assert verdict["threshold_source"] == "deployment_default"
+
+        db = SimpleNamespace(
+            get_jobs=AsyncMock(return_value=[_stalled_job()]),
+            get_agent=AsyncMock(
+                return_value={
+                    "id": AGENT_ID,
+                    "last_heartbeat": NOW - timedelta(seconds=30),
+                }
+            ),
+        )
+        lines, _ = await sitrep._jobs_section(
+            db,
+            _audit_reader(end=NOW - timedelta(minutes=48)),
+            PROJECT_ID,
+            {},
+            None,
+            NOW,
+        )
+        assert "stall threshold 47m, deployment_default" in "\n".join(lines)
 
     @pytest.mark.asyncio
     async def test_batch_shares_agent_lookups_and_matches_single(self):

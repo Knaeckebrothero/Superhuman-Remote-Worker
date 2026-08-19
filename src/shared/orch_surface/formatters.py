@@ -1427,16 +1427,17 @@ def format_evidence_read(job_id: str, evidence_id: str, data: dict[str, Any]) ->
         if note:
             window.append(f"[{note}]")
         return "\n".join(header + window)
-    # Binary / screenshot: safe metadata + the existing viewer representation.
+    # Binary / screenshot: bytes are a typed attachment and are deliberately
+    # never interpolated into ordinary formatter text.
     lines = header
     if data.get("note"):
         lines.append(f"[{data['note']}]")
-    view = data.get("view")
-    if isinstance(view, dict):
+    attachment = data.get("attachment")
+    if isinstance(attachment, dict):
         lines.append(
-            "Binary content is not inlined; open it via the existing job-file "
-            f"viewer at path '{view.get('path')}' pinned to revision "
-            f"{str(view.get('ref'))[:12]}."
+            "One bounded image attachment is available for multimodal delivery "
+            f"({attachment.get('media_type')}, {attachment.get('byte_size')} bytes, "
+            f"{attachment.get('width')}x{attachment.get('height')})."
         )
     return "\n".join(lines)
 
@@ -1523,7 +1524,7 @@ def format_agent_stats(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_stuck_jobs(data: list[dict[str, Any]], threshold: int) -> str:
+def format_stuck_jobs(data: dict[str, Any] | list[dict[str, Any]]) -> str:
     """Format stuck jobs list (E3: liveness-backed rows).
 
     Rows carry the shared liveness contract: ``state`` (suspected_stuck, or
@@ -1531,11 +1532,24 @@ def format_stuck_jobs(data: list[dict[str, Any]], threshold: int) -> str:
     honestly, never silently promoted to "stuck"), reasons, last activity,
     and the job's description for triage.
     """
-    if not data:
-        return f"No stuck jobs found (threshold: {threshold} minutes)."
+    if isinstance(data, list):
+        jobs = data
+        threshold = None
+        source = "legacy"
+    else:
+        jobs = data.get("jobs") or []
+        threshold = data.get("threshold_minutes")
+        source = str(data.get("threshold_source") or "unknown")
+    policy = (
+        f"threshold: {threshold} minutes, source: {source}"
+        if threshold is not None
+        else f"threshold source: {source}"
+    )
+    if not jobs:
+        return f"No stuck jobs found ({policy})."
 
-    lines = [f"Stuck jobs ({len(data)}, threshold: {threshold} min):\n"]
-    for job in data:
+    lines = [f"Stuck jobs ({len(jobs)}, {policy}):\n"]
+    for job in jobs:
         job_id = job.get("id", job.get("job_id", "unknown"))
         status = job.get("status", "unknown")
 

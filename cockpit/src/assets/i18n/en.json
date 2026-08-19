@@ -3228,7 +3228,12 @@
       "on": "on — ready tickets are dispatched into free pool slots",
       "off": "off — pools stay idle until he dispatches by hand",
       "stalled": "Stalled",
-      "stalledDetail": "{{count}} claimed ticket(s) not moving — these are never released automatically; resume or cancel the job, then close or re-ready the ticket."
+      "stalledDetail": "{{count}} claimed ticket(s) not moving beyond {{threshold}} h ({{source}}) — these are never released automatically; resume or cancel the job, then close or re-ready the ticket.",
+      "thresholdSource": {
+        "deployment_default": "deployment default",
+        "request_override": "request override",
+        "unavailable": "policy unavailable"
+      }
     },
     "brain": {
       "actionsHint": "Hard cap on tool calls each wake.",
@@ -3400,6 +3405,25 @@
       "overdueMinutes": "overdue {{count}} min"
     },
     "workspace": {"sandbox": "sandbox", "virtual": "virtual", "none": "none", "vmRoot": "VM (root)"}
+  },
+  "statistics": {
+    "stuckPolicy": "{{threshold}} min · {{source}}",
+    "policyUnavailable": "liveness policy unavailable",
+    "thresholdSource": {
+      "deployment_default": "deployment default",
+      "request_override": "request override",
+      "unavailable": "unavailable"
+    },
+    "livenessState": {
+      "active": "active",
+      "waiting": "waiting",
+      "paused": "paused",
+      "suspected_stuck": "suspected stuck",
+      "unavailable": "liveness unavailable",
+      "terminal": "terminal"
+    },
+    "lastActivity": "last authoritative activity {{time}}",
+    "activityUnavailable": "no authoritative activity timestamp"
   },
   "pwa": {
     "splash": "Assembling legion…",

@@ -20,9 +20,11 @@ from src.shared.orch_surface.client import AsyncCockpitClient
 from src.shared.orch_surface.jobs import (
     CallerCtx,
     JOB_DESCRIPTORS,
+    JobToolResult,
     make_bound_handler,
     registry_metadata,
 )
+from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE
 
 from ..context import ToolContext
 
@@ -116,6 +118,28 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
         parent_job_id=parent_job_id,
         resolve_job_id_prefixes=True,
         runtime_actor=runtime_actor,
+        supports_multimodal=context.get_phase_multimodal(),
+    )
+
+
+def _agent_tool_result(result: str | JobToolResult) -> str:
+    """Bridge a typed shared result into the existing transient image tag.
+
+    The graph/persistent-graph post-processor strips this tag before the
+    ToolMessage is checkpointed and creates the provider image block. Plain
+    text never contains base64 after that boundary.
+    """
+    if isinstance(result, str):
+        return result
+    if result.image is None:
+        return result.text
+    return (
+        result.text
+        + "\n"
+        + IMAGE_DATA_TAG_TEMPLATE.format(
+            mime=result.image.media_type,
+            b64=result.image.base64_data,
+        )
     )
 
 
@@ -249,13 +273,13 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             context, chat_models=chat_models, capabilities=capabilities
         )
 
-    caller = _caller_ctx(context)
     job_tools = [
         tool(
             make_bound_handler(
                 item,
                 client_provider=_get_surface_client,
-                caller_provider=lambda caller=caller: caller,
+                caller_provider=lambda context=context: _caller_ctx(context),
+                result_adapter=_agent_tool_result,
             )
         )
         for item in JOB_DESCRIPTORS

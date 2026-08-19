@@ -1222,6 +1222,42 @@ $$;
 
 
 --
+-- Name: mirror_legacy_message_delivery_intent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.mirror_legacy_message_delivery_intent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.direction = 'outbound'
+       AND NEW.status <> 'rate_limited'
+       AND NEW.effective_audience = 'legacy_human' THEN
+        INSERT INTO public.message_delivery_intents (
+            routing_generation, job_id, project_id, user_id, bucket,
+            effective_audience, state, reserved_at, accepted_at, metadata
+        )
+        SELECT NEW.routing_generation,
+               NEW.job_id,
+               j.project_id,
+               NEW.user_id,
+               'human',
+               'legacy_human',
+               CASE WHEN NEW.status IN ('sent', 'delivered')
+                    THEN 'accepted' ELSE 'failed' END,
+               NEW.created_at,
+               CASE WHEN NEW.status IN ('sent', 'delivered')
+                    THEN NEW.created_at ELSE NULL END,
+               jsonb_build_object('legacy_replica', true, 'message_id', NEW.id)
+          FROM (SELECT 1) AS one
+          LEFT JOIN public.jobs j ON j.id = NEW.job_id
+        ON CONFLICT (routing_generation, bucket) DO NOTHING;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_canvas_origin_session_change(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -5857,6 +5893,9 @@ CREATE TABLE public.job_message_routes (
     transitions jsonb DEFAULT '[]'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    routing_generation uuid DEFAULT gen_random_uuid() NOT NULL,
+    effective_audience text DEFAULT 'legacy_human'::text NOT NULL,
+    CONSTRAINT job_message_routes_effective_audience_check CHECK ((effective_audience = ANY (ARRAY['legacy_human'::text, 'human'::text, 'officer'::text, 'officer_and_user'::text, 'explicit_recipient'::text]))),
     CONSTRAINT job_message_routes_policy_is_object CHECK ((jsonb_typeof(policy_snapshot) = 'object'::text)),
     CONSTRAINT job_message_routes_state_check CHECK ((state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'user_direct'::text, 'escalated_to_user'::text, 'resolved_by_officer'::text, 'resolved_by_user'::text, 'timed_out'::text, 'delivery_failed'::text, 'closed'::text]))),
     CONSTRAINT job_message_routes_transitions_is_array CHECK ((jsonb_typeof(transitions) = 'array'::text))
@@ -6215,6 +6254,86 @@ COMMENT ON COLUMN public.magic_link_tokens.used_at IS 'Single-use enforcement: C
 
 
 --
+-- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.message_delivery_attempts (
+    attempt_id bigint NOT NULL,
+    intent_id uuid NOT NULL,
+    attempt_number integer NOT NULL,
+    state text DEFAULT 'attempted'::text NOT NULL,
+    attempted_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    failure_class text,
+    detail text,
+    CONSTRAINT message_delivery_attempts_attempt_number_check CHECK ((attempt_number > 0)),
+    CONSTRAINT message_delivery_attempts_state_check CHECK ((state = ANY (ARRAY['attempted'::text, 'accepted'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: message_delivery_attempts_attempt_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.message_delivery_attempts_attempt_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: message_delivery_attempts_attempt_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.message_delivery_attempts_attempt_id_seq OWNED BY public.message_delivery_attempts.attempt_id;
+
+
+--
+-- Name: message_delivery_intents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.message_delivery_intents (
+    intent_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    routing_generation uuid NOT NULL,
+    route_id uuid,
+    job_id uuid,
+    project_id uuid,
+    user_id uuid,
+    bucket text NOT NULL,
+    effective_audience text NOT NULL,
+    state text DEFAULT 'reserved'::text NOT NULL,
+    reserved_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_attempted_at timestamp with time zone,
+    accepted_at timestamp with time zone,
+    last_failed_at timestamp with time zone,
+    failure_class text,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT message_delivery_intents_attempt_count_check CHECK ((attempt_count >= 0)),
+    CONSTRAINT message_delivery_intents_bucket_check CHECK ((bucket = ANY (ARRAY['human'::text, 'officer_internal'::text]))),
+    CONSTRAINT message_delivery_intents_effective_audience_check CHECK ((effective_audience = ANY (ARRAY['legacy_human'::text, 'human'::text, 'officer'::text, 'officer_and_user'::text, 'explicit_recipient'::text]))),
+    CONSTRAINT message_delivery_intents_metadata_check CHECK ((jsonb_typeof(metadata) = 'object'::text)),
+    CONSTRAINT message_delivery_intents_state_check CHECK ((state = ANY (ARRAY['reserved'::text, 'attempted'::text, 'accepted'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE message_delivery_intents; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.message_delivery_intents IS 'OC-07 durable quota reservation and effective-audience identity. One row per routing generation and bucket; quota is reserved before any non-idempotent delivery and retries reuse this identity.';
+
+
+--
+-- Name: COLUMN message_delivery_intents.effective_audience; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.message_delivery_intents.effective_audience IS 'Server-resolved durable audience. Quota meaning is never reconstructed from message_log.direction.';
+
+
+--
 -- Name: message_log; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6232,7 +6351,10 @@ CREATE TABLE public.message_log (
     error_message text,
     created_at timestamp with time zone DEFAULT now(),
     email_message_id text,
-    read_at timestamp with time zone
+    read_at timestamp with time zone,
+    routing_generation uuid DEFAULT gen_random_uuid() NOT NULL,
+    effective_audience text DEFAULT 'legacy_human'::text NOT NULL,
+    CONSTRAINT message_log_effective_audience_check CHECK ((effective_audience = ANY (ARRAY['legacy_human'::text, 'human'::text, 'officer'::text, 'officer_and_user'::text, 'explicit_recipient'::text])))
 );
 
 
@@ -9195,6 +9317,13 @@ ALTER SEQUENCE public.workspace_intervals_id_seq OWNED BY public.workspace_inter
 
 
 --
+-- Name: message_delivery_attempts attempt_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_attempts ALTER COLUMN attempt_id SET DEFAULT nextval('public.message_delivery_attempts_attempt_id_seq'::regclass);
+
+
+--
 -- Name: session_wake_events id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -9677,6 +9806,38 @@ ALTER TABLE ONLY public.auth_tokens
 
 ALTER TABLE ONLY public.auth_tokens
     ADD CONSTRAINT mcp_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: message_delivery_attempts message_delivery_attempts_intent_id_attempt_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_attempts
+    ADD CONSTRAINT message_delivery_attempts_intent_id_attempt_number_key UNIQUE (intent_id, attempt_number);
+
+
+--
+-- Name: message_delivery_attempts message_delivery_attempts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_attempts
+    ADD CONSTRAINT message_delivery_attempts_pkey PRIMARY KEY (attempt_id);
+
+
+--
+-- Name: message_delivery_intents message_delivery_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_intents
+    ADD CONSTRAINT message_delivery_intents_pkey PRIMARY KEY (intent_id);
+
+
+--
+-- Name: message_delivery_intents message_delivery_intents_routing_generation_bucket_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_intents
+    ADD CONSTRAINT message_delivery_intents_routing_generation_bucket_key UNIQUE (routing_generation, bucket);
 
 
 --
@@ -11324,6 +11485,34 @@ CREATE INDEX idx_mcp_tokens_user ON public.auth_tokens USING btree (user_id);
 
 
 --
+-- Name: idx_message_delivery_human_job_reserved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_message_delivery_human_job_reserved ON public.message_delivery_intents USING btree (job_id, reserved_at DESC) WHERE (bucket = 'human'::text);
+
+
+--
+-- Name: idx_message_delivery_human_user_reserved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_message_delivery_human_user_reserved ON public.message_delivery_intents USING btree (user_id, reserved_at DESC) WHERE (bucket = 'human'::text);
+
+
+--
+-- Name: idx_message_delivery_internal_job_reserved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_message_delivery_internal_job_reserved ON public.message_delivery_intents USING btree (job_id, reserved_at DESC) WHERE (bucket = 'officer_internal'::text);
+
+
+--
+-- Name: idx_message_delivery_internal_project_reserved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_message_delivery_internal_project_reserved ON public.message_delivery_intents USING btree (project_id, reserved_at DESC) WHERE (bucket = 'officer_internal'::text);
+
+
+--
 -- Name: idx_message_log_email_msgid; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -12612,6 +12801,13 @@ CREATE TRIGGER legacy_workspace_cutover_plans_frozen BEFORE DELETE OR UPDATE ON 
 
 
 --
+-- Name: message_log mirror_legacy_message_delivery_intent; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER mirror_legacy_message_delivery_intent AFTER INSERT ON public.message_log FOR EACH ROW EXECUTE FUNCTION public.mirror_legacy_message_delivery_intent();
+
+
+--
 -- Name: jobs officer_ticket_claim_job_delete_audit; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -13656,6 +13852,38 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 ALTER TABLE ONLY public.auth_tokens
     ADD CONSTRAINT mcp_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: message_delivery_attempts message_delivery_attempts_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_attempts
+    ADD CONSTRAINT message_delivery_attempts_intent_id_fkey FOREIGN KEY (intent_id) REFERENCES public.message_delivery_intents(intent_id) ON DELETE CASCADE;
+
+
+--
+-- Name: message_delivery_intents message_delivery_intents_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_intents
+    ADD CONSTRAINT message_delivery_intents_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: message_delivery_intents message_delivery_intents_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_intents
+    ADD CONSTRAINT message_delivery_intents_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
+
+
+--
+-- Name: message_delivery_intents message_delivery_intents_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.message_delivery_intents
+    ADD CONSTRAINT message_delivery_intents_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --

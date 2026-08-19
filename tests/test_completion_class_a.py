@@ -654,6 +654,33 @@ class TestCompleteJobClassA:
         assert job["completed_at"] == "set"
 
     @pytest.mark.asyncio
+    async def test_evidence_record_failure_never_persists_private_coordinates(
+        self, caplog
+    ):
+        private_detail = "victim-private-repo/private/report.png"
+        job = _job()
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "services.job_evidence.build_evidence_manifest",
+                    AsyncMock(side_effect=RuntimeError(private_detail)),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == "completed"
+        assert private_detail not in caplog.text
+        assert private_detail not in json.dumps(db.context_writes)
+
+    @pytest.mark.asyncio
     async def test_auto_pause_uses_report_payload_after_initial_persist_failure(self):
         freeze = {
             "freeze_type": "version_upgrade",

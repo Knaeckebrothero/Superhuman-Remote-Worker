@@ -53,6 +53,7 @@ from services.officer_admission import (
 )
 from services.officer_slots import roster_from_meta
 from services.officer_preflight import ensure_officer_job_activated
+from services.job_liveness import JobLivenessPolicy, get_liveness_policy
 from services.project_backlog import BacklogCursor, fetch_backlog, fetch_ticket_state
 from services.work_categories import (
     EXECUTOR,
@@ -70,7 +71,9 @@ TICK_SECONDS = int(os.getenv("OFFICER_BACKLOG_TICK_SECONDS", "60"))
 # Never auto-released: a second job for a claimed ticket must not exist until
 # the officer releases the first, which is the failure mode silent-redelivery
 # queues are famous for.
-STALE_CLAIM_HOURS = float(os.getenv("OFFICER_STALE_CLAIM_HOURS", "4"))
+# Compatibility/export only. Runtime decisions resolve the stale-claim arm of
+# the shared typed liveness policy once per tick.
+STALE_CLAIM_HOURS = get_liveness_policy().stale_claim.minutes / 60.0
 
 # pending_review claims page rather than merely rendering — that lane has a
 # known dead zone, and a silently stranded review is exactly the invisibility
@@ -253,7 +256,10 @@ def evaluate_breaker(
 
 
 def stale_claims(
-    claims: Sequence[dict[str, Any]], now: datetime
+    claims: Sequence[dict[str, Any]],
+    now: datetime,
+    *,
+    policy: JobLivenessPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """Claims whose job has not moved in STALE_CLAIM_HOURS, oldest first.
 
@@ -262,7 +268,8 @@ def stale_claims(
     this row"), not the liveness verdict — a job that looks stalled to the tick
     still gets its real reading from ``compute_jobs_liveness`` on the sitrep.
     """
-    cutoff = now - timedelta(hours=STALE_CLAIM_HOURS)
+    effective_policy = policy or get_liveness_policy()
+    cutoff = now - timedelta(minutes=effective_policy.stale_claim.minutes)
     out = []
     for job in claims:
         moved = _aware(job.get("updated_at")) or _aware(job.get("created_at"))
@@ -899,6 +906,7 @@ async def tick_officer(
 ) -> dict[str, int]:
     """One officer's pass. Never raises — a bad post must not stop the fleet."""
     now = now or _now()
+    liveness_policy = get_liveness_policy()
     counts = {"dispatched": 0, "skipped": 0, "breakers_opened": 0, "wakes": 0}
 
     thread_id = str(officer_row.get("id") or "")
@@ -948,10 +956,14 @@ async def tick_officer(
     # Stale claims: computed once for the whole post, recorded for the sitrep.
     open_claims = await db.list_stale_officer_claims(
         lineage,
-        stale_before=now - timedelta(hours=STALE_CLAIM_HOURS),
+        stale_before=now - timedelta(minutes=liveness_policy.stale_claim.minutes),
     )
-    stalled = stale_claims(open_claims, now)
+    stalled = stale_claims(open_claims, now, policy=liveness_policy)
     state_patch["backlog_stale_claims"] = stalled
+    state_patch["backlog_stale_claim_policy"] = {
+        "threshold_minutes": liveness_policy.stale_claim.minutes,
+        "threshold_source": liveness_policy.stale_claim.source,
+    }
     for claim in stalled:
         if (
             claim["status"] == "pending_review"
@@ -1200,10 +1212,11 @@ async def officer_backlog_tick_loop(
     notify: Any = None,
 ) -> None:
     """The ~60s tick, mounted leader-gated from main.py's lifespan."""
+    stale_policy = get_liveness_policy().stale_claim
     logger.info(
         "Officer backlog tick started (tick=%ds, stale_claim=%.1fh, breaker=%.0fm)",
         TICK_SECONDS,
-        STALE_CLAIM_HOURS,
+        stale_policy.minutes / 60.0,
         BREAKER_OPEN_MINUTES,
     )
     while not shutdown_event.is_set():

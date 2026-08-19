@@ -227,29 +227,42 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             headers["X-MCP-User-Id"] = context.user_id
 
         try:
+            routing_generation = str(uuid.uuid4())
             async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
-                resp = await client.post(
-                    api_url,
-                    json={
-                        "to": to,
-                        "subject": subject,
-                        "message": message,
-                        "mode": mode,
-                        "thread_id": thread_id,
-                        "purpose": purpose,
-                        "project_id": getattr(context, "project_id", None),
-                        "lease_token": (
-                            context._worker_lease_token
-                            if context._stateless_worker
-                            else None
-                        ),
-                        "agent_id": (
-                            getattr(context.orchestrator_client, "agent_id", None)
-                            if not context._stateless_worker
-                            else None
-                        ),
-                    },
-                )
+                payload = {
+                    "to": to,
+                    "subject": subject,
+                    "message": message,
+                    "mode": mode,
+                    "thread_id": thread_id,
+                    "purpose": purpose,
+                    "project_id": getattr(context, "project_id", None),
+                    "lease_token": (
+                        context._worker_lease_token
+                        if context._stateless_worker
+                        else None
+                    ),
+                    "agent_id": (
+                        getattr(context.orchestrator_client, "agent_id", None)
+                        if not context._stateless_worker
+                        else None
+                    ),
+                    "routing_generation": routing_generation,
+                }
+                # One bounded transport retry covers response loss while the
+                # same durable generation suppresses a second quota charge,
+                # route, or provider delivery. A fresh model-authored send is
+                # still a fresh generation.
+                for send_attempt in range(2):
+                    try:
+                        resp = await client.post(api_url, json=payload)
+                    except httpx.TransportError:
+                        if send_attempt == 0:
+                            continue
+                        raise
+                    if resp.status_code >= 500 and send_attempt == 0:
+                        continue
+                    break
 
             if resp.status_code == 429:
                 data = resp.json()

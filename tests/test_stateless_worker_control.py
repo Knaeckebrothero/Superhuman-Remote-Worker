@@ -1332,10 +1332,32 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         AsyncMock(return_value={"job_hourly": 0, "job_daily": 0, "user_daily": 0}),
     )
     monkeypatch.setattr(
+        main.postgres_db,
+        "reserve_message_delivery_intent",
+        AsyncMock(
+            return_value={
+                "allowed": True,
+                "intent_id": str(uuid4()),
+                "accepted_at": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "begin_message_delivery_attempt",
+        AsyncMock(return_value={"delivery_claimed": True, "attempt_number": 1}),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "settle_message_delivery_attempt",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
         main.postgres_db, "get_message_sequence", AsyncMock(return_value=1)
     )
     monkeypatch.setattr(main.postgres_db, "log_message", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "set_message_email_id", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "settle_outbound_message_log", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "mark_route_user_delivery", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "create_routed_blocking_freeze", committed)
     monkeypatch.setattr(main.postgres_db, "acquire", acquire)

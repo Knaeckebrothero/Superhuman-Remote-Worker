@@ -538,7 +538,14 @@ export function nextWakeLabel(
                     <span class="k">{{ 'officerCard.backlog.stalled' | transloco }}</span>
                     <span class="v officer-warn">{{
                       'officerCard.backlog.stalledDetail'
-                        | transloco: { count: staleClaims().length }
+                        | transloco
+                          : {
+                              count: staleClaims().length,
+                              threshold: staleClaimThresholdHours() ?? '?',
+                              source:
+                                ('officerCard.backlog.thresholdSource.' +
+                                  staleClaimThresholdSource() | transloco),
+                            }
                     }}</span>
                   </div>
                 }
@@ -1381,6 +1388,13 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     return hasPools ? (post?.backlog ?? null) : null;
   });
   readonly staleClaims = computed(() => this.backlogState()?.stale_claims ?? []);
+  readonly staleClaimThresholdHours = computed(() => {
+    const minutes = this.backlogState()?.stale_claim_policy?.threshold_minutes;
+    return minutes === undefined ? null : minutes / 60;
+  });
+  readonly staleClaimThresholdSource = computed(
+    () => this.backlogState()?.stale_claim_policy?.threshold_source ?? 'unavailable',
+  );
   readonly provisioningProblems = computed(
     () => this.post()?.backlog?.provisioning_preflights ?? [],
   );

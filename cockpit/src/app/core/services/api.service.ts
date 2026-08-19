@@ -79,7 +79,7 @@ import {
     ProjectUpdateRequest,
     PullRequestStatus,
     PromoteRequest,
-    StuckJob,
+    StuckJobsResponse,
     TableDataResponse,
     TableInfo,
     ThreadCloudApplyResult,
@@ -2190,13 +2190,20 @@ export class ApiService {
   /**
    * Get stuck jobs.
    */
-  getStuckJobs(thresholdMinutes: number = 60): Observable<StuckJob[]> {
-    const params = new HttpParams().set('threshold_minutes', thresholdMinutes.toString());
+  getStuckJobs(thresholdMinutes?: number): Observable<StuckJobsResponse> {
+    let params = new HttpParams();
+    if (thresholdMinutes !== undefined) {
+      params = params.set('threshold_minutes', thresholdMinutes.toString());
+    }
 
-    return this.http.get<StuckJob[]>(`${this.baseUrl}/stats/stuck`, { params }).pipe(
+    return this.http.get<StuckJobsResponse>(`${this.baseUrl}/stats/stuck`, { params }).pipe(
       catchError((error) => {
         console.error('Failed to fetch stuck jobs:', error);
-        return of([]);
+        return of<StuckJobsResponse>({
+          jobs: [],
+          threshold_minutes: null,
+          threshold_source: 'unavailable',
+        });
       }),
     );
   }

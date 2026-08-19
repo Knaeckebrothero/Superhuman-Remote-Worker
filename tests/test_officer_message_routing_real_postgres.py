@@ -16,6 +16,8 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import asyncpg
@@ -24,6 +26,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from services import message_routing
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -61,8 +64,9 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
     await store.connect()
     async with store.acquire() as conn:
         await conn.execute(
-            "TRUNCATE job_message_routes, session_wake_events, message_log, "
-            "jobs, project_officers, threads, projects CASCADE"
+            "TRUNCATE message_delivery_attempts, message_delivery_intents, "
+            "job_message_routes, session_wake_events, message_log, "
+            "jobs, project_officers, threads, projects, users CASCADE"
         )
     try:
         yield store
@@ -75,7 +79,14 @@ async def _seed(db, *, job_status: str = "processing"):
     project_id = uuid4()
     officer_tid = uuid4()
     job_id = uuid4()
+    user_id = uuid4()
     async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, display_name, email) "
+            "VALUES ($1, 'Routing Owner', $2)",
+            user_id,
+            f"routing-{user_id}@example.test",
+        )
         await conn.execute(
             "INSERT INTO projects (id, name) VALUES ($1, 'routing proof')",
             project_id,
@@ -103,18 +114,43 @@ async def _seed(db, *, job_status: str = "processing"):
         await conn.execute(
             """
             INSERT INTO jobs (id, description, status, execution_lane,
-                              project_id, config_name)
-            VALUES ($1, 'routing proof job', $2, 'pinned', $3, 'worker_base')
+                              project_id, user_id, config_name)
+            VALUES ($1, 'routing proof job', $2, 'pinned', $3, $4, 'worker_base')
             """,
             job_id,
             job_status,
             project_id,
+            user_id,
         )
     return {
         "project_id": str(project_id),
         "officer_thread_id": str(officer_tid),
         "job_id": str(job_id),
+        "user_id": str(user_id),
     }
+
+
+async def _reserve(
+    db: PostgresDB,
+    seed: dict[str, str],
+    generation: str,
+    *,
+    bucket: str,
+    audience: str,
+    job_hourly_limit: int = 5,
+    internal_job_hourly_limit: int = 30,
+) -> dict:
+    return await db.reserve_message_delivery_intent(
+        routing_generation=generation,
+        route_id=generation,
+        bucket=bucket,
+        effective_audience=audience,
+        job_id=seed["job_id"],
+        project_id=seed["project_id"],
+        user_id=seed["user_id"] if bucket == "human" else None,
+        job_hourly_limit=job_hourly_limit,
+        internal_job_hourly_limit=internal_job_hourly_limit,
+    )
 
 
 def _route_dict(seed, *, route_id=None, state="pending_officer", **overrides):
@@ -167,6 +203,246 @@ _MESSAGE_ENTRY = {
     "message": "Which DB should I use?",
     "status": "sent",
 }
+
+
+# =============================================================================
+# OC-07 — durable effective-audience quota and delivery identity
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_officer_internal_and_human_buckets_are_independent(db):
+    seed = await _seed(db)
+    internal = await _reserve(
+        db,
+        seed,
+        str(uuid4()),
+        bucket="officer_internal",
+        audience="officer",
+    )
+    human = await _reserve(
+        db,
+        seed,
+        str(uuid4()),
+        bucket="human",
+        audience="human",
+    )
+    assert internal["allowed"] and human["allowed"]
+    async with db.acquire() as conn:
+        counts = dict(
+            await conn.fetchrow(
+                "SELECT count(*) FILTER (WHERE bucket='human') AS human, "
+                "count(*) FILTER (WHERE bucket='officer_internal') AS internal "
+                "FROM message_delivery_intents"
+            )
+        )
+    assert counts == {"human": 1, "internal": 1}
+
+
+@pytest.mark.asyncio
+async def test_internal_flood_limit_does_not_consume_human_quota(db):
+    seed = await _seed(db)
+    for _ in range(2):
+        assert (
+            await _reserve(
+                db,
+                seed,
+                str(uuid4()),
+                bucket="officer_internal",
+                audience="officer",
+                internal_job_hourly_limit=2,
+            )
+        )["allowed"]
+    refused = await _reserve(
+        db,
+        seed,
+        str(uuid4()),
+        bucket="officer_internal",
+        audience="officer",
+        internal_job_hourly_limit=2,
+    )
+    assert refused["allowed"] is False
+    assert refused["limit"] == "internal_job_hourly"
+    assert (
+        await _reserve(
+            db,
+            seed,
+            str(uuid4()),
+            bucket="human",
+            audience="human",
+            job_hourly_limit=1,
+        )
+    )["allowed"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retries_reserve_and_attempt_once(db):
+    seed = await _seed(db)
+    generation = str(uuid4())
+    reservations = await asyncio.gather(
+        *(
+            _reserve(
+                db,
+                seed,
+                generation,
+                bucket="human",
+                audience="officer_and_user",
+            )
+            for _ in range(8)
+        )
+    )
+    assert all(row["allowed"] for row in reservations)
+    assert len({row["intent_id"] for row in reservations}) == 1
+    attempts = await asyncio.gather(
+        *(
+            db.begin_message_delivery_attempt(reservations[0]["intent_id"])
+            for _ in range(8)
+        )
+    )
+    assert sum(bool(row["delivery_claimed"]) for row in attempts) == 1
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM message_delivery_intents "
+                "WHERE routing_generation=$1::uuid AND bucket='human'",
+                generation,
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval("SELECT count(*) FROM message_delivery_attempts") == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_generation_replay_cannot_cross_job_or_project_authority(db):
+    first = await _seed(db)
+    second = await _seed(db)
+    generation = str(uuid4())
+    assert (
+        await _reserve(
+            db,
+            first,
+            generation,
+            bucket="human",
+            audience="human",
+        )
+    )["allowed"]
+    with pytest.raises(ValueError, match="different job/project/user authority"):
+        await _reserve(
+            db,
+            second,
+            generation,
+            bucket="human",
+            audience="human",
+        )
+
+
+@pytest.mark.asyncio
+async def test_accepted_delivery_is_sticky_and_suppresses_retry(db):
+    seed = await _seed(db)
+    intent = await _reserve(
+        db,
+        seed,
+        str(uuid4()),
+        bucket="human",
+        audience="human",
+    )
+    attempt = await db.begin_message_delivery_attempt(intent["intent_id"])
+    assert attempt["delivery_claimed"]
+    assert await db.settle_message_delivery_attempt(
+        intent["intent_id"], attempt["attempt_number"], accepted=True
+    )
+    replay = await db.begin_message_delivery_attempt(intent["intent_id"])
+    assert replay == {
+        "intent_id": intent["intent_id"],
+        "delivery_claimed": False,
+        "accepted": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_or_abandoned_attempt_remains_recoverable(db):
+    seed = await _seed(db)
+    intent = await _reserve(
+        db,
+        seed,
+        str(uuid4()),
+        bucket="human",
+        audience="human",
+    )
+    first = await db.begin_message_delivery_attempt(intent["intent_id"])
+    assert await db.settle_message_delivery_attempt(
+        intent["intent_id"],
+        first["attempt_number"],
+        accepted=False,
+        failure_class="provider_rejected",
+    )
+    second = await db.begin_message_delivery_attempt(intent["intent_id"])
+    assert second["delivery_claimed"]
+    assert second["attempt_number"] == 2
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE message_delivery_attempts SET attempted_at=now()-interval '2 minutes' "
+            "WHERE intent_id=$1::uuid AND attempt_number=2",
+            intent["intent_id"],
+        )
+    third = await db.begin_message_delivery_attempt(
+        intent["intent_id"], attempt_timeout_seconds=60
+    )
+    assert third["delivery_claimed"]
+    assert third["attempt_number"] == 3
+    async with db.acquire() as conn:
+        abandoned = await conn.fetchval(
+            "SELECT failure_class FROM message_delivery_attempts "
+            "WHERE intent_id=$1::uuid AND attempt_number=2",
+            intent["intent_id"],
+        )
+    assert abandoned == "attempt_owner_lost"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_escalation_delivers_and_charges_once(db):
+    seed = await _seed(db)
+    route = _route_dict(
+        seed,
+        state="escalated_to_user",
+        officer_deadline=None,
+        routing_generation=str(uuid4()),
+        effective_audience="officer_and_user",
+    )
+    assert await db.create_message_route(route)
+    stored = await db.get_message_route(route["route_id"])
+    notifier = SimpleNamespace(
+        dispatch=AsyncMock(return_value={"email": True, "email_message_id": "<x>"})
+    )
+    results = await asyncio.gather(
+        *(
+            message_routing.deliver_route_to_user(
+                db, stored, reason="officer_escalated", notifier=notifier
+            )
+            for _ in range(8)
+        )
+    )
+    assert sum(bool(result) for result in results) == 1
+    assert notifier.dispatch.await_count == 1
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM message_delivery_intents "
+                "WHERE routing_generation=$1::uuid AND bucket='human'",
+                route["routing_generation"],
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT user_delivery_at IS NOT NULL FROM job_message_routes "
+                "WHERE route_id=$1::uuid",
+                route["route_id"],
+            )
+            is True
+        )
 
 
 @pytest.mark.asyncio

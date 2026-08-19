@@ -138,6 +138,23 @@ class TestCategories:
         assert allows_parallel(TESTER)
         assert not allows_parallel(EXECUTOR)
 
+    @pytest.mark.parametrize(
+        "category",
+        [None, "", "   ", "execuutor", "executor,tester", "future-category"],
+    )
+    def test_parallel_policy_rejects_absent_malformed_and_unknown(self, category):
+        with pytest.raises(UnknownCategory, match="unknown work category"):
+            allows_parallel(category)
+
+    def test_parallel_policy_is_exhaustive_for_every_supported_category(self):
+        assert {
+            category: allows_parallel(category) for category in WORK_CATEGORIES
+        } == {
+            RESEARCHER: True,
+            TESTER: True,
+            EXECUTOR: False,
+        }
+
     def test_every_category_has_a_default_expert_in_its_own_map(self):
         for category in WORK_CATEGORIES:
             expert = default_expert(category)
@@ -196,6 +213,11 @@ class TestLegacyRoleBridge:
         assert role_to_category("some-future-role") == EXECUTOR
         assert role_to_category(None) == EXECUTOR
         assert role_to_category("") == EXECUTOR
+
+    def test_legacy_role_fallback_does_not_weaken_category_policy(self):
+        assert role_to_category("future-role") == EXECUTOR
+        with pytest.raises(UnknownCategory):
+            allows_parallel("future-role")
 
     def test_case_and_whitespace_tolerant(self):
         assert role_to_category(" Product-QA ") == TESTER

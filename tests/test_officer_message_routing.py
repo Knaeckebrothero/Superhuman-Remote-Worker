@@ -277,6 +277,23 @@ def _send_db(job, policy, *, officer=True, held=False):
     db.check_message_rate_limit = AsyncMock(
         return_value={"job_hourly": 0, "job_daily": 0, "user_daily": 0}
     )
+    db.reserve_message_delivery_intent = AsyncMock(
+        side_effect=lambda **_kwargs: {
+            "allowed": True,
+            "idempotent": False,
+            "intent_id": str(uuid4()),
+            "accepted_at": None,
+        }
+    )
+    db.begin_message_delivery_attempt = AsyncMock(
+        return_value={
+            "delivery_claimed": True,
+            "accepted": False,
+            "attempt_number": 1,
+        }
+    )
+    db.settle_message_delivery_attempt = AsyncMock(return_value=True)
+    db.get_message_route = AsyncMock(return_value=None)
     db.get_message_sequence = AsyncMock(return_value=1)
     db.get_project_officer = AsyncMock(return_value=_post(policy))
     db.get_officer_thread_for_project = AsyncMock(
@@ -291,6 +308,7 @@ def _send_db(job, policy, *, officer=True, held=False):
     db.create_message_route = AsyncMock(return_value=str(uuid4()))
     db.mark_route_user_delivery = AsyncMock(return_value=True)
     db.set_message_email_id = AsyncMock(return_value=True)
+    db.settle_outbound_message_log = AsyncMock(return_value=True)
     db.publish_blocking_message = AsyncMock(return_value=True)
     db.log_message = AsyncMock(
         return_value={"id": str(uuid4()), "thread_id": "t", "status": "sent"}
@@ -324,6 +342,32 @@ def _send_patches(db, notifier, *, flag=True):
         patch.object(main, "postgres_db", db),
         patch.object(main, "notification_service", notifier),
         patch.object(main, "_kick_officer_event_drain", MagicMock()),
+    )
+
+
+def test_message_quota_policy_defaults_and_overrides(monkeypatch):
+    for name in (
+        "MESSAGE_HUMAN_JOB_HOURLY_LIMIT",
+        "MESSAGE_HUMAN_JOB_DAILY_LIMIT",
+        "MESSAGE_HUMAN_USER_DAILY_LIMIT",
+        "OFFICER_MESSAGE_JOB_HOURLY_LIMIT",
+        "OFFICER_MESSAGE_PROJECT_DAILY_LIMIT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    policy = routing.message_quota_policy()
+    assert (
+        policy.human_job_hourly,
+        policy.human_job_daily,
+        policy.human_user_daily,
+    ) == (5, 15, 30)
+    assert (policy.internal_job_hourly, policy.internal_project_daily) == (30, 300)
+
+    monkeypatch.setenv("OFFICER_MESSAGE_JOB_HOURLY_LIMIT", "17")
+    monkeypatch.setenv("OFFICER_MESSAGE_PROJECT_DAILY_LIMIT", "91")
+    overridden = routing.message_quota_policy()
+    assert (overridden.internal_job_hourly, overridden.internal_project_daily) == (
+        17,
+        91,
     )
 
 
@@ -373,6 +417,9 @@ class TestOfficerFirstBlockingSend:
         assert wake["dedup_key"] == f"route:{route['route_id']}"
         assert wake["thread_id"] == OFFICER_TID
         assert kwargs["message_entry"]["recipient_email"] is None
+        quota = db.reserve_message_delivery_intent.await_args.kwargs
+        assert quota["bucket"] == "officer_internal"
+        assert quota["effective_audience"] == "officer"
 
     @pytest.mark.asyncio
     async def test_guard_loss_is_409_with_zero_side_effects(self):
@@ -426,6 +473,10 @@ class TestOfficerFirstBlockingSend:
         # which also logs the message — hence no separate log_message call.
         assert db.create_routed_blocking_freeze.await_args.kwargs["wake"] is None
         db.log_message.assert_not_awaited()
+        assert [
+            call.kwargs["bucket"]
+            for call in db.reserve_message_delivery_intent.await_args_list
+        ] == ["officer_internal", "human"]
 
     @pytest.mark.asyncio
     async def test_held_officer_routes_blocking_to_user_immediately(self):
@@ -484,7 +535,10 @@ class TestOfficerAndUserSend:
         assert kwargs["wake"] is not None
         notifier.dispatch.assert_awaited_once()
         db.mark_route_user_delivery.assert_awaited_once()
-        db.set_message_email_id.assert_awaited_once()
+        db.settle_outbound_message_log.assert_awaited_once()
+        quota = db.reserve_message_delivery_intent.await_args.kwargs
+        assert quota["bucket"] == "human"
+        assert quota["effective_audience"] == "officer_and_user"
 
     @pytest.mark.asyncio
     async def test_async_officer_first_creates_route_without_wake_or_email(self):
@@ -542,6 +596,9 @@ class TestUserDirectByteCompat:
         db.create_message_route.assert_not_awaited()
         db.log_message.assert_not_awaited()
         notifier.dispatch.assert_awaited_once()
+        quota = db.reserve_message_delivery_intent.await_args.kwargs
+        assert quota["bucket"] == "human"
+        assert quota["effective_audience"] == "human"
 
     @pytest.mark.asyncio
     async def test_route_bookkeeping_failure_never_fails_the_send(self):
@@ -568,6 +625,78 @@ class TestUserDirectByteCompat:
             )
         assert result["status"] == "sent"
         db.create_message_route.assert_not_awaited()
+        db.log_message.assert_awaited_once()
+        assert db.log_message.await_args.kwargs["status"] == "pending"
+        db.settle_outbound_message_log.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_async_user_direct_refuses_delivery_when_prelog_fails(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "user_direct"})
+        db.log_message = AsyncMock(return_value=None)
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            with pytest.raises(HTTPException) as exc:
+                await main.send_agent_message(
+                    MagicMock(), job["id"], _body(mode="async")
+                )
+        assert exc.value.status_code == 503
+        notifier.dispatch.assert_not_awaited()
+        assert (
+            db.settle_message_delivery_attempt.await_args.kwargs["failure_class"]
+            == "message_log_failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_recipient_stays_direct_and_charges_human_once(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"})
+        db.get_project_members = AsyncMock(
+            return_value=[
+                {
+                    "user_id": str(uuid4()),
+                    "display_name": "Alice Example",
+                    "email": "alice@example.test",
+                }
+            ]
+        )
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(),
+                job["id"],
+                _body(to="Alice Example", mode="async", project_id=PROJECT_ID),
+            )
+        assert result["status"] == "sent"
+        db.get_project_officer.assert_not_awaited()
+        quota = db.reserve_message_delivery_intent.await_args.kwargs
+        assert quota["bucket"] == "human"
+        assert quota["effective_audience"] == "explicit_recipient"
+        assert db.reserve_message_delivery_intent.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_internal_flood_refusal_never_touches_human_notifier(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"})
+        db.reserve_message_delivery_intent = AsyncMock(
+            return_value={
+                "allowed": False,
+                "bucket": "officer_internal",
+                "limit": "internal_job_hourly",
+                "retry_after_seconds": 3600,
+            }
+        )
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(mode="async")
+            )
+        assert result.status_code == 429
+        notifier.dispatch.assert_not_awaited()
+        assert db.log_message.await_args.kwargs["effective_audience"] == "officer"
 
 
 # =============================================================================

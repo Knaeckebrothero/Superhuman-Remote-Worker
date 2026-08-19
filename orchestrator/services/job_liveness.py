@@ -6,8 +6,7 @@ alive?", consumed by:
 - ``GET /api/jobs/{id}/progress`` (the corrected get_job_progress);
 - ``GET /api/stats/stuck`` (get_stuck_jobs);
 - the SITREP active-job lines (``services/sitrep.py``);
-- (later) officer_backlog_pools' stale-claim age — the batch entry point is
-  deliberately project-scoped-batch-friendly for it.
+- officer_backlog_pools' intentionally longer stale-claim threshold.
 
 Inputs in descending authority:
 
@@ -36,20 +35,105 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-#: The one stall threshold (minutes without observed activity before a
-#: processing job is *suspected* stuck). Env-tunable, consumed by every
-#: surface; per-call overrides (the get_stuck_jobs tool argument) narrow or
-#: widen the same computation rather than forking it.
-STALL_THRESHOLD_MINUTES = int(os.environ.get("JOB_LIVENESS_STALL_MINUTES", "30"))
+DEFAULT_STALL_THRESHOLD_MINUTES = 30
+DEFAULT_STALE_CLAIM_MINUTES = 4 * 60
+DEFAULT_HEARTBEAT_FRESH_SECONDS = 180
+THRESHOLD_MINUTES_BOUNDS = (1, 1440)
+ThresholdSource = Literal["deployment_default", "request_override"]
 
-#: Agent heartbeats arrive every ~60s and agents are marked offline after
-#: 3 minutes — a heartbeat older than that is stale binding evidence.
-HEARTBEAT_FRESH_SECONDS = int(os.environ.get("JOB_LIVENESS_HEARTBEAT_FRESH", "180"))
+
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveThreshold:
+    """One named threshold and the authority that selected it."""
+
+    minutes: int
+    source: ThresholdSource
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"threshold_minutes": self.minutes, "threshold_source": self.source}
+
+
+@dataclass(frozen=True, slots=True)
+class JobLivenessPolicy:
+    """The typed, server-owned liveness policy shared by every surface."""
+
+    stall: EffectiveThreshold
+    stale_claim: EffectiveThreshold
+    heartbeat_fresh_seconds: int
+
+    def with_stall_override(self, minutes: int | None) -> "JobLivenessPolicy":
+        if minutes is None:
+            return self
+        lo, hi = THRESHOLD_MINUTES_BOUNDS
+        bounded = min(max(int(minutes), lo), hi)
+        return replace(
+            self,
+            stall=EffectiveThreshold(bounded, "request_override"),
+        )
+
+
+def get_liveness_policy(
+    *, stall_override_minutes: int | None = None
+) -> JobLivenessPolicy:
+    """Resolve deployment defaults once for a request/tick.
+
+    The stale-claim policy intentionally remains four hours.  Its legacy
+    ``OFFICER_STALE_CLAIM_HOURS`` environment spelling is accepted during the
+    rolling transition, but the value is normalized into this same typed
+    policy instead of being re-read by the backlog module.
+    """
+    stall = _bounded_env_int(
+        "JOB_LIVENESS_STALL_MINUTES",
+        DEFAULT_STALL_THRESHOLD_MINUTES,
+        minimum=THRESHOLD_MINUTES_BOUNDS[0],
+        maximum=THRESHOLD_MINUTES_BOUNDS[1],
+    )
+    if "JOB_LIVENESS_STALE_CLAIM_MINUTES" in os.environ:
+        stale_claim = _bounded_env_int(
+            "JOB_LIVENESS_STALE_CLAIM_MINUTES",
+            DEFAULT_STALE_CLAIM_MINUTES,
+            minimum=1,
+            maximum=7 * 24 * 60,
+        )
+    else:
+        try:
+            stale_claim = int(
+                float(os.environ.get("OFFICER_STALE_CLAIM_HOURS", "4")) * 60
+            )
+        except (TypeError, ValueError):
+            stale_claim = DEFAULT_STALE_CLAIM_MINUTES
+        stale_claim = min(max(stale_claim, 1), 7 * 24 * 60)
+    heartbeat = _bounded_env_int(
+        "JOB_LIVENESS_HEARTBEAT_FRESH",
+        DEFAULT_HEARTBEAT_FRESH_SECONDS,
+        minimum=1,
+        maximum=3600,
+    )
+    return JobLivenessPolicy(
+        stall=EffectiveThreshold(stall, "deployment_default"),
+        stale_claim=EffectiveThreshold(stale_claim, "deployment_default"),
+        heartbeat_fresh_seconds=heartbeat,
+    ).with_stall_override(stall_override_minutes)
+
+
+# Compatibility constants for imports that only display a default.  Runtime
+# decisions use ``get_liveness_policy`` so a deployment override has one source.
+STALL_THRESHOLD_MINUTES = get_liveness_policy().stall.minutes
+HEARTBEAT_FRESH_SECONDS = get_liveness_policy().heartbeat_fresh_seconds
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
@@ -153,6 +237,7 @@ async def compute_job_liveness(
     audit_reader: Any = None,
     db: Any = None,
     threshold_minutes: int | None = None,
+    policy: JobLivenessPolicy | None = None,
     now: datetime | None = None,
     _agent_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -161,9 +246,12 @@ async def compute_job_liveness(
     Returns ``{state, observed_at, reasons, last_activity_at, threshold_minutes}``.
     """
     now = now or _now()
-    threshold = (
-        threshold_minutes if threshold_minutes is not None else STALL_THRESHOLD_MINUTES
+    effective_policy = policy or get_liveness_policy(
+        stall_override_minutes=threshold_minutes
     )
+    if policy is not None and threshold_minutes is not None:
+        effective_policy = policy.with_stall_override(threshold_minutes)
+    threshold = effective_policy.stall.minutes
     status = str(job.get("status") or "unknown")
     job_id = str(job.get("id") or "")
     reasons: list[str] = []
@@ -181,6 +269,7 @@ async def compute_job_liveness(
             "reasons": reasons,
             "last_activity_at": _iso(last_activity),
             "threshold_minutes": threshold,
+            "threshold_source": effective_policy.stall.source,
             "sources": sources,
         }
 
@@ -214,7 +303,9 @@ async def compute_job_liveness(
         db, job.get("assigned_agent_id"), _agent_cache
     )
     heartbeat_fresh = bool(
-        heartbeat and (now - heartbeat).total_seconds() <= HEARTBEAT_FRESH_SECONDS
+        heartbeat
+        and (now - heartbeat).total_seconds()
+        <= effective_policy.heartbeat_fresh_seconds
     )
     if not audit_reachable:
         sources.append(
@@ -233,10 +324,15 @@ async def compute_job_liveness(
             }
         )
     if job.get("assigned_agent_id"):
+        heartbeat_status = (
+            "fresh"
+            if heartbeat_fresh
+            else ("stale" if agent_known and heartbeat is not None else "unavailable")
+        )
         sources.append(
             {
                 "name": "agent_heartbeat",
-                "status": "fresh" if agent_known and heartbeat else "unavailable",
+                "status": heartbeat_status,
                 **({"as_of": _iso(heartbeat)} if heartbeat else {}),
                 **(
                     {}
@@ -307,6 +403,7 @@ async def compute_jobs_liveness(
     audit_reader: Any = None,
     db: Any = None,
     threshold_minutes: int | None = None,
+    policy: JobLivenessPolicy | None = None,
     now: datetime | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Batch variant keyed by job id — one agent lookup per distinct agent.
@@ -315,6 +412,11 @@ async def compute_jobs_liveness(
     every surface shares one computation and one threshold.
     """
     now = now or _now()
+    effective_policy = policy or get_liveness_policy(
+        stall_override_minutes=threshold_minutes
+    )
+    if policy is not None and threshold_minutes is not None:
+        effective_policy = policy.with_stall_override(threshold_minutes)
     agent_cache: dict[str, Any] = {}
     results: dict[str, dict[str, Any]] = {}
     for job in jobs:
@@ -325,7 +427,7 @@ async def compute_jobs_liveness(
             job,
             audit_reader=audit_reader,
             db=db,
-            threshold_minutes=threshold_minutes,
+            policy=effective_policy,
             now=now,
             _agent_cache=agent_cache,
         )
@@ -334,8 +436,14 @@ async def compute_jobs_liveness(
 
 __all__ = [
     "HEARTBEAT_FRESH_SECONDS",
+    "DEFAULT_STALE_CLAIM_MINUTES",
+    "DEFAULT_STALL_THRESHOLD_MINUTES",
+    "EffectiveThreshold",
+    "JobLivenessPolicy",
     "STALL_THRESHOLD_MINUTES",
     "TERMINAL_STATUSES",
+    "ThresholdSource",
     "compute_job_liveness",
     "compute_jobs_liveness",
+    "get_liveness_policy",
 ]

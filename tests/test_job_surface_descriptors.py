@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import inspect
 import json
 from pathlib import Path
@@ -19,6 +20,7 @@ from src.shared.orch_surface.client import AsyncCockpitClient
 from src.shared.orch_surface.jobs import (
     CallerCtx,
     JOB_DESCRIPTORS,
+    JobToolResult,
     get_descriptor,
     make_bound_handler,
 )
@@ -269,6 +271,114 @@ async def test_mcp_and_langchain_render_the_same_handler_output(
 
 
 @pytest.mark.asyncio
+async def test_evidence_image_is_typed_for_mcp_and_base64_free_for_text_lane() -> None:
+    encoded = base64.b64encode(b"bounded-png").decode("ascii")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/jobs/job-1/evidence/ev-shot"
+        return httpx.Response(
+            200,
+            json={
+                "entry": {
+                    "id": "ev-shot",
+                    "kind": "screenshot",
+                    "label": "known feature",
+                    "media_type": "image/png",
+                    "byte_size": 11,
+                    "sha256": "abc",
+                    "availability": "available",
+                },
+                "attachment": {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "base64_data": encoded,
+                    "byte_size": 11,
+                    "width": 2,
+                    "height": 2,
+                },
+            },
+        )
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    fake = FakeMcp()
+    register_job_tools(
+        fake,
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="mcp"),
+        capabilities=TOOL_CAPABILITIES,
+    )
+    text_invoke = make_bound_handler(
+        get_descriptor("read_job_evidence"),
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="session", supports_multimodal=False),
+    )
+    try:
+        mcp_output = await fake.tools["read_job_evidence"](
+            job_id="job-1", evidence_id="ev-shot"
+        )
+        text_output = await text_invoke(job_id="job-1", evidence_id="ev-shot")
+    finally:
+        await client.close()
+
+    assert isinstance(mcp_output, list)
+    assert type(mcp_output[0]).__name__ == "TextContent"
+    assert type(mcp_output[1]).__name__ == "ImageContent"
+    assert mcp_output[1].data == encoded
+    assert mcp_output[1].mimeType == "image/png"
+    assert encoded not in mcp_output[0].text
+    assert isinstance(text_output, str)
+    assert encoded not in text_output
+    assert "text-only" in text_output
+
+
+@pytest.mark.asyncio
+async def test_multimodal_descriptor_returns_exactly_one_attachment() -> None:
+    encoded = base64.b64encode(b"one-image").decode("ascii")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "entry": {
+                    "id": "ev-shot",
+                    "kind": "screenshot",
+                    "media_type": "image/png",
+                    "availability": "available",
+                },
+                "attachment": {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "base64_data": encoded,
+                    "byte_size": 9,
+                    "width": 1,
+                    "height": 1,
+                },
+            },
+        )
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    invoke = make_bound_handler(
+        get_descriptor("read_job_evidence"),
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="session", supports_multimodal=True),
+    )
+    try:
+        result = await invoke(job_id="job-1", evidence_id="ev-shot")
+    finally:
+        await client.close()
+    assert isinstance(result, JobToolResult)
+    assert result.image is not None
+    assert result.image.decoded() == b"one-image"
+    assert encoded not in result.text
+
+
+@pytest.mark.asyncio
 async def test_mcp_job_ids_remain_verbatim_without_agent_prefix_resolution() -> None:
     observed_paths: list[str] = []
 
@@ -333,6 +443,10 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
             work_category="tester",
             context={
                 "ordinary": "preserved",
+                "evidence_manifest": {
+                    "source_repository": "victim-private-repo",
+                    "source_revision": "f" * 40,
+                },
                 "ticket_note_id": "forged-context-ticket",
                 "officer_admission": {"ticket_claim_source": "forged"},
                 "ticket_ready_at": "2099-01-01T00:00:00Z",
@@ -348,6 +462,7 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
     assert body["context"]["officer_slot"] == "test"
     assert body["context"]["ordinary"] == "preserved"
     assert not set(body["context"]) & {
+        "evidence_manifest",
         "ticket_note_id",
         "officer_admission",
         "ticket_ready_at",

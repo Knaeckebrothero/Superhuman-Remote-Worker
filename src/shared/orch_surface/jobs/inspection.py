@@ -15,7 +15,7 @@ from typing import Literal
 from .. import formatters as fmt
 from ..client import AsyncCockpitClient
 from ._utils import job_read_error, repo_head_line, resolve_job_id
-from .descriptors import CallerCtx, descriptor
+from .descriptors import CallerCtx, JobToolResult, ToolImageAttachment, descriptor
 from .envelope import Source, build_envelope, friendly_reason, http_status_of, observe
 
 _ALL = frozenset({"mcp", "session", "officer"})
@@ -768,20 +768,18 @@ async def get_stuck_jobs(
     unreachable are reported as unavailable, never silently called stuck.
 
     Args:
-        threshold_minutes: Minutes without activity before a job counts as
-            stuck (1-1440). Default depends on the caller: 60 for
-            officer/session supervision, 30 for MCP.
+        threshold_minutes: Optional minutes without activity before a job
+            counts as stuck (1-1440). Omit it to use the server deployment
+            default shared by REST, SITREP, sessions, MCP, and Cockpit.
 
     Returns:
         List of stuck jobs with liveness state, reasons, and last activity
     """
-    # F7: the pre-unification officer/session default was 60; MCP shipped 30.
-    if threshold_minutes is None:
-        threshold_minutes = 30 if caller.kind == "mcp" else 60
-    threshold_minutes = min(max(threshold_minutes, 1), 1440)
+    if threshold_minutes is not None:
+        threshold_minutes = min(max(threshold_minutes, 1), 1440)
     try:
         data = await client.get_stuck_jobs(threshold_minutes)
-        return fmt.format_stuck_jobs(data, threshold_minutes)
+        return fmt.format_stuck_jobs(data)
     except Exception as error:
         return fmt.format_monitoring_error("get stuck jobs", error)
 
@@ -1171,7 +1169,7 @@ async def read_job_evidence(
     job_id: str,
     evidence_id: str,
     offset: int = 0,
-) -> str:
+) -> str | JobToolResult:
     """Read one evidence entry by its opaque manifest ID.
 
     The server resolves the ID to the pinned source revision and returns
@@ -1200,4 +1198,22 @@ async def read_job_evidence(
                 "list_job_evidence to see the recorded manifest."
             )
         return job_read_error("read evidence", job_id, error)
-    return fmt.format_evidence_read(resolved, evidence_id, data)
+    rendered = fmt.format_evidence_read(resolved, evidence_id, data)
+    attachment = data.get("attachment")
+    if not isinstance(attachment, dict):
+        return rendered
+    b64 = attachment.get("base64_data")
+    media_type = attachment.get("media_type")
+    if not isinstance(b64, str) or not isinstance(media_type, str):
+        return (
+            rendered + "\n[Image attachment unavailable; delegate a tester/recon job.]"
+        )
+    if caller.kind != "mcp" and caller.supports_multimodal is not True:
+        return (
+            rendered + "\n[This model is text-only and cannot inspect the screenshot. "
+            "Delegate a tester/recon job to produce a bounded textual report.]"
+        )
+    return JobToolResult(
+        text=rendered,
+        image=ToolImageAttachment(base64_data=b64, media_type=media_type),
+    )

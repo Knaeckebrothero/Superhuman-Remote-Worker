@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,102 @@ _POLICIES = (POLICY_USER_DIRECT, POLICY_OFFICER_AND_USER, POLICY_OFFICER_FIRST)
 DEFAULT_OFFICER_RESPONSE_MINUTES = 15
 OFFICER_RESPONSE_MINUTES_BOUNDS = (5, 120)
 DEFAULT_BLOCKING_TIMEOUT_HOURS = 24.0
+
+
+def _positive_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True, slots=True)
+class MessageQuotaPolicy:
+    """Human interruption and Officer-internal flood-control ceilings."""
+
+    human_job_hourly: int
+    human_job_daily: int
+    human_user_daily: int
+    internal_job_hourly: int
+    internal_project_daily: int
+
+
+def message_quota_policy() -> MessageQuotaPolicy:
+    """Resolve conservative configurable defaults from deployment env.
+
+    Internal Officer traffic may be more frequent than human paging, but 30
+    messages/hour from one job or 300/day across a project is already far
+    beyond normal coalesced triage and bounds a runaway without touching the
+    human 5/hour, 15/job-day, 30/user-day counters.
+    """
+    return MessageQuotaPolicy(
+        human_job_hourly=_positive_env("MESSAGE_HUMAN_JOB_HOURLY_LIMIT", 5),
+        human_job_daily=_positive_env("MESSAGE_HUMAN_JOB_DAILY_LIMIT", 15),
+        human_user_daily=_positive_env("MESSAGE_HUMAN_USER_DAILY_LIMIT", 30),
+        internal_job_hourly=_positive_env("OFFICER_MESSAGE_JOB_HOURLY_LIMIT", 30),
+        internal_project_daily=_positive_env(
+            "OFFICER_MESSAGE_PROJECT_DAILY_LIMIT", 300
+        ),
+    )
+
+
+async def reserve_quota_intent(
+    db: Any,
+    *,
+    routing_generation: str,
+    route_id: str | None,
+    bucket: str,
+    effective_audience: str,
+    job_id: str,
+    project_id: str | None,
+    user_id: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    """Reserve one durable charge before any delivery side effect."""
+    policy = message_quota_policy()
+    return await db.reserve_message_delivery_intent(
+        routing_generation=routing_generation,
+        route_id=route_id,
+        bucket=bucket,
+        effective_audience=effective_audience,
+        job_id=job_id,
+        project_id=project_id,
+        user_id=user_id,
+        job_hourly_limit=policy.human_job_hourly,
+        job_daily_limit=policy.human_job_daily,
+        user_daily_limit=policy.human_user_daily,
+        internal_job_hourly_limit=policy.internal_job_hourly,
+        internal_project_daily_limit=policy.internal_project_daily,
+        metadata={"reason": reason},
+    )
+
+
+async def begin_delivery_attempt(db: Any, intent: dict[str, Any]) -> dict[str, Any]:
+    return await db.begin_message_delivery_attempt(
+        str(intent["intent_id"]),
+        attempt_timeout_seconds=_positive_env(
+            "MESSAGE_DELIVERY_ATTEMPT_TIMEOUT_SECONDS", 60
+        ),
+    )
+
+
+async def settle_delivery_attempt(
+    db: Any,
+    intent: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    accepted: bool,
+    failure_class: str | None = None,
+    detail: str | None = None,
+) -> bool:
+    return await db.settle_message_delivery_attempt(
+        str(intent["intent_id"]),
+        int(attempt["attempt_number"]),
+        accepted=accepted,
+        failure_class=failure_class,
+        detail=detail,
+    )
+
 
 # Route states (mirror of migration 0159's CHECK).
 ROUTE_OPEN_STATES = (
@@ -487,6 +584,31 @@ async def deliver_route_to_user(
             )
             return False
 
+        generation = str(route.get("routing_generation") or route.get("route_id") or "")
+        intent = await reserve_quota_intent(
+            db,
+            routing_generation=generation,
+            route_id=str(route.get("route_id") or "") or None,
+            bucket="human",
+            effective_audience="officer_and_user",
+            job_id=str(route["job_id"]),
+            project_id=(str(route["project_id"]) if route.get("project_id") else None),
+            user_id=str(job["user_id"]),
+            reason=reason,
+        )
+        if not intent.get("allowed"):
+            logger.warning(
+                "message routing: human quota refused route %s (%s)",
+                str(route.get("route_id"))[:8],
+                intent.get("limit"),
+            )
+            return False
+        # Provider acceptance is durable independently of the route stamp. If
+        # a prior call settled acceptance and crashed before user_delivery_at,
+        # repair the stamp without spending or notifying again.
+        if intent.get("accepted_at") is not None:
+            return bool(await db.mark_route_user_delivery(str(route["route_id"])))
+
         original = await _load_original_message(db, route)
         reason_lines = {
             "officer_escalated": (
@@ -530,17 +652,34 @@ async def deliver_route_to_user(
         else:
             subject = f"[Escalated] {clean_subject}"
 
-        dispatch = await notifier.dispatch(
-            user_id=str(job["user_id"]),
-            job_id=str(route["job_id"]),
-            subject=subject,
-            message_md=body,
-            job_description=(job.get("description") or "")[:100],
-            config_name=str(job.get("config_name") or "worker_base"),
-            thread_id=str(route["thread_id"]),
-            recipient_email=user.get("email"),
-            recipient_name=user.get("display_name") or "User",
-        )
+        attempt = await begin_delivery_attempt(db, intent)
+        if not attempt.get("delivery_claimed"):
+            if attempt.get("accepted"):
+                return bool(await db.mark_route_user_delivery(str(route["route_id"])))
+            # Another replica owns the bounded delivery attempt. Its failure
+            # or timeout leaves the route unstamped for the reconciler.
+            return False
+        try:
+            dispatch = await notifier.dispatch(
+                user_id=str(job["user_id"]),
+                job_id=str(route["job_id"]),
+                subject=subject,
+                message_md=body,
+                job_description=(job.get("description") or "")[:100],
+                config_name=str(job.get("config_name") or "worker_base"),
+                thread_id=str(route["thread_id"]),
+                recipient_email=user.get("email"),
+                recipient_name=user.get("display_name") or "User",
+            )
+        except Exception:
+            await settle_delivery_attempt(
+                db,
+                intent,
+                attempt,
+                accepted=False,
+                failure_class="notifier_exception",
+            )
+            raise
         outcome = classify_dispatch(dispatch)
         # Thread continuity: the escalation is an outbound row on the SAME
         # thread, so the cockpit shows it and an emailed reply (In-Reply-To
@@ -557,6 +696,8 @@ async def deliver_route_to_user(
                 mode="async",
                 status=outcome.log_status,
                 email_message_id=dispatch.get("email_message_id"),
+                routing_generation=generation,
+                effective_audience="officer_and_user",
             )
         except Exception:
             logger.warning(
@@ -567,6 +708,14 @@ async def deliver_route_to_user(
         # reconciler retries exactly while this stamp is null, so stamping a
         # failure is what stops the retry loop and strands the user's thread.
         if not outcome.accepted:
+            await settle_delivery_attempt(
+                db,
+                intent,
+                attempt,
+                accepted=False,
+                failure_class="provider_rejected",
+                detail=outcome.detail,
+            )
             logger.warning(
                 "message routing: delivery not accepted for route %s (%s) — "
                 "leaving retryable",
@@ -574,6 +723,13 @@ async def deliver_route_to_user(
                 outcome.detail,
             )
             return False
+        await settle_delivery_attempt(
+            db,
+            intent,
+            attempt,
+            accepted=True,
+            detail=outcome.detail,
+        )
         stamped = await db.mark_route_user_delivery(str(route["route_id"]))
         return bool(stamped)
     except Exception:

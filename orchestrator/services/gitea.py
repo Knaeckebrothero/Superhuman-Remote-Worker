@@ -743,7 +743,12 @@ class GiteaClient:
             return None
 
     async def get_file_bytes(
-        self, repo_name: str, file_path: str, ref: str | None = None
+        self,
+        repo_name: str,
+        file_path: str,
+        ref: str | None = None,
+        *,
+        redact_coordinates: bool = False,
     ) -> bytes | None:
         """Read raw file content as bytes from a repository.
 
@@ -771,10 +776,16 @@ class GiteaClient:
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
-                logger.warning(
-                    f"Failed to read {file_path} bytes from {repo_name} "
-                    f"(status {resp.status_code})"
-                )
+                if redact_coordinates:
+                    logger.warning(
+                        "Failed to read private repository object bytes (status %s)",
+                        resp.status_code,
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to read {file_path} bytes from {repo_name} "
+                        f"(status {resp.status_code})"
+                    )
                 return None
             data = resp.json()
             content_b64 = data.get("content", "")
@@ -782,7 +793,12 @@ class GiteaClient:
                 return b""
             return base64.b64decode(content_b64)
         except Exception as e:
-            logger.warning(f"Failed to read {file_path} bytes from {repo_name}: {e}")
+            if redact_coordinates:
+                logger.warning("Failed to read private repository object bytes")
+            else:
+                logger.warning(
+                    f"Failed to read {file_path} bytes from {repo_name}: {e}"
+                )
             return None
 
     async def get_commits(
@@ -1141,7 +1157,13 @@ class GiteaClient:
             )
             return False
 
-    async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
+    async def get_branch_head_sha(
+        self,
+        repo_name: str,
+        branch: str,
+        *,
+        redact_coordinates: bool = False,
+    ) -> str | None:
         """Return the HEAD commit SHA for a branch.
 
         Uses ``GET /repos/{owner}/{repo}/branches/{branch}``. ``branch``
@@ -1166,15 +1188,24 @@ class GiteaClient:
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
-                logger.warning(
-                    f"Failed to read branch '{branch}' on {repo_name} "
-                    f"(status {resp.status_code})"
-                )
+                if redact_coordinates:
+                    logger.warning(
+                        "Failed to resolve private repository revision (status %s)",
+                        resp.status_code,
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to read branch '{branch}' on {repo_name} "
+                        f"(status {resp.status_code})"
+                    )
                 return None
             data = resp.json()
             return data.get("commit", {}).get("id")
         except Exception as e:
-            logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
+            if redact_coordinates:
+                logger.warning("Failed to resolve private repository revision")
+            else:
+                logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
             return None
 
     async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:

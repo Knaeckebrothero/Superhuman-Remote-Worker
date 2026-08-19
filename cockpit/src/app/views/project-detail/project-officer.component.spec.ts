@@ -914,6 +914,10 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
         backlog: {
           auto_pull: false,
           breakers: {},
+          stale_claim_policy: {
+            threshold_minutes: 240,
+            threshold_source: 'deployment_default',
+          },
           stale_claims: [
             {
               job_id: 'j-1',
@@ -932,7 +936,13 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
         }),
       );
       expect(root.textContent).toContain(tr('officerCard.backlog.off'));
-      expect(root.textContent).toContain(tr('officerCard.backlog.stalledDetail', { count: 1 }));
+      expect(root.textContent).toContain(
+        tr('officerCard.backlog.stalledDetail', {
+          count: 1,
+          threshold: 4,
+          source: tr('officerCard.backlog.thresholdSource.deployment_default'),
+        }),
+      );
       expect(root.textContent).toContain(tr('officerCard.actions.openLog'));
       expect(root.textContent).not.toContain(tr('officerCard.actions.rejoinConference'));
       expect(root.querySelector('[data-testid="officer-release"]')).toBeNull();

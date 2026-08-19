@@ -83,10 +83,15 @@ CATEGORY_DEFAULT_EXPERT: dict[str, str] = {
 # where a typo would fail every job in the pool and chain-trip its breaker.
 KNOWN_EXPERTS: frozenset[str] = frozenset().union(*CATEGORY_EXPERTS.values())
 
-# Executors are singletons because they write to shared project state; two of
-# them make conflicting implicit decisions about the same surface. Researchers
-# and testers coordinate through the KB, where concurrent writes are additive.
-_SERIALIZED_CATEGORIES: frozenset[str] = frozenset({EXECUTOR})
+# Exhaustive policy map.  This is intentionally not expressed as "everything
+# except executor": a newly introduced or malformed category must acquire an
+# explicit serialization decision before it can be used.  Failing open here
+# would make a typo parallel-safe.
+_CATEGORY_ALLOWS_PARALLEL: dict[str, bool] = {
+    RESEARCHER: True,
+    TESTER: True,
+    EXECUTOR: False,
+}
 
 
 class UnknownCategory(ValueError):
@@ -106,9 +111,18 @@ def normalize_category(value: str | None) -> str | None:
     return candidate if candidate in WORK_CATEGORIES else None
 
 
-def allows_parallel(category: str) -> bool:
-    """True if a category's jobs may run concurrently with each other."""
-    return normalize_category(category) not in _SERIALIZED_CATEGORIES
+def allows_parallel(category: str | None) -> bool:
+    """Whether a *recognized* category may run concurrently.
+
+    Category-policy input is stored/machine data, not the legacy loop-role
+    bridge below.  Unknown, blank, absent, or mixed values therefore raise
+    :class:`UnknownCategory`; callers cannot accidentally interpret a falsey
+    normalization result as the permissive researcher/tester policy.
+    """
+    normalized = normalize_category(category)
+    if normalized is None:
+        raise UnknownCategory(f"unknown work category: {category!r}")
+    return _CATEGORY_ALLOWS_PARALLEL[normalized]
 
 
 def default_expert(category: str) -> str:

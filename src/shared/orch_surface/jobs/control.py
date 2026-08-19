@@ -30,6 +30,9 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
         "officer_incarnation",
     }
 )
+_SERVER_OWNED_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
+    "evidence_manifest"
+}
 
 
 @descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
@@ -226,7 +229,7 @@ async def create_job(
 
     merged_context = dict(context) if context is not None else None
     if merged_context is not None:
-        for key in _SERVER_OWNED_OFFICER_CONTEXT_KEYS:
+        for key in _SERVER_OWNED_CREATE_CONTEXT_KEYS:
             merged_context.pop(key, None)
     if slot is not None:
         merged_context = merged_context or {}

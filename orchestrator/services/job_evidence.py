@@ -13,8 +13,9 @@ deliberately mints no new table):
 
 A raw worker path is never copied into an officer tool call: reads resolve
 the opaque ID server-side at the PINNED revision — the model cannot supply a
-path, traverse directories, or switch revisions. Binary/screenshot entries
-return safe metadata plus the existing job-file viewer representation.
+path, traverse directories, or switch revisions. Screenshot reads return one
+bounded transient image attachment. Repository coordinates remain
+server-private on both list and read surfaces.
 
 Bounds (Legate-ratified §10 recommendation): 256 KiB paginated text per item,
 five images per job, 2 000 diff/change-summary lines; oversize material is
@@ -24,12 +25,18 @@ material belongs in a KB report.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import logging
+import re
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
+
+from PIL import Image, UnidentifiedImageError
 
 from services.deliverable_gate import normalize_deliverable_path
 from src.shared.content_redaction import sanitize
@@ -48,6 +55,13 @@ TEXT_LIMIT_BYTES = 256 * 1024  #: per text item (test_report/change_summary/repo
 MAX_IMAGES_PER_JOB = 5
 DIFF_LINE_LIMIT = 2000  #: change_summary entries
 BINARY_LIMIT_BYTES = 8 * 1024 * 1024  #: sanity ceiling for screenshots
+MAX_IMAGE_PIXELS = 40_000_000
+IMAGE_MEDIA_TYPES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
 READ_PAGE_CHARS = 16000  #: pagination window for read_job_evidence
 MAX_WORKER_ENTRIES = 20
 
@@ -70,8 +84,55 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _actual_image_type(data: bytes) -> tuple[str, int, int] | None:
+    """Validate raster bytes and return (MIME, width, height).
+
+    Declared extensions/media types carry no authority. Pillow verifies the
+    actual signature/decoder under a pixel ceiling; SVG and every other active
+    or unsupported format remain outside the allowlist. Animated GIF/WebP is
+    refused outright: screenshots are a static-evidence contract, so an
+    attacker cannot hide an unbounded aggregate frame count behind a small
+    first frame.
+    """
+    if not data or len(data) > BINARY_LIMIT_BYTES:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                media_type = IMAGE_MEDIA_TYPES.get(str(image.format or "").upper())
+                width, height = image.size
+                if (
+                    media_type is None
+                    or width <= 0
+                    or height <= 0
+                    or width * height > MAX_IMAGE_PIXELS
+                    or int(getattr(image, "n_frames", 1)) != 1
+                ):
+                    return None
+                image.verify()
+    except (
+        UnidentifiedImageError,
+        EOFError,
+        OSError,
+        SyntaxError,
+        TypeError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        return None
+    return media_type, width, height
+
+
 def parse_manifest(job: dict[str, Any]) -> dict[str, Any] | None:
-    """The recorded manifest from a job row's context, or None."""
+    """The recorded manifest bound to this exact job row, or ``None``.
+
+    ``context`` was caller-writable before ES-01's ingress repair. Requiring
+    the embedded job identity here makes every list/read/report surface reject
+    a copied historical manifest instead of treating agreement inside the blob
+    as authority.
+    """
     context = job.get("context")
     if isinstance(context, str):
         try:
@@ -81,7 +142,12 @@ def parse_manifest(job: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(context, dict):
         return None
     manifest = context.get(CONTEXT_KEY)
-    return manifest if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        return None
+    job_id = str(job.get("id") or "")
+    if not job_id or str(manifest.get("job_id") or "") != job_id:
+        return None
+    return manifest
 
 
 def _safe_repo_path(raw: Any) -> str | None:
@@ -119,7 +185,7 @@ async def _resolve_repo_and_head(
     if not repo_name or not ref:
         return None, None, None
     try:
-        sha = await gitea.get_branch_head_sha(repo_name, ref)
+        sha = await gitea.get_branch_head_sha(repo_name, ref, redact_coordinates=True)
     except Exception:  # noqa: BLE001
         sha = None
     return repo_name, ref, sha
@@ -315,21 +381,24 @@ async def build_evidence_manifest(
 
         content: bytes | None = None
         try:
-            content = await gitea.get_file_bytes(repo_name, path, ref=head_sha)
+            content = await gitea.get_file_bytes(
+                repo_name, path, ref=head_sha, redact_coordinates=True
+            )
             if content is None:
                 # Repository checkouts may place files under repo/ — the same
                 # dual spelling the deliverable gate accepts.
                 content = await gitea.get_file_bytes(
-                    repo_name, f"repo/{path}", ref=head_sha
+                    repo_name,
+                    f"repo/{path}",
+                    ref=head_sha,
+                    redact_coordinates=True,
                 )
                 if content is not None:
                     path = f"repo/{path}"
         except Exception:  # noqa: BLE001
             logger.warning(
-                "evidence: resolve failed for job %s path %r",
-                job_id,
-                path,
-                exc_info=True,
+                "evidence: private object resolution failed for job %s",
+                job_id[:8],
             )
             content = None
 
@@ -353,12 +422,33 @@ async def build_evidence_manifest(
         entry["sha256"] = _sha256(content)
 
         media = entry["media_type"]
-        if kind == "screenshot" or not _is_text_media(media):
+        if kind == "screenshot":
             if len(content) > BINARY_LIMIT_BYTES:
                 entry["availability"] = "oversize"
                 entry["availability_reason"] = (
                     f"{len(content)} B exceeds the {BINARY_LIMIT_BYTES} B binary bound"
                 )
+            else:
+                image_info = _actual_image_type(content)
+                if image_info is None:
+                    entry["availability"] = "bad_media"
+                    entry["availability_reason"] = (
+                        "declared screenshot is not an allowed, decodable raster image"
+                    )
+                elif media and image_info[0] != media:
+                    entry["availability"] = "bad_media"
+                    entry["availability_reason"] = (
+                        "declared media type does not match the image signature"
+                    )
+                else:
+                    entry["media_type"] = image_info[0]
+                    entry["image_width"] = image_info[1]
+                    entry["image_height"] = image_info[2]
+        elif not _is_text_media(media):
+            entry["availability"] = "bad_media"
+            entry["availability_reason"] = (
+                "binary evidence is unsupported unless kind=screenshot"
+            )
         else:
             if len(content) > TEXT_LIMIT_BYTES:
                 entry["availability"] = "oversize"
@@ -381,22 +471,53 @@ async def build_evidence_manifest(
         "recorded_at": now,
         "job_id": job_id,
         "source_revision": head_sha,
+        # Internal authority anchors used to revalidate every later opaque-ID
+        # read. public_manifest() removes them from the list surface.
+        "source_repository": repo_name,
+        "source_ref": ref,
         "entries": entries,
     }
 
 
+def _public_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Strip bytes and object-plane coordinates from an evidence record."""
+    public = {
+        key: value
+        for key, value in entry.items()
+        if key not in {"inline_content", "source"}
+    }
+    source = entry.get("source")
+    if isinstance(source, dict):
+        public_source = {
+            key: source[key]
+            for key in ("type", "revision")
+            if source.get(key) is not None
+        }
+        if public_source:
+            public["source"] = public_source
+    return public
+
+
 def public_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    """The manifest with inline payloads stripped (list view)."""
-    entries = []
-    for entry in manifest.get("entries") or []:
-        public = {k: v for k, v in entry.items() if k != "inline_content"}
-        entries.append(public)
-    return {**manifest, "entries": entries}
+    """The manifest with bytes and object-plane coordinates stripped."""
+    entries = [
+        _public_entry(entry)
+        for entry in manifest.get("entries") or []
+        if isinstance(entry, dict)
+    ]
+    return {
+        **{
+            key: value
+            for key, value in manifest.items()
+            if key not in {"source_repository", "source_ref"}
+        },
+        "entries": entries,
+    }
 
 
 def find_entry(manifest: dict[str, Any], evidence_id: str) -> dict[str, Any] | None:
     for entry in manifest.get("entries") or []:
-        if entry.get("id") == evidence_id:
+        if isinstance(entry, dict) and entry.get("id") == evidence_id:
             return entry
     return None
 
@@ -424,17 +545,79 @@ def _redaction_note(clean: Any) -> dict[str, Any]:
     return {"redacted": True, "redacted_count": clean.count}
 
 
+def _refused(public_entry: dict[str, Any]) -> dict[str, Any]:
+    """One coordinate-free refusal for malformed or unauthoritative records."""
+    return {
+        "entry": public_entry,
+        "note": "content REFUSED: evidence provenance is not authoritative",
+    }
+
+
+def _valid_revision(value: Any) -> bool:
+    return (
+        isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+    )
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+    )
+
+
+def _valid_recorded_size(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+async def _canonical_repo_authority(
+    job: dict[str, Any], db: Any
+) -> tuple[str | None, str | None]:
+    """Resolve repository/ref solely from job rows, never manifest fields."""
+    from services.deliverable_gate import _resolve_repo_ref
+
+    try:
+        return await _resolve_repo_ref(job, db)
+    except Exception:  # noqa: BLE001 -- missing authority is a safe refusal
+        return None, None
+
+
+def _worker_declared_repo_path(job: dict[str, Any], resolved_path: str) -> bool:
+    """Confirm the accepted completion payload named this artifact path.
+
+    The manifest is a server projection of ``freeze_data.evidence``. Historical
+    context can be forged, but the accepted worker completion payload lives in
+    the job's separate freeze column and is fenced by completion ownership.
+    Checking it prevents a forged historical manifest from turning an
+    arbitrary safe path in the otherwise-canonical job repository into an
+    object-reader capability. ``repo/`` is the one server-generated fallback
+    spelling used during manifest construction.
+    """
+    for declaration in _declared_evidence({}, job):
+        if not isinstance(declaration, dict):
+            continue
+        raw_source = declaration.get("source")
+        if isinstance(raw_source, dict):
+            raw_source = raw_source.get("path")
+        declared_path = _safe_repo_path(raw_source)
+        if declared_path is None:
+            continue
+        if resolved_path in {declared_path, f"repo/{declared_path}"}:
+            return True
+    return False
+
+
 async def read_evidence_entry(
     job: dict[str, Any],
     entry: dict[str, Any],
     *,
     offset: int = 0,
+    db: Any = None,
     gitea: Any = None,
 ) -> dict[str, Any]:
     """Resolve one manifest entry for reading. Authorization happens upstream.
 
-    Text entries return a bounded, secret-redacted page; binary/screenshot
-    entries return safe metadata plus the job-file viewer pointer. All reads
+    Text entries return a bounded, secret-redacted page; screenshot entries
+    return one transient bounded image attachment. All reads
     resolve at the PINNED revision recorded in the manifest — never a branch
     head — and verify the recorded sha256 before returning content.
 
@@ -443,7 +626,11 @@ async def read_evidence_entry(
     knowingly-incomplete artifact rather than a quietly-shortened one. The
     stored bytes and their sha256 are untouched — only this view is sanitized.
     """
-    public_entry = {k: v for k, v in entry.items() if k != "inline_content"}
+    public_entry = _public_entry(entry)
+    manifest = parse_manifest(job)
+    if manifest is None:
+        return _refused(public_entry)
+
     availability = entry.get("availability")
     if availability not in (None, "available"):
         return {
@@ -460,11 +647,27 @@ async def read_evidence_entry(
 
     inline = entry.get("inline_content")
     if isinstance(inline, str):
+        raw_inline = inline.encode("utf-8")
+        source = entry.get("source")
+        if (
+            entry.get("kind") not in SERVER_KINDS
+            or entry.get("producer") != "server"
+            or not isinstance(source, dict)
+            or source.get("type") != "inline"
+            or source.get("revision") != manifest.get("source_revision")
+            or not _valid_recorded_size(entry.get("byte_size"))
+            or entry.get("byte_size") != len(raw_inline)
+            or not _valid_sha256(entry.get("sha256"))
+            or entry.get("sha256") != _sha256(raw_inline)
+        ):
+            return _refused(public_entry)
         clean = sanitize(inline)
         page = _paginate(clean.text, offset)
         return {"entry": public_entry, **page, **_redaction_note(clean)}
 
-    source = entry.get("source") or {}
+    source = entry.get("source")
+    if not isinstance(source, dict):
+        return _refused(public_entry)
     repo = source.get("repo")
     path = source.get("path")
     revision = source.get("revision")
@@ -473,12 +676,62 @@ async def read_evidence_entry(
             "entry": public_entry,
             "note": "content not readable: entry carries no pinned source",
         }
+    pinned_revision = manifest.get("source_revision")
+    pinned_repository = manifest.get("source_repository")
+    pinned_ref = manifest.get("source_ref")
+    canonical_repository, canonical_ref = await _canonical_repo_authority(job, db)
+    safe_path = _safe_repo_path(path)
+    recorded_sha = entry.get("sha256")
+    recorded_size = entry.get("byte_size")
+    media = entry.get("media_type")
+    if (
+        entry.get("kind") not in WORKER_KINDS
+        or entry.get("producer") != "worker"
+        or source.get("type") != "job_repo"
+        or not _valid_revision(pinned_revision)
+        or canonical_repository is None
+        or canonical_ref is None
+        or pinned_repository != canonical_repository
+        or pinned_ref != canonical_ref
+        or safe_path is None
+        or safe_path != path
+        or not _worker_declared_repo_path(job, safe_path)
+        or revision != pinned_revision
+        or repo != canonical_repository
+        or source.get("ref") != canonical_ref
+        or not _valid_sha256(recorded_sha)
+        or not _valid_recorded_size(recorded_size)
+        or not isinstance(media, str)
+        or not media
+    ):
+        return _refused(public_entry)
+    size_ceiling = (
+        BINARY_LIMIT_BYTES if entry.get("kind") == "screenshot" else TEXT_LIMIT_BYTES
+    )
+    if recorded_size > size_ceiling:
+        return _refused(public_entry)
     if gitea is None or not getattr(gitea, "is_initialized", False):
         return {
             "entry": public_entry,
             "note": "content unavailable: Gitea is not reachable right now",
         }
-    content = await gitea.get_file_bytes(repo, path, ref=revision)
+    try:
+        content = await gitea.get_file_bytes(
+            canonical_repository,
+            path,
+            ref=pinned_revision,
+            redact_coordinates=True,
+        )
+    except Exception:  # noqa: BLE001 — optional object tier, generic result only
+        logger.warning(
+            "evidence: pinned object read failed for job %s evidence %s",
+            str(job.get("id") or "")[:8],
+            str(entry.get("id") or "")[:20],
+        )
+        return {
+            "entry": public_entry,
+            "note": "content unavailable: pinned evidence store read failed",
+        }
     if content is None:
         return {
             "entry": public_entry,
@@ -487,21 +740,45 @@ async def read_evidence_entry(
                 "(repository pruned or rewritten)"
             ),
         }
-    recorded_sha = entry.get("sha256")
-    if recorded_sha and _sha256(content) != recorded_sha:
+    if len(content) != recorded_size or _sha256(content) != recorded_sha:
         return {
             "entry": public_entry,
             "note": (
                 "content REFUSED: bytes at the pinned revision no longer match "
-                "the recorded sha256 — treat this evidence as tampered"
+                "the recorded measurement — treat this evidence as tampered"
             ),
         }
 
-    media = str(entry.get("media_type") or "")
-    if entry.get("kind") == "screenshot" or not _is_text_media(media):
+    media = str(media)
+    if entry.get("kind") == "screenshot":
+        if len(content) > BINARY_LIMIT_BYTES:
+            return {
+                "entry": public_entry,
+                "note": "content REFUSED: screenshot exceeds the byte ceiling",
+            }
+        image_info = _actual_image_type(content)
+        if image_info is None or image_info[0] != media:
+            return {
+                "entry": public_entry,
+                "note": (
+                    "content REFUSED: bytes are not the recorded allowed image type"
+                ),
+            }
         return {
             "entry": public_entry,
-            "view": {"type": "job_repo_file", "path": path, "ref": revision},
+            "attachment": {
+                "type": "image",
+                "media_type": image_info[0],
+                "base64_data": base64.b64encode(content).decode("ascii"),
+                "byte_size": len(content),
+                "width": image_info[1],
+                "height": image_info[2],
+            },
+        }
+    if not _is_text_media(media):
+        return {
+            "entry": public_entry,
+            "note": "content REFUSED: unsupported binary evidence type",
         }
     text = content.decode("utf-8", errors="replace")
     clean = sanitize(text)
@@ -515,6 +792,8 @@ __all__ = [
     "CONTEXT_KEY",
     "DIFF_LINE_LIMIT",
     "MAX_IMAGES_PER_JOB",
+    "MAX_IMAGE_PIXELS",
+    "IMAGE_MEDIA_TYPES",
     "READ_PAGE_CHARS",
     "SERVER_KINDS",
     "TEXT_LIMIT_BYTES",

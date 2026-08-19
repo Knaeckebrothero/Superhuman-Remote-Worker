@@ -1868,6 +1868,13 @@ class PostgresDB:
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
         context = dict(context or {})
+        # Evidence manifests are minted only by completion finalization after
+        # the repository and exact revision have been resolved. Every create
+        # path (REST, session/tool, automation, loop, direct service call)
+        # reaches this funnel, so a caller cannot seed Gitea object authority.
+        # merge_job_context deliberately remains able to record the legitimate
+        # completion-time manifest.
+        context.pop("evidence_manifest", None)
         # Recovery containment is derived only from DB/audit authority. A
         # caller-provided job context may never seed/reset its counter or
         # forge a circuit-trip diagnostic.
@@ -7368,16 +7375,18 @@ class PostgresDB:
 
     async def detect_stuck_jobs(
         self,
-        threshold_minutes: int = 60,
+        threshold_minutes: int | None = None,
         *,
         owner_user_id: str | None = None,
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Detect jobs that appear to be stuck.
+        """Legacy control-row prefilter; not an authoritative liveness verdict.
 
-        A job is considered stuck if it's in 'processing' status but hasn't
-        been updated within the threshold period.
+        New callers must use ``services.job_liveness`` so audit movement and
+        heartbeat evidence decide the six-state verdict. This compatibility
+        read shares that policy's default and is retained only for external
+        database consumers during the transition.
 
         Args:
             threshold_minutes: Minutes without activity to consider stuck
@@ -7387,6 +7396,10 @@ class PostgresDB:
         Returns:
             List of stuck job dictionaries with stuck reason
         """
+        if threshold_minutes is None:
+            from services.job_liveness import get_liveness_policy
+
+            threshold_minutes = get_liveness_policy().stall.minutes
         threshold = datetime.now(timezone.utc) - timedelta(minutes=threshold_minutes)
 
         visibility, vis_vals, _next_idx = self._visibility_clause(
@@ -13411,6 +13424,7 @@ class PostgresDB:
         result = dict(row)
         for key in (
             "route_id",
+            "routing_generation",
             "job_id",
             "project_id",
             "officer_thread_id",
@@ -13464,9 +13478,10 @@ class PostgresDB:
                     route_id, job_id, project_id, thread_id,
                     originating_message_id, policy_snapshot, state, blocking,
                     officer_thread_id, officer_incarnation, officer_deadline,
-                    user_delivery_at, total_deadline, transitions
+                    user_delivery_at, total_deadline, transitions,
+                    routing_generation, effective_audience
                 ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
-                          $11, $12, $13, $14::jsonb)
+                          $11, $12, $13, $14::jsonb, $15, $16)
                 RETURNING route_id
                 """,
                 route_uuid,
@@ -13483,6 +13498,8 @@ class PostgresDB:
                 route.get("user_delivery_at"),
                 route.get("total_deadline"),
                 json.dumps(route.get("transitions") or []),
+                UUID(str(route.get("routing_generation") or route_uuid)),
+                str(route.get("effective_audience") or "legacy_human"),
             )
         return str(row["route_id"]) if row else None
 
@@ -13668,9 +13685,10 @@ class PostgresDB:
                         """
                         INSERT INTO message_log (
                             job_id, user_id, thread_id, direction,
-                            recipient_email, subject, message, mode, status
+                            recipient_email, subject, message, mode, status,
+                            routing_generation, effective_audience
                         ) VALUES ($1, $2, $3, 'outbound', $4, $5, $6,
-                                  'blocking', $7)
+                                  'blocking', $7, $8, $9)
                         RETURNING id
                         """,
                         job_uuid,
@@ -13684,6 +13702,8 @@ class PostgresDB:
                         str(message_entry["subject"]),
                         str(message_entry["message"]),
                         str(message_entry.get("status") or "sent"),
+                        UUID(str(route.get("routing_generation") or route_uuid)),
+                        str(route.get("effective_audience") or "legacy_human"),
                     )
 
                     await conn.execute(
@@ -13693,9 +13713,9 @@ class PostgresDB:
                             originating_message_id, policy_snapshot, state,
                             blocking, officer_thread_id, officer_incarnation,
                             officer_deadline, user_delivery_at, total_deadline,
-                            transitions
+                            transitions, routing_generation, effective_audience
                         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, TRUE,
-                                  $8, $9, $10, $11, $12, $13::jsonb)
+                                  $8, $9, $10, $11, $12, $13::jsonb, $14, $15)
                         """,
                         route_uuid,
                         job_uuid,
@@ -13710,6 +13730,8 @@ class PostgresDB:
                         route.get("user_delivery_at"),
                         route.get("total_deadline"),
                         json.dumps(route.get("transitions") or []),
+                        UUID(str(route.get("routing_generation") or route_uuid)),
+                        str(route.get("effective_audience") or "legacy_human"),
                     )
 
                     if wake is not None:
@@ -13783,6 +13805,31 @@ class PostgresDB:
                 "WHERE id = $1 AND email_message_id IS NULL",
                 message_uuid,
                 str(email_message_id),
+            )
+        return result == "UPDATE 1"
+
+    async def settle_outbound_message_log(
+        self,
+        message_id: str,
+        *,
+        accepted: bool,
+        error_message: str | None = None,
+        email_message_id: str | None = None,
+    ) -> bool:
+        """Truthfully settle a message row prelogged before provider I/O."""
+        try:
+            message_uuid = UUID(str(message_id))
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE message_log SET status=$2, error_message=$3, "
+                "email_message_id=coalesce(email_message_id,$4) "
+                "WHERE id=$1 AND direction='outbound'",
+                message_uuid,
+                "sent" if accepted else "failed",
+                None if accepted else (error_message or "delivery failed")[:500],
+                email_message_id,
             )
         return result == "UPDATE 1"
 
@@ -13909,6 +13956,12 @@ class PostgresDB:
                 f"""
                 UPDATE job_message_routes
                    SET state = $2,
+                       effective_audience = CASE
+                           WHEN $2 = 'escalated_to_user'
+                                AND effective_audience = 'officer'
+                           THEN 'officer_and_user'
+                           ELSE effective_audience
+                       END,
                        transitions = transitions
                            || jsonb_set($4::jsonb, '{{0,from}}', to_jsonb(state)),
                        updated_at = now()
@@ -13931,6 +13984,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 "UPDATE job_message_routes SET user_delivery_at = now(), "
+                "effective_audience = CASE WHEN effective_audience='officer' "
+                "THEN 'officer_and_user' ELSE effective_audience END, "
                 "updated_at = now() WHERE route_id = $1 "
                 "AND user_delivery_at IS NULL RETURNING route_id",
                 route_uuid,
@@ -24865,6 +24920,8 @@ class PostgresDB:
         mode: str | None = None,
         error_message: str | None = None,
         email_message_id: str | None = None,
+        routing_generation: str | None = None,
+        effective_audience: str = "legacy_human",
     ) -> Dict[str, Any] | None:
         """Log a message to the message_log table.
 
@@ -24900,15 +24957,20 @@ class PostgresDB:
                 user_uuid = UUID(user_id)
             except ValueError:
                 pass
+        generation_uuid = (
+            UUID(str(routing_generation)) if routing_generation is not None else uuid4()
+        )
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO message_log (
                     job_id, user_id, thread_id, direction, recipient_email,
-                    subject, message, mode, status, error_message, email_message_id
+                    subject, message, mode, status, error_message, email_message_id,
+                    routing_generation, effective_audience
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12, $13)
                 RETURNING id, job_id, thread_id, direction, status, created_at
                 """,
                 job_uuid,
@@ -24922,6 +24984,8 @@ class PostgresDB:
                 status,
                 error_message,
                 email_message_id,
+                generation_uuid,
+                effective_audience,
             )
 
         return dict(row) if row else None
@@ -25086,6 +25150,328 @@ class PostgresDB:
             "job_daily": job_daily or 0,
             "user_daily": user_daily or 0,
         }
+
+    async def reserve_message_delivery_intent(
+        self,
+        *,
+        routing_generation: str,
+        bucket: str,
+        effective_audience: str,
+        job_id: str,
+        project_id: str | None,
+        user_id: str | None,
+        route_id: str | None = None,
+        job_hourly_limit: int = 5,
+        job_daily_limit: int = 15,
+        user_daily_limit: int = 30,
+        internal_job_hourly_limit: int = 30,
+        internal_project_daily_limit: int = 300,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve one idempotent OC-07 quota/delivery intent.
+
+        Advisory transaction locks serialize the semantic job/user or
+        job/project buckets across replicas. The unique generation+bucket key
+        makes a retry return the existing reservation without charging twice.
+        All counts come from this durable audience ledger, never from an
+        ambiguous outbound message row.
+        """
+        if bucket not in {"human", "officer_internal"}:
+            raise ValueError(f"unknown message quota bucket: {bucket!r}")
+        generation_uuid = UUID(str(routing_generation))
+        job_uuid = UUID(str(job_id))
+        project_uuid = UUID(str(project_id)) if project_id else None
+        user_uuid = UUID(str(user_id)) if user_id else None
+        route_uuid = UUID(str(route_id)) if route_id else None
+
+        lock_keys = [f"message-quota:{bucket}:job:{job_uuid}"]
+        if bucket == "human" and user_uuid is not None:
+            lock_keys.append(f"message-quota:{bucket}:user:{user_uuid}")
+        if bucket == "officer_internal" and project_uuid is not None:
+            lock_keys.append(f"message-quota:{bucket}:project:{project_uuid}")
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                for key in sorted(lock_keys):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        key,
+                    )
+                existing = await conn.fetchrow(
+                    "SELECT * FROM message_delivery_intents "
+                    "WHERE routing_generation=$1 AND bucket=$2",
+                    generation_uuid,
+                    bucket,
+                )
+                if existing is not None:
+                    same_authority = (
+                        existing["job_id"] == job_uuid
+                        and existing["project_id"] == project_uuid
+                        and (bucket != "human" or existing["user_id"] == user_uuid)
+                    )
+                    if not same_authority:
+                        raise ValueError(
+                            "message routing generation belongs to a different "
+                            "job/project/user authority"
+                        )
+                    result = dict(existing)
+                    result.update(
+                        {
+                            "allowed": True,
+                            "idempotent": True,
+                            "intent_id": str(existing["intent_id"]),
+                        }
+                    )
+                    return result
+
+                if bucket == "human":
+                    job_counts = await conn.fetchrow(
+                        """
+                        SELECT count(*) FILTER (
+                                   WHERE reserved_at > now() - interval '1 hour'
+                               ) AS hourly,
+                               count(*) FILTER (
+                                   WHERE reserved_at > now() - interval '24 hours'
+                               ) AS daily
+                          FROM message_delivery_intents
+                         WHERE bucket='human' AND job_id=$1
+                        """,
+                        job_uuid,
+                    )
+                    job_hourly = int(job_counts["hourly"] or 0)
+                    job_daily = int(job_counts["daily"] or 0)
+                    user_daily = 0
+                    if user_uuid is not None:
+                        user_daily = int(
+                            await conn.fetchval(
+                                "SELECT count(*) FROM message_delivery_intents "
+                                "WHERE bucket='human' AND user_id=$1 "
+                                "AND reserved_at > now() - interval '24 hours'",
+                                user_uuid,
+                            )
+                            or 0
+                        )
+                    checks = (
+                        ("job_hourly", job_hourly, job_hourly_limit, 3600),
+                        ("job_daily", job_daily, job_daily_limit, 86400),
+                        ("user_daily", user_daily, user_daily_limit, 86400),
+                    )
+                else:
+                    job_hourly = int(
+                        await conn.fetchval(
+                            "SELECT count(*) FROM message_delivery_intents "
+                            "WHERE bucket='officer_internal' AND job_id=$1 "
+                            "AND reserved_at > now() - interval '1 hour'",
+                            job_uuid,
+                        )
+                        or 0
+                    )
+                    project_daily = 0
+                    if project_uuid is not None:
+                        project_daily = int(
+                            await conn.fetchval(
+                                "SELECT count(*) FROM message_delivery_intents "
+                                "WHERE bucket='officer_internal' AND project_id=$1 "
+                                "AND reserved_at > now() - interval '24 hours'",
+                                project_uuid,
+                            )
+                            or 0
+                        )
+                    checks = (
+                        (
+                            "internal_job_hourly",
+                            job_hourly,
+                            internal_job_hourly_limit,
+                            3600,
+                        ),
+                        (
+                            "internal_project_daily",
+                            project_daily,
+                            internal_project_daily_limit,
+                            86400,
+                        ),
+                    )
+                for limit_name, count, ceiling, retry_after in checks:
+                    if count >= max(1, int(ceiling)):
+                        return {
+                            "allowed": False,
+                            "idempotent": False,
+                            "bucket": bucket,
+                            "limit": limit_name,
+                            "count": count,
+                            "ceiling": int(ceiling),
+                            "retry_after_seconds": retry_after,
+                        }
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO message_delivery_intents (
+                        routing_generation, route_id, job_id, project_id,
+                        user_id, bucket, effective_audience, metadata
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+                    RETURNING *
+                    """,
+                    generation_uuid,
+                    route_uuid,
+                    job_uuid,
+                    project_uuid,
+                    user_uuid,
+                    bucket,
+                    effective_audience,
+                    json.dumps(metadata or {}),
+                )
+                result = dict(row)
+                result.update(
+                    {
+                        "allowed": True,
+                        "idempotent": False,
+                        "intent_id": str(row["intent_id"]),
+                    }
+                )
+                return result
+
+    async def begin_message_delivery_attempt(
+        self, intent_id: str, *, attempt_timeout_seconds: int = 60
+    ) -> dict[str, Any]:
+        """Claim one bounded delivery attempt before non-idempotent I/O.
+
+        The intent row is the cross-replica mutex.  A concurrent retry sees
+        the live attempt and must not invoke the provider; an attempt whose
+        owner vanished becomes retryable after the short lease.  Provider
+        acceptance is sticky and suppresses every later delivery attempt.
+        """
+        intent_uuid = UUID(str(intent_id))
+        timeout_seconds = max(1, min(int(attempt_timeout_seconds), 900))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    "SELECT accepted_at FROM message_delivery_intents "
+                    "WHERE intent_id=$1 FOR UPDATE",
+                    intent_uuid,
+                )
+                if intent is None:
+                    raise ValueError("message delivery intent not found")
+                if intent["accepted_at"] is not None:
+                    return {
+                        "intent_id": str(intent_uuid),
+                        "delivery_claimed": False,
+                        "accepted": True,
+                    }
+                active = await conn.fetchrow(
+                    "SELECT attempt_number, attempted_at "
+                    "FROM message_delivery_attempts "
+                    "WHERE intent_id=$1 AND state='attempted' "
+                    "AND attempted_at > now() - make_interval(secs => $2::integer) "
+                    "ORDER BY attempt_number DESC LIMIT 1",
+                    intent_uuid,
+                    timeout_seconds,
+                )
+                if active is not None:
+                    return {
+                        "intent_id": str(intent_uuid),
+                        "attempt_number": int(active["attempt_number"]),
+                        "delivery_claimed": False,
+                        "accepted": False,
+                    }
+                await conn.execute(
+                    "UPDATE message_delivery_attempts SET state='failed', "
+                    "settled_at=now(), failure_class='attempt_owner_lost' "
+                    "WHERE intent_id=$1 AND state='attempted'",
+                    intent_uuid,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE message_delivery_intents
+                       SET attempt_count=attempt_count+1,
+                           last_attempted_at=now(),
+                           state=CASE WHEN accepted_at IS NULL
+                                      THEN 'attempted' ELSE state END
+                     WHERE intent_id=$1
+                    RETURNING attempt_count
+                    """,
+                    intent_uuid,
+                )
+                attempt = await conn.fetchrow(
+                    """
+                    INSERT INTO message_delivery_attempts (
+                        intent_id, attempt_number, state
+                    ) VALUES ($1,$2,'attempted')
+                    RETURNING attempt_id, attempt_number, attempted_at
+                    """,
+                    intent_uuid,
+                    int(row["attempt_count"]),
+                )
+        return {
+            **dict(attempt),
+            "intent_id": str(intent_uuid),
+            "delivery_claimed": True,
+            "accepted": False,
+        }
+
+    async def settle_message_delivery_attempt(
+        self,
+        intent_id: str,
+        attempt_number: int,
+        *,
+        accepted: bool,
+        failure_class: str | None = None,
+        detail: str | None = None,
+    ) -> bool:
+        """Settle one attempted delivery without erasing prior acceptance."""
+        intent_uuid = UUID(str(intent_id))
+        state = "accepted" if accepted else "failed"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                attempt = await conn.fetchrow(
+                    """
+                    UPDATE message_delivery_attempts
+                       SET state=$3, settled_at=now(), failure_class=$4, detail=$5
+                     WHERE intent_id=$1 AND attempt_number=$2
+                       AND state='attempted'
+                    RETURNING attempt_id
+                    """,
+                    intent_uuid,
+                    int(attempt_number),
+                    state,
+                    failure_class,
+                    (detail or "")[:500] or None,
+                )
+                if attempt is None:
+                    return False
+                await conn.execute(
+                    """
+                    UPDATE message_delivery_intents
+                       SET state=CASE WHEN accepted_at IS NOT NULL THEN state ELSE $2 END,
+                           accepted_at=CASE WHEN $3 THEN coalesce(accepted_at, now())
+                                            ELSE accepted_at END,
+                           last_failed_at=CASE WHEN $3 THEN last_failed_at ELSE now() END,
+                           failure_class=CASE WHEN $3 THEN NULL ELSE $4 END
+                     WHERE intent_id=$1
+                    """,
+                    intent_uuid,
+                    state,
+                    accepted,
+                    failure_class,
+                )
+        return True
+
+    async def get_message_delivery_intent(
+        self, routing_generation: str, bucket: str
+    ) -> dict[str, Any] | None:
+        generation_uuid = UUID(str(routing_generation))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM message_delivery_intents "
+                "WHERE routing_generation=$1 AND bucket=$2",
+                generation_uuid,
+                bucket,
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["intent_id"] = str(result["intent_id"])
+        result["routing_generation"] = str(result["routing_generation"])
+        return result
 
     async def get_message_threads(self, job_id: str) -> List[Dict[str, Any]]:
         """Get message threads for a job.

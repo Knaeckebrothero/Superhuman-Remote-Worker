@@ -378,7 +378,16 @@ async def _jobs_section(
             if len(new) > _MAX_NEW:
                 lines.append(f"- (+{len(new) - _MAX_NEW} more new)")
         if active_lines:
-            lines.append("In flight:")
+            policy_view = next(iter(liveness_by_id.values()), {})
+            threshold = policy_view.get("threshold_minutes")
+            source = policy_view.get("threshold_source")
+            if threshold is not None:
+                lines.append(
+                    "In flight "
+                    f"(stall threshold {threshold}m, {source or 'unknown source'}):"
+                )
+            else:
+                lines.append("In flight:")
             lines += active_lines
             if len(active_ids) > _MAX_ACTIVE:
                 lines.append(f"- (+{len(active_ids) - _MAX_ACTIVE} more in flight)")

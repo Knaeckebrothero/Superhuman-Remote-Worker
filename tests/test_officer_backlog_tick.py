@@ -337,6 +337,20 @@ class TestStaleClaims:
         ]
         assert stale_claims(claims, NOW) == []
 
+    def test_deployment_stale_claim_policy_is_shared_and_configurable(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("JOB_LIVENESS_STALE_CLAIM_MINUTES", "300")
+        claim = {
+            "id": "j1",
+            "ticket_note_id": "t1",
+            "status": "paused",
+            "updated_at": NOW - timedelta(minutes=270),
+        }
+        assert stale_claims([claim], NOW) == []
+        claim["updated_at"] = NOW - timedelta(minutes=301)
+        assert [row["job_id"] for row in stale_claims([claim], NOW)] == ["j1"]
+
 
 # =============================================================================
 # The tick end to end, against a doubled DB
@@ -1080,6 +1094,10 @@ class TestTickOfficer:
         db.merge_thread_officer_state.assert_awaited()
         patch = db.merge_thread_officer_state.await_args.args[1]
         assert "backlog_stale_claims" in patch
+        assert patch["backlog_stale_claim_policy"] == {
+            "threshold_minutes": 240,
+            "threshold_source": "deployment_default",
+        }
 
 
 class TestExecutorSerialization:
