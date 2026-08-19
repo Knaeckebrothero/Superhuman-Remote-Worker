@@ -3088,6 +3088,71 @@ class TestKbWriteWithoutNeo4j:
         ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
             note_id="new-title", content="identical"
         )
+        # Explicit: the short-circuit is only correct when the note is already
+        # searchable. The unindexed case is a repair, covered below.
+        ctx.knowledge_store.note_is_indexed.return_value = True
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "identical"},
+            )
+        assert "identical content" in result
+        assert calls == []
+
+    def test_no_kg_exact_duplicate_reports_index_state(self):
+        """The no-op still has to answer "is it searchable?".
+
+        Slice A's contract is that a write result always states the index
+        state; this path used to return a bare sentence with no suffix, so an
+        author could not tell a healthy note from a deferred one.
+        """
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            note_id="new-title", content="identical"
+        )
+        ctx.knowledge_store.note_is_indexed.return_value = True
+        tools, _ = _make_tools(ctx)
+        patcher, _calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "identical"},
+            )
+        assert "indexed=yes" in result
+
+    def test_no_kg_exact_duplicate_repairs_a_deferred_index(self):
+        """Re-writing identical content is the documented repair for a note
+        whose first write deferred its index — so it must not be swallowed.
+
+        ``kb_materialize._is_canonical`` admits ``skipped/unchanged`` purely so
+        this retry re-indexes. Returning early here made that unreachable from
+        ``kb_write``: the note stayed unsearchable until the next sweep and the
+        author got no signal at all.
+        """
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            note_id="new-title", content="identical"
+        )
+        ctx.knowledge_store.note_is_indexed.return_value = False
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "identical"},
+            )
+        assert calls, "unindexed duplicate must re-materialise, not no-op"
+        assert calls[0]["slug"] == "new-title"
+
+    def test_no_kg_exact_duplicate_assumes_indexed_when_probe_fails(self):
+        """A failing probe must not invent a write. Degrade to the old no-op."""
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            note_id="new-title", content="identical"
+        )
+        ctx.knowledge_store.note_is_indexed.side_effect = RuntimeError("index down")
         tools, _ = _make_tools(ctx)
         patcher, calls = _capture_materialize()
         with patcher:

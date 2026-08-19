@@ -1977,10 +1977,43 @@ def create_kb_tools(
         if isinstance(existing, dict) and _content_hash(content) == _content_hash(
             existing.get("content", "")
         ):
-            return (
-                f"Note '{candidate_slug}' already exists with identical content "
-                f"— no change written."
-            )
+            # "Nothing to write" is not "nothing to do". A note whose first
+            # write deferred its index (oversized, KB lock held, embedding
+            # provider down) sits here canonical-but-unsearchable, and
+            # re-writing it is the *documented* repair: kb_materialize's
+            # `_is_canonical` admits `skipped/unchanged` for exactly this
+            # retry. Returning early unconditionally made that repair
+            # unreachable from kb_write — the note stayed invisible until the
+            # next sweep, and the result reported no index state at all, so
+            # the author could not tell. Probe first, then either report the
+            # truth or run the repair.
+            try:
+                already_indexed = bool(
+                    _run_async(
+                        ks.note_is_indexed(uuid.UUID(project_id), candidate_slug)
+                    )
+                )
+            except Exception as e:
+                # A probe must never turn a no-op into a write. Assume healthy
+                # and keep the historical behaviour exactly.
+                logger.warning(
+                    "kb_write: index-state probe failed for %r (%s) — assuming "
+                    "indexed and short-circuiting as before",
+                    candidate_slug,
+                    e,
+                )
+                already_indexed = True
+            if already_indexed:
+                return (
+                    f"Note '{candidate_slug}' already exists with identical "
+                    f"content — no change written. "
+                    f"{_index_state_suffix({'indexed': True})}"
+                )
+            # Canonical but unsearchable. Route through the normal update path
+            # (the same delegation the verdict gate's UPDATE action uses) so
+            # the file is re-rendered and re-materialised by one code path
+            # rather than a second, subtly different one here.
+            return _update_existing(candidate_slug, content=content)
 
         # Ingestion verdict gate (slice 2 PR2) — only when the curator wired a
         # service. Adjudicate the candidate against its nearest active notes
