@@ -741,6 +741,23 @@ async def fetch_main_requests(audit_reader: Any, job_id: str) -> list[dict[str, 
                         item.get("output_tokens"),
                     ),
                     "latency_ms": _first_int(item.get("latency_ms")),
+                    # Provider-side prefix-cache reads. Two shapes carry the
+                    # same number: LangChain's usage_metadata and the OpenAI
+                    # token_usage detail block, so read whichever this
+                    # provider filled. Absent (0) is indistinguishable from a
+                    # genuine cold call here, which is why cold_calls below
+                    # only counts requests that did report input tokens.
+                    "cache_read_tokens": _first_int(
+                        (
+                            (
+                                item.get("usage_metadata")
+                                or (item.get("metrics") or {}).get("usage_metadata")
+                                or {}
+                            ).get("input_token_details")
+                            or {}
+                        ).get("cache_read"),
+                        (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                    ),
                 }
             )
         has_more = bool(data.get("hasMore") or data.get("has_more"))
@@ -830,6 +847,9 @@ def analyze_job_metrics(
     output_tokens = [
         int(request.get("output_tokens") or 0) for request in normalized_requests
     ]
+    cache_reads = [
+        int(request.get("cache_read_tokens") or 0) for request in normalized_requests
+    ]
     result.update(
         {
             "wall_minutes": round((t1 - t0).total_seconds() / 60, 3),
@@ -838,6 +858,24 @@ def analyze_job_metrics(
             "output_tokens": sum(output_tokens),
             "median_prompt_tokens": _median_number(input_tokens),
             "med_in": _median_number(input_tokens),
+            "cache_read_tokens": sum(cache_reads),
+            "cache_hit_pct": (
+                round(100.0 * sum(cache_reads) / sum(input_tokens), 1)
+                if sum(input_tokens)
+                else None
+            ),
+            # The load-bearing lane metric. A rotation that discarded the
+            # provider prefix cache would re-pay full input on the first call
+            # of every batch, so cold calls -- not the hit ratio -- is what
+            # separates "the handoff is cheap" from "the handoff re-reads
+            # everything". Counted only over requests that reported input
+            # tokens so a provider that omits cache detail reads as unknown
+            # rather than as universally cold.
+            "cold_calls": sum(
+                1
+                for tokens, cached in zip(input_tokens, cache_reads)
+                if tokens > 0 and cached == 0
+            ),
             "total_latency_ms": sum(
                 int(request.get("latency_ms") or 0) for request in normalized_requests
             ),
@@ -961,6 +999,10 @@ def build_aggregates(
                 "strategic_share_prompt_tokens_pct": metric_summary(
                     [row.get("strategic_share_prompt_tokens_pct") for row in clean]
                 ),
+                "cache_hit_pct": metric_summary(
+                    [row.get("cache_hit_pct") for row in clean]
+                ),
+                "cold_calls": metric_summary([row.get("cold_calls") for row in clean]),
             }
             aggregate: dict[str, Any] = {
                 "task": task.get("id"),
