@@ -6,12 +6,14 @@ entirely to avoid requiring SSH infrastructure.
 
 import errno
 import io
+import logging
 import os
 import re
 import socket
 import stat as stat_module
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 import sys
 from pathlib import Path
@@ -290,12 +292,14 @@ class TestExecDrainLoopDeadline:
 from src.core.backends.remote import (  # noqa: E402
     RemoteBackend,
     _INHERITED_BUSY_SENTINEL,
+    _PENDING_GUARD_STALE_SECONDS,
     _RemoteTab,
     _TMUX_FIELD_SEPARATOR,
     _TMUX_GENERATION_OPTION,
     _TMUX_OWNER_ID_OPTION,
     _TMUX_OWNER_TOKEN_OPTION,
     _TMUX_PENDING_SENTINEL_OPTION,
+    _TMUX_PENDING_SINCE_OPTION,
     _TMUX_PROTOCOL_OPTION,
     _TMUX_PROMPT_TOKEN_OPTION,
     _TMUX_SETUP_COMPLETE,
@@ -2641,7 +2645,11 @@ class TestRemoteBackendTmuxFences:
         assert _TMUX_OWNER_TOKEN_OPTION in command
         assert "= 9 ] || exit 75" in command
         assert _TMUX_PENDING_SENTINEL_OPTION in command
-        assert '"$_srw_pending" = ' in command
+        assert '"$_srw_pending" != ' in command
+        assert "exit 74" in command
+        # The guard is stamped, and only a stamped-stale guard may be aged out.
+        assert _TMUX_PENDING_SINCE_OPTION in command
+        assert f"-ge {_PENDING_GUARD_STALE_SECONDS} ] || exit 74" in command
         assert "__DONE_0123456789ab__" in command
         assert command.count("tmux send-keys") == 2
         assert "%17" in command
@@ -2686,6 +2694,254 @@ class TestRemoteBackendTmuxFences:
         assert guard in command
         assert "npm run dev" in command
         assert command.count("tmux send-keys") == 2
+
+
+class TestPendingGuardStaleAging:
+    """The durable pane guard ages out instead of refusing forever.
+
+    These tests execute the generated locked mutation for real (bash + flock)
+    against a stateful fake tmux, so the CAS/aging decision is proven in the
+    shell where it runs, not merely present in the generated text.
+    """
+
+    _FAKE_TMUX = """#!/usr/bin/env python3
+import os
+import sys
+
+state = os.environ["FAKE_TMUX_STATE"]
+args = sys.argv[1:]
+
+
+def path(option):
+    return os.path.join(state, option.lstrip("@"))
+
+
+def read(option):
+    try:
+        with open(path(option)) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+if not args:
+    sys.exit(0)
+cmd, rest = args[0], args[1:]
+if cmd == "display-message":
+    fmt = rest[-1]
+    for option in ("@srw_pending_sentinel", "@srw_pending_since"):
+        if option in fmt:
+            print(read(option))
+            break
+    else:
+        print("")
+elif cmd == "set-option":
+    positional = []
+    unset = False
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "-u":
+            unset = True
+        elif arg == "-t":
+            i += 1  # consume the target argument
+        elif not arg.startswith("-"):
+            positional.append(arg)
+        i += 1
+    option = positional[0]
+    if unset:
+        try:
+            os.remove(path(option))
+        except FileNotFoundError:
+            pass
+    else:
+        with open(path(option), "w") as fh:
+            fh.write(positional[1] if len(positional) > 1 else "")
+elif cmd == "send-keys":
+    with open(os.path.join(state, "send_keys.log"), "a") as fh:
+        fh.write(" ".join(rest) + chr(10))
+sys.exit(0)
+"""
+
+    def _local_exec_env(self, tmp_path):
+        """Return (state_dir, side_effect) executing exec'd shell locally."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        fake_tmux = fake_bin / "tmux"
+        fake_tmux.write_text(self._FAKE_TMUX)
+        fake_tmux.chmod(0o755)
+        state = tmp_path / "tmux-state"
+        state.mkdir(exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(tmp_path)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["FAKE_TMUX_STATE"] = str(state)
+
+        def run_locally(command, timeout=30, *, retain_tail=False):
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            assert completed.returncode != 127, completed.stderr
+            return completed.stdout, completed.returncode
+
+        return state, run_locally
+
+    @staticmethod
+    def _seed_guard(state, value, since=None):
+        (state / "srw_pending_sentinel").write_text(value)
+        if since is not None:
+            (state / "srw_pending_since").write_text(str(int(since)))
+
+    def test_fresh_foreign_guard_still_refuses_with_exit_74(
+        self, remote_backend, tmp_path
+    ):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+        state, run_locally = self._local_exec_env(tmp_path)
+        self._seed_guard(state, "__DONE_aaaaaaaaaaaa__", since=time.time() - 30)
+
+        with patch.object(backend, "_exec_with_status", side_effect=run_locally):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 74"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_bbbbbbbbbbbb__",
+                    command="git status",
+                )
+
+        assert (state / "srw_pending_sentinel").read_text() == "__DONE_aaaaaaaaaaaa__"
+        assert not (state / "send_keys.log").exists()
+
+    def test_second_reserve_on_freshly_guarded_pane_still_collides(
+        self, remote_backend, tmp_path
+    ):
+        """The CAS still prevents a genuinely concurrent second command."""
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+        state, run_locally = self._local_exec_env(tmp_path)
+
+        with patch.object(backend, "_exec_with_status", side_effect=run_locally):
+            backend._reserve_and_send_shell_command(
+                "default",
+                expected=None,
+                sentinel="__DONE_aaaaaaaaaaaa__",
+                command="sleep 600",
+            )
+            assert (
+                state / "srw_pending_sentinel"
+            ).read_text() == "__DONE_aaaaaaaaaaaa__"
+            # The winning reservation stamped its guard with the pane clock.
+            assert (state / "srw_pending_since").read_text().isdigit()
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 74"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_bbbbbbbbbbbb__",
+                    command="git status",
+                )
+
+        assert (state / "srw_pending_sentinel").read_text() == "__DONE_aaaaaaaaaaaa__"
+        log = (state / "send_keys.log").read_text()
+        assert "sleep 600" in log
+        assert "git status" not in log
+
+    def test_stale_guard_is_cleared_reserve_proceeds_and_warns(
+        self, remote_backend, tmp_path, caplog
+    ):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+        state, run_locally = self._local_exec_env(tmp_path)
+        self._seed_guard(
+            state,
+            "__DONE_aaaaaaaaaaaa__",
+            since=time.time() - _PENDING_GUARD_STALE_SECONDS - 60,
+        )
+
+        with patch.object(backend, "_exec_with_status", side_effect=run_locally):
+            with caplog.at_level(logging.WARNING, logger="src.core.backends.remote"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_bbbbbbbbbbbb__",
+                    command="git status",
+                )
+
+        assert (state / "srw_pending_sentinel").read_text() == "__DONE_bbbbbbbbbbbb__"
+        assert "git status" in (state / "send_keys.log").read_text()
+        assert backend._tabs["default"].pending_sentinel == "__DONE_bbbbbbbbbbbb__"
+        warning = next(
+            record
+            for record in caplog.records
+            if "stale" in record.getMessage().lower()
+        )
+        assert "__DONE_aaaaaaaaaaaa__" in warning.getMessage()
+        assert re.search(r"age_seconds=\d+", warning.getMessage())
+
+    def test_legacy_unstamped_guard_gets_one_full_bound_then_ages_out(
+        self, remote_backend, tmp_path
+    ):
+        """A guard written by pre-aging code has no stamp: the first refusal
+        stamps it 'now' (it may be seconds old), and only after a full bound
+        does a reserve reclaim the pane."""
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+        state, run_locally = self._local_exec_env(tmp_path)
+        self._seed_guard(state, "__DONE_aaaaaaaaaaaa__")
+
+        with patch.object(backend, "_exec_with_status", side_effect=run_locally):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 74"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_bbbbbbbbbbbb__",
+                    command="git status",
+                )
+            # The refusal stamped the legacy guard so it can age out.
+            assert (state / "srw_pending_since").read_text().isdigit()
+            assert not (state / "send_keys.log").exists()
+
+            # Bound elapses; the CAS failure cleared the local registry, as a
+            # reattaching claimant would rebuild it.
+            (state / "srw_pending_since").write_text(
+                str(int(time.time()) - _PENDING_GUARD_STALE_SECONDS - 5)
+            )
+            backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+            backend._reserve_and_send_shell_command(
+                "default",
+                expected=None,
+                sentinel="__DONE_cccccccccccc__",
+                command="git push",
+            )
+
+        assert (state / "srw_pending_sentinel").read_text() == "__DONE_cccccccccccc__"
+        assert "git push" in (state / "send_keys.log").read_text()
+
+    def test_clear_tab_pending_drops_the_freshness_stamp(
+        self, remote_backend, tmp_path
+    ):
+        """A cleared guard must not leave a stamp behind: a later guard from
+        pre-aging code would inherit it and look instantly stale."""
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+        state, run_locally = self._local_exec_env(tmp_path)
+
+        with patch.object(backend, "_exec_with_status", side_effect=run_locally):
+            backend._reserve_and_send_shell_command(
+                "default",
+                expected=None,
+                sentinel="__DONE_aaaaaaaaaaaa__",
+                command="git fetch",
+            )
+            backend._clear_tab_pending("default", "__DONE_aaaaaaaaaaaa__")
+
+        assert not (state / "srw_pending_sentinel").exists()
+        assert not (state / "srw_pending_since").exists()
+        assert backend._tabs["default"].pending_sentinel is None
 
 
 class TestRemoteBackendCheckBlocked:

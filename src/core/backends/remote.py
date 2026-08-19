@@ -229,6 +229,7 @@ TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 # 3.4 and 3.7 format engines (3.4 escapes ASCII control separators as ``\037``).
 _TMUX_TAB_TYPE_OPTION = "@srw_tab_type"
 _TMUX_PENDING_SENTINEL_OPTION = "@srw_pending_sentinel"
+_TMUX_PENDING_SINCE_OPTION = "@srw_pending_since"
 _TMUX_PANE_ID_OPTION = "@srw_pane_id"
 _TMUX_OWNER_ID_OPTION = "@srw_owner_id"
 _TMUX_OWNER_TOKEN_OPTION = "@srw_owner_token"
@@ -247,6 +248,22 @@ _TMUX_WINDOW_SETUP_OPTION = "@srw_window_setup_state"
 _TMUX_FIELD_SEPARATOR = "|"
 _TMUX_TAB_TYPES = frozenset({"shell", "ssh", "repl", "process"})
 _INHERITED_BUSY_SENTINEL = "__SRW_INHERITED_BUSY__"
+# Every durable pane guard is written together with a remote-clock epoch stamp
+# (`@srw_pending_since`). A reserve attempt that loses the guard CAS normally
+# refuses with exit 74, but a guard older than this bound is treated as
+# abandoned, cleared, and replaced. The bound is safe against legitimately
+# long commands (git clone/fetch) because a *tracked* guard never reaches the
+# CAS: its owner either observes the completion record and CAS-clears it, or
+# holds it in the local tab registry so colliding calls refuse at pre-flight.
+# Only a claimant whose registry lost the guard (transport reconnect) races
+# the CAS against it, and a single synchronous wait is already capped at
+# HARD_TIMEOUT_CAP_SECONDS (600 s), after which the guard survives only as
+# registry state. 1.5x that cap keeps abandoned guards from bricking a pane
+# forever without reaping a freshly reserved one.
+_PENDING_GUARD_STALE_SECONDS = 15 * 60
+# Marker printed by the reserve CAS when it clears a stale guard so the
+# Python side can log the recovered value and its age.
+_STALE_GUARD_CLEARED_MARKER = "__SRW_STALE_GUARD_CLEARED__"
 _TMUX_PANE_ID_PATTERN = re.compile(r"^%(?:0|[1-9][0-9]*)$")
 _TMUX_PENDING_PATTERN = re.compile(r"^__DONE_[0-9a-f]{12}__$")
 _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -2420,6 +2437,71 @@ __SRW_PROCESS_ZERO_PY__
             operation=f"read session option {option}",
         ).strip()
 
+    def _pending_guard_cas_shell(self, pane: str, expected_value: str) -> str:
+        """CAS the durable pane guard, aging out abandoned reservations.
+
+        On mismatch against a *present* guard, consult its epoch stamp: a
+        guard older than ``_PENDING_GUARD_STALE_SECONDS`` is abandoned (its
+        owner would have CAS-cleared it or still hold it in a local registry
+        whose pre-flight blocks before this CAS runs), so clear it, report it
+        for logging, and let the reservation proceed. A guard with no stamp
+        (written by pre-aging code) or a stamp from a regressed clock gets
+        stamped ``now`` and refused; it then ages out normally, so a legacy
+        guard keeps one full bound of collision protection before recovery.
+        Both stamp and comparison use the workspace clock (``date +%s``), so
+        local/remote skew cannot forge or mask staleness.
+        """
+        return (
+            "_srw_pending=$(tmux display-message -p "
+            f"-t {pane} '#{{{_TMUX_PENDING_SENTINEL_OPTION}}}')\n"
+            f'if [ "$_srw_pending" != {shlex.quote(expected_value)} ]; then\n'
+            '  [ -n "$_srw_pending" ] || exit 74\n'
+            "  _srw_now=$(date +%s)\n"
+            "  _srw_since=$(tmux display-message -p "
+            f"-t {pane} '#{{{_TMUX_PENDING_SINCE_OPTION}}}')\n"
+            '  case "$_srw_since" in\n'
+            "    ''|*[!0-9]*) _srw_since='' ;;\n"
+            "  esac\n"
+            '  if [ -z "$_srw_since" ] || [ "$_srw_now" -lt "$_srw_since" ]; '
+            "then\n"
+            f"    tmux set-option -w -t {pane} {_TMUX_PENDING_SINCE_OPTION} "
+            '"$_srw_now"\n'
+            "    exit 74\n"
+            "  fi\n"
+            "  _srw_age=$((_srw_now - _srw_since))\n"
+            f'  [ "$_srw_age" -ge {_PENDING_GUARD_STALE_SECONDS} ] || exit 74\n'
+            f"  printf '{_STALE_GUARD_CLEARED_MARKER} %s %s\\n' "
+            '"$_srw_age" "$_srw_pending"\n'
+            "fi\n"
+        )
+
+    def _pending_guard_set_shell(self, pane: str, sentinel: str) -> str:
+        """Install the durable guard together with its freshness stamp."""
+        return (
+            f"tmux set-option -w -t {pane} {_TMUX_PENDING_SENTINEL_OPTION} "
+            f"{shlex.quote(sentinel)}\n"
+            f"tmux set-option -w -t {pane} {_TMUX_PENDING_SINCE_OPTION} "
+            '"$(date +%s)"'
+        )
+
+    def _warn_if_stale_guard_cleared(self, tab_name: str, output: str) -> None:
+        for line in output.splitlines():
+            parts = line.strip().split(maxsplit=2)
+            if (
+                len(parts) == 3
+                and parts[0] == _STALE_GUARD_CLEARED_MARKER
+                and parts[1].isdigit()
+            ):
+                logger.warning(
+                    "Cleared stale remote tmux pending guard: session=%s "
+                    "tab=%s stale_value=%s age_seconds=%s (stale after %s s)",
+                    self._session_name,
+                    tab_name,
+                    parts[2],
+                    parts[1],
+                    _PENDING_GUARD_STALE_SECONDS,
+                )
+
     def _set_tab_pending(
         self,
         tab_name: str,
@@ -2429,14 +2511,12 @@ __SRW_PROCESS_ZERO_PY__
     ) -> None:
         pane = self._tmux_pane_target(tab_name)
         expected_value = expected or ""
-        self._tmux_mutate_checked(
-            "_srw_pending=$(tmux display-message -p "
-            f"-t {pane} '#{{{_TMUX_PENDING_SENTINEL_OPTION}}}')\n"
-            f'[ "$_srw_pending" = {shlex.quote(expected_value)} ] || exit 74\n'
-            f"tmux set-option -w -t {pane} {_TMUX_PENDING_SENTINEL_OPTION} "
-            f"{shlex.quote(sentinel)}",
+        output = self._tmux_mutate_checked(
+            self._pending_guard_cas_shell(pane, expected_value)
+            + self._pending_guard_set_shell(pane, sentinel),
             operation=f"reserve pending state on {tab_name}",
         )
+        self._warn_if_stale_guard_cleared(tab_name, output)
         tab = self._tabs.get(tab_name)
         if tab is None:
             # `_exec` may have reconnected the SSH transport and invalidated
@@ -2458,7 +2538,11 @@ __SRW_PROCESS_ZERO_PY__
             f"-t {pane} '#{{{_TMUX_PENDING_SENTINEL_OPTION}}}')\n"
             f'[ "$_srw_pending" = {shlex.quote(expected)} ] || exit 74\n'
             f"tmux set-option -w -u -t {pane} "
-            f"{_TMUX_PENDING_SENTINEL_OPTION} 2>/dev/null || true",
+            f"{_TMUX_PENDING_SENTINEL_OPTION} 2>/dev/null || true\n"
+            # Drop the stamp with the guard: a leftover old stamp would make
+            # the next guard written by pre-aging code look instantly stale.
+            f"tmux set-option -w -u -t {pane} "
+            f"{_TMUX_PENDING_SINCE_OPTION} 2>/dev/null || true",
             operation=f"clear pending state on {tab_name}",
         )
         # A transport reconnect clears the local tab registry so the next
@@ -2493,16 +2577,14 @@ __SRW_PROCESS_ZERO_PY__
         """CAS the pane guard and type a command under one remote lock."""
         pane = self._tmux_pane_target(tab_name)
         expected_value = expected or ""
-        self._tmux_mutate_checked(
-            "_srw_pending=$(tmux display-message -p "
-            f"-t {pane} '#{{{_TMUX_PENDING_SENTINEL_OPTION}}}')\n"
-            f'[ "$_srw_pending" = {shlex.quote(expected_value)} ] || exit 74\n'
-            f"tmux set-option -w -t {pane} {_TMUX_PENDING_SENTINEL_OPTION} "
-            f"{shlex.quote(sentinel)}\n"
-            f"tmux send-keys -t {pane} -l {shlex.quote(command)}\n"
+        output = self._tmux_mutate_checked(
+            self._pending_guard_cas_shell(pane, expected_value)
+            + self._pending_guard_set_shell(pane, sentinel)
+            + f"\ntmux send-keys -t {pane} -l {shlex.quote(command)}\n"
             f"tmux send-keys -t {pane} Enter",
             operation=f"reserve and send command on {tab_name}",
         )
+        self._warn_if_stale_guard_cleared(tab_name, output)
         tab = self._tabs.get(tab_name)
         if tab is None:
             raise WorkspaceUnavailableError(
@@ -2521,13 +2603,15 @@ __SRW_PROCESS_ZERO_PY__
         """Replace a guard, send C-c, then queue a completion probe atomically."""
         pane = self._tmux_pane_target(tab_name)
         probe = f"printf '\\n{sentinel} 130 %s\\n' \"$PWD\""
+        # Cancel targets one specific known guard; a mismatch means someone
+        # else owns the pane now, so the CAS stays strict (no stale aging —
+        # interrupting an unknown owner is never a recovery).
         self._tmux_mutate_checked(
             "_srw_pending=$(tmux display-message -p "
             f"-t {pane} '#{{{_TMUX_PENDING_SENTINEL_OPTION}}}')\n"
             f'[ "$_srw_pending" = {shlex.quote(expected)} ] || exit 74\n'
-            f"tmux set-option -w -t {pane} {_TMUX_PENDING_SENTINEL_OPTION} "
-            f"{shlex.quote(sentinel)}\n"
-            f"tmux send-keys -t {pane} C-c\n"
+            + self._pending_guard_set_shell(pane, sentinel)
+            + f"\ntmux send-keys -t {pane} C-c\n"
             f"tmux send-keys -t {pane} -l {shlex.quote(probe)}\n"
             f"tmux send-keys -t {pane} Enter",
             operation=f"cancel and probe command on {tab_name}",
