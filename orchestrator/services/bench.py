@@ -297,6 +297,8 @@ def freeze_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
             frozen_arm["config_name"] = canonical_config_name(str(arm["config_name"]))
         if arm.get("expert_id"):
             frozen_arm["expert_id"] = str(arm["expert_id"])
+        if arm.get("execution_lane"):
+            frozen_arm["execution_lane"] = str(arm["execution_lane"])
         arms.append(frozen_arm)
 
     project_id = spec.get("project_id")
@@ -626,6 +628,11 @@ def build_bench_job_payload(
         # must freeze IDs/revisions once in the run spec instead.
         "datasource_ids": [],
         "priority": int(task.get("priority", 5)),
+        # Frozen at run creation like every other arm field, so replicates of
+        # one arm cannot drift across lanes mid-run. None keeps the JobCreate
+        # default rather than asserting "pinned", so omitting the field leaves
+        # historical single-lane specs byte-identical in behaviour.
+        "execution_lane": arm.get("execution_lane"),
     }
 
 

@@ -219,6 +219,63 @@ def test_job_payload_is_owned_tagged_and_deep_merged_with_pins_last():
     }
 
 
+def test_lane_is_frozen_per_arm_and_reaches_the_job_payload():
+    """A lane A/B is only expressible if the arm can carry the lane.
+
+    ``execution_lane`` is a top-level ``JobCreate`` field, not config, so it
+    cannot ride inside ``config_override``; without this passthrough the
+    stateless-vs-pinned comparison the S3 rollout gate asks for could not be
+    written at all. Freezing it alongside the other arm fields is what keeps
+    replicates of one arm from drifting across planes mid-run.
+    """
+
+    spec = freeze_spec(
+        {
+            "tasks": [{"id": "t1", "description": "task"}],
+            "replicates": 1,
+            "max_in_flight": 1,
+            "arms": [
+                {"name": "pinned-arm", "model": "m", "execution_lane": "pinned"},
+                {
+                    "name": "stateless-arm",
+                    "model": "m",
+                    "execution_lane": "stateless",
+                },
+            ],
+        }
+    )
+    assert [arm.get("execution_lane") for arm in spec["arms"]] == [
+        "pinned",
+        "stateless",
+    ]
+
+    run = {"id": RUN_ID, "created_by": USER_ID, "spec": spec}
+    task = spec["tasks"][0]
+    lanes = [
+        build_bench_job_payload(run, task, arm, 1)["execution_lane"]
+        for arm in spec["arms"]
+    ]
+    assert lanes == ["pinned", "stateless"]
+
+
+def test_omitted_lane_stays_none_so_existing_specs_are_unchanged():
+    """Historical single-lane specs must keep their exact behaviour.
+
+    ``None`` is not the same as ``"pinned"`` to ``JobCreate``: omitted means
+    "root stays pinned, child inherits its authoritative parent", so asserting
+    "pinned" here would silently re-parent child semantics for every bench run
+    that predates lane arms.
+    """
+
+    run = _run()
+    arm = run["spec"]["arms"][0]
+    assert "execution_lane" not in arm
+    assert (
+        build_bench_job_payload(run, run["spec"]["tasks"][0], arm, 1)["execution_lane"]
+        is None
+    )
+
+
 def test_seeded_queue_is_stable_and_skips_ledger_entries():
     run = _run(replicates=2)
     first = build_submission_queue(run)
