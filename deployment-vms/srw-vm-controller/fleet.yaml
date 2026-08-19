@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-8f09f3b"
+  version: "0.0.0-dev.sha-2847e1f"
   takeOwnership: true
   values:
     license:
@@ -50,7 +50,7 @@ helm:
       orchestrator:
         # Independently-built component identity; CI updates this from
         # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
-        tag: "sha-e97c643"
+        tag: "sha-2847e1f"
         digest: ""
       vmController:
         tag: "sha-bfb11e9"
