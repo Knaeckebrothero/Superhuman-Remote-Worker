@@ -157,6 +157,106 @@ class TestPushSkipLogging:
         )
 
 
+class TestPushDetachedHead:
+    """push() with no branch must refuse on a detached HEAD.
+
+    The old fallback guessed "main", which pushes a STALE main — reporting
+    success while delivering none of the work at HEAD. Nothing legitimately
+    relied on the guess: the workspace repo is never deliberately detached
+    (rewind restores via ``checkout <sha> -- .`` to keep HEAD on its branch).
+    """
+
+    def _detach(self, temp_workspace):
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "checkout", "--detach"],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_detached_head_refuses_and_logs(
+        self, initialized_git, temp_workspace, bare_remote, caplog
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        self._detach(temp_workspace)
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is False
+        assert any(
+            "push refused" in r.message and "detached" in r.message
+            for r in caplog.records
+        ), caplog.text
+
+    def test_detached_head_does_not_push_a_stale_branch(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """The silent-wrong-ref scenario end to end: work committed on a
+        detached HEAD must not become a no-op push of the old branch tip."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        assert initialized_git.push() is True
+        before = initialized_git.rev_parse(f"origin/{branch}")
+        self._detach(temp_workspace)
+        (temp_workspace / "detached.txt").write_text("work")
+        assert initialized_git.commit("work while detached") is True
+        assert initialized_git.push() is False
+        assert initialized_git.rev_parse(f"origin/{branch}") == before
+
+    def test_explicit_branch_still_pushes_while_detached(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        self._detach(temp_workspace)
+        assert initialized_git.push(branch=branch) is True
+
+
+class TestGitManagerCheckoutBranch:
+    """checkout_branch backs the repo_checkout tool — the only way a
+    shell-less worker can move HEAD in an attached clone."""
+
+    def test_switches_to_an_existing_branch(self, initialized_git, temp_workspace):
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "branch", "feature"],
+            check=True,
+            capture_output=True,
+        )
+        assert initialized_git.checkout_branch("feature") is True
+        assert initialized_git.current_branch() == "feature"
+
+    def test_missing_branch_fails_without_create(self, initialized_git):
+        before = initialized_git.current_branch()
+        assert initialized_git.checkout_branch("missing") is False
+        assert initialized_git.current_branch() == before
+
+    def test_create_makes_and_switches_to_a_new_branch(self, initialized_git):
+        assert initialized_git.checkout_branch("job/fix-1", create=True) is True
+        assert initialized_git.current_branch() == "job/fix-1"
+
+    def test_create_tracks_an_existing_remote_branch(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        base = initialized_git.current_branch()
+        assert initialized_git.checkout_branch("remote-only", create=True) is True
+        (temp_workspace / "r.txt").write_text("r")
+        initialized_git.commit("remote work")
+        assert initialized_git.push() is True
+        # Drop the local branch so only origin/remote-only remains.
+        assert initialized_git.checkout_branch(base) is True
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "branch", "-D", "remote-only"],
+            check=True,
+            capture_output=True,
+        )
+        assert initialized_git.checkout_branch("remote-only", create=True) is True
+        assert initialized_git.current_branch() == "remote-only"
+        assert initialized_git.rev_parse("remote-only") == initialized_git.rev_parse(
+            "origin/remote-only"
+        )
+
+    def test_inactive_repo_returns_false(self, git_manager):
+        assert git_manager.checkout_branch("anything") is False
+
+
 class TestRevParse:
     """rev_parse resolves refs so repo_push can verify what actually moved."""
 

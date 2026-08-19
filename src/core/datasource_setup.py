@@ -129,6 +129,7 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
         "category": "repo",
         "read": ["repo_pull", "repo_pr_status"],
         "write": [
+            "repo_checkout",
             "repo_commit",
             "repo_push",
             "repo_pull",
@@ -1012,7 +1013,8 @@ def clone_repository_datasources(
 
             target = workspace_manager.path / "repos" / repo_name
             remote_cwd = f"repos/{repo_name}"
-            if backend.exists(f"{remote_cwd}/.git"):
+            reused = backend.exists(f"{remote_cwd}/.git")
+            if reused:
                 # A session workspace may outlive its agent pod (PVC hot tier)
                 # or be restored from the thread repository. Re-register the
                 # managed checkout instead of attempting a second clone into
@@ -1036,8 +1038,24 @@ def clone_repository_datasources(
                 )
             if git_mgr:
                 branch_ready = True
-                if branch:
+                if branch and (not reused or ds.get("require_default_branch")):
                     branch_ready = git_mgr.checkout_branch(branch)
+                elif branch:
+                    # Reused checkout without require_default_branch: the
+                    # worker may have moved HEAD (e.g. onto a job branch)
+                    # before this re-attach; re-running checkout here silently
+                    # reverted that on every resume (job 12a0e92c). Only a
+                    # review session pins the branch on reuse — its entire
+                    # point is that this exact delivery is checked out
+                    # (orchestrator/services/job_delivery.py sets
+                    # require_default_branch).
+                    logger.debug(
+                        "Reused repos/%s keeps its checked-out branch %r "
+                        "(pinned default %r not re-applied on re-attach)",
+                        repo_name,
+                        git_mgr.current_branch(),
+                        branch,
+                    )
                 if ds.get("require_default_branch") and not branch_ready:
                     logger.error(
                         "Repository datasource %r could not check out required "

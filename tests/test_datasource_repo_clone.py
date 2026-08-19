@@ -6,6 +6,7 @@ clone_repository_datasources(); the former agent-local subprocess
 credentials and repos onto the agent pod (no_workspace_agent_mode.md §9.4).
 """
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -175,6 +176,9 @@ class TestBackendClone:
         assert any("required branch" in r.message for r in caplog.records)
 
     def test_existing_checkout_is_reused_and_re_registered_on_resume(self):
+        """require_default_branch (review sessions) pins the branch even on
+        reuse — the session's entire point is that this exact delivery is
+        checked out (orchestrator/services/job_delivery.py)."""
         ws = make_workspace_manager()
         ws.backend.exists = MagicMock(
             side_effect=lambda path: path == "repos/repo/.git"
@@ -202,6 +206,50 @@ class TestBackendClone:
         )
         existing.checkout_branch.assert_called_once_with("design/hotel-rheinland-theme")
         assert ws.source_repos["repo"] is existing
+
+    def test_reused_checkout_keeps_the_workers_branch(self, caplog):
+        """Re-attach must not move HEAD in a reused clone: re-running
+        checkout_branch(default_branch) on every resume silently reverted
+        the branch the worker had checked out (job 12a0e92c)."""
+        ws = make_workspace_manager()
+        ws.backend.exists = MagicMock(
+            side_effect=lambda path: path == "repos/repo/.git"
+        )
+        existing = MagicMock()
+        existing.current_branch.return_value = "job/fix-thing"
+
+        with patch("src.managers.git_manager.GitManager") as git_manager:
+            git_manager.return_value = existing
+            with caplog.at_level(logging.DEBUG, logger="src.core.datasource_setup"):
+                clone_repository_datasources([token_ds(default_branch="dev")], ws)
+
+        existing.checkout_branch.assert_not_called()
+        assert ws.source_repos["repo"] is existing
+        assert any(
+            "job/fix-thing" in r.message and "dev" in r.message for r in caplog.records
+        ), caplog.text
+
+    def test_reused_checkout_still_refuses_unready_required_branch(self, caplog):
+        """The require_default_branch refusal must keep meaning what it says
+        on the reuse path — preserving HEAD there must not turn the gate
+        into a trivially-green check."""
+        ws = make_workspace_manager()
+        ws.backend.exists = MagicMock(
+            side_effect=lambda path: path == "repos/repo/.git"
+        )
+        existing = MagicMock()
+        existing.checkout_branch.return_value = False
+
+        with patch("src.managers.git_manager.GitManager") as git_manager:
+            git_manager.return_value = existing
+            clone_repository_datasources(
+                [token_ds(default_branch="gone", require_default_branch=True)],
+                ws,
+            )
+
+        existing.checkout_branch.assert_called_once_with("gone")
+        assert ws.source_repos == {}
+        assert any("required branch" in r.message for r in caplog.records)
 
     def test_clone_root_is_ignored_by_the_durable_session_repository(self):
         """Fallback restore must re-clone content, not restore an empty gitlink."""
@@ -401,6 +449,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         tools = load_tools(names, ToolContext(workspace_manager=ws))
 
         assert [t.name for t in tools] == [
+            "repo_checkout",
             "repo_commit",
             "repo_push",
             "repo_pull",
