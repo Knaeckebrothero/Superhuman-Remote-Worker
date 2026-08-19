@@ -1511,6 +1511,33 @@ class KnowledgeStore:
             "ready_at": r.get("ready_at"),
         }
 
+    async def note_is_indexed(self, kb_id: uuid.UUID, note_id: str) -> bool:
+        """Whether this note's chunks are durable — i.e. it is searchable.
+
+        Reads the stamp, not the row. ``embedding_version`` is written **last**,
+        after the chunk rows land (``index_single_note``), so a non-NULL stamp
+        is the index's own promise that the note can be found; a row with a NULL
+        stamp is precisely the deferred state a write reports as
+        ``indexed=deferred:<reason>``. Distinguishing the two is the whole point
+        — "the note exists" and "the note is findable" are different questions,
+        and only this one answers the second.
+
+        Files-canonical like :meth:`get_note_by_slug`: a pathless ghost row from
+        the DELETE dual-write gap is not an indexed note. Returns False for an
+        unknown slug, so callers can treat "absent" and "unindexed" alike.
+        """
+        row = await self.db.fetchrow(
+            """
+            SELECT embedding_version IS NOT NULL AS indexed
+            FROM knowledge_index
+            WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
+            LIMIT 1
+            """,
+            kb_id,
+            note_id,
+        )
+        return bool(row and row["indexed"])
+
     async def get_charter_note(self, project_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """The project's ACTIVE charter note, if one exists (centurion.md §5).
 
