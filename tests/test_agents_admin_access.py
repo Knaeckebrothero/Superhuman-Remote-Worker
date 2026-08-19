@@ -8,7 +8,8 @@ running for them, without infrastructure metadata.
 * `GET /api/agents`              → admin only
 * `GET /api/agents/{id}`         → admin only
 * `GET /api/agents/{id}/system-info` → admin only
-* `DELETE /api/agents/{id}`      → admin only
+* `DELETE /api/agents/{id}`      → admin, or X-Internal-Key (agent
+  self-deregistration on graceful exit)
 * `GET /api/me/active-jobs`      → any approved user; returns caller's
   visible jobs filtered to active statuses (created / processing /
   paused / pending_review). Uses the G1 visibility helpers, so MCP
@@ -128,6 +129,28 @@ class TestAgentsAdminOnly:
         with _patch_caller_and_db(user_admin, fake_db):
             result = await delete_agent(fake_request, "agent-1")
         assert result == {"status": "deleted"}
+
+    @pytest.mark.asyncio
+    async def test_delete_agent_internal_key_bypasses_admin_gate(
+        self, fake_db, fake_request
+    ):
+        """An agent deregistering itself on graceful exit carries only
+        X-Internal-Key — no user resolves, so admin auth must not run."""
+        from main import delete_agent
+
+        fake_db.delete_agent = AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.is_internal_call", lambda request: True))
+            stack.enter_context(
+                patch(
+                    "main.require_approved_user",
+                    AsyncMock(side_effect=AssertionError("user auth consulted")),
+                )
+            )
+            stack.enter_context(patch("main.postgres_db", fake_db))
+            result = await delete_agent(fake_request, "agent-1")
+        assert result == {"status": "deleted"}
+        fake_db.delete_agent.assert_awaited_once_with("agent-1")
 
 
 # =============================================================================

@@ -47027,15 +47027,16 @@ async def get_job_shell_state(request: Request, job_id: str) -> dict[str, Any]:
 
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
-    """Deregister an agent. **Admin only** (G4).
+    """Deregister an agent. **Admin or internal-key** (G4).
 
-    Used by the cockpit's agent-list admin tool. Agents may also call
-    this on graceful shutdown, but Track B (agent ↔ orchestrator auth)
-    will give them a proper bearer-credentialled path — for now the
-    heartbeat timeout (3min) handles agent crashes without needing
-    this endpoint to be open.
+    Used by the cockpit's agent-list admin tool, and by agents
+    deregistering on graceful shutdown via X-Internal-Key so clean exits
+    stop aging into missed-heartbeat corpses (Track B will move them to a
+    bearer-credentialled path). The heartbeat timeout (3min) remains the
+    backstop for crashes.
     """
-    await _require_admin(request)
+    if not is_internal_call(request):
+        await _require_admin(request)
     try:
         success = await postgres_db.delete_agent(agent_id)
         if not success:
