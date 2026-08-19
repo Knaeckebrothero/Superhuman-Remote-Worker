@@ -406,6 +406,15 @@ jobs:
       image: mcr.microsoft.com/playwright:v1.59.0-noble
     env:
       PLAYWRIGHT_VERSION: 1.59.0
+      # A container job runs as root with HOME=/github/home, a runner-owned
+      # bind mount (pwuser inside this image). Firefox refuses to launch when
+      # $HOME belongs to another user ("Running Nightly as root in a regular
+      # user's session is not supported"), so all 11 firefox specs died at
+      # browser launch on the first cockpit push after the image switch, while
+      # chromium and webkit passed. /root is owned by the user this job
+      # actually runs as. This is Playwright's documented workaround; drop it
+      # only if the job stops running as root.
+      HOME: /root
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
