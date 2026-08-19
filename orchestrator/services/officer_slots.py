@@ -166,9 +166,10 @@ def admit(
     tool call carried). Raises SlotAdmissionError with an actionable message
     when the dispatch does not fit.
 
-    ``in_flight_by_slot`` maps stamp → count for the officer's non-terminal
-    jobs (None key = pre-roster jobs); the caller reads it under the same
-    durable post lock that serializes parallel creates across incarnations.
+    ``in_flight_by_slot`` maps stamp → count for the officer's slot-occupying
+    jobs — non-terminal minus paused, which vacates its slot (None key =
+    pre-roster jobs); the caller reads it under the same durable post lock
+    that serializes parallel creates across incarnations.
     """
     roster = roster_from_meta(officer_meta)
 

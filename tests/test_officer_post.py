@@ -27,7 +27,9 @@ import pytest_asyncio
 
 from orchestrator.database.postgres import PostgresDB
 from services import sitrep
-from services.officer_slots import SlotAdmissionError, admit
+from services.officer_admission import count_in_flight_by_slot
+from services.officer_slots import SlotAdmissionError, admit, capacity_lines
+from src.shared.orch_surface.formatters import format_officer_post
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
@@ -123,6 +125,9 @@ class TestSitrepCapacityLineage:
         db.get_officer_capacity_lineage.assert_awaited_once_with(current)
         query, param = conn.fetch.await_args.args
         assert "= ANY($1::uuid[])" in query
+        # The shared helper's predicate: paused vacates its slot, so the
+        # capacity line the officer sees can never disagree with admission.
+        assert "'paused'" in query
         assert param == [current, prior]
         assert lines and "line 2/2" in lines[0]
 
@@ -511,8 +516,12 @@ class TestLineageCapacity:
         # One job left running by the prior incarnation, one by the current.
         await _seed_job(db, created_by_thread_id=prior, status="processing")
         await _seed_job(db, created_by_thread_id=current, status="created")
-        # Terminal jobs never count.
+        # pending_review still owns its slot (it stays classified in flight).
+        await _seed_job(db, created_by_thread_id=prior, status="pending_review")
+        # Terminal jobs never count — and neither does paused: it keeps its
+        # ticket claim but vacates its slot (owner ruling 2026-08-18).
         await _seed_job(db, created_by_thread_id=prior, status="completed")
+        await _seed_job(db, created_by_thread_id=current, status="paused")
 
         lineage = await db.get_project_officer_lineage(project_id)
         assert set(lineage) == {prior, current}
@@ -521,26 +530,74 @@ class TestLineageCapacity:
             current,
         }
 
-        # The exact in-flight count admission and the sitrep share (§4).
+        # THE in-flight count — admission, the officer card's kit view and
+        # the sitrep all read this one helper (§4).
         async with db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
-                  FROM jobs
-                 WHERE created_by_thread_id = ANY($1::uuid[])
-                   AND status IN ('created', 'processing')
-                 GROUP BY 1
-                """,
-                await db.get_officer_capacity_lineage(current),
+            in_flight = await count_in_flight_by_slot(
+                conn, await db.get_officer_capacity_lineage(current)
             )
-        in_flight = {r["slot"]: int(r["n"]) for r in rows}
-        assert in_flight == {"line": 2}
+        assert in_flight == {"line": 3}
 
-        # line ×2 with 2 in flight across the lineage → the third dispatch
+        # line ×3 with 3 in flight across the lineage → the next dispatch
         # is refused, even though the CURRENT thread only created one job.
-        officer_meta = {"enabled": True, "slots": {"line": {"count": 2}}}
+        officer_meta = {"enabled": True, "slots": {"line": {"count": 3}}}
         with pytest.raises(SlotAdmissionError):
             admit(officer_meta, "line", in_flight)
+
+    @pytest.mark.asyncio
+    async def test_paused_zombies_do_not_starve_the_kit(self, db):
+        """The 2026-08-18 starvation shape, inverted by the owner's ruling.
+
+        Two paused jobs held ``build 1/1`` and ``test 1/1`` and the officer
+        could dispatch nothing. Paused now vacates the slot everywhere the
+        count is read — admission, the card's kit view, the capacity line —
+        while a processing job still occupies its slot.
+        """
+        project_id = await _seed_project(db)
+        current = await _seed_thread(db, project_id, officer_enabled=True)
+        assert await db.register_project_officer_thread(project_id, current)
+
+        # The two zombies: paused, one per pool.
+        await _seed_job(db, created_by_thread_id=current, status="paused", slot="build")
+        await _seed_job(db, created_by_thread_id=current, status="paused", slot="test")
+
+        officer_meta = {
+            "enabled": True,
+            "slots": {"build": {"count": 1}, "test": {"count": 1}},
+        }
+        lineage = await db.get_officer_capacity_lineage(current)
+        async with db.acquire() as conn:
+            in_flight = await count_in_flight_by_slot(conn, lineage)
+        assert in_flight == {}
+
+        # Enforcement: both pools admit a dispatch again.
+        assert admit(officer_meta, "build", in_flight)[0] == "build"
+        assert admit(officer_meta, "test", in_flight)[0] == "test"
+
+        # Display, same number: the officer's capacity line and the Legate's
+        # post card (kit composed exactly the way the summary endpoint does).
+        assert "build 0/1" in capacity_lines(officer_meta, in_flight)
+        assert "test 0/1" in capacity_lines(officer_meta, in_flight)
+        kit = {
+            name: {**spec, "in_flight": int(in_flight.get(name) or 0)}
+            for name, spec in officer_meta["slots"].items()
+        }
+        card = format_officer_post(
+            {"commissioned": True, "officer": {"thread_id": current}, "kit": kit}
+        )
+        assert "build: 0/1 in flight" in card
+        assert "test: 0/1 in flight" in card
+
+        # A job that is actually running still occupies its slot.
+        await _seed_job(
+            db, created_by_thread_id=current, status="processing", slot="build"
+        )
+        async with db.acquire() as conn:
+            in_flight = await count_in_flight_by_slot(conn, lineage)
+        assert in_flight == {"build": 1}
+        with pytest.raises(SlotAdmissionError, match="1/1"):
+            admit(officer_meta, "build", in_flight)
+        assert admit(officer_meta, "test", in_flight)[0] == "test"
 
     @pytest.mark.asyncio
     async def test_unregistered_thread_degrades_to_itself(self, db):

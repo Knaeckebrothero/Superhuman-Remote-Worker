@@ -121,6 +121,7 @@ async def seeded(db):
             INSERT INTO jobs (description, config_name, status, project_id)
             VALUES ('running one', 'worker_base', 'processing', $1),
                    ('done one', 'worker_base', 'completed', $1),
+                   ('paused zombie', 'worker_base', 'paused', $1),
                    ('elsewhere', 'worker_base', 'processing', $2)
             """,
             alpha,
@@ -146,7 +147,8 @@ async def test_the_roster_reports_both_posts_with_their_live_numbers(db, seeded)
     assert alpha["next_wake_at"] == seeded["fire_at"]
     # Its own timer + its own note; the sibling thread's timer stays out.
     assert alpha["pending_events"] == 2
-    # Non-terminal jobs on THIS project only.
+    # Slot-occupying jobs on THIS project only — the seeded paused zombie is
+    # not in flight (owner ruling 2026-08-18: paused vacates its slot).
     assert alpha["in_flight_jobs"] == 1
     assert alpha["last_agent_activity"] is not None
 

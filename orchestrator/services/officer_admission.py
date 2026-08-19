@@ -38,11 +38,25 @@ from services.officer_slots import admit as admit_slot
 
 logger = logging.getLogger(__name__)
 
-# Occupying a slot means "this job still owns its work". Mirrors
-# job_liveness.TERMINAL_STATUSES; kept local so changing liveness presentation
-# cannot silently change capacity.
+# Terminal means "this job no longer owns its work" — ticket claim and slot
+# both released. Mirrors job_liveness.TERMINAL_STATUSES; kept local so changing
+# liveness presentation cannot silently change capacity.
 TERMINAL_JOB_STATUSES: tuple[str, ...] = ("completed", "failed", "cancelled")
 _TERMINAL_STATUSES_SQL = "(" + ", ".join(f"'{s}'" for s in TERMINAL_JOB_STATUSES) + ")"
+
+# A paused job keeps its ticket claim but does NOT occupy a kit slot (owner
+# ruling 2026-08-18): nothing is running, so the capacity is real — two paused
+# zombies must never starve a pool the way they did on that date. A later
+# resume may transiently push a pool over its cap; that is accepted, with no
+# compensating machinery. Ticket dedup deliberately still counts paused — one
+# live job per ticket, whatever its status — so this set widens only the
+# capacity predicates, never `_validate_ticket_claim`.
+SLOT_VACATING_STATUSES: tuple[str, ...] = ("paused",)
+_SLOT_RELEASED_STATUSES_SQL = (
+    "("
+    + ", ".join(f"'{s}'" for s in TERMINAL_JOB_STATUSES + SLOT_VACATING_STATUSES)
+    + ")"
+)
 
 OFFICER_HELD_MESSAGE = (
     "conference in progress — this officer is held; scheduling resumes with "
@@ -325,7 +339,13 @@ async def prepare_officer_admission(
 async def count_in_flight_by_slot(
     conn: Any, capacity_lineage: Sequence[Any]
 ) -> dict[str | None, int]:
-    """All-non-terminal capacity by slot over the complete post lineage."""
+    """Slot-occupying jobs by slot over the complete post lineage.
+
+    Non-terminal minus ``SLOT_VACATING_STATUSES``: a paused job is not in
+    flight and holds no kit slot. This is the one count admission enforces
+    and the officer card's kit view and the sitrep capacity line display —
+    all three read it here so they can never disagree.
+    """
 
     if not capacity_lineage:
         return {}
@@ -334,7 +354,7 @@ async def count_in_flight_by_slot(
         SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
           FROM jobs
          WHERE created_by_thread_id = ANY($1::uuid[])
-           AND status NOT IN {_TERMINAL_STATUSES_SQL}
+           AND status NOT IN {_SLOT_RELEASED_STATUSES_SQL}
          GROUP BY 1
         """,
         list(capacity_lineage),
@@ -632,6 +652,7 @@ __all__ = [
     "OFFICER_HELD_MESSAGE",
     "OfficerAdmissionConflict",
     "OfficerAdmissionPreparation",
+    "SLOT_VACATING_STATUSES",
     "SlotAdmissionError",
     "TERMINAL_JOB_STATUSES",
     "admit_and_create_job",
