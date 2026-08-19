@@ -10,7 +10,11 @@ import asyncpg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
-from orchestrator.database.postgres import LeaseRecoveryBatch, PostgresDB
+from orchestrator.database.postgres import (
+    LeaseRecoveryBatch,
+    PostgresDB,
+    RecoveredJob,
+)
 
 
 SCHEMA_FILE = (
@@ -86,7 +90,9 @@ async def test_expired_command_routes_away_from_legacy_lease_recovery():
 
             assert await db.recover_expired_lease_jobs(
                 completion_commands_enabled=True
-            ) == LeaseRecoveryBatch(recovered_job_ids=(str(legacy_job_id),))
+            ) == LeaseRecoveryBatch(
+                recovered_jobs=(RecoveredJob(job_id=str(legacy_job_id)),)
+            )
             routed = await conn.fetchrow(
                 "SELECT status, assigned_agent_id, lease_expires_at "
                 "FROM jobs WHERE id=$1",
@@ -100,7 +106,9 @@ async def test_expired_command_routes_away_from_legacy_lease_recovery():
             # recovered once command ownership is deliberately ignored.
             assert await db.recover_expired_lease_jobs(
                 completion_commands_enabled=False
-            ) == LeaseRecoveryBatch(recovered_job_ids=(str(command_job_id),))
+            ) == LeaseRecoveryBatch(
+                recovered_jobs=(RecoveredJob(job_id=str(command_job_id)),)
+            )
             legacy = await conn.fetchrow(
                 "SELECT status, assigned_agent_id, lease_expires_at "
                 "FROM jobs WHERE id=$1",
@@ -222,12 +230,20 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
             first = await db.recover_expired_lease_jobs(
                 audit_fingerprint_provider=audit_fingerprint
             )
-            assert first == LeaseRecoveryBatch(recovered_job_ids=(str(job_id),))
+            assert first == LeaseRecoveryBatch(
+                recovered_jobs=(
+                    RecoveredJob(job_id=str(job_id), project_id=str(project_id)),
+                )
+            )
             await rearm(agent_ids[1]["id"])
             second = await db.recover_expired_lease_jobs(
                 audit_fingerprint_provider=audit_fingerprint
             )
-            assert second == LeaseRecoveryBatch(recovered_job_ids=(str(job_id),))
+            assert second == LeaseRecoveryBatch(
+                recovered_jobs=(
+                    RecoveredJob(job_id=str(job_id), project_id=str(project_id)),
+                )
+            )
 
             # Both replicas discover the same expired row. Post/thread/job
             # locks plus the processing-state CAS permit one trip and no
@@ -510,8 +526,7 @@ async def test_legacy_orphan_and_registration_paths_leave_leased_rows_to_expiry(
                 # same offline agent.
                 assert (
                     await db.recover_orphaned_jobs(completion_commands_enabled=enabled)
-                    == 1
-                )
+                ).count == 1
                 rows = await conn.fetch(
                     "SELECT id, status, assigned_agent_id FROM jobs "
                     "WHERE id=ANY($1::uuid[]) ORDER BY id",
@@ -526,7 +541,9 @@ async def test_legacy_orphan_and_registration_paths_leave_leased_rows_to_expiry(
                     await db.recover_expired_lease_jobs(
                         completion_commands_enabled=enabled
                     )
-                ) == LeaseRecoveryBatch(recovered_job_ids=(str(leased_id),))
+                ) == LeaseRecoveryBatch(
+                    recovered_jobs=(RecoveredJob(job_id=str(leased_id)),)
+                )
 
                 same_host_agent = await conn.fetchval(
                     "INSERT INTO agents (config_name, hostname, status) "
@@ -583,8 +600,7 @@ async def test_legacy_orphan_and_registration_paths_leave_leased_rows_to_expiry(
                 )
                 assert (
                     await db.recover_orphaned_jobs(completion_commands_enabled=enabled)
-                    == 0
-                )
+                ).count == 0
                 registered_recovery = await db.recover_expired_lease_jobs(
                     completion_commands_enabled=enabled
                 )
@@ -651,9 +667,11 @@ async def test_real_detector_order_counts_offline_ready_and_deleted_cycles_once(
             await db.connect()
 
             # Offline cycle 1: legacy first, lease authority second.
-            assert await db.recover_orphaned_jobs() == 0
+            assert (await db.recover_orphaned_jobs()).count == 0
             assert await db.recover_expired_lease_jobs() == LeaseRecoveryBatch(
-                recovered_job_ids=(str(job_id),)
+                recovered_jobs=(
+                    RecoveredJob(job_id=str(job_id), project_id=str(project_id)),
+                )
             )
 
             # Ready cycle 2: use the real claim funnel, then expire its lease.
@@ -663,9 +681,11 @@ async def test_real_detector_order_counts_offline_ready_and_deleted_cycles_once(
                 "WHERE id=$1",
                 job_id,
             )
-            assert await db.recover_orphaned_jobs() == 0
+            assert (await db.recover_orphaned_jobs()).count == 0
             assert await db.recover_expired_lease_jobs() == LeaseRecoveryBatch(
-                recovered_job_ids=(str(job_id),)
+                recovered_jobs=(
+                    RecoveredJob(job_id=str(job_id), project_id=str(project_id)),
+                )
             )
 
             # Deleted-agent cycle 3: ON DELETE SET NULL must not make the
@@ -677,7 +697,7 @@ async def test_real_detector_order_counts_offline_ready_and_deleted_cycles_once(
                 job_id,
             )
             assert await db.delete_agent(str(agents[2]["id"]))
-            assert await db.recover_orphaned_jobs() == 0
+            assert (await db.recover_orphaned_jobs()).count == 0
             third = await db.recover_expired_lease_jobs()
             assert len(third.circuit_trips) == 1
             assert third.circuit_trips[0].job_id == str(job_id)

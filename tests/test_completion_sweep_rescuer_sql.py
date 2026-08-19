@@ -30,17 +30,29 @@ def _assert_view_mode(sql: str, *, enabled: bool, count: int = 1) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_orphan_recovery_all_four_arms_share_completion_exclusion(enabled):
+    project_id = uuid4()
     conn = AsyncMock()
-    conn.execute = AsyncMock(
-        side_effect=["UPDATE 1", "UPDATE 2", "UPDATE 3", "UPDATE 4"]
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [{"id": uuid4(), "project_id": project_id}],
+            [{"id": uuid4(), "project_id": None} for _ in range(2)],
+            [{"id": uuid4(), "project_id": project_id} for _ in range(3)],
+            [{"id": uuid4(), "project_id": None} for _ in range(4)],
+        ]
     )
     db = _db_with_connection(conn)
 
-    assert await db.recover_orphaned_jobs(completion_commands_enabled=enabled) == 10
-    statements = [call.args[0] for call in conn.execute.await_args_list]
+    batch = await db.recover_orphaned_jobs(completion_commands_enabled=enabled)
+    assert batch.count == 10
+    # Every arm's RETURNING rows surface once, with their owning project (for
+    # per-project officer scoping) or None when the job has no project.
+    assert len(batch.recovered_jobs) == 10
+    assert {job.project_id for job in batch.recovered_jobs} == {str(project_id), None}
+    statements = [call.args[0] for call in conn.fetch.await_args_list]
     sql = "\n".join(statements)
     _assert_view_mode(sql, enabled=enabled, count=4)
     assert "lease_expires_at IS NULL" in statements[0]
+    assert all("RETURNING id, project_id" in statement for statement in statements)
 
 
 @pytest.mark.asyncio

@@ -121,15 +121,49 @@ class LeaseRecoveryCircuitTrip:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveredJob:
+    """One job a recovery sweep returned to the dispatchable pool.
+
+    ``project_id`` is carried so fleet officer wakes can be scoped to the
+    owning project's officer instead of broadcast to every officer; ``None``
+    when the job belongs to no project.
+    """
+
+    job_id: str
+    project_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LeaseRecoveryBatch:
     """Structured lease sweep result: only recovered ids may be dispatched."""
 
-    recovered_job_ids: tuple[str, ...] = ()
+    recovered_jobs: tuple[RecoveredJob, ...] = ()
     circuit_trips: tuple[LeaseRecoveryCircuitTrip, ...] = ()
 
     @property
+    def recovered_job_ids(self) -> tuple[str, ...]:
+        return tuple(job.job_id for job in self.recovered_jobs)
+
+    @property
     def changed(self) -> bool:
-        return bool(self.recovered_job_ids or self.circuit_trips)
+        return bool(self.recovered_jobs or self.circuit_trips)
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanRecoveryBatch:
+    """Agents-table orphan sweep result.
+
+    ``count`` preserves the historical row-update total across all four
+    mutation arms (a job touched by two arms counts twice, as it always has);
+    ``recovered_jobs`` lists each distinct affected job once with its owning
+    project, so officer capacity wakes can be scoped per project.
+    """
+
+    count: int = 0
+    recovered_jobs: tuple[RecoveredJob, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.count)
 
 
 def _completion_sweep_exclusion_clause(
@@ -7835,36 +7869,64 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
-    async def mark_stale_agents_offline(self, timeout_minutes: int = 3) -> int:
+    async def mark_stale_agents_offline(
+        self, timeout_minutes: int = 3
+    ) -> List[Dict[str, Any]]:
         """Mark agents as offline if no heartbeat for timeout period.
 
         Args:
             timeout_minutes: Minutes without heartbeat before marking offline
 
         Returns:
-            Number of agents marked offline
+            One row per agent marked offline: ``agent_id`` plus the
+            ``project_id`` of the job it was serving — its current job when
+            that row still exists, else its most recently updated assigned
+            job — or ``None`` when no project is derivable. The caller uses
+            the project to scope officer capacity wakes to the owning
+            project's officer instead of the whole roster.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
         async with self.acquire() as conn:
-            result = await conn.execute(
+            rows = await conn.fetch(
                 """
-                UPDATE agents
-                SET status = 'offline'
-                WHERE last_heartbeat < $1
-                  AND status NOT IN ('offline', 'failed')
+                WITH marked AS (
+                    UPDATE agents
+                    SET status = 'offline'
+                    WHERE last_heartbeat < $1
+                      AND status NOT IN ('offline', 'failed')
+                    RETURNING id, current_job_id
+                )
+                SELECT marked.id AS agent_id,
+                       COALESCE(current_job.project_id, last_job.project_id)
+                           AS project_id
+                  FROM marked
+                  LEFT JOIN jobs AS current_job
+                         ON current_job.id = marked.current_job_id
+                  LEFT JOIN LATERAL (
+                      SELECT jobs.project_id
+                        FROM jobs
+                       WHERE jobs.assigned_agent_id = marked.id
+                       ORDER BY jobs.updated_at DESC
+                       LIMIT 1
+                  ) AS last_job ON TRUE
                 """,
                 cutoff,
             )
 
-        # Parse result like "UPDATE 3" to get count
-        if result.startswith("UPDATE "):
-            return int(result.split()[1])
-        return 0
+        return [
+            {
+                "agent_id": str(row["agent_id"]),
+                "project_id": (
+                    str(row["project_id"]) if row["project_id"] is not None else None
+                ),
+            }
+            for row in rows
+        ]
 
     async def recover_orphaned_jobs(
         self, *, completion_commands_enabled: bool = False
-    ) -> int:
+    ) -> OrphanRecoveryBatch:
         """Pause jobs still assigned to offline, deleted, or non-working agents.
 
         Finds jobs in 'processing' status that are orphaned because:
@@ -7880,7 +7942,9 @@ class PostgresDB:
         dispatcher ignores while an agent id is attached).
 
         Returns:
-            Number of jobs recovered
+            :class:`OrphanRecoveryBatch` — the historical row-update count
+            plus each distinct affected job with its owning project, so the
+            caller can scope officer capacity wakes per project.
         """
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
@@ -7891,7 +7955,7 @@ class PostgresDB:
             else ""
         )
         async with self.acquire() as conn:
-            result = await conn.execute(
+            result = await conn.fetch(
                 f"""
                 UPDATE jobs
                 SET status = 'paused',
@@ -7918,13 +7982,14 @@ class PostgresDB:
                   )
                   {completion_exclusion}
                   {control_guard}
+                RETURNING id, project_id
                 """
             )
 
             # Also clear stale agent assignments on waiting jobs.
             # Don't change status — the job must stay in 'waiting' until its
             # children complete and the unblock handler fires.
-            result2 = await conn.execute(
+            result2 = await conn.fetch(
                 f"""
                 UPDATE jobs
                 SET assigned_agent_id = NULL,
@@ -7937,6 +8002,7 @@ class PostgresDB:
                   )
                   {completion_exclusion}
                   {control_guard}
+                RETURNING id, project_id
                 """
             )
 
@@ -7945,7 +8011,7 @@ class PostgresDB:
             # offline agent (e.g. a freeze→paused path that didn't clear the
             # assignment) is un-dispatchable until the 24h agent GC's FK
             # cascade — sweep it free here instead.
-            result3 = await conn.execute(
+            result3 = await conn.fetch(
                 f"""
                 UPDATE jobs
                 SET assigned_agent_id = NULL,
@@ -7958,6 +8024,7 @@ class PostgresDB:
                   )
                   {completion_exclusion}
                   {control_guard}
+                RETURNING id, project_id
                 """
             )
 
@@ -7971,7 +8038,7 @@ class PostgresDB:
             # AUTO_REDISPATCH_FREEZE_TYPES). The shared registry is passed as a
             # query parameter so this recovery path cannot drift from status
             # determination when a new continuation freeze is introduced.
-            result4 = await conn.execute(
+            result4 = await conn.fetch(
                 f"""
                 UPDATE jobs
                 SET freeze_data = NULL,
@@ -7984,20 +8051,29 @@ class PostgresDB:
                   AND freeze_data->>'freeze_type' = ANY($1::text[])
                   {completion_exclusion}
                   {control_guard}
+                RETURNING id, project_id
                 """,
                 sorted(AUTO_REDISPATCH_FREEZE_TYPES),
             )
 
-        count = 0
-        if result.startswith("UPDATE "):
-            count += int(result.split()[1])
-        if result2.startswith("UPDATE "):
-            count += int(result2.split()[1])
-        if result3.startswith("UPDATE "):
-            count += int(result3.split()[1])
-        if result4.startswith("UPDATE "):
-            count += int(result4.split()[1])
-        return count
+        arms = (result, result2, result3, result4)
+        recovered_by_id: dict[str, RecoveredJob] = {}
+        for rows in arms:
+            for row in rows:
+                job_id = str(row["id"])
+                if job_id not in recovered_by_id:
+                    recovered_by_id[job_id] = RecoveredJob(
+                        job_id=job_id,
+                        project_id=(
+                            str(row["project_id"])
+                            if row["project_id"] is not None
+                            else None
+                        ),
+                    )
+        return OrphanRecoveryBatch(
+            count=sum(len(rows) for rows in arms),
+            recovered_jobs=tuple(recovered_by_id.values()),
+        )
 
     async def recover_expired_lease_jobs(
         self,
@@ -8096,7 +8172,7 @@ class PostgresDB:
                     "the last known audit component"
                 )
 
-        recovered: list[str] = []
+        recovered: list[RecoveredJob] = []
         trips: list[LeaseRecoveryCircuitTrip] = []
         for candidate in candidates:
             job_uuid = UUID(str(candidate["id"]))
@@ -8327,7 +8403,16 @@ class PostgresDB:
                         continue
 
                     if not tripped:
-                        recovered.append(str(job_uuid))
+                        recovered.append(
+                            RecoveredJob(
+                                job_id=str(job_uuid),
+                                project_id=(
+                                    str(project_uuid)
+                                    if project_uuid is not None
+                                    else None
+                                ),
+                            )
+                        )
                         continue
 
                     destination = "job_diagnostic"
@@ -8419,7 +8504,7 @@ class PostgresDB:
                     )
 
         return LeaseRecoveryBatch(
-            recovered_job_ids=tuple(recovered),
+            recovered_jobs=tuple(recovered),
             circuit_trips=tuple(trips),
         )
 
@@ -10872,8 +10957,11 @@ class PostgresDB:
         Deliberately a plain read. The per-project card runs
         ``get_or_create_project_officer``; fanning that across a user's
         projects would commission posts as a side effect of looking.
+
+        ``in_flight_jobs`` matches the capacity reading: paused jobs are not
+        in flight and hold no slot (officer_admission.SLOT_VACATING_STATUSES).
         """
-        from services.officer_admission import _TERMINAL_STATUSES_SQL
+        from services.officer_admission import _SLOT_RELEASED_STATUSES_SQL
 
         ids = [UUID(str(pid)) for pid in project_ids] if project_ids else None
         async with self.acquire() as conn:
@@ -10896,7 +10984,7 @@ class PostgresDB:
                        (SELECT COUNT(*)
                           FROM jobs j
                          WHERE j.project_id = po.project_id
-                           AND j.status NOT IN {_TERMINAL_STATUSES_SQL})
+                           AND j.status NOT IN {_SLOT_RELEASED_STATUSES_SQL})
                            AS in_flight_jobs,
                        (SELECT MAX(m.created_at)
                           FROM thread_messages m
@@ -13302,7 +13390,12 @@ class PostgresDB:
     # both §5.2 deadlines, and the CAS surface every resolver (officer reply,
     # user reply, reconciler) transitions exactly once.
 
-    _ROUTE_TERMINAL_STATES = ("resolved_by_officer", "resolved_by_user", "timed_out")
+    _ROUTE_TERMINAL_STATES = (
+        "resolved_by_officer",
+        "resolved_by_user",
+        "timed_out",
+        "closed",
+    )
     _ROUTE_OPEN_STATES = (
         "pending_officer",
         "pending_both",
@@ -13978,6 +14071,93 @@ class PostgresDB:
                 now,
                 limit,
             )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def close_message_routes_for_terminal_jobs(
+        self, job_id: Optional[str] = None, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Close every still-open route whose job already reached a terminal
+        status (completed/failed/cancelled).
+
+        The auto-close ruling: a dead job's question must not haunt the
+        officer sitrep/inbox as "open" forever, and no manual close verb
+        exists on purpose (officer ack refuses blocking routes; a human reply
+        risks resuming a dead job). One transaction: the FOR UPDATE SKIP
+        LOCKED claim CAS stamps ``closed`` + the resolved_* triple + the audit
+        transition (``closed automatically: job <status>``), then the routes'
+        still-undelivered officer wake intents (state='pending') are retired
+        so the dead question also stops counting in officer pending events.
+        In-flight ('sending') wakes settle on their own; the sitrep they
+        deliver simply no longer lists the route.
+
+        Idempotent — a second terminalization matches zero rows. Never
+        delivers to anyone and never resumes anything; the closed row (and
+        the message_log thread) stay visible in history. ``job_id=None`` is
+        the reconciler's backstop sweep over ALL terminal jobs, covering the
+        terminal paths that write status directly with no hook.
+        """
+        job_uuid: Optional[UUID] = None
+        if job_id is not None:
+            try:
+                job_uuid = UUID(str(job_id))
+            except (ValueError, TypeError):
+                return []
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    UPDATE job_message_routes r
+                       SET state = 'closed',
+                           resolved_by_kind = 'system',
+                           resolved_by_id = 'job_' || due.job_status,
+                           resolved_at = now(),
+                           transitions = r.transitions || jsonb_build_array(
+                               jsonb_build_object(
+                                   'at', now()::text,
+                                   'from', r.state,
+                                   'to', 'closed',
+                                   'actor_kind', 'system',
+                                   'actor_id', 'job_' || due.job_status,
+                                   'note', 'closed automatically: job '
+                                           || due.job_status)),
+                           updated_at = now()
+                      FROM (
+                            SELECT r2.route_id, j.status::text AS job_status
+                              FROM job_message_routes r2
+                              JOIN jobs j ON j.id = r2.job_id
+                             WHERE r2.state IN ('pending_officer',
+                                                'pending_both', 'user_direct',
+                                                'escalated_to_user',
+                                                'delivery_failed')
+                               AND j.status IN ('completed', 'failed',
+                                                'cancelled')
+                               AND ($1::uuid IS NULL OR r2.job_id = $1::uuid)
+                             ORDER BY r2.created_at
+                             LIMIT $2
+                               FOR UPDATE OF r2 SKIP LOCKED
+                           ) due
+                     WHERE r.route_id = due.route_id
+                    RETURNING r.*
+                    """,
+                    job_uuid,
+                    limit,
+                )
+                if rows:
+                    # The blocking send's durable officer wake intent keys on
+                    # 'route:<route_id>' (see create_routed_blocking_freeze /
+                    # list_stale_pending_officer_routes). A pending one for a
+                    # closed route would wake the officer about — and count
+                    # toward pending events for — a question nobody can act
+                    # on any more.
+                    await conn.execute(
+                        """
+                        DELETE FROM session_wake_events
+                         WHERE source = 'worker_message'
+                           AND state = 'pending'
+                           AND dedup_key = ANY($1::text[])
+                        """,
+                        [f"route:{row['route_id']}" for row in rows],
+                    )
         return [self._message_route_row_to_dict(row) for row in rows]
 
     async def list_timed_out_routes_still_frozen(

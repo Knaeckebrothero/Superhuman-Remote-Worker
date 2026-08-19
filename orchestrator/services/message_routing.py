@@ -58,7 +58,12 @@ ROUTE_OPEN_STATES = (
     "escalated_to_user",
     "delivery_failed",
 )
-ROUTE_TERMINAL_STATES = ("resolved_by_officer", "resolved_by_user", "timed_out")
+ROUTE_TERMINAL_STATES = (
+    "resolved_by_officer",
+    "resolved_by_user",
+    "timed_out",
+    "closed",
+)
 
 # Officer-addressed states an officer action may act on. ``escalated_to_user``
 # is deliberately included for replies: an officer answering seconds after his
@@ -709,3 +714,43 @@ async def record_reply_resolution(
 
 def job_is_terminal(job: Dict[str, Any]) -> bool:
     return str(job.get("status") or "") in _TERMINAL_JOB_STATUSES
+
+
+async def close_routes_for_terminal_job(
+    db: Any, job_id: str, terminal_status: str
+) -> int:
+    """Auto-close a just-terminalized job's still-open routes. Never raises.
+
+    The ruling behind it: an open route outlives its job as a permanently
+    "open" worker message in every sitrep and pending count, and no closure
+    verb is safe (officer ack refuses blocking routes; a human reply risks
+    resuming the dead job). So terminal transitions close the ledger
+    themselves — stamped ``closed automatically: job <status>`` on the
+    route's transitions audit, still visible in history. Nothing is
+    delivered and nothing resumes; a repeat call is a no-op (the CAS
+    matches zero rows). Direct-write terminal paths with no hook are swept
+    by the reconciler's backstop leg one tick later.
+
+    Returns the number of routes closed.
+    """
+    if terminal_status not in _TERMINAL_JOB_STATUSES:
+        return 0
+    try:
+        closed = await db.close_message_routes_for_terminal_jobs(str(job_id))
+    except Exception:
+        logger.exception(
+            "message routing: terminal auto-close failed for job %s (%s) — "
+            "the reconciler backstop will retry",
+            str(job_id)[:8],
+            terminal_status,
+        )
+        return 0
+    for route in closed:
+        logger.info(
+            "message routing: closed route %s (thread %s) — job %s reached %s",
+            str(route.get("route_id"))[:8],
+            route.get("thread_id"),
+            str(job_id)[:8],
+            terminal_status,
+        )
+    return len(closed)

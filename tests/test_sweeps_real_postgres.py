@@ -168,7 +168,11 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
     NULL-lease (pre-deploy) rows are left to the legacy sweep."""
     import asyncpg
 
-    from orchestrator.database.postgres import LeaseRecoveryBatch, PostgresDB
+    from orchestrator.database.postgres import (
+        LeaseRecoveryBatch,
+        PostgresDB,
+        RecoveredJob,
+    )
 
     test_db_name = f"srw_lease_{uuid4().hex[:12]}"
     admin = await asyncpg.connect(SWEEP_TEST_PG_DSN)
@@ -236,7 +240,9 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 job_id,
             )
         recovered = await db.recover_expired_lease_jobs()
-        assert recovered == LeaseRecoveryBatch(recovered_job_ids=(str(job_id),))
+        assert recovered == LeaseRecoveryBatch(
+            recovered_jobs=(RecoveredJob(job_id=str(job_id), project_id=None),)
+        )
         async with db.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT status, assigned_agent_id, lease_expires_at "
@@ -298,7 +304,12 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
         # The pinned legacy row is recovered and the pinned boundary freeze is
         # cleared through the shared SQL-array registry; none of the four
         # stateless rows may contribute to the count.
-        assert await db.recover_orphaned_jobs() == 2
+        orphan_batch = await db.recover_orphaned_jobs()
+        assert orphan_batch.count == 2
+        assert {job.job_id for job in orphan_batch.recovered_jobs} == {
+            str(legacy_job_id),
+            str(pinned_boundary_id),
+        }
         async with db.acquire() as conn:
             assert (
                 await conn.fetchval(

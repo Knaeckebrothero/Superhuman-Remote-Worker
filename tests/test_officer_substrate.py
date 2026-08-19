@@ -385,6 +385,76 @@ class TestSessionWakeOfficerHelpers:
         assert ok is False
         db.enqueue_session_wake_event.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_notify_owning_officers_scopes_to_each_projects_officer(self):
+        """Two projects with a job-derived fleet event: only the project with
+        a commissioned officer is woken, and only with its own payload."""
+        from services import session_wake
+
+        officers = {"proj-a": {"id": "thread-a"}}
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(
+            side_effect=lambda project_id: officers.get(project_id)
+        )
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+        enqueued = await session_wake.notify_owning_officers(
+            db,
+            {
+                "proj-a": {"summary": "1 job(s) recovered: aaaa1111"},
+                "proj-b": {"summary": "1 job(s) recovered: bbbb2222"},
+            },
+            source="fleet",
+            dedup_key="fleet:lease_recovered",
+        )
+
+        assert enqueued == 1
+        db.enqueue_session_wake_event.assert_awaited_once()
+        args = db.enqueue_session_wake_event.await_args
+        assert args.args[0] == "thread-a"
+        assert args.kwargs["source"] == "fleet"
+        assert args.kwargs["dedup_key"] == "fleet:lease_recovered"
+        assert args.kwargs["payload"] == {"summary": "1 job(s) recovered: aaaa1111"}
+        assert args.kwargs["project_id"] == "proj-a"
+
+    @pytest.mark.asyncio
+    async def test_notify_owning_officers_without_an_officer_notifies_nobody(self):
+        """No commissioned officer means no notification — the event is not
+        rerouted to other projects' officers."""
+        from services import session_wake
+
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.enqueue_session_wake_event = AsyncMock()
+
+        enqueued = await session_wake.notify_owning_officers(
+            db,
+            {"proj-a": {"summary": "x"}},
+            source="fleet",
+            dedup_key="fleet:orphans_recovered",
+        )
+
+        assert enqueued == 0
+        db.enqueue_session_wake_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_notify_owning_officers_never_raises_and_skips_blank_keys(self):
+        from services import session_wake
+
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(side_effect=RuntimeError("db"))
+        db.enqueue_session_wake_event = AsyncMock()
+
+        enqueued = await session_wake.notify_owning_officers(
+            db,
+            {"": {"summary": "skipped"}, "proj-a": {"summary": "swallowed"}},
+            source="fleet",
+            dedup_key="fleet:agents_offline",
+        )
+
+        assert enqueued == 0
+        db.enqueue_session_wake_event.assert_not_awaited()
+
     def test_format_officer_wake_renders_sitrep_bracket(self):
         from services import session_wake
 
