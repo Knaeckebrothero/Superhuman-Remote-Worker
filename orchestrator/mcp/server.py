@@ -221,10 +221,19 @@ _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
 async def canonical_tool_schema() -> tuple[list[dict[str, Any]], str]:
-    """Return canonical raw ``tools/list`` material and its SHA-256 digest."""
+    """Return canonical raw ``tools/list`` material and its SHA-256 digest.
+
+    The middleware chain runs because it is part of what a client receives:
+    FastMCP enables ``DereferenceRefsMiddleware`` by default, which inlines
+    ``$defs``/``$ref`` on the way out for clients that cannot follow them.
+    Bypassing it was invisible while every tool returned a plain ``str`` and
+    no schema carried a ``$ref``; the first descriptor with a model in its
+    return type (``read_job_evidence`` -> ``JobToolResult``) made this artifact
+    disagree with two fresh clients and failed the image smoke at build time.
+    """
     global _tool_schema_cache
     if _tool_schema_cache is None:
-        registered = await mcp.list_tools(run_middleware=False)
+        registered = await mcp.list_tools()
         tools = [
             tool.to_mcp_tool(name=tool.name).model_dump(
                 mode="json", by_alias=True, exclude_none=True
