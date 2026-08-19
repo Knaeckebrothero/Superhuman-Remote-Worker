@@ -273,3 +273,81 @@ class TestVmHeadscaleWaitDecision:
             self._decide(ctx, now=1000.1, headscale_timeout_s=900.0)
             == VM_PARK_HEADSCALE
         )
+
+
+class TestVmTeardownAndSuspendDecision:
+    """Teardown must be bounded, and a suspended VM must never be recycled.
+
+    Three defects from the VM reliability audit, all in this one pure function
+    (knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-4/P1-5/P1-6):
+
+    * ``deleting`` returned WAIT unconditionally, *before* the timeout branch.
+      Both the delete request and the controller's answer are fire-and-forget
+      core NATS, so one lost message wedged the job forever with no signal.
+    * ``delete_failed``/``query_failed`` matched no branch and fell through to
+      the generic not-ready arm, which RECYCLEs forever: PARK_EXHAUSTED only
+      triggers on absent-or-``deleted``, so the job could never reach a
+      terminal state.
+    * ``suspended``/``suspending``/``restoring`` also matched no branch, so a
+      deliberately-suspended VM read as "stuck short of ready" and was torn
+      down — the disk was kept on purpose and the recycle purges it.
+    """
+
+    def _decide(self, vm_ctx, *, attempts=0, cap=3, now=1000.0, timeout_s=600.0):
+        return vm_provisioning_decision(
+            vm_ctx,
+            provision_attempts=attempts,
+            max_provision_attempts=cap,
+            now=now,
+            timeout_s=timeout_s,
+        )
+
+    # --- P1-4: a teardown in flight must not wait forever -------------------
+
+    def test_deleting_in_flight_waits(self):
+        ctx = {"status": "deleting", "deleting_started_at": 990.0}
+        assert self._decide(ctx, now=1000.0) == VM_WAIT
+
+    def test_deleting_stuck_past_budget_recycles(self):
+        # The delete request or its answer was lost — re-issue the teardown.
+        ctx = {"status": "deleting", "deleting_started_at": 100.0}
+        assert self._decide(ctx, now=1000.0) == VM_RECYCLE
+
+    def test_deleting_stuck_parks_once_attempts_are_exhausted(self):
+        ctx = {"status": "deleting", "deleting_started_at": 100.0}
+        assert self._decide(ctx, now=1000.0, attempts=3, cap=3) == VM_PARK_EXHAUSTED
+
+    def test_deleting_without_a_stamp_waits(self):
+        # Rows written before the stamp existed carry no start time; staleness
+        # is unknowable, so stay with the old non-destructive behaviour.
+        assert self._decide({"status": "deleting"}) == VM_WAIT
+
+    # --- P1-5: a failed teardown must reach a terminal state ----------------
+
+    def test_delete_failed_retries_within_budget(self):
+        assert self._decide({"status": "delete_failed"}) == VM_RECYCLE
+
+    def test_delete_failed_parks_once_attempts_are_exhausted(self):
+        assert self._decide({"status": "delete_failed"}, attempts=3, cap=3) == (
+            VM_PARK_EXHAUSTED
+        )
+
+    def test_query_failed_is_bounded_the_same_way(self):
+        assert self._decide({"status": "query_failed"}, attempts=3, cap=3) == (
+            VM_PARK_EXHAUSTED
+        )
+
+    # --- P1-6: never tear down a deliberately-suspended VM ------------------
+
+    def test_suspended_long_past_budget_is_not_recycled(self):
+        # A suspended VM keeps its rootdisk on purpose; recycling purges it.
+        ctx = {"status": "suspended", "provisioned_at": 100.0}
+        assert self._decide(ctx, now=1000.0) == VM_WAIT
+
+    def test_suspending_is_not_recycled(self):
+        ctx = {"status": "suspending", "provisioned_at": 100.0}
+        assert self._decide(ctx, now=1000.0) == VM_WAIT
+
+    def test_restoring_is_not_recycled(self):
+        ctx = {"status": "restoring", "provisioned_at": 100.0}
+        assert self._decide(ctx, now=1000.0) == VM_WAIT

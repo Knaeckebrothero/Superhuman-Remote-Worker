@@ -2198,6 +2198,10 @@ class VMProvisioner:
             # Headscale-wait anchor.
             "golden_wait_started_at": None,
             "headscale_wait_started_at": None,
+            # Same for the teardown anchor: a stale one would make this
+            # incarnation read as instantly-stuck the moment it enters
+            # 'deleting', and the dispatcher would recycle it on sight.
+            "deleting_started_at": None,
             "headscale_error": None,
             "provisioned_at": time.time(),
         }

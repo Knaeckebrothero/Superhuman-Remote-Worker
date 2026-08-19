@@ -70,6 +70,17 @@ VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
 VM_HEADSCALE_POLL = "headscale_poll"  # mesh VPN down → re-poll create, free
 VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
 
+# Teardown states the controller reports when a delete does not complete. Both
+# used to match no branch and fall through to the generic not-ready arm, which
+# RECYCLEs forever — PARK_EXHAUSTED only triggers on absent-or-'deleted', so the
+# job could never reach a terminal state.
+TEARDOWN_FAILED_STATUSES = ("delete_failed", "query_failed")
+
+# Suspend/restore states. The suspension subsystem owns these transitions and
+# keeps the rootdisk on purpose; the dispatcher must wait rather than treat them
+# as "stuck short of ready" and tear the VM down (which purges that disk).
+SUSPEND_STATUSES = ("suspending", "suspended", "restoring")
+
 # Bounded patience for a cold golden-image import (an agent-vm-base bump).
 # Observed cold import on the shared VM cluster: ~30 min — deliberately above
 # both VM_PROVISION_TIMEOUT_S (600) and the controller's VM_GOLDEN_POLL_TIMEOUT
@@ -83,6 +94,19 @@ DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
 # where Headscale trailed the VM controller by ~8 min. 15 min leaves margin
 # without stalling a loop iteration on a genuinely dead mesh.
 DEFAULT_HEADSCALE_WAIT_TIMEOUT_S = 900.0
+
+
+def _bounded_teardown_retry(
+    provision_attempts: int, max_provision_attempts: int
+) -> str:
+    """Retry a failed/stuck teardown, but let the attempt budget end it.
+
+    RECYCLE re-issues the delete; without this bound the controller's
+    delete_failed → RECYCLE → delete_failed cycle never terminates.
+    """
+    if provision_attempts >= max_provision_attempts:
+        return VM_PARK_EXHAUSTED
+    return VM_RECYCLE
 
 
 def vm_provisioning_decision(
@@ -110,7 +134,15 @@ def vm_provisioning_decision(
     States:
       absent / 'deleted' → PROVISION, or PARK_EXHAUSTED once retries are used up
       'failed'           → PARKED (don't hot-retry the shared VM cluster)
-      'deleting'         → WAIT (teardown in flight)
+      'suspending'/'suspended'/'restoring'
+                         → WAIT (the suspension subsystem owns these and keeps
+                           the rootdisk deliberately; recycling would purge it)
+      'deleting'         → WAIT while in flight; once stuck past ``timeout_s``
+                           from ``deleting_started_at``, RECYCLE to re-issue the
+                           teardown, or PARK_EXHAUSTED once retries are gone
+      'delete_failed'/'query_failed'
+                         → RECYCLE (re-issue), PARK_EXHAUSTED once retries are
+                           gone — previously these reached no terminal state
       'waiting_golden'   → GOLDEN_POLL within ``golden_timeout_s`` of
                            ``golden_wait_started_at``, else PARK_GOLDEN. The
                            controller has NOT created a VM yet — it is waiting
@@ -142,8 +174,20 @@ def vm_provisioning_decision(
         return VM_PROVISION
     if status == "failed":
         return VM_PARKED
-    if status == "deleting":
+    if status in SUSPEND_STATUSES:
         return VM_WAIT
+    if status == "deleting":
+        # Both the delete request and the controller's answer are fire-and-forget
+        # core NATS (at-most-once, no JetStream), so a dropped message strands the
+        # job here. Re-issue the teardown once it is provably stuck. Rows written
+        # before this stamp existed carry no start time — staleness is unknowable,
+        # so they keep the old non-destructive behaviour.
+        started = vm_ctx.get("deleting_started_at")
+        if started and (now - float(started)) > timeout_s:
+            return _bounded_teardown_retry(provision_attempts, max_provision_attempts)
+        return VM_WAIT
+    if status in TEARDOWN_FAILED_STATUSES:
+        return _bounded_teardown_retry(provision_attempts, max_provision_attempts)
     if status == "waiting_golden":
         started = vm_ctx.get("golden_wait_started_at")
         if started and (now - float(started)) > golden_timeout_s:
