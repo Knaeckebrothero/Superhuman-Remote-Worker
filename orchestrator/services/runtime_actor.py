@@ -9,9 +9,11 @@ and revalidated against current durable state on every authorization.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -49,6 +51,24 @@ LIVENESS_SLIDE_BELOW_SECONDS = int(
         "RUNTIME_ACTOR_LIVENESS_SLIDE_BELOW_SECONDS", str(REFRESH_TTL_SECONDS // 2)
     )
 )
+OFFICER_RENEW_BEFORE_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_OFFICER_RENEW_BEFORE_SECONDS", "21600")
+)
+OFFICER_AGENT_LIVE_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_OFFICER_AGENT_LIVE_SECONDS", "180")
+)
+REFRESH_ROTATION_OVERLAP_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_REFRESH_ROTATION_OVERLAP_SECONDS", "120")
+)
+INCIDENT_RETRY_BASE_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_INCIDENT_RETRY_BASE_SECONDS", "60")
+)
+INCIDENT_RETRY_MAX_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_INCIDENT_RETRY_MAX_SECONDS", "900")
+)
+INCIDENT_NOTIFICATION_CLAIM_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_INCIDENT_NOTIFICATION_CLAIM_SECONDS", "300")
+)
 
 _TOKEN_RE = re.compile(r"^sr(?:a|r|b)_[A-Za-z0-9_-]{32,128}$")
 _SENSITIVE_ACTIONS = frozenset({"machine_tags", "charter"})
@@ -70,12 +90,64 @@ class RuntimeActorCredentialError(Exception):
         super().__init__(message)
 
 
+@dataclass(frozen=True, slots=True)
+class OfficerRuntimeMaintenance:
+    """Credential-independent watchdog result with no secret-bearing fields."""
+
+    authorized: bool
+    state: str
+    project_id: str | None = None
+    thread_id: str | None = None
+    officer_incarnation: int | None = None
+    failure_code: str | None = None
+    retry_at: datetime | None = None
+    notification_due: bool = False
+    notification_claim_id: str | None = None
+    incident_changed: bool = False
+
+
 def _token(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
 
 
 def _digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def _encrypt_refresh_handoff(token: str) -> str:
+    """Encrypt one rotation bearer with the existing orchestrator key."""
+
+    try:
+        from orchestrator.security.crypto import encrypt
+    except ImportError:  # pragma: no cover - top-level orchestrator imports
+        from security.crypto import encrypt
+
+    return encrypt(token)
+
+
+def _decrypt_refresh_handoff(ciphertext: Any) -> str:
+    """Recover a pending bearer without ever persisting or logging plaintext."""
+
+    if not isinstance(ciphertext, str) or not ciphertext:
+        raise RuntimeActorCredentialError(
+            "invalid_credential", "Runtime actor refresh handoff is unavailable."
+        )
+    try:
+        from orchestrator.security.crypto import DecryptionError, decrypt
+    except ImportError:  # pragma: no cover - top-level orchestrator imports
+        from security.crypto import DecryptionError, decrypt
+
+    try:
+        token = decrypt(ciphertext)
+    except (DecryptionError, RuntimeError, ValueError, TypeError) as exc:
+        raise RuntimeActorCredentialError(
+            "invalid_credential", "Runtime actor refresh handoff is unavailable."
+        ) from exc
+    if not _valid_token(token, "srr"):
+        raise RuntimeActorCredentialError(
+            "invalid_credential", "Runtime actor refresh handoff is unavailable."
+        )
+    return token
 
 
 def _as_utc(value: Any) -> datetime | None:
@@ -222,24 +294,134 @@ async def _insert_access_token(
     return access_token, access_expires_at
 
 
+async def _lock_officer_mint_authority(
+    conn: Any,
+    actor: RuntimeActorContext,
+    *,
+    agent_id: str,
+    now: datetime,
+) -> Any:
+    """Revalidate Post -> thread -> agent before minting Officer authority."""
+
+    post = await conn.fetchrow(
+        "SELECT project_id, thread_id, incarnations, state FROM project_officers "
+        "WHERE project_id = $1::uuid FOR UPDATE",
+        actor.project_id,
+    )
+    if post is None or str(post.get("thread_id") or "") != str(actor.thread_id):
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The Officer post incarnation changed.", actor=actor
+        )
+    thread = await conn.fetchrow(
+        "SELECT id, project_id, user_id, status, metadata, agent_id FROM threads "
+        "WHERE id = $1::uuid FOR UPDATE",
+        actor.thread_id,
+    )
+    bound = await conn.fetchrow(
+        "SELECT id, thread_id, status, last_heartbeat FROM agents "
+        "WHERE id = $1::uuid FOR UPDATE",
+        agent_id,
+    )
+    incarnations = post.get("incarnations") or []
+    if isinstance(incarnations, str):
+        try:
+            incarnations = json.loads(incarnations)
+        except (TypeError, ValueError):
+            incarnations = []
+    incarnation = len(incarnations) if isinstance(incarnations, list) else 0
+    metadata = _json_object(thread.get("metadata")) if thread else {}
+    officer = _json_object(_json_object(metadata.get("config_override")).get("officer"))
+    heartbeat = _as_utc(bound.get("last_heartbeat")) if bound else None
+    if (
+        thread is None
+        or str(thread.get("project_id") or "") != str(post["project_id"])
+        or str(thread.get("user_id") or "") != str(actor.user_id)
+        or str(thread.get("agent_id") or "") != str(agent_id)
+        or str(thread.get("status") or "") == "ended"
+        or officer.get("enabled") not in {True, "true", "True", 1}
+        or bound is None
+        or str(bound.get("thread_id") or "") != str(thread["id"])
+        or str(bound.get("status") or "") in {"offline", "failed", "draining"}
+        or heartbeat is None
+        or heartbeat <= now - timedelta(seconds=max(1, OFFICER_AGENT_LIVE_SECONDS))
+        or int(actor.officer_incarnation or 0) != incarnation
+    ):
+        raise RuntimeActorCredentialError(
+            "runtime_not_current",
+            "The Officer grant does not match the current live runtime.",
+            actor=actor,
+        )
+    role_row = await conn.fetchrow(
+        "SELECT u.is_admin, pm.role FROM users u LEFT JOIN project_members pm "
+        "ON pm.user_id = u.id AND pm.project_id = $2::uuid "
+        "WHERE u.id = $1::uuid",
+        actor.user_id,
+        actor.project_id,
+    )
+    role = (
+        "admin"
+        if role_row and bool(role_row.get("is_admin"))
+        else str(role_row.get("role"))
+        if role_row and role_row.get("role")
+        else ""
+    )
+    if role != str(actor.project_role or ""):
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The Officer project authority changed.", actor=actor
+        )
+    return post
+
+
 async def mint_runtime_actor(
-    db: Any, actor: RuntimeActorContext
+    db: Any,
+    actor: RuntimeActorContext,
+    *,
+    agent_id: str | None = None,
 ) -> RuntimeActorContext:
     """Mint opaque access/refresh credentials for a derived actor."""
 
     refresh_token = _token("srr")
     now = datetime.now(timezone.utc)
     refresh_expires_at = now + timedelta(seconds=REFRESH_TTL_SECONDS)
+    if actor.caller_kind == "officer" and not agent_id:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current",
+            "Officer runtime grants require the authoritative agent binding.",
+            actor=actor,
+        )
     async with db.acquire() as conn:
         async with conn.transaction():
+            officer_post = None
+            if actor.caller_kind == "officer" and agent_id:
+                officer_post = await _lock_officer_mint_authority(
+                    conn, actor, agent_id=agent_id, now=now
+                )
+                # One durable authority per Officer incarnation, including
+                # across pod replacement. Revoking every predecessor here is
+                # also the rolling-upgrade fence: an older replica still sees
+                # revoked_at and cannot refresh the losing pod's grant.
+                await conn.execute(
+                    """
+                    UPDATE runtime_actor_grants
+                       SET revoked_at = COALESCE(revoked_at, $3)
+                     WHERE caller_kind = 'officer'
+                       AND thread_id = $1::uuid
+                       AND officer_incarnation = $2
+                       AND revoked_at IS NULL
+                    """,
+                    actor.thread_id,
+                    actor.officer_incarnation,
+                    now,
+                )
             row = await conn.fetchrow(
                 """
                 INSERT INTO runtime_actor_grants (
                     refresh_token_hash, caller_kind, user_id, project_id,
-                    project_role, thread_id, officer_incarnation,
+                    project_role, thread_id, officer_incarnation, agent_id,
                     refresh_expires_at
                 )
-                VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6::uuid, $7, $8)
+                VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6::uuid, $7,
+                        $8::uuid, $9)
                 RETURNING id
                 """,
                 _digest(refresh_token),
@@ -249,11 +431,20 @@ async def mint_runtime_actor(
                 actor.project_role,
                 actor.thread_id,
                 actor.officer_incarnation,
+                agent_id,
                 refresh_expires_at,
             )
             access_token, access_expires_at = await _insert_access_token(
                 conn, row["id"], now=now
             )
+            if officer_post is not None:
+                await _resolve_runtime_incident_on_conn(
+                    conn,
+                    officer_post,
+                    thread_id=str(actor.thread_id),
+                    incarnation=int(actor.officer_incarnation or 0),
+                    now=now,
+                )
     actor.access_credential = access_token
     actor.refresh_credential = refresh_token
     actor.access_expires_at = access_expires_at
@@ -266,9 +457,10 @@ async def mint_thread_runtime_actor(
     *,
     thread_id: str,
     project_ids: list[str] | tuple[str, ...] | None = None,
+    agent_id: str | None = None,
 ) -> RuntimeActorContext:
     actor = await derive_runtime_actor(db, thread_id=thread_id, project_ids=project_ids)
-    return await mint_runtime_actor(db, actor)
+    return await mint_runtime_actor(db, actor, agent_id=agent_id)
 
 
 async def mint_worker_runtime_actor(
@@ -374,13 +566,34 @@ async def exchange_runtime_actor_pod_bootstrap(
             "runtime_not_current",
             "This agent is not the bound agent for the requested session.",
         )
-    return await mint_thread_runtime_actor(db, thread_id=str(thread_id))
+    return await mint_thread_runtime_actor(
+        db, thread_id=str(thread_id), agent_id=str(agent_id)
+    )
 
 
 async def exchange_runtime_actor_bootstrap(
-    db: Any, *, thread_id: str, bootstrap_token: str
+    db: Any,
+    *,
+    thread_id: str,
+    bootstrap_token: str,
+    agent_id: str | None = None,
 ) -> RuntimeActorContext:
     """Exchange a pod-unique bootstrap after the registration bind succeeds."""
+
+    await validate_thread_runtime_actor_bootstrap(
+        db, thread_id=thread_id, bootstrap_token=bootstrap_token
+    )
+    return await mint_thread_runtime_actor(
+        db,
+        thread_id=str(thread_id),
+        agent_id=str(agent_id) if agent_id else None,
+    )
+
+
+async def validate_thread_runtime_actor_bootstrap(
+    db: Any, *, thread_id: str, bootstrap_token: str
+) -> None:
+    """Validate a dedicated pod secret before mutating its agent binding."""
 
     if not _valid_token(bootstrap_token, "srb"):
         raise RuntimeActorCredentialError(
@@ -403,7 +616,6 @@ async def exchange_runtime_actor_bootstrap(
         raise RuntimeActorCredentialError(
             "invalid_bootstrap", "Runtime actor bootstrap is invalid or expired."
         )
-    return await mint_thread_runtime_actor(db, thread_id=str(thread_id))
 
 
 def _valid_token(token: Any, prefix: str) -> bool:
@@ -486,9 +698,16 @@ async def _actor_for_access(db: Any, token: str) -> RuntimeActorContext:
             """
             SELECT g.caller_kind, g.user_id, g.project_id, g.project_role,
                    g.thread_id, g.officer_incarnation, g.refresh_expires_at,
-                   g.revoked_at, a.expires_at AS access_expires_at
+                   g.revoked_at, g.agent_id,
+                   a.expires_at AS access_expires_at,
+                   t.agent_id AS current_thread_agent_id,
+                   bound.thread_id AS current_agent_thread_id,
+                   bound.status AS current_agent_status,
+                   bound.last_heartbeat AS current_agent_heartbeat
               FROM runtime_actor_access_tokens a
               JOIN runtime_actor_grants g ON g.id = a.grant_id
+              LEFT JOIN threads t ON t.id = g.thread_id
+              LEFT JOIN agents bound ON bound.id = g.agent_id
              WHERE a.token_hash = $1
             """,
             _digest(token),
@@ -517,6 +736,23 @@ async def _actor_for_access(db: Any, token: str) -> RuntimeActorContext:
         raise RuntimeActorCredentialError(
             "expired_credential", "Runtime actor grant has expired.", actor=actor
         )
+    if actor.caller_kind == "officer":
+        heartbeat = _as_utc(row.get("current_agent_heartbeat"))
+        binding_current = (
+            row.get("agent_id") is not None
+            and row.get("current_thread_agent_id") == row.get("agent_id")
+            and row.get("current_agent_thread_id") == row.get("thread_id")
+            and str(row.get("current_agent_status") or "")
+            not in {"offline", "failed", "draining"}
+            and heartbeat is not None
+            and heartbeat > now - timedelta(seconds=max(1, OFFICER_AGENT_LIVE_SECONDS))
+        )
+        if not binding_current:
+            raise RuntimeActorCredentialError(
+                "runtime_not_current",
+                "The Officer credential is not bound to the current live runtime.",
+                actor=actor,
+            )
     return actor
 
 
@@ -646,22 +882,403 @@ async def authorize_runtime_actor_request(
         raise _http_denial(error, action=action) from error
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _officer_incident_key(thread_id: Any, incarnation: Any) -> str:
+    return f"runtime_actor:{thread_id}:{int(incarnation)}"
+
+
+def _incident_retry_at(now: datetime, attempt: int) -> datetime:
+    delay = min(
+        max(1, INCIDENT_RETRY_MAX_SECONDS),
+        max(1, INCIDENT_RETRY_BASE_SECONDS) * (2 ** max(0, min(attempt - 1, 8))),
+    )
+    return now + timedelta(seconds=delay)
+
+
+def _incident_notification_due(incident: dict[str, Any], now: datetime) -> bool:
+    notification = _json_object(incident.get("notification"))
+    state = str(notification.get("state") or "pending")
+    retry_at = _parse_incident_time(notification.get("next_retry_at"))
+    claim_expires = _parse_incident_time(notification.get("claim_expires_at"))
+    return (
+        state == "pending"
+        or (state == "failed" and (retry_at is None or retry_at <= now))
+        or (state == "sending" and (claim_expires is None or claim_expires <= now))
+    )
+
+
+async def _claim_runtime_incident_notification_on_conn(
+    conn: Any,
+    post: Any,
+    incident: dict[str, Any],
+    *,
+    now: datetime,
+) -> str | None:
+    """Lease one project-scoped page attempt under the locked Post row."""
+
+    if not _incident_notification_due(incident, now):
+        return None
+    claim_id = secrets.token_urlsafe(24)
+    notification = _json_object(incident.get("notification"))
+    notification.update(
+        {
+            "state": "sending",
+            "claim_id": claim_id,
+            "claimed_at": now.isoformat(),
+            "claim_expires_at": (
+                now + timedelta(seconds=max(1, INCIDENT_NOTIFICATION_CLAIM_SECONDS))
+            ).isoformat(),
+        }
+    )
+    incident["notification"] = notification
+    await conn.execute(
+        """
+        UPDATE project_officers
+           SET state = jsonb_set(COALESCE(state, '{}'::jsonb),
+                                 '{runtime_actor_incident}', $2::jsonb, true),
+               updated_at = now()
+         WHERE project_id = $1
+        """,
+        post["project_id"],
+        json.dumps(incident),
+    )
+    return claim_id
+
+
+async def _write_runtime_incident_on_conn(
+    conn: Any,
+    post: Any,
+    *,
+    thread_id: str,
+    incarnation: int,
+    failure_code: str,
+    now: datetime,
+) -> tuple[dict[str, Any], bool, bool]:
+    """Open/update one deduplicated Post incident while its row is locked."""
+
+    state = _json_object(post.get("state"))
+    existing = _json_object(state.get("runtime_actor_incident"))
+    key = _officer_incident_key(thread_id, incarnation)
+    same_open = existing.get("key") == key and existing.get("status") == "open"
+    attempt = int(existing.get("attempt_count") or 0) + 1 if same_open else 1
+    notification = _json_object(existing.get("notification")) if same_open else {}
+    notification_state = str(notification.get("state") or "pending")
+    incident = {
+        "key": key,
+        "status": "open",
+        "failure_class": str(failure_code)[:128],
+        "summary": (
+            "The commissioned Officer runtime authorization could not be "
+            "maintained. Autonomous planning is suppressed until the exact "
+            "current runtime recovers."
+        ),
+        "thread_id": str(thread_id),
+        "officer_incarnation": int(incarnation),
+        "first_failed_at": (
+            existing.get("first_failed_at") if same_open else now.isoformat()
+        ),
+        "last_failed_at": now.isoformat(),
+        "attempt_count": attempt,
+        "next_retry_at": _incident_retry_at(now, attempt).isoformat(),
+        "recovery_probe_at": existing.get("recovery_probe_at") if same_open else None,
+        "notification": {
+            "state": notification_state,
+            "attempt_count": int(notification.get("attempt_count") or 0),
+            "last_attempted_at": notification.get("last_attempted_at"),
+            "delivered_at": notification.get("delivered_at"),
+            "failure_class": notification.get("failure_class"),
+            "next_retry_at": notification.get("next_retry_at"),
+            "claim_id": notification.get("claim_id"),
+            "claimed_at": notification.get("claimed_at"),
+            "claim_expires_at": notification.get("claim_expires_at"),
+        },
+    }
+    await conn.execute(
+        """
+        UPDATE project_officers
+           SET state = jsonb_set(COALESCE(state, '{}'::jsonb),
+                                 '{runtime_actor_incident}', $2::jsonb, true),
+               updated_at = now()
+         WHERE project_id = $1
+        """,
+        post["project_id"],
+        json.dumps(incident),
+    )
+    return incident, not same_open, False
+
+
+async def _resolve_runtime_incident_on_conn(
+    conn: Any,
+    post: Any,
+    *,
+    thread_id: str,
+    incarnation: int,
+    now: datetime,
+) -> bool:
+    state = _json_object(post.get("state"))
+    existing = _json_object(state.get("runtime_actor_incident"))
+    if existing.get("status") != "open":
+        return False
+    current_key = _officer_incident_key(thread_id, incarnation)
+    same_incarnation = existing.get("key") == current_key
+    resolved = {
+        **existing,
+        "status": "resolved" if same_incarnation else "superseded",
+        "resolved_at": now.isoformat(),
+        "next_retry_at": None,
+        "resolution": "recovered" if same_incarnation else "incarnation_changed",
+    }
+    await conn.execute(
+        """
+        UPDATE project_officers
+           SET state = jsonb_set(COALESCE(state, '{}'::jsonb),
+                                 '{runtime_actor_incident}', $2::jsonb, true),
+               updated_at = now()
+         WHERE project_id = $1
+        """,
+        post["project_id"],
+        json.dumps(resolved),
+    )
+    # An authorization incident may have deferred already-durable wake rows.
+    # Re-arm them without creating a duplicate intent.
+    await conn.execute(
+        """
+        UPDATE session_wake_events
+           SET fire_at = LEAST(COALESCE(fire_at, $2), $2)
+         WHERE thread_id = $1
+           AND state = 'pending'
+        """,
+        str(thread_id),
+        now,
+    )
+    return True
+
+
+async def _lock_officer_authority_for_grant(
+    conn: Any,
+    grant_hint: Any,
+    *,
+    now: datetime,
+) -> tuple[Any, Any, Any, Any, str]:
+    """Lock Post -> thread -> agent -> grant and rederive exact authority."""
+
+    project_id = grant_hint.get("project_id")
+    thread_id = grant_hint.get("thread_id")
+    if not project_id or not thread_id:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The Officer grant has no durable binding."
+        )
+    post = await conn.fetchrow(
+        "SELECT project_id, thread_id, incarnations, state "
+        "FROM project_officers WHERE project_id = $1 FOR UPDATE",
+        project_id,
+    )
+    if post is None or post.get("thread_id") != thread_id:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The Officer post incarnation changed."
+        )
+    thread = await conn.fetchrow(
+        """
+        SELECT id, project_id, user_id, status, metadata, agent_id
+          FROM threads
+         WHERE id = $1
+         FOR UPDATE
+        """,
+        thread_id,
+    )
+    if thread is None:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The Officer thread is no longer current."
+        )
+    agent_id = thread.get("agent_id")
+    agent = (
+        await conn.fetchrow(
+            """
+            SELECT id, thread_id, status, last_heartbeat
+              FROM agents
+             WHERE id = $1
+             FOR UPDATE
+            """,
+            agent_id,
+        )
+        if agent_id
+        else None
+    )
+    grant = await conn.fetchrow(
+        """
+        SELECT id, refresh_token_hash, previous_refresh_token_hash,
+               previous_refresh_valid_until, refresh_handoff_ciphertext,
+               refresh_handoff_acknowledged_at,
+               caller_kind, user_id, project_id,
+               project_role, thread_id, officer_incarnation, agent_id,
+               credential_generation, refresh_rotation_required,
+               refresh_expires_at, revoked_at, created_at
+          FROM runtime_actor_grants
+         WHERE id = $1
+         FOR UPDATE
+        """,
+        grant_hint["id"],
+    )
+    if grant is None or grant.get("revoked_at") is not None:
+        raise RuntimeActorCredentialError(
+            "revoked_credential", "The Officer grant is no longer current."
+        )
+
+    metadata = _json_object(thread.get("metadata"))
+    officer = _json_object(_json_object(metadata.get("config_override")).get("officer"))
+    incarnations = post.get("incarnations") or []
+    if isinstance(incarnations, str):
+        try:
+            incarnations = json.loads(incarnations)
+        except (TypeError, ValueError):
+            incarnations = []
+    current_incarnation = len(incarnations) if isinstance(incarnations, list) else 0
+    heartbeat = _as_utc(agent.get("last_heartbeat")) if agent else None
+    live_agent = (
+        agent is not None
+        and agent.get("thread_id") == thread.get("id")
+        and str(agent.get("status") or "") not in {"offline", "failed", "draining"}
+        and heartbeat is not None
+        and heartbeat > now - timedelta(seconds=max(1, OFFICER_AGENT_LIVE_SECONDS))
+    )
+    shape_current = (
+        grant.get("caller_kind") == "officer"
+        and grant.get("project_id") == post.get("project_id")
+        and grant.get("thread_id") == thread.get("id")
+        and grant.get("user_id") == thread.get("user_id")
+        and int(grant.get("officer_incarnation") or 0) == current_incarnation
+        and thread.get("project_id") == post.get("project_id")
+        and str(thread.get("status") or "") != "ended"
+        and officer.get("enabled") in {True, "true", "True", 1}
+        and live_agent
+        and (grant.get("agent_id") is None or grant.get("agent_id") == agent.get("id"))
+    )
+    if not shape_current:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current",
+            "The Officer grant does not match the current live incarnation.",
+            actor=_actor_from_row(grant),
+        )
+
+    if grant.get("agent_id") is None:
+        # A pre-0171 grant has no agent provenance. One otherwise-current
+        # candidate can be adopted under the exact Post/thread/live-agent
+        # locks. More than one is ambiguous: timestamp order cannot prove
+        # which bearer the live pod holds, so touch none of them.
+        legacy_candidates = await conn.fetch(
+            """
+            SELECT id
+              FROM runtime_actor_grants
+             WHERE caller_kind = 'officer'
+               AND project_id = $1
+               AND thread_id = $2
+               AND officer_incarnation = $3
+               AND agent_id IS NULL
+               AND revoked_at IS NULL
+             ORDER BY id
+             LIMIT 2
+             FOR UPDATE
+            """,
+            post["project_id"],
+            thread["id"],
+            current_incarnation,
+        )
+        if len(legacy_candidates) != 1 or legacy_candidates[0]["id"] != grant["id"]:
+            raise RuntimeActorCredentialError(
+                "ambiguous_legacy_grants",
+                "The Officer runtime grant cannot be adopted unambiguously.",
+                actor=_actor_from_row(grant),
+            )
+
+    role_row = await conn.fetchrow(
+        """
+        SELECT u.is_admin, pm.role
+          FROM users u
+          LEFT JOIN project_members pm
+            ON pm.user_id = u.id AND pm.project_id = $2
+         WHERE u.id = $1
+        """,
+        thread["user_id"],
+        post["project_id"],
+    )
+    current_role = (
+        "admin"
+        if role_row and bool(role_row.get("is_admin"))
+        else str(role_row.get("role"))
+        if role_row and role_row.get("role")
+        else ""
+    )
+    if current_role != str(grant.get("project_role") or ""):
+        raise RuntimeActorCredentialError(
+            "runtime_not_current",
+            "The Officer project authority changed.",
+            actor=_actor_from_row(grant),
+        )
+    return post, thread, agent, grant, current_role
+
+
+def _refresh_digest_matches(grant: Any, presented_digest: bytes, now: datetime) -> bool:
+    if grant.get("refresh_token_hash") == presented_digest:
+        return True
+    previous_until = _as_utc(grant.get("previous_refresh_valid_until"))
+    acknowledged_at = _as_utc(grant.get("refresh_handoff_acknowledged_at"))
+    return (
+        grant.get("previous_refresh_token_hash") == presented_digest
+        and grant.get("refresh_handoff_ciphertext") is not None
+        and (
+            acknowledged_at is None
+            or (previous_until is not None and previous_until > now)
+        )
+    )
+
+
 async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorContext:
-    """Mint a fresh short-lived access token from a stable opaque refresh grant."""
+    """Maintain one actor and mint a fresh short-lived access credential.
+
+    Workers retain 0161's fixed refresh lifetime. A current Officer may renew
+    before expiry or recover after expiry, but the exceptional recovery is
+    accepted only after Post -> thread -> live-agent -> grant revalidation and
+    rotates the refresh bearer. Rotation is an acknowledged handoff: until
+    the new bearer is presented, predecessor retries re-deliver the same
+    encrypted generation even across response loss or orchestrator restart.
+    Acknowledgement starts the bounded predecessor overlap.
+    """
 
     action = "refresh"
     try:
         token = _required_request_token(request, RUNTIME_ACTOR_REFRESH_HEADER, "srr")
+        presented_digest = _digest(token)
         async with db.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, caller_kind, user_id, project_id, project_role,
-                       thread_id, officer_incarnation, refresh_expires_at,
-                       revoked_at
+                SELECT id, refresh_token_hash, previous_refresh_token_hash,
+                       previous_refresh_valid_until, refresh_handoff_ciphertext,
+                       refresh_handoff_acknowledged_at, caller_kind, user_id,
+                       project_id, project_role, thread_id,
+                       officer_incarnation, agent_id, credential_generation,
+                       refresh_rotation_required, refresh_expires_at,
+                       revoked_at, created_at
                   FROM runtime_actor_grants
                  WHERE refresh_token_hash = $1
+                    OR (previous_refresh_token_hash = $1
+                        AND refresh_handoff_ciphertext IS NOT NULL
+                        AND (refresh_handoff_acknowledged_at IS NULL
+                             OR previous_refresh_valid_until > now()))
+                 ORDER BY (refresh_token_hash = $1) DESC
+                 LIMIT 1
                 """,
-                _digest(token),
+                presented_digest,
             )
         if row is None:
             raise RuntimeActorCredentialError(
@@ -673,61 +1290,160 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
             raise RuntimeActorCredentialError(
                 "revoked_credential", "Runtime actor grant was revoked.", actor=actor
             )
+        if actor.caller_kind == "officer":
+            async with db.acquire() as conn:
+                async with conn.transaction():
+                    (
+                        post,
+                        _thread,
+                        agent,
+                        grant,
+                        _role,
+                    ) = await _lock_officer_authority_for_grant(conn, row, now=now)
+                    if not _refresh_digest_matches(grant, presented_digest, now):
+                        raise RuntimeActorCredentialError(
+                            "invalid_credential",
+                            "Runtime actor refresh is no longer current.",
+                            actor=_actor_from_row(grant),
+                        )
+                    expired = (
+                        _as_utc(grant.get("refresh_expires_at")) is None
+                        or _as_utc(grant.get("refresh_expires_at")) <= now
+                    )
+                    using_previous = grant.get("refresh_token_hash") != presented_digest
+                    next_refresh = now + timedelta(seconds=REFRESH_TTL_SECONDS)
+                    refresh_token = token
+                    generation = int(grant.get("credential_generation") or 1)
+                    previous_hash = grant.get("previous_refresh_token_hash")
+                    previous_until = grant.get("previous_refresh_valid_until")
+                    handoff_ciphertext = grant.get("refresh_handoff_ciphertext")
+                    handoff_acknowledged_at = grant.get(
+                        "refresh_handoff_acknowledged_at"
+                    )
+
+                    if using_previous:
+                        # The predecessor is a recovery receipt for this one
+                        # pending generation, never authority to rotate again.
+                        # Decrypt only after exact lifecycle revalidation and
+                        # verify the ciphertext against the authoritative hash.
+                        refresh_token = _decrypt_refresh_handoff(handoff_ciphertext)
+                        if _digest(refresh_token) != grant.get("refresh_token_hash"):
+                            raise RuntimeActorCredentialError(
+                                "invalid_credential",
+                                "Runtime actor refresh handoff is unavailable.",
+                                actor=_actor_from_row(grant),
+                            )
+                    elif expired or bool(grant.get("refresh_rotation_required")):
+                        refresh_token = _token("srr")
+                        previous_hash = grant.get("refresh_token_hash")
+                        # No deadline runs while delivery is ambiguous. The
+                        # first request using ``refresh_token`` acknowledges
+                        # receipt and replaces infinity with the 120s overlap.
+                        previous_until = datetime.max.replace(tzinfo=timezone.utc)
+                        handoff_ciphertext = _encrypt_refresh_handoff(refresh_token)
+                        handoff_acknowledged_at = None
+                        generation += 1
+                    elif handoff_ciphertext is not None:
+                        acknowledged = _as_utc(handoff_acknowledged_at)
+                        overlap_until = _as_utc(previous_until)
+                        if acknowledged is None:
+                            handoff_acknowledged_at = now
+                            previous_until = now + timedelta(
+                                seconds=max(1, REFRESH_ROTATION_OVERLAP_SECONDS)
+                            )
+                        elif overlap_until is None or overlap_until <= now:
+                            previous_hash = None
+                            previous_until = None
+                            handoff_ciphertext = None
+                            handoff_acknowledged_at = None
+                    await conn.execute(
+                        """
+                        UPDATE runtime_actor_grants
+                           SET refresh_token_hash = $2,
+                               previous_refresh_token_hash = $3,
+                               previous_refresh_valid_until = $4,
+                               refresh_handoff_ciphertext = $5,
+                               refresh_handoff_acknowledged_at = $6,
+                               agent_id = $7,
+                               credential_generation = $8,
+                               last_refreshed_at = $9,
+                               last_maintenance_at = $9,
+                               refresh_expires_at = $10,
+                               refresh_rotation_required = FALSE
+                         WHERE id = $1
+                        """,
+                        grant["id"],
+                        _digest(refresh_token),
+                        previous_hash,
+                        previous_until,
+                        handoff_ciphertext,
+                        handoff_acknowledged_at,
+                        agent["id"],
+                        generation,
+                        now,
+                        next_refresh,
+                    )
+                    # Access credentials never straddle a renewal/recovery.
+                    # Concurrent calls serialize here; the last committed
+                    # response is the sole live access authority.
+                    await conn.execute(
+                        "DELETE FROM runtime_actor_access_tokens WHERE grant_id = $1",
+                        grant["id"],
+                    )
+                    access_token, access_expires_at = await _insert_access_token(
+                        conn, grant["id"], now=now
+                    )
+                    await _resolve_runtime_incident_on_conn(
+                        conn,
+                        post,
+                        thread_id=str(grant["thread_id"]),
+                        incarnation=int(grant["officer_incarnation"]),
+                        now=now,
+                    )
+            actor.access_credential = access_token
+            actor.refresh_credential = refresh_token
+            actor.access_expires_at = access_expires_at
+            actor.refresh_expires_at = next_refresh
+            return actor
+
+        # Non-Officer actors keep their existing authority and expiry rules.
         if actor.refresh_expires_at is None or actor.refresh_expires_at <= now:
             raise RuntimeActorCredentialError(
                 "expired_credential", "Runtime actor refresh has expired.", actor=actor
             )
         await _current_actor(db, actor)
-
-        # The grant's lifetime is an IDLE timeout, not a fixed lease. Sliding it
-        # forward on each successful refresh is what lets an agent that is
-        # SPECIFIED to run indefinitely — a Centurion on its wake/sleep cycle —
-        # keep working. The previous absolute wall made officer capability a
-        # function of when its pod last started, the same nondeterminism the
-        # POD_BOOTSTRAP_TTL comment above exists to remove: officer 6ce5bc4c
-        # went silently unauthorized 24h after boot and burned ~52 turns being
-        # refused (knowledge/issues/
-        # officer_runtime_grant_expires_after_24h_and_dies_silently.md).
-        #
-        # Liveness, not trust, licenses the extension: reaching this line means
-        # _current_actor re-derived authority from the live thread, and
-        # derive_runtime_actor refuses an `ended` one. An active thread is
-        # therefore the signal, so a thread-bound grant needs no absolute cap
-        # while its thread lives. Authority itself is never cached — it is
-        # recomputed on every access and every refresh — so the window bounds
-        # only how long a stolen refresh token stays useful, and a stolen token
-        # can only be used while the thread it names is still alive.
-        #
-        # Workers are deliberately excluded: they are job-scoped, _current_actor
-        # short-circuits them without any thread check, and they have no
-        # liveness to justify an open-ended credential.
         slides = actor.caller_kind != "worker" and bool(row["thread_id"])
-        next_refresh_expires_at = (
-            now + timedelta(seconds=REFRESH_TTL_SECONDS) if slides else None
-        )
+        next_refresh = now + timedelta(seconds=REFRESH_TTL_SECONDS) if slides else None
         async with db.acquire() as conn:
             async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM runtime_actor_access_tokens WHERE grant_id = $1",
+                    row["id"],
+                )
                 access_token, access_expires_at = await _insert_access_token(
                     conn, row["id"], now=now
                 )
-                if next_refresh_expires_at is not None:
+                if next_refresh is not None:
                     await conn.execute(
-                        "UPDATE runtime_actor_grants SET last_refreshed_at = now(), "
-                        "refresh_expires_at = $2 WHERE id = $1",
+                        "UPDATE runtime_actor_grants SET last_refreshed_at = $2, "
+                        "last_maintenance_at = $2, refresh_expires_at = $3 "
+                        "WHERE id = $1",
                         row["id"],
-                        next_refresh_expires_at,
+                        now,
+                        next_refresh,
                     )
                 else:
                     await conn.execute(
-                        "UPDATE runtime_actor_grants SET last_refreshed_at = now() "
-                        "WHERE id = $1",
+                        "UPDATE runtime_actor_grants SET last_refreshed_at = $2, "
+                        "last_maintenance_at = $2 WHERE id = $1",
                         row["id"],
+                        now,
                     )
         actor.access_credential = access_token
         actor.refresh_credential = token
         actor.access_expires_at = access_expires_at
-        if next_refresh_expires_at is not None:
-            actor.refresh_expires_at = next_refresh_expires_at
+        if next_refresh is not None:
+            actor.refresh_expires_at = next_refresh
         return actor
     except RuntimeActorCredentialError as error:
         await _audit_denial(
@@ -826,3 +1542,439 @@ async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
             )
         slid = True
     return slid
+
+
+async def maintain_current_officer_runtime(
+    db: Any,
+    *,
+    project_id: str,
+    thread_id: str,
+    now: datetime | None = None,
+) -> OfficerRuntimeMaintenance:
+    """Renew or recover the exact current live Officer grant.
+
+    This credential-independent liveness point re-derives and locks the current
+    Post, thread, live agent binding, project authority, incarnation, and grant.
+    It may recover an expired grant only when every one of those server-owned
+    facts still matches. Recovery restores the existing bearer just long
+    enough to keep an already-running pod usable and marks it for mandatory
+    rotation on its next refresh. Historical Officers and workers never enter
+    this path. Other failures become one durable Post incident.
+    """
+
+    observed_at = now or datetime.now(timezone.utc)
+    try:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT project_id, thread_id, incarnations, state "
+                    "FROM project_officers WHERE project_id = $1::uuid FOR UPDATE",
+                    str(project_id),
+                )
+                if post is None or str(post.get("thread_id") or "") != str(thread_id):
+                    return OfficerRuntimeMaintenance(False, "not_current")
+                thread = await conn.fetchrow(
+                    "SELECT id, project_id, user_id, status, metadata, agent_id "
+                    "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    str(thread_id),
+                )
+                incarnations = post.get("incarnations") or []
+                if isinstance(incarnations, str):
+                    try:
+                        incarnations = json.loads(incarnations)
+                    except (TypeError, ValueError):
+                        incarnations = []
+                incarnation = len(incarnations) if isinstance(incarnations, list) else 0
+                incident = _json_object(
+                    _json_object(post.get("state")).get("runtime_actor_incident")
+                )
+                incident_retry = _parse_incident_time(incident.get("next_retry_at"))
+                if (
+                    incident.get("status") == "open"
+                    and incident.get("key")
+                    == _officer_incident_key(thread_id, incarnation)
+                    and incident_retry is not None
+                    and incident_retry > observed_at
+                ):
+                    # The 60-second watchdog cadence must not silently defeat
+                    # the durable exponential retry policy. Credential-bearing
+                    # recovery can still resolve this incident at any moment.
+                    notification_claim_id = (
+                        await _claim_runtime_incident_notification_on_conn(
+                            conn, post, incident, now=observed_at
+                        )
+                    )
+                    return OfficerRuntimeMaintenance(
+                        False,
+                        "backoff",
+                        project_id=str(post["project_id"]),
+                        thread_id=str(thread_id),
+                        officer_incarnation=incarnation,
+                        failure_code=str(
+                            incident.get("failure_class") or "authorization"
+                        ),
+                        retry_at=incident_retry,
+                        notification_due=notification_claim_id is not None,
+                        notification_claim_id=notification_claim_id,
+                    )
+                metadata = _json_object(thread.get("metadata")) if thread else {}
+                officer = _json_object(
+                    _json_object(metadata.get("config_override")).get("officer")
+                )
+                if (
+                    thread is None
+                    or thread.get("project_id") != post.get("project_id")
+                    or str(thread.get("status") or "") == "ended"
+                    or officer.get("enabled") not in {True, "true", "True", 1}
+                ):
+                    return OfficerRuntimeMaintenance(False, "not_current")
+                agent = (
+                    await conn.fetchrow(
+                        "SELECT id, thread_id, status, last_heartbeat FROM agents "
+                        "WHERE id = $1 FOR UPDATE",
+                        thread.get("agent_id"),
+                    )
+                    if thread.get("agent_id")
+                    else None
+                )
+                heartbeat = _as_utc(agent.get("last_heartbeat")) if agent else None
+                live_agent = (
+                    agent is not None
+                    and agent.get("thread_id") == thread.get("id")
+                    and str(agent.get("status") or "")
+                    not in {"offline", "failed", "draining"}
+                    and heartbeat is not None
+                    and heartbeat
+                    > observed_at
+                    - timedelta(seconds=max(1, OFFICER_AGENT_LIVE_SECONDS))
+                )
+                if not live_agent:
+                    # Pod drain, deletion, suspension and replacement are
+                    # runtime lifecycle states owned by the watchdog respawn
+                    # path. They suppress authorization/spend, but must not
+                    # create a misleading credential incident during the
+                    # expected no-agent interval.
+                    return OfficerRuntimeMaintenance(
+                        False,
+                        "lifecycle_pending",
+                        project_id=str(post["project_id"]),
+                        thread_id=str(thread["id"]),
+                        officer_incarnation=incarnation,
+                        failure_code="live_agent_binding_missing",
+                    )
+
+                grant = await conn.fetchrow(
+                    """
+                    SELECT id, refresh_token_hash, previous_refresh_token_hash,
+                           previous_refresh_valid_until,
+                           refresh_handoff_ciphertext,
+                           refresh_handoff_acknowledged_at,
+                           caller_kind, user_id, project_id, project_role,
+                           thread_id, officer_incarnation, agent_id,
+                           credential_generation, refresh_rotation_required,
+                           refresh_expires_at, revoked_at, created_at
+                      FROM runtime_actor_grants
+                     WHERE caller_kind = 'officer'
+                       AND project_id = $1
+                       AND thread_id = $2
+                       AND officer_incarnation = $3
+                       AND revoked_at IS NULL
+                       AND agent_id = $4
+                     FOR UPDATE
+                    """,
+                    post["project_id"],
+                    thread["id"],
+                    incarnation,
+                    agent["id"],
+                )
+                legacy_ambiguous = False
+                if grant is None:
+                    legacy_candidates = await conn.fetch(
+                        """
+                        SELECT id, refresh_token_hash, previous_refresh_token_hash,
+                               previous_refresh_valid_until,
+                               refresh_handoff_ciphertext,
+                               refresh_handoff_acknowledged_at,
+                               caller_kind, user_id, project_id, project_role, thread_id,
+                               officer_incarnation, agent_id,
+                               credential_generation, refresh_rotation_required,
+                               refresh_expires_at, revoked_at, created_at
+                          FROM runtime_actor_grants
+                         WHERE caller_kind = 'officer'
+                           AND project_id = $1
+                           AND thread_id = $2
+                           AND officer_incarnation = $3
+                           AND revoked_at IS NULL
+                           AND agent_id IS NULL
+                         ORDER BY id
+                         LIMIT 2
+                         FOR UPDATE
+                        """,
+                        post["project_id"],
+                        thread["id"],
+                        incarnation,
+                    )
+                    if len(legacy_candidates) == 1:
+                        grant = legacy_candidates[0]
+                    elif len(legacy_candidates) > 1:
+                        legacy_ambiguous = True
+                failure_code = None
+                if legacy_ambiguous:
+                    failure_code = "ambiguous_legacy_grants"
+                elif grant is None:
+                    failure_code = "current_grant_missing"
+                elif grant.get("user_id") != thread.get("user_id"):
+                    failure_code = "grant_owner_mismatch"
+                else:
+                    role_row = await conn.fetchrow(
+                        """
+                        SELECT u.is_admin, pm.role
+                          FROM users u
+                          LEFT JOIN project_members pm
+                            ON pm.user_id = u.id AND pm.project_id = $2
+                         WHERE u.id = $1
+                        """,
+                        thread["user_id"],
+                        post["project_id"],
+                    )
+                    current_role = (
+                        "admin"
+                        if role_row and bool(role_row.get("is_admin"))
+                        else str(role_row.get("role"))
+                        if role_row and role_row.get("role")
+                        else ""
+                    )
+                    if current_role != str(grant.get("project_role") or ""):
+                        failure_code = "grant_authority_changed"
+                expiry = _as_utc(grant.get("refresh_expires_at")) if grant else None
+                expired = expiry is None or expiry <= observed_at
+
+                if failure_code is not None:
+                    incident, changed, _ = await _write_runtime_incident_on_conn(
+                        conn,
+                        post,
+                        thread_id=str(thread["id"]),
+                        incarnation=incarnation,
+                        failure_code=failure_code,
+                        now=observed_at,
+                    )
+                    notification_claim_id = (
+                        await _claim_runtime_incident_notification_on_conn(
+                            conn, post, incident, now=observed_at
+                        )
+                    )
+                    return OfficerRuntimeMaintenance(
+                        False,
+                        "failed",
+                        project_id=str(post["project_id"]),
+                        thread_id=str(thread["id"]),
+                        officer_incarnation=incarnation,
+                        failure_code=failure_code,
+                        retry_at=_parse_incident_time(incident.get("next_retry_at")),
+                        notification_due=notification_claim_id is not None,
+                        notification_claim_id=notification_claim_id,
+                        incident_changed=changed,
+                    )
+
+                assert grant is not None and agent is not None
+                # Make every losing grant for this immutable incarnation
+                # unusable even to a pre-0171 replica. Never invent agent
+                # provenance for unbound legacy losers: NULL truthfully means
+                # the old schema did not record which pod held that bearer.
+                await conn.execute(
+                    """
+                    UPDATE runtime_actor_grants
+                       SET revoked_at = $2
+                     WHERE caller_kind = 'officer'
+                       AND project_id = $1
+                       AND thread_id = $3
+                       AND officer_incarnation = $4
+                       AND id <> $5
+                       AND revoked_at IS NULL
+                    """,
+                    post["project_id"],
+                    observed_at,
+                    thread["id"],
+                    incarnation,
+                    grant["id"],
+                )
+                recovered = expired
+                renewed = recovered or expiry <= observed_at + timedelta(
+                    seconds=max(1, OFFICER_RENEW_BEFORE_SECONDS)
+                )
+                next_expiry = (
+                    observed_at + timedelta(seconds=REFRESH_TTL_SECONDS)
+                    if renewed
+                    else expiry
+                )
+                await conn.execute(
+                    """
+                    UPDATE runtime_actor_grants
+                           SET agent_id = $2,
+                               refresh_expires_at = $3,
+                               last_maintenance_at = $4,
+                               refresh_rotation_required =
+                                   refresh_rotation_required OR $5
+                     WHERE id = $1
+                    """,
+                    grant["id"],
+                    agent["id"],
+                    next_expiry,
+                    observed_at,
+                    recovered,
+                )
+                resolved = await _resolve_runtime_incident_on_conn(
+                    conn,
+                    post,
+                    thread_id=str(thread["id"]),
+                    incarnation=incarnation,
+                    now=observed_at,
+                )
+                return OfficerRuntimeMaintenance(
+                    True,
+                    "recovered" if recovered else "renewed" if renewed else "current",
+                    project_id=str(post["project_id"]),
+                    thread_id=str(thread["id"]),
+                    officer_incarnation=incarnation,
+                    incident_changed=resolved,
+                )
+    except RuntimeActorCredentialError as exc:
+        return OfficerRuntimeMaintenance(
+            False,
+            "failed",
+            project_id=str(project_id),
+            thread_id=str(thread_id),
+            failure_code=exc.code,
+        )
+
+
+def _parse_incident_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if isinstance(value, str):
+        try:
+            return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError:
+            return None
+    return None
+
+
+async def admit_officer_wake_for_runtime(
+    db: Any, *, project_id: str, thread_id: str, now: datetime | None = None
+) -> tuple[bool, datetime | None]:
+    """Allow one compatibility recovery wake, then suppress repeated spend."""
+
+    observed_at = now or datetime.now(timezone.utc)
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            post = await conn.fetchrow(
+                "SELECT project_id, thread_id, incarnations, state "
+                "FROM project_officers WHERE project_id = $1::uuid FOR UPDATE",
+                str(project_id),
+            )
+            if post is None or str(post.get("thread_id") or "") != str(thread_id):
+                return False, None
+            incident = _json_object(
+                _json_object(post.get("state")).get("runtime_actor_incident")
+            )
+            if incident.get("status") != "open":
+                return True, None
+            incarnations = post.get("incarnations") or []
+            if isinstance(incarnations, str):
+                try:
+                    incarnations = json.loads(incarnations)
+                except (TypeError, ValueError):
+                    incarnations = []
+            incarnation = len(incarnations) if isinstance(incarnations, list) else 0
+            if incident.get("key") != _officer_incident_key(thread_id, incarnation):
+                # An incident belongs to one immutable incarnation. It remains
+                # historical/operator-visible but cannot suppress the
+                # successor's commission wake or credential maintenance.
+                return True, None
+            if incident.get("recovery_probe_at") is None:
+                incident["recovery_probe_at"] = observed_at.isoformat()
+                await conn.execute(
+                    """
+                    UPDATE project_officers
+                       SET state = jsonb_set(COALESCE(state, '{}'::jsonb),
+                                             '{runtime_actor_incident}',
+                                             $2::jsonb, true),
+                           updated_at = now()
+                     WHERE project_id = $1
+                    """,
+                    post["project_id"],
+                    json.dumps(incident),
+                )
+                return True, None
+            return False, _parse_incident_time(incident.get("next_retry_at"))
+
+
+async def settle_officer_runtime_incident_notification(
+    db: Any,
+    *,
+    project_id: str,
+    thread_id: str,
+    officer_incarnation: int,
+    notification_claim_id: str,
+    delivered: bool,
+    failure_class: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """CAS one out-of-band page outcome into the durable incident."""
+
+    observed_at = now or datetime.now(timezone.utc)
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            post = await conn.fetchrow(
+                "SELECT project_id, thread_id, state FROM project_officers "
+                "WHERE project_id = $1::uuid FOR UPDATE",
+                str(project_id),
+            )
+            if post is None or str(post.get("thread_id") or "") != str(thread_id):
+                return False
+            incident = _json_object(
+                _json_object(post.get("state")).get("runtime_actor_incident")
+            )
+            if incident.get("status") != "open" or incident.get(
+                "key"
+            ) != _officer_incident_key(thread_id, officer_incarnation):
+                return False
+            notification = _json_object(incident.get("notification"))
+            if (
+                notification.get("state") != "sending"
+                or notification.get("claim_id") != notification_claim_id
+            ):
+                return False
+            attempts = int(notification.get("attempt_count") or 0) + 1
+            notification.update(
+                {
+                    "state": "delivered" if delivered else "failed",
+                    "attempt_count": attempts,
+                    "last_attempted_at": observed_at.isoformat(),
+                    "delivered_at": observed_at.isoformat() if delivered else None,
+                    "failure_class": None
+                    if delivered
+                    else str(failure_class or "delivery"),
+                    "next_retry_at": (
+                        None
+                        if delivered
+                        else _incident_retry_at(observed_at, attempts).isoformat()
+                    ),
+                    "claim_id": None,
+                    "claimed_at": None,
+                    "claim_expires_at": None,
+                }
+            )
+            incident["notification"] = notification
+            await conn.execute(
+                """
+                UPDATE project_officers
+                   SET state = jsonb_set(COALESCE(state, '{}'::jsonb),
+                                         '{runtime_actor_incident}', $2::jsonb, true),
+                       updated_at = now()
+                 WHERE project_id = $1
+                """,
+                post["project_id"],
+                json.dumps(incident),
+            )
+            return True

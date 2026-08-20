@@ -17,6 +17,7 @@ from src.core.product_capabilities import ProductComponent
 from src.core.runtime_provenance import component_provenance_from_environment
 from src.shared.runtime_actor import (
     RUNTIME_ACTOR_BOOTSTRAP_HEADER,
+    RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,
 )
 
@@ -352,6 +353,9 @@ class OrchestratorClient:
         self._client: Optional[httpx.AsyncClient] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._stop_heartbeat = asyncio.Event()
+        self._runtime_actor_maintenance_lock = asyncio.Lock()
+        self._runtime_actor_maintenance_failures = 0
+        self._runtime_actor_retry_at = 0.0
 
     async def connect(self) -> None:
         """Initialize the HTTP client.
@@ -447,8 +451,8 @@ class OrchestratorClient:
         if response.status_code == 200:
             data = response.json()
             self.agent_id = data.get("agent_id")
-            self.runtime_actor = RuntimeActorContext.from_payload(
-                data.get("runtime_actor")
+            self.adopt_runtime_actor(
+                RuntimeActorContext.from_payload(data.get("runtime_actor"))
             )
             self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
             logger.info(
@@ -1143,11 +1147,18 @@ class OrchestratorClient:
                 response.text[:200],
             )
             return False
-        self.runtime_actor = RuntimeActorContext.from_payload(
-            response.json().get("runtime_actor")
+        self.adopt_runtime_actor(
+            RuntimeActorContext.from_payload(response.json().get("runtime_actor"))
         )
         logger.info(f"Runtime actor bound for thread {thread_id}")
         return True
+
+    def adopt_runtime_actor(self, actor: RuntimeActorContext | None) -> None:
+        """Bind the exact actor object shared by heartbeat and session tools."""
+
+        self.runtime_actor = actor
+        self._runtime_actor_maintenance_failures = 0
+        self._runtime_actor_retry_at = 0.0
 
     def clear_runtime_actor(self) -> None:
         """Drop the actor when this pod stops serving its session.
@@ -1156,7 +1167,90 @@ class OrchestratorClient:
         thread — and a different project — next. Keeping the old actor would
         leave a credential scoped to the previous session lying in memory.
         """
-        self.runtime_actor = None
+        self.adopt_runtime_actor(None)
+
+    async def maintain_runtime_actor(self, *, force: bool = False) -> tuple[bool, str]:
+        """Renew/recover the hidden Officer actor with bounded local backoff.
+
+        Heartbeats call this before the refresh idle wall; the persistent turn
+        gate calls it with ``force=True`` before any provider request. Identity
+        is never supplied in the body: the opaque refresh bearer selects a
+        grant and the server re-derives its Post/thread/agent authority.
+        """
+
+        actor = self.runtime_actor
+        if actor is None:
+            return False, "server-derived actor context is missing"
+        if actor.caller_kind != "officer":
+            return True, "non-Officer grant keeps its existing lifecycle"
+        if not actor.refresh_credential:
+            return False, "runtime actor refresh credential is missing"
+        renew_before = int(
+            os.environ.get("RUNTIME_ACTOR_OFFICER_RENEW_BEFORE_SECONDS", "21600")
+        )
+        if not force and not actor.refresh_needs_renewal(skew_seconds=renew_before):
+            return True, "Officer runtime grant is inside its renewal window"
+        now = asyncio.get_running_loop().time()
+        if now < self._runtime_actor_retry_at:
+            return False, "Officer runtime authorization retry is backed off"
+
+        async with self._runtime_actor_maintenance_lock:
+            actor = self.runtime_actor
+            if actor is None or not actor.refresh_credential:
+                return False, "runtime actor refresh credential is missing"
+            now = asyncio.get_running_loop().time()
+            if now < self._runtime_actor_retry_at:
+                return False, "Officer runtime authorization retry is backed off"
+            if not self._client:
+                await self.connect()
+            assert self._client is not None
+            try:
+                response = await self._client.post(
+                    f"{self.orchestrator_url}/api/runtime-actors/refresh",
+                    headers={RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential},
+                )
+                if response.status_code != 200:
+                    code = f"http-{response.status_code}"
+                    try:
+                        detail = response.json().get("detail")
+                        if isinstance(detail, dict) and isinstance(
+                            detail.get("code"), str
+                        ):
+                            code = detail["code"]
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"refresh denied ({code})")
+                payload = response.json().get("runtime_actor")
+                if not actor.apply_refreshed_payload(payload):
+                    raise RuntimeError("refresh response changed identity")
+            except Exception as exc:
+                self._runtime_actor_maintenance_failures += 1
+                base = max(
+                    1,
+                    int(os.environ.get("RUNTIME_ACTOR_RETRY_BASE_SECONDS", "60")),
+                )
+                ceiling = max(
+                    base,
+                    int(os.environ.get("RUNTIME_ACTOR_RETRY_MAX_SECONDS", "900")),
+                )
+                delay = min(
+                    ceiling,
+                    base * (2 ** min(self._runtime_actor_maintenance_failures - 1, 8)),
+                )
+                self._runtime_actor_retry_at = now + delay
+                # Never include response bodies or credentials in this log.
+                reason = type(exc).__name__
+                logger.error(
+                    "Officer runtime authorization maintenance failed (%s); "
+                    "planning is suppressed for %ss",
+                    type(exc).__name__,
+                    delay,
+                )
+                return False, reason[:160]
+
+            self._runtime_actor_maintenance_failures = 0
+            self._runtime_actor_retry_at = 0.0
+            return True, "Officer runtime authorization maintained"
 
     async def release_thread_agent(self, thread_id: str) -> bool:
         """Clear threads.agent_id when this agent's session attach fails.
@@ -1349,6 +1443,17 @@ class OrchestratorClient:
                     metrics = get_metrics()
 
                     response = await self.heartbeat(status, job_id, metrics)
+                    actor = self.runtime_actor
+                    if (
+                        response is not None
+                        and actor is not None
+                        and actor.caller_kind == "officer"
+                    ):
+                        # Credential maintenance is liveness work, not model
+                        # choice. This call is normally a local no-op until the
+                        # six-hour renewal margin, then refreshes before the
+                        # 24-hour idle wall even if no privileged tool ran.
+                        await self.maintain_runtime_actor(force=False)
                     if response is not None and on_response is not None:
                         try:
                             ret = on_response(response)

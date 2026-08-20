@@ -363,6 +363,7 @@ class TestCallbackWiring:
         cb = captured["callbacks"]
         assert cb is not None, "loop was never started"
         assert cb.announce_permission_batch is pa._loop_announce_permission_batch
+        assert cb.before_turn_authorization is pa._loop_before_turn_authorization
 
 
 # =============================================================================

@@ -212,6 +212,26 @@ def test_the_post_renders_a_vacant_post_without_pretending_otherwise():
     assert "vacant" in text.lower()
 
 
+def test_the_post_surfaces_runtime_authorization_without_private_detail():
+    text = format_officer_post(
+        {
+            "commissioned": True,
+            "officer": {"thread_id": THREAD_ID, "status": "active"},
+            "runtime_authorization": {
+                "status": "unavailable",
+                "failure_class": "refresh_expired",
+                "credential_generation": 99,
+            },
+        },
+        project_name="X",
+    )
+
+    assert "Runtime authorization: UNAVAILABLE" in text
+    assert "suppressed" in text
+    assert "refresh_expired" not in text
+    assert "99" not in text
+
+
 def test_a_note_that_only_reached_the_queue_never_reads_as_delivered():
     text = format_officer_note_result(
         {

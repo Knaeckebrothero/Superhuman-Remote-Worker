@@ -215,7 +215,7 @@ APP_JOB_COMPLETION_STATUS_REORDER = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "orchestrator/database/migrations/app/0170_project_status_validate.sql"
+    / "orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

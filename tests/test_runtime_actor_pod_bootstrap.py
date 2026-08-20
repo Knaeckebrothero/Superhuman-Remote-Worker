@@ -73,6 +73,7 @@ async def test_a_pool_pod_binds_the_thread_the_agents_row_says_it_serves(monkeyp
 
     assert actor == "ACTOR"
     assert minted.await_args.kwargs["thread_id"] == THREAD_ID
+    assert minted.await_args.kwargs["agent_id"] == AGENT_ID
     # The bootstrap must be matched thread-lessly; a pool pod's secret is not
     # bound to any session until this moment.
     assert "thread_id IS NULL" in conn.statements[0]

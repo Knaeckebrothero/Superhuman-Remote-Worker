@@ -50,8 +50,18 @@ async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
     wake._resolve_live_agent = AsyncMock(return_value=None)
     provisioner = MagicMock()
     provisioner.create_agent_pod = AsyncMock(return_value=True)
+    maintenance = AsyncMock(
+        return_value=SimpleNamespace(
+            authorized=False,
+            state="lifecycle_pending",
+            notification_due=False,
+        )
+    )
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+    monkeypatch.setattr(
+        orch_main, "_maintain_officer_runtime_authorization", maintenance
+    )
 
     await orch_main._officer_watchdog_check_one(thread, wake)
 
@@ -59,6 +69,7 @@ async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
     assert "agent_id = NULL" in sql
     assert "status = 'active'" in sql
     assert "control_admission_agent_id = NULL" in sql
+    maintenance.assert_awaited_once_with(thread)
     provisioner.create_agent_pod.assert_awaited_once()
 
 

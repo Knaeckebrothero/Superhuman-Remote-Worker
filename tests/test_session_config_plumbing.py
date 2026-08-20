@@ -98,6 +98,11 @@ def _patch_session_attach_reservation():
             "_reserve_session_attach_binding",
             AsyncMock(return_value=True),
         ),
+        patch.object(
+            orch_main,
+            "_release_session_attach_binding",
+            AsyncMock(),
+        ),
     ):
         yield
 

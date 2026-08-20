@@ -966,6 +966,32 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       manager.fixture.destroy();
     });
 
+    it(`renders the ${lang} runtime-authorization incident without credential detail`, async () => {
+      const { fixture } = await renderComponent(
+        commissionedPost({
+          can_manage: false,
+          runtime_authorization: {
+            status: 'unavailable',
+            failure_class: 'refresh_expired',
+            operator_notification: 'delivered',
+            planning_suppressed: true,
+          },
+        }),
+        lang,
+      );
+      const alert = (fixture.nativeElement as HTMLElement).querySelector(
+        '[data-testid="officer-runtime-authorization"]',
+      );
+
+      expect(alert?.getAttribute('role')).toBe('alert');
+      expect(alert?.getAttribute('aria-label')).toBe(
+        tr('officerCard.runtimeAuthorization.a11y'),
+      );
+      expect(alert?.textContent).toContain(tr('officerCard.runtimeAuthorization.unavailable'));
+      expect(alert?.textContent).not.toContain('refresh_expired');
+      fixture.destroy();
+    });
+
     it(`frames ${lang} mutation failures locally without exposing controls to stale authority`, async () => {
       const { fixture, api } = await renderComponent(commissionedPost(), lang);
       api.updateOfficerPost.mockReturnValue(
