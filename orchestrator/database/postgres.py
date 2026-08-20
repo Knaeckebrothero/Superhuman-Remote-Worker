@@ -41,7 +41,6 @@ try:
 except ImportError:
     asyncpg = None
 
-from security.access import project_status_filter_sql
 from security.crypto import (
     DecryptionError,
     decrypt,
@@ -24302,6 +24301,14 @@ class PostgresDB:
         status_clause = ""
         params: List[Any] = [uuid_val, limit]
         if statuses is not None:
+            # Lazy import for the same reason as redact_config_override above,
+            # plus one this module must keep true: security.access imports
+            # FastAPI, and `python -m database.migrate` loads this file through
+            # database/__init__.py with only asyncpg + cryptography installed
+            # (db-migrations.yml). A module-scope import here would make the
+            # migration runner depend on the whole web framework.
+            from security.access import project_status_filter_sql
+
             params.append(list(statuses))
             status_clause = f" AND {project_status_filter_sql('$3', column='p.status')}"
 

@@ -1,7 +1,18 @@
 name: db-migrations
 
 # Gate for changes under orchestrator/database/migrations/** (plus the schema
-# artifacts, the runner, and the squawk config).
+# artifacts, the runner and its import surface, and the squawk config).
+#
+# The trigger list carries database/__init__.py and database/postgres.py even
+# though neither is a migration: `python -m database.migrate` loads the package
+# __init__, which eagerly imports postgres.py, so a module-scope import there of
+# anything outside the runner's install set (asyncpg + cryptography) breaks the
+# dry-run and artifact jobs before a single statement reaches Postgres. A
+# module-scope `security.access` import — which pulls in FastAPI — did exactly
+# that on 2026-08-20. Listing the two files makes that breakage surface on the
+# commit that causes it instead of reddening the next, unrelated migration PR.
+# postgres.py is large and changes often, so this deliberately trades CI minutes
+# for the runner staying importable.
 #
 # Runs four jobs in parallel:
 #   1. squawk      — static lint of the migrations ADDED/MODIFIED by this push
@@ -28,6 +39,9 @@ on:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      # Runner import surface, not migrations — see the header note.
+      - 'orchestrator/database/__init__.py'
+      - 'orchestrator/database/postgres.py'
       - 'orchestrator/database/*_current.sql'
       - 'orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'
@@ -42,6 +56,9 @@ on:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      # Runner import surface, not migrations — see the header note.
+      - 'orchestrator/database/__init__.py'
+      - 'orchestrator/database/postgres.py'
       - 'orchestrator/database/*_current.sql'
       - 'orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'

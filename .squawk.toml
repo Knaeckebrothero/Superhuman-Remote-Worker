@@ -105,6 +105,27 @@ excluded_rules = [
 #                before the pinned-linter pass, so fix-forward migrations
 #                0148/0149 add the receipt index concurrently and validate the
 #                FK/CHECK while this already-applied file remains immutable.
+#        - app/0171: two constraint-missing-not-valid plus three
+#                require-concurrent-index-creation findings on the Officer
+#                runtime-grant liveness fence. The CHECKs are the app/0123
+#                carve-out exactly: both constrain columns added by the SAME
+#                ALTER TABLE, and neither can see a row it would reject —
+#                credential_generation arrives NOT NULL DEFAULT 1 (satisfies
+#                > 0) and the four refresh-handoff columns arrive all-NULL
+#                (satisfies the shape check). NOT VALID + a later VALIDATE
+#                would be strictly worse here, opening a window in which a
+#                violating row could land. The three indexes are the app/0117
+#                shape: the file is transactional-atomic by design — the two
+#                UNIQUE indexes are the enforcement half of the same fence as
+#                the BEFORE INSERT OR UPDATE trigger this file creates, so
+#                they must land in the trigger's transaction, and
+#                CONCURRENTLY cannot run in one. runtime_actor_grants is a
+#                small retained ledger (dev: ~750 rows), so each build is
+#                sub-second under the file's 2 s lock timeout. Applied on the
+#                dev cluster 2026-08-20 (the develop pipeline shipped the
+#                image before this gate reported), so the bytes are pinned by
+#                the migration checksum guard and an in-place rewrite would
+#                wedge that cluster's boot.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
@@ -118,5 +139,6 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
     "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
     "orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
+    "orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]
