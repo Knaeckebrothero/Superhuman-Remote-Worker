@@ -75,7 +75,7 @@ async def test_bound_invocations_isolate_project_scope_and_reset_context(
         ("user-session", ""),
     }
     assert observed[2] == ("", "")
-    assert direct == []
+    assert direct["jobs"] == []
 
 
 @pytest.mark.asyncio
@@ -130,8 +130,8 @@ async def test_request_scope_headers_are_isolated_between_users_and_health(
     finally:
         await client.close()
 
-    assert first == [{"user_id": "user-a", "scope": "project:project-a"}]
-    assert second == [{"user_id": "user-b", "scope": "project:project-b"}]
+    assert first["jobs"] == [{"user_id": "user-a", "scope": "project:project-a"}]
+    assert second["jobs"] == [{"user_id": "user-b", "scope": "project:project-b"}]
     assert health == {"status": "healthy"}
     assert set(observed) == {
         ("/api/jobs", "user-a", "project:project-a", "test-internal-key"),

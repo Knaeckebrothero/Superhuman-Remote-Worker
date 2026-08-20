@@ -143,3 +143,63 @@ export interface JobSummary {
   /** Newest open request id, for the inbox deep-link (`/inbox?sudo=<id>`). */
   pending_approval_request_id?: string | null;
 }
+
+/**
+ * One page of `/api/jobs`, matching the server envelope.
+ *
+ * `total` is exact up to a server-side cap and `null` when the caller opted
+ * out with `include_total=false`; `total_is_capped` says which. `has_more` is
+ * exact either way — the server fetches one row past the page rather than
+ * comparing against `total`.
+ */
+export interface JobListPage {
+  jobs: JobSummary[];
+  total: number | null;
+  total_is_capped: boolean;
+  has_more: boolean;
+  limit: number;
+  offset: number;
+  /**
+   * Creation-time watermark that froze this result window. Pass it back on
+   * later pages, or rows inserted meanwhile shift the offset underneath the
+   * user and rows are skipped or repeated.
+   */
+  as_of?: string;
+  /**
+   * What the server actually applied, including its own defaults. Drives the
+   * applied-filter tokens, so a hidden row is never hidden silently.
+   */
+  filters?: JobListFilters;
+}
+
+export interface JobListFilters {
+  status?: string[];
+  project_id?: string[];
+  has_project?: boolean | null;
+  include_archived_projects?: boolean;
+  search?: string | null;
+  user_id?: string | null;
+}
+
+export interface JobListQuery {
+  status?: string | string[];
+  projectIds?: string[];
+  hasProject?: boolean;
+  includeArchivedProjects?: boolean;
+  search?: string;
+  asOf?: string;
+  userId?: string;
+  limit?: number;
+  offset?: number;
+  includeTotal?: boolean;
+}
+
+/** What `getJobsPage()` yields when the request fails. */
+export const EMPTY_JOB_LIST_PAGE: JobListPage = {
+  jobs: [],
+  total: 0,
+  total_is_capped: false,
+  has_more: false,
+  limit: 0,
+  offset: 0,
+};

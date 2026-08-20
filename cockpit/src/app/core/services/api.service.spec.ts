@@ -1075,3 +1075,93 @@ describe('ApiService project lifecycle', () => {
     await expect(swallowed).resolves.toBeNull();
   });
 });
+
+describe('ApiService job list envelope', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('unwraps the envelope so existing callers still receive an array', async () => {
+    const pending = firstValueFrom(api.getJobs());
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    request.flush({
+      jobs: [{id: 'job-1', description: 'x', status: 'completed', created_at: 'now'}],
+      total: 806,
+      total_is_capped: false,
+      has_more: true,
+      limit: 100,
+      offset: 0,
+    });
+
+    const jobs = await pending;
+    expect(Array.isArray(jobs)).toBe(true);
+    expect(jobs.map((job) => job.id)).toEqual(['job-1']);
+  });
+
+  it('keeps the counts a paging UI needs on getJobsPage', async () => {
+    const pending = firstValueFrom(api.getJobsPage({limit: 25, offset: 25}));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    expect(request.request.params.get('limit')).toBe('25');
+    expect(request.request.params.get('offset')).toBe('25');
+    request.flush({
+      jobs: [],
+      total: 806,
+      total_is_capped: false,
+      has_more: true,
+      limit: 25,
+      offset: 25,
+      as_of: '2026-08-20T12:00:00Z',
+      filters: {include_archived_projects: false},
+    });
+
+    const page = await pending;
+    expect(page.total).toBe(806);
+    expect(page.has_more).toBe(true);
+    expect(page.filters?.include_archived_projects).toBe(false);
+  });
+
+  it('repeats status and project_id rather than joining them', async () => {
+    const pending = firstValueFrom(
+      api.getJobsPage({status: ['failed', 'paused'], projectIds: ['p1', 'p2']}),
+    );
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    expect(request.request.params.getAll('status')).toEqual(['failed', 'paused']);
+    expect(request.request.params.getAll('project_id')).toEqual(['p1', 'p2']);
+    request.flush({
+      jobs: [],
+      total: 0,
+      total_is_capped: false,
+      has_more: false,
+      limit: 100,
+      offset: 0,
+    });
+    await pending;
+  });
+
+  it('falls back to an empty page instead of throwing', async () => {
+    const pending = firstValueFrom(api.getJobsPage());
+    const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
+    request.flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
+
+    const page = await pending;
+    expect(page.jobs).toEqual([]);
+    expect(page.has_more).toBe(false);
+  });
+});

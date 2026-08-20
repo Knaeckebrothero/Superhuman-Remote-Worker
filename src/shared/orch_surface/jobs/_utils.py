@@ -68,7 +68,7 @@ async def resolve_job_id(
     if not cleaned or _is_uuid(cleaned) or len(cleaned) < 8:
         return cleaned
 
-    jobs = await client.list_jobs(limit=500)
+    jobs = (await client.list_jobs(limit=500)).get("jobs", [])
     matches = [
         str(job.get("id"))
         for job in jobs

@@ -65,6 +65,36 @@ def _scoped(user: dict, scope: str) -> dict:
 # =============================================================================
 
 
+#: Calling a FastAPI handler directly leaves unpassed parameters as ``Query``
+#: objects rather than their defaults, so every test has to supply the full
+#: signature. Centralising it here means adding a filter is a one-line change
+#: instead of an edit to every case.
+_LIST_JOBS_DEFAULTS: dict = {
+    "status": None,
+    "project_id": None,
+    "has_project": None,
+    "include_archived_projects": False,
+    "search": None,
+    "as_of": None,
+    "user_id": None,
+    "limit": 100,
+    "offset": 0,
+    "include_total": True,
+}
+
+
+async def _list_jobs(fake_request, **overrides):
+    from main import list_jobs
+
+    return await list_jobs(fake_request, **{**_LIST_JOBS_DEFAULTS, **overrides})
+
+
+def _result(jobs=None, **kwargs):
+    from database.postgres import JobQueryResult
+
+    return JobQueryResult(jobs=list(jobs or []), **kwargs)
+
+
 class TestListJobs:
     """The single ``query_jobs`` call must carry the caller's visibility.
 
@@ -80,11 +110,9 @@ class TestListJobs:
         self, user_a, fake_db, fake_request
     ):
         """Caller's own + project-member jobs via OR-clause."""
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            await _list_jobs(fake_request)
 
         fake_db.query_jobs.assert_awaited_once()
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -98,13 +126,11 @@ class TestListJobs:
         self, user_a, fake_db, fake_request
     ):
         """Empty visible_project_ids → OR-clause still returns own-user jobs."""
-        from main import list_jobs
-
         # Strip user_a's project memberships.
         fake_db.get_projects_for_user = AsyncMock(return_value=[])
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            await _list_jobs(fake_request)
 
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
@@ -115,11 +141,9 @@ class TestListJobs:
         self, user_admin, fake_db, fake_request
     ):
         """``owner_user_id=None`` is what makes it the full-fleet view."""
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            await _list_jobs(fake_request)
 
         fake_db.query_jobs.assert_awaited_once()
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -132,13 +156,9 @@ class TestListJobs:
     async def test_admin_cross_user_query_passes_user_id_through(
         self, user_admin, user_a, fake_db, fake_request
     ):
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
-            await list_jobs(
-                fake_request, status=None, user_id=str(user_a["id"]), limit=100
-            )
+            await _list_jobs(fake_request, user_id=str(user_a["id"]))
 
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["user_id"] == str(user_a["id"])
@@ -148,13 +168,9 @@ class TestListJobs:
     async def test_non_admin_cross_user_query_403(
         self, user_a, user_b, fake_db, fake_request
     ):
-        from main import list_jobs
-
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
             with pytest.raises(HTTPException) as exc:
-                await list_jobs(
-                    fake_request, status=None, user_id=str(user_b["id"]), limit=100
-                )
+                await _list_jobs(fake_request, user_id=str(user_b["id"]))
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -167,13 +183,9 @@ class TestListJobs:
         own-jobs-only and silently drop the caller's project rows — a
         read *regression* dressed up as a redundant filter.
         """
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
-            await list_jobs(
-                fake_request, status=None, user_id=str(user_a["id"]), limit=100
-            )
+            await _list_jobs(fake_request, user_id=str(user_a["id"]))
 
         fake_db.query_jobs.assert_awaited_once()
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -182,14 +194,12 @@ class TestListJobs:
 
     @pytest.mark.asyncio
     async def test_status_filter_passes_through(self, user_a, fake_db, fake_request):
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status="completed", user_id=None, limit=50)
+            await _list_jobs(fake_request, status=["completed"], limit=50)
 
         kwargs = fake_db.query_jobs.call_args.kwargs
-        assert kwargs["status"] == "completed"
+        assert kwargs["statuses"] == ["completed"]
         assert kwargs["limit"] == 50
 
     @pytest.mark.asyncio
@@ -197,12 +207,10 @@ class TestListJobs:
         self, user_admin, project_a, fake_db, fake_request
     ):
         """An MCP `project:<uuid>` scope adds AND project_id = <pid> for admins."""
-        from main import list_jobs
-
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            await _list_jobs(fake_request)
 
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])
@@ -212,12 +220,10 @@ class TestListJobs:
     async def test_mcp_project_scope_narrows_non_admin(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import list_jobs
-
         scoped = _scoped(user_a, f"project:{project_a['id']}")
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
-            await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            await _list_jobs(fake_request)
 
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])
@@ -226,9 +232,7 @@ class TestListJobs:
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
         """If `require_approved_user` raises, no DB call happens."""
-        from main import list_jobs
-
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=_result())
         with (
             patch(
                 "main.require_approved_user",
@@ -238,23 +242,28 @@ class TestListJobs:
             _patch_audit_unavailable(),
         ):
             with pytest.raises(HTTPException) as exc:
-                await list_jobs(fake_request, status=None, user_id=None, limit=100)
+                await _list_jobs(fake_request)
         assert exc.value.status_code == 401
         fake_db.query_jobs.assert_not_awaited()
 
+
+# =============================================================================
+# list_jobs — the paging envelope and its filters
+# =============================================================================
+
+
+class TestListJobsEnvelope:
+    """Pins the *wire shape*, which the kwargs assertions above cannot see.
+
+    Every test in ``TestListJobs`` stubs the query and asserts on
+    ``call_args``, so the response could change shape under all of them and
+    they would stay green. These are the ones that notice.
+    """
+
     @pytest.mark.asyncio
-    async def test_response_is_a_bare_list_of_job_dicts(
+    async def test_response_is_an_envelope_not_a_bare_list(
         self, user_a, fake_db, fake_request
     ):
-        """Pins the *wire shape* of GET /api/jobs, not just the call kwargs.
-
-        Every other test here stubs ``[]`` and asserts on ``call_args``, so
-        the envelope could change under them and they would all stay green.
-        This is the one that notices. Phase 2's envelope work flips it
-        deliberately; until then a bare JSON array is the contract.
-        """
-        from main import list_jobs
-
         row = {
             "id": "11111111-1111-4111-8111-111111111111",
             "description": "Ship the report",
@@ -263,16 +272,271 @@ class TestListJobs:
             "project_id": None,
             "user_id": str(user_a["id"]),
         }
-        fake_db.query_jobs = AsyncMock(return_value=[dict(row)])
+        fake_db.query_jobs = AsyncMock(
+            return_value=_result([dict(row)], total=806, has_more=True)
+        )
         with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
-            result = await list_jobs(fake_request, status=None, user_id=None, limit=100)
+            body = await _list_jobs(fake_request, limit=25, offset=25)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["id"] == row["id"]
-        assert result[0]["status"] == "completed"
+        assert isinstance(body, dict)
+        assert [j["id"] for j in body["jobs"]] == [row["id"]]
+        assert body["total"] == 806
+        assert body["total_is_capped"] is False
+        assert body["has_more"] is True
+        assert body["limit"] == 25
+        assert body["offset"] == 25
         # Enrichment the route is responsible for, not the query.
-        assert result[0]["audit_count"] is None
+        assert body["jobs"][0]["audit_count"] is None
+
+    @pytest.mark.asyncio
+    async def test_filters_echo_makes_server_side_defaults_visible(
+        self, user_a, fake_db, fake_request
+    ):
+        """An MCP caller that never read the docs must be able to see that
+        archived-project jobs were hidden, or it will conclude the job does
+        not exist rather than widening the query."""
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            body = await _list_jobs(fake_request, status=["failed"], search="abc")
+
+        assert body["filters"]["include_archived_projects"] is False
+        assert body["filters"]["status"] == ["failed"]
+        assert body["filters"]["search"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_as_of_is_generated_when_absent_and_echoed_back(
+        self, user_a, fake_db, fake_request
+    ):
+        """Paging without a watermark lets concurrent inserts shift the
+        window, so the server mints one and the client carries it."""
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            body = await _list_jobs(fake_request)
+
+        assert body["as_of"]
+        assert fake_db.query_jobs.call_args.kwargs["as_of"] is not None
+
+    @pytest.mark.asyncio
+    async def test_supplied_as_of_is_passed_through_unchanged(
+        self, user_a, fake_db, fake_request
+    ):
+        from datetime import datetime, timezone
+
+        pinned = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            body = await _list_jobs(fake_request, as_of=pinned)
+
+        assert fake_db.query_jobs.call_args.kwargs["as_of"] == pinned
+        # Zulu, not "+00:00": the value is meant to be pasted straight back
+        # into a query string, where '+' would decode as a space and 422.
+        assert body["as_of"] == "2026-08-20T12:00:00Z"
+        assert "+" not in body["as_of"]
+
+    @pytest.mark.asyncio
+    async def test_include_total_false_is_forwarded(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result(total=None))
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            body = await _list_jobs(fake_request, include_total=False, offset=100)
+
+        assert fake_db.query_jobs.call_args.kwargs["include_total"] is False
+        assert body["total"] is None
+
+    @pytest.mark.asyncio
+    async def test_capped_total_is_reported_as_capped(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(
+            return_value=_result(total=10_000, total_is_capped=True, has_more=True)
+        )
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            body = await _list_jobs(fake_request)
+
+        assert body["total"] == 10_000
+        assert body["total_is_capped"] is True
+
+
+# =============================================================================
+# list_jobs — filter validation
+# =============================================================================
+
+
+class TestListJobsFilterValidation:
+    @pytest.mark.asyncio
+    async def test_unknown_status_is_422_not_an_empty_page(
+        self, user_a, fake_db, fake_request
+    ):
+        """Silently returning zero rows for a typo reads as data loss."""
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, status=["completed", "donezo"])
+
+        assert exc.value.status_code == 422
+        assert "donezo" in exc.value.detail
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeated_status_values_are_deduped(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request, status=["failed", "failed", "paused"])
+
+        assert fake_db.query_jobs.call_args.kwargs["statuses"] == ["failed", "paused"]
+
+    @pytest.mark.asyncio
+    async def test_offset_beyond_the_ceiling_is_400(
+        self, user_a, fake_db, fake_request
+    ):
+        """A runaway MCP loop must not be able to table-scan the fleet."""
+        from main import JOBS_MAX_OFFSET
+
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, offset=JOBS_MAX_OFFSET + 1)
+
+        assert exc.value.status_code == 400
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_project_id_none_selects_the_projectless_bucket(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request, project_id=["none"])
+
+        kwargs = fake_db.query_jobs.call_args.kwargs
+        assert kwargs["has_project"] is False
+        assert kwargs["project_ids"] is None
+
+    @pytest.mark.asyncio
+    async def test_project_id_none_mixed_with_real_ids_is_422(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        """ "these projects OR no project" is a union the AND-composed filter
+        set cannot express; refusing beats returning one arm."""
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(
+                    fake_request, project_id=["none", str(project_a["id"])]
+                )
+
+        assert exc.value.status_code == 422
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_visible_project_filter_reaches_the_query(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request, project_id=[str(project_a["id"])])
+
+        assert fake_db.query_jobs.call_args.kwargs["project_ids"] == [
+            str(project_a["id"])
+        ]
+
+    @pytest.mark.asyncio
+    async def test_filtering_by_an_invisible_project_is_403(
+        self, user_a, project_b, fake_db, fake_request
+    ):
+        """403 rather than an empty page, matching /api/datasources/eligible.
+
+        This is a *narrowing* filter, so it is not a security boundary — the
+        visibility OR-clause already bounds the result and an unauthorized id
+        would merely return zero rows. It exists so the caller is told why.
+        """
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, project_id=[str(project_b["id"])])
+
+        assert exc.value.status_code == 403
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_admin_may_filter_by_any_project(
+        self, user_admin, project_b, fake_db, fake_request
+    ):
+        """Admins see the full fleet, so the visibility check must not run for
+        them — gating it on membership would 403 an admin out of their own
+        fleet view."""
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_admin, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request, project_id=[str(project_b["id"])])
+
+        assert fake_db.query_jobs.call_args.kwargs["project_ids"] == [
+            str(project_b["id"])
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mcp_scope_cannot_be_widened_by_a_project_filter(
+        self, user_a, project_a, project_b, fake_db, fake_request
+    ):
+        scoped = _scoped(user_a, f"project:{project_a['id']}")
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(scoped, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, project_id=[str(project_b["id"])])
+
+        assert exc.value.status_code == 403
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_too_many_project_filters_is_422(self, user_a, fake_db, fake_request):
+        """Repeated UUIDs hit nginx's URL ceiling around 40 values, where the
+        failure is a truncated request rather than a clear error."""
+        from main import JOBS_MAX_PROJECT_FILTERS
+
+        many = [
+            f"{i:08d}-0000-4000-8000-000000000000"
+            for i in range(JOBS_MAX_PROJECT_FILTERS + 1)
+        ]
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, project_id=many)
+
+        assert exc.value.status_code == 422
+        fake_db.query_jobs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_malformed_project_id_is_422_not_500(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            with pytest.raises(HTTPException) as exc:
+                await _list_jobs(fake_request, project_id=["not-a-uuid"])
+
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_archived_projects_are_excluded_by_default(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request)
+
+        assert fake_db.query_jobs.call_args.kwargs["include_archived_projects"] is False
+
+    @pytest.mark.asyncio
+    async def test_archived_projects_can_be_opted_back_in(
+        self, user_a, fake_db, fake_request
+    ):
+        fake_db.query_jobs = AsyncMock(return_value=_result())
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            await _list_jobs(fake_request, include_archived_projects=True)
+
+        assert fake_db.query_jobs.call_args.kwargs["include_archived_projects"] is True
 
 
 # =============================================================================

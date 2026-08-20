@@ -97,7 +97,15 @@ import {
   UploadInfo,
   UploadResponse,
 } from '../models/file.model';
-import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
+import {
+  AuditEntry,
+  AuditFilterCategory,
+  AuditResponse,
+  EMPTY_JOB_LIST_PAGE,
+  JobListPage,
+  JobListQuery,
+  JobSummary,
+} from '../models/audit.model';
 import {LLMRequest} from '../../workbench/request.model';
 import {GraphChangeResponse} from '../../workbench/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
@@ -336,20 +344,52 @@ export class ApiService {
 
   /**
    * Get list of jobs with optional status and user filter.
+   *
+   * `/api/jobs` returns a paging envelope; this unwraps it so existing
+   * callers keep receiving a plain array. The filter bar and pagination
+   * controls need `total`/`has_more`, so they call `getJobsPage()` instead.
    */
   getJobs(status?: string, limit: number = 100, userId?: string): Observable<JobSummary[]> {
-    let params = new HttpParams().set('limit', limit.toString());
-    if (status) {
-      params = params.set('status', status);
+    return this.getJobsPage({ status, limit, userId }).pipe(map((page) => page.jobs));
+  }
+
+  /**
+   * Get one page of jobs together with the counts a paging UI needs.
+   */
+  getJobsPage(options: JobListQuery = {}): Observable<JobListPage> {
+    let params = new HttpParams().set('limit', (options.limit ?? 100).toString());
+    for (const status of options.status ? [options.status].flat() : []) {
+      params = params.append('status', status);
     }
-    if (userId) {
-      params = params.set('user_id', userId);
+    for (const projectId of options.projectIds ?? []) {
+      params = params.append('project_id', projectId);
+    }
+    if (options.userId) {
+      params = params.set('user_id', options.userId);
+    }
+    if (options.hasProject !== undefined) {
+      params = params.set('has_project', String(options.hasProject));
+    }
+    if (options.includeArchivedProjects) {
+      params = params.set('include_archived_projects', 'true');
+    }
+    if (options.search) {
+      params = params.set('search', options.search);
+    }
+    if (options.asOf) {
+      params = params.set('as_of', options.asOf);
+    }
+    if (options.offset) {
+      params = params.set('offset', options.offset.toString());
+    }
+    if (options.includeTotal === false) {
+      params = params.set('include_total', 'false');
     }
 
-    return this.http.get<JobSummary[]>(`${this.baseUrl}/jobs`, { params }).pipe(
+    return this.http.get<JobListPage>(`${this.baseUrl}/jobs`, { params }).pipe(
       catchError((error) => {
         console.error('Failed to fetch jobs:', error);
-        return of([]);
+        return of(EMPTY_JOB_LIST_PAGE);
       }),
     );
   }

@@ -22,6 +22,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
+from database.postgres import JobQueryResult
+
 
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
@@ -174,7 +176,7 @@ class TestListMyActiveJobs:
             {"id": "j5", "status": "created"},
             {"id": "j6", "status": "pending_review"},
         ]
-        fake_db.query_jobs = AsyncMock(return_value=rows)
+        fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=rows))
         with _patch_caller_and_db(user_a, fake_db):
             result = await list_my_active_jobs(fake_request, limit=100)
         kept_ids = {r["id"] for r in result}
@@ -186,7 +188,7 @@ class TestListMyActiveJobs:
     ):
         from main import list_my_active_jobs
 
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_a, fake_db):
             await list_my_active_jobs(fake_request, limit=100)
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -202,7 +204,7 @@ class TestListMyActiveJobs:
         """Admin gets their personal active set (not the full fleet) — for that they use /api/agents."""
         from main import list_my_active_jobs
 
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_admin, fake_db):
             await list_my_active_jobs(fake_request, limit=100)
         fake_db.query_jobs.assert_awaited_once()
@@ -233,7 +235,7 @@ class TestListMyActiveJobs:
         from main import list_my_active_jobs
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
             await list_my_active_jobs(fake_request, limit=100)
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -247,7 +249,7 @@ class TestListMyActiveJobs:
         from main import list_my_active_jobs
 
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
-        fake_db.query_jobs = AsyncMock(return_value=[])
+        fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
             await list_my_active_jobs(fake_request, limit=100)
         kwargs = fake_db.query_jobs.call_args.kwargs

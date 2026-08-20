@@ -117,6 +117,7 @@ from database import (  # noqa: E402
     MIGRATIONS_AUDIT_DIR,
 )
 from database.postgres import (  # noqa: E402
+    KNOWN_JOB_STATUSES,
     DatasourceCatalogCursorError,
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -12418,13 +12419,57 @@ async def workspace_status(request: Request) -> dict[str, Any]:
     }
 
 
+#: Beyond this the list is not a list any more, it is a table scan wearing a
+#: page number. Elasticsearch's ``max_result_window`` draws the same line.
+JOBS_MAX_OFFSET = 50_000
+
+#: Repeated UUIDs run into nginx's ~4k URL ceiling around 40 values, where the
+#: failure mode is a truncated request rather than a clear error.
+JOBS_MAX_PROJECT_FILTERS = 40
+
+
 @app.get("/api/jobs")
 async def list_jobs(
     request: Request,
-    status: str | None = Query(default=None),
+    status: list[str] | None = Query(
+        default=None,
+        description="Lifecycle status(es) to keep (repeatable)",
+    ),
+    project_id: list[str] | None = Query(
+        default=None,
+        description=(
+            "Project(s) to keep (repeatable). Pass 'none' for jobs with no project."
+        ),
+    ),
+    has_project: bool | None = Query(
+        default=None,
+        description="true keeps only jobs with a project, false only those without",
+    ),
+    include_archived_projects: bool = Query(
+        default=False,
+        description="Include jobs belonging to archived projects",
+    ),
+    search: str | None = Query(
+        default=None,
+        max_length=200,
+        description="Match against job description (substring) or id (prefix)",
+    ),
+    as_of: datetime | None = Query(
+        default=None,
+        description=(
+            "Freeze the window at this creation-time watermark so paging is "
+            "not shifted by concurrent inserts. Echoed in the response; pass "
+            "it back on subsequent pages."
+        ),
+    ),
     user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-) -> list[dict[str, Any]]:
+    offset: int = Query(default=0, ge=0),
+    include_total: bool = Query(
+        default=True,
+        description="Compute the capped total. Pass false when paging.",
+    ),
+) -> dict[str, Any]:
     """List jobs visible to the caller.
 
     Visibility model (G1):
@@ -12437,7 +12482,20 @@ async def list_jobs(
           then ignored — AND-ing it onto the OR-clause would narrow the view
           to own-jobs-only and silently drop the caller's project rows.
 
-    Returns jobs enriched with audit_count from the audit store if available.
+    Returns an envelope, not a bare array::
+
+        {"jobs": [...], "total": 806, "total_is_capped": false,
+         "has_more": true, "limit": 100, "offset": 0, "as_of": "...",
+         "filters": {...}}
+
+    ``total`` is exact up to 10,000 and reported as capped beyond it; an
+    exact filtered count cannot be made cheap, and bounding it is what keeps
+    page 1 fast at a million rows. ``has_more`` is exact regardless.
+
+    The ``filters`` echo exists for MCP callers: it makes a server-side
+    default like ``include_archived_projects: false`` visible to a model that
+    never read the docs, so an agent that finds nothing knows to widen its
+    query rather than concluding the job does not exist.
     """
     user = await require_approved_user(request, postgres_db)
     is_admin = bool(user.get("is_admin"))
@@ -12449,28 +12507,141 @@ async def list_jobs(
             detail="Not authorized to query other users' jobs",
         )
 
+    statuses = list(dict.fromkeys(status or []))
+    unknown = [value for value in statuses if value not in KNOWN_JOB_STATUSES]
+    if unknown:
+        # 422 rather than an empty page: a typo that silently returns zero
+        # rows gets reported as data loss.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown job status(es): {', '.join(sorted(unknown))}. "
+                f"Valid values: {', '.join(KNOWN_JOB_STATUSES)}"
+            ),
+        )
+
+    if offset > JOBS_MAX_OFFSET:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"offset exceeds the maximum of {JOBS_MAX_OFFSET}. "
+                "Narrow the filters instead of paging further."
+            ),
+        )
+
+    # 'none' is the project-less bucket. A model will guess it, so accept it
+    # rather than treating it as a malformed uuid.
+    raw_project_ids = list(dict.fromkeys(str(value) for value in (project_id or [])))
+    wants_projectless = any(
+        value.lower() in ("none", "null") for value in raw_project_ids
+    )
+    filter_project_ids = sorted(
+        value for value in raw_project_ids if value.lower() not in ("none", "null")
+    )
+    if len(filter_project_ids) > JOBS_MAX_PROJECT_FILTERS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Too many project_id values ({len(filter_project_ids)}); "
+                f"the maximum is {JOBS_MAX_PROJECT_FILTERS}."
+            ),
+        )
+    for value in filter_project_ids:
+        try:
+            UUID(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"project_id is not a uuid: {value}",
+            ) from exc
+
+    effective_has_project = has_project
+    if wants_projectless and not filter_project_ids:
+        effective_has_project = False
+    elif wants_projectless and filter_project_ids:
+        # "these projects OR no project" is a union the AND-composed filter
+        # set cannot express; say so instead of quietly returning one arm.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "project_id=none cannot be combined with specific project "
+                "ids; issue them as separate queries."
+            ),
+        )
+
+    if scope_pid is not None and filter_project_ids:
+        # A project-scoped MCP token cannot widen itself by asking for
+        # another project. The AND-combined scope would already return zero
+        # rows; saying so is clearer than an empty page.
+        if filter_project_ids != [str(scope_pid)]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied by MCP token scope",
+            )
+
+    # Freeze the window on first page so later pages see the same set. The
+    # client carries it back; a shared "page 3" link therefore shows the
+    # recipient what the sender saw.
+    effective_as_of = as_of or datetime.now(timezone.utc)
+    # Emit Zulu, not "+00:00". The offset form round-trips through a properly
+    # encoded query string but breaks the moment anything concatenates it
+    # naively, because '+' decodes as a space and the parse then 422s. The
+    # value is meant to be pasted back verbatim, so hand out the form that
+    # survives that.
+    as_of_wire = effective_as_of.isoformat().replace("+00:00", "Z")
+
     try:
         if is_admin:
             owner_user_id = None
-            project_ids = None
+            visible_ids = None
         else:
             visible = await user_visible_project_ids(user, postgres_db)
             # Non-admin always lands on a concrete set (never "all").
             owner_user_id = str(user["id"])
-            project_ids = [str(p) for p in visible] if visible != "all" else []
+            visible_ids = [str(p) for p in visible] if visible != "all" else []
 
-        jobs = await postgres_db.query_jobs(
+            # Refuse a project the caller cannot see rather than returning an
+            # empty page. This is a narrowing filter, not an authorization
+            # boundary — the visibility OR-clause already bounds the result —
+            # so it must NOT run for admins, who legitimately filter by any
+            # project in the fleet, and it is deliberately not
+            # `require_project_member`: that gate is bypassed wholesale for
+            # X-Internal-Key callers and would relabel this endpoint's
+            # security classification as membership-gated, which it is not.
+            #
+            # Known gap: a caller who owns a job in a project they are not a
+            # member of cannot filter by that project id. The OR-clause still
+            # shows the job in the unfiltered list.
+            unauthorized = sorted(set(filter_project_ids) - set(visible_ids))
+            if unauthorized:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Not authorized to filter by project(s): "
+                        f"{', '.join(unauthorized)}"
+                    ),
+                )
+
+        result = await postgres_db.query_jobs(
             owner_user_id=owner_user_id,
-            visible_project_ids=project_ids,
+            visible_project_ids=visible_ids,
             scope_project_id=str(scope_pid) if scope_pid else None,
-            status=status,
+            statuses=statuses or None,
+            project_ids=filter_project_ids or None,
+            has_project=effective_has_project,
+            include_archived_projects=include_archived_projects,
+            search=search or None,
+            as_of=effective_as_of,
             # Admin-only cross-user filter. A non-admin's ?user_id= is
             # validated above but deliberately NOT forwarded: the OR-clause
             # already bounds them, and AND-ing it on would *narrow* the
             # result to own-jobs-only, dropping their project rows.
             user_id=user_id if is_admin else None,
             limit=limit,
+            offset=offset,
+            include_total=include_total,
         )
+        jobs = result.jobs
 
         if audit_reader.is_available:
             counts = await audit_reader.get_audit_counts(
@@ -12482,9 +12653,26 @@ async def list_jobs(
             for job in jobs:
                 job["audit_count"] = None
 
-        return [
-            _with_cloud_review_mode(_redact_job_config_override(job)) for job in jobs
-        ]
+        return {
+            "jobs": [
+                _with_cloud_review_mode(_redact_job_config_override(job))
+                for job in jobs
+            ],
+            "total": result.total,
+            "total_is_capped": result.total_is_capped,
+            "has_more": result.has_more,
+            "limit": limit,
+            "offset": offset,
+            "as_of": as_of_wire,
+            "filters": {
+                "status": statuses,
+                "project_id": filter_project_ids,
+                "has_project": effective_has_project,
+                "include_archived_projects": include_archived_projects,
+                "search": search,
+                "user_id": user_id if is_admin else None,
+            },
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -47819,15 +48007,20 @@ async def list_my_active_jobs(
             project_ids = [str(p) for p in visible] if visible != "all" else []
             owner_filter = None
 
-        jobs = await postgres_db.query_jobs(
+        result = await postgres_db.query_jobs(
             owner_user_id=owner_user_id,
             visible_project_ids=project_ids,
             scope_project_id=str(scope_pid) if scope_pid else None,
-            status=None,
+            statuses=sorted(_ME_ACTIVE_JOB_STATUSES),
             user_id=owner_filter,
             limit=limit,
+            include_total=False,
         )
-        return [j for j in jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
+        # Filtering in SQL is what makes ?limit= mean "up to N active jobs"
+        # rather than "the active ones among the newest N of any status".
+        # The post-filter stays as the gate: it is what a caller-side test
+        # pins, and it costs nothing once the query already narrowed.
+        return [j for j in result.jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
     except HTTPException:
         raise
     except Exception as e:
