@@ -2426,6 +2426,14 @@ export class ApiService {
     );
   }
 
+  /** Safely replace only the commissioned Officer's dedicated runtime pod. */
+  recycleOfficer(projectId: string): Observable<{state?: string; phase?: string}> {
+    return this.http.post<{state?: string; phase?: string}>(
+      `${this.baseUrl}/projects/${projectId}/officer/recycle`,
+      {},
+    );
+  }
+
   /**
    * Edit the post — partial kit/budget/brain fields, and the row-only
    * `communication_policy`. When commissioned the server live-merges the

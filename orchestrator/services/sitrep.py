@@ -647,6 +647,23 @@ async def _capacity_section(
                 oldest_claim_age_hours=oldest_hours,
             )
         ]
+        from services.persistent_recycler import persistent_recycle_view
+
+        runtime = persistent_recycle_view(metadata)
+        if runtime.get("observed_build_sha") or runtime.get("expected_build_sha"):
+            lines.append(
+                "Runtime: "
+                f"drift={runtime['drift_state']}; "
+                f"recycle={runtime['recycle_phase']}; "
+                f"observed={runtime.get('observed_build_sha') or 'missing'}; "
+                f"expected={runtime.get('expected_build_sha') or 'unpinned'}"
+                + (
+                    f"; failure={runtime['last_failure']}"
+                    if runtime.get("last_failure")
+                    else ""
+                )
+                + "."
+            )
         lines += pool_status_lines(officer_meta, officer_state, now)
         if project_id:
             try:

@@ -147,6 +147,11 @@ orchestrator:
   # -- Local crash-recovery proof hook: pause after durable command acceptance
   # and before inline finalization. Keep at zero outside an intentional test.
   completionFinalizerInlineDelaySeconds: 0
+  # -- Automatic image-drift and missing-pod reconciliation for commissioned
+  # Officer runtimes. First rollout stays dark until every orchestrator
+  # replica serves the parked-boundary acknowledgement contract; the
+  # owner/admin manual recycle endpoint remains available while false.
+  persistentAgentReconciliationEnabled: false
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:

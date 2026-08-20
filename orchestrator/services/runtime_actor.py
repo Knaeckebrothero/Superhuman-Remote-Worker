@@ -1228,6 +1228,101 @@ async def _lock_officer_authority_for_grant(
     return post, thread, agent, grant, current_role
 
 
+async def lock_current_officer_runtime_grant(
+    conn: Any,
+    *,
+    post: Any,
+    thread: Any,
+    agent: Any,
+    now: datetime | None = None,
+) -> Any | None:
+    """Lock and return the one exact live grant for a locked Officer runtime.
+
+    Callers must already hold the Post -> thread -> agent locks.  This helper
+    centralizes the same incarnation, owner-role, liveness, and grant-shape
+    authority used by refresh/maintenance so lifecycle replacement cannot
+    accept a merely unrevoked thread/agent-shaped row.
+    """
+
+    observed_at = now or datetime.now(timezone.utc)
+    incarnations = post.get("incarnations") or []
+    if isinstance(incarnations, str):
+        try:
+            incarnations = json.loads(incarnations)
+        except (TypeError, ValueError):
+            return None
+    incarnation = len(incarnations) if isinstance(incarnations, list) else 0
+    metadata = _json_object(thread.get("metadata"))
+    officer = _json_object(_json_object(metadata.get("config_override")).get("officer"))
+    heartbeat = _as_utc(agent.get("last_heartbeat")) if agent else None
+    if (
+        post.get("thread_id") != thread.get("id")
+        or post.get("project_id") != thread.get("project_id")
+        or str(thread.get("status") or "") == "ended"
+        or officer.get("enabled") not in {True, "true", "True", 1}
+        or agent is None
+        or agent.get("id") != thread.get("agent_id")
+        or agent.get("thread_id") != thread.get("id")
+        or str(agent.get("status") or "") in {"offline", "failed", "draining"}
+        or heartbeat is None
+        or heartbeat
+        <= observed_at - timedelta(seconds=max(1, OFFICER_AGENT_LIVE_SECONDS))
+    ):
+        return None
+
+    role_row = await conn.fetchrow(
+        "SELECT u.is_admin, pm.role FROM users u LEFT JOIN project_members pm "
+        "ON pm.user_id = u.id AND pm.project_id = $2 "
+        "WHERE u.id = $1",
+        thread.get("user_id"),
+        post.get("project_id"),
+    )
+    current_role = (
+        "admin"
+        if role_row and bool(role_row.get("is_admin"))
+        else str(role_row.get("role"))
+        if role_row and role_row.get("role")
+        else ""
+    )
+    grants = await conn.fetch(
+        """
+        SELECT id, caller_kind, user_id, project_id, project_role,
+               thread_id, officer_incarnation, agent_id,
+               refresh_expires_at, revoked_at
+          FROM runtime_actor_grants
+         WHERE caller_kind = 'officer'
+           AND project_id = $1
+           AND thread_id = $2
+           AND officer_incarnation = $3
+           AND agent_id = $4
+           AND revoked_at IS NULL
+           AND refresh_expires_at > $5
+         ORDER BY id
+         LIMIT 2
+         FOR UPDATE
+        """,
+        post.get("project_id"),
+        thread.get("id"),
+        incarnation,
+        agent.get("id"),
+        observed_at,
+    )
+    if len(grants) != 1:
+        return None
+    grant = grants[0]
+    if (
+        grant.get("caller_kind") != "officer"
+        or grant.get("user_id") != thread.get("user_id")
+        or grant.get("project_id") != post.get("project_id")
+        or grant.get("thread_id") != thread.get("id")
+        or int(grant.get("officer_incarnation") or 0) != incarnation
+        or grant.get("agent_id") != agent.get("id")
+        or str(grant.get("project_role") or "") != current_role
+    ):
+        return None
+    return grant
+
+
 def _refresh_digest_matches(grant: Any, presented_digest: bytes, now: datetime) -> bool:
     if grant.get("refresh_token_hash") == presented_digest:
         return True

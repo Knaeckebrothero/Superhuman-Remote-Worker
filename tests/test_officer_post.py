@@ -132,6 +132,35 @@ class TestSitrepCapacityLineage:
         assert lines and "line 2/2" in lines[0]
 
     @pytest.mark.asyncio
+    async def test_capacity_surfaces_runtime_drift_and_bounded_failure(self):
+        current = str(uuid4())
+        conn = SimpleNamespace()
+        conn.fetch = AsyncMock(return_value=[])
+        db = SimpleNamespace()
+        db.get_officer_capacity_lineage = AsyncMock(return_value=[current])
+        db.get_oldest_open_officer_claim = AsyncMock(return_value=None)
+        db.acquire = lambda: _FakeAcquire(conn)
+        thread = {
+            "id": current,
+            "metadata": {
+                "config_override": {"officer": {"enabled": True}},
+                "agent_pod": {
+                    "observed_build_sha": "old-build",
+                    "expected_build_sha": "new-build",
+                    "recycle": {
+                        "phase": "failed_retryable",
+                        "last_failure": {"class": "replacement_not_ready"},
+                    },
+                },
+            },
+        }
+
+        lines = await sitrep._capacity_section(db, thread, current)
+
+        assert any("drift=drifted" in line for line in lines)
+        assert any("replacement_not_ready" in line for line in lines)
+
+    @pytest.mark.asyncio
     async def test_empty_lineage_degrades_to_the_thread_itself(self):
         current = str(uuid4())
         conn = SimpleNamespace()

@@ -482,6 +482,29 @@ export function nextWakeLabel(
                 </div>
               }
 
+              @if (post()?.runtime_lifecycle; as lifecycle) {
+                <div class="officer-slots" data-testid="officer-runtime-lifecycle">
+                  <span class="k">{{ 'officerCard.runtimeLifecycle.label' | transloco }}</span>
+                  <span class="v" [class.officer-warn]="lifecycle.drift_state !== 'current'">
+                    {{ 'officerCard.runtimeLifecycle.drift.' + (lifecycle.drift_state || 'unknown') | transloco }}
+                    · {{
+                      'officerCard.runtimeLifecycle.phase.' +
+                        ((lifecycle.recycle_phase || 'unknown').replaceAll('_', '-')) | transloco
+                    }}
+                    @if (lifecycle.observed_build_sha || lifecycle.expected_build_sha) {
+                      · {{ lifecycle.observed_build_sha || ('officerCard.runtimeLifecycle.missing' | transloco) }}
+                      → {{ lifecycle.expected_build_sha || ('officerCard.runtimeLifecycle.unpinned' | transloco) }}
+                    }
+                    @if (lifecycle.last_failure) { · {{ lifecycle.last_failure }} }
+                    · {{
+                      (lifecycle.automatic_reconciliation_enabled
+                        ? 'officerCard.runtimeLifecycle.automatic.enabled'
+                        : 'officerCard.runtimeLifecycle.automatic.disabled') | transloco
+                    }}
+                  </span>
+                </div>
+              }
+
               <div class="officer-meta">
                 <div>
                   <span class="k">{{ 'officerCard.summary.nextWake' | transloco }}</span>
@@ -888,6 +911,16 @@ export function nextWakeLabel(
             <div class="officer-actions">
               @if (canManage()) {
                 <app-button
+                  variant="secondary"
+                  size="sm"
+                  [disabled]="busy() || recycleActive()"
+                  (clicked)="recycle()"
+                  data-testid="officer-recycle"
+                  [ariaLabel]="'officerCard.a11y.recycle' | transloco"
+                >
+                  {{ 'officerCard.actions.recycle' | transloco }}
+                </app-button>
+                <app-button
                   variant="primary"
                   size="sm"
                   [disabled]="busy() || !dirty()"
@@ -913,7 +946,7 @@ export function nextWakeLabel(
                       : ('officerCard.actions.conference' | transloco)
                   }}
                 </app-button>
-                @if (postState() === 'held') {
+                @if (postState() === 'held' && !recycleActive()) {
                   <app-button
                     variant="secondary"
                     size="sm"
@@ -1383,6 +1416,10 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly modelOptions = computed(() => this.modelService.models().flatMap((g) => g.models));
   readonly postState = computed<OfficerPostState>(() => postStateOf(this.post()));
   readonly canManage = computed(() => this.post()?.can_manage === true);
+  readonly recycleActive = computed(() => {
+    const phase = this.post()?.runtime_lifecycle?.recycle_phase;
+    return !!phase && !['idle', 'complete', 'cancelled'].includes(phase);
+  });
   readonly showImmediacy = computed(() => this.postState() !== 'vacant');
   readonly holdLabel = computed(() => holdBadgeLabel(this.post()?.held, this.tr));
   readonly wakeLabel = computed(() =>
@@ -1746,6 +1783,22 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
       this.refresh(true);
     } catch (err) {
       this.message.set(this.errText(err, 'officerCard.errors.release'));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async recycle(): Promise<void> {
+    const pid = this.projectId();
+    if (!pid || !this.canManage() || this.busy() || this.recycleActive()) return;
+    this.busy.set(true);
+    this.message.set('');
+    try {
+      await firstValueFrom(this.api.recycleOfficer(pid));
+      this.message.set(this.tr('officerCard.messages.recycleStarted'));
+      this.refresh(true);
+    } catch (err) {
+      this.message.set(this.errText(err, 'officerCard.errors.recycle'));
     } finally {
       this.busy.set(false);
     }

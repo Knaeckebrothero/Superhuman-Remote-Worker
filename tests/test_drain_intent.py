@@ -352,13 +352,210 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "workspace_suspension_service", suspension),
         ):
-            result = await orch_main.agent_suspend_thread(object(), "tid-drain-1")
+            request = MagicMock()
+            request.headers = {}
+            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
 
         assert result == {"suspended": True, "status": "suspended"}
         sql = " ".join(conn.fetchval.await_args.args[0].split())
         assert "status = 'suspended'" in sql
         assert "agent_id = NULL" in sql
         assert "control_admission_agent_id = NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_recycle_boundary_bypasses_workspace_snapshot_and_never_ends(self):
+        from orchestrator import main as orch_main
+        from orchestrator.services.persistent_recycler import (
+            ParkedBoundaryAcknowledgement,
+        )
+
+        db, _conn = self._db()
+        recycler = MagicMock()
+        recycler.acknowledge_parked_boundary = AsyncMock(
+            return_value=ParkedBoundaryAcknowledgement(True, True, "acknowledged")
+        )
+        suspension = MagicMock()
+        suspension.is_enabled = True
+        suspension.suspend_thread_workspace = AsyncMock(return_value=True)
+        request = MagicMock()
+        request.headers = {"X-Agent-ID": "agent-current"}
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(orch_main, "workspace_suspension_service", suspension),
+        ):
+            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+
+        assert result == {
+            "suspended": True,
+            "status": "suspended",
+            "reason": "persistent_recycle",
+        }
+        recycler.acknowledge_parked_boundary.assert_awaited_once_with(
+            thread_id="tid-drain-1", agent_id="agent-current"
+        )
+        suspension.suspend_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("officer", [True, False])
+    async def test_headerless_prechange_client_acknowledges_active_recycle(
+        self, officer
+    ):
+        from orchestrator import main as orch_main
+        from orchestrator.services.persistent_recycler import (
+            ParkedBoundaryAcknowledgement,
+        )
+        from starlette.requests import Request
+
+        db, _conn = self._db()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "tid-drain-1",
+                "status": "active",
+                "execution_lane": "pinned",
+                "project_id": "project-1" if officer else None,
+            }
+        )
+        recycler = MagicMock()
+        recycler.acknowledge_parked_boundary = AsyncMock(
+            return_value=ParkedBoundaryAcknowledgement(True, True, "acknowledged")
+        )
+        suspension = MagicMock()
+        suspension.is_enabled = False
+        suspension.suspend_thread_workspace = AsyncMock(return_value=False)
+        # Exact pre-change request shape: transport key is handled by
+        # require_internal, but there is no X-Agent-ID assertion.
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/agents/threads/tid-drain-1/suspend",
+                "headers": [(b"x-internal-key", b"transport-authenticated")],
+            }
+        )
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(orch_main, "workspace_suspension_service", suspension),
+        ):
+            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+
+        assert result["reason"] == "persistent_recycle"
+        recycler.acknowledge_parked_boundary.assert_awaited_once_with(
+            thread_id="tid-drain-1", agent_id=None
+        )
+        db.get_thread.assert_not_awaited()
+        suspension.suspend_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mismatching_header_is_rejected_without_legacy_suspend(self):
+        from fastapi import HTTPException
+
+        from orchestrator import main as orch_main
+        from orchestrator.services.persistent_recycler import (
+            ParkedBoundaryAcknowledgement,
+        )
+        from starlette.requests import Request
+
+        db, _conn = self._db()
+        recycler = MagicMock()
+        recycler.acknowledge_parked_boundary = AsyncMock(
+            return_value=ParkedBoundaryAcknowledgement(
+                True, False, "agent_assertion_mismatch"
+            )
+        )
+        suspension = MagicMock()
+        suspension.suspend_thread_workspace = AsyncMock(return_value=True)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/agents/threads/tid-drain-1/suspend",
+                "headers": [
+                    (b"x-internal-key", b"transport-authenticated"),
+                    (b"x-agent-id", b"spoofed-agent"),
+                ],
+            }
+        )
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(orch_main, "workspace_suspension_service", suspension),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.agent_suspend_thread(request, "tid-drain-1")
+
+        assert exc.value.status_code == 409
+        db.get_thread.assert_not_awaited()
+        suspension.suspend_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recycle_owns_legacy_ended_fallback_too(self):
+        from orchestrator import main as orch_main
+        from orchestrator.services.persistent_recycler import (
+            ParkedBoundaryAcknowledgement,
+        )
+
+        db, _conn = self._db()
+        recycler = MagicMock()
+        recycler.acknowledge_parked_boundary = AsyncMock(
+            return_value=ParkedBoundaryAcknowledgement(True, True, "acknowledged")
+        )
+        suspend_resources = AsyncMock()
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
+        ):
+            result = await orch_main.agent_update_thread_status(
+                MagicMock(),
+                "tid-drain-1",
+                orch_main.AgentThreadStatusRequest(status="ended"),
+            )
+
+        assert result == {"status": "suspended"}
+        db.get_thread.assert_not_awaited()
+        suspend_resources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_active_generation_retains_legacy_suspend(self):
+        from orchestrator import main as orch_main
+        from orchestrator.services.persistent_recycler import (
+            ParkedBoundaryAcknowledgement,
+        )
+        from starlette.requests import Request
+
+        db, conn = self._db()
+        recycler = MagicMock()
+        recycler.acknowledge_parked_boundary = AsyncMock(
+            return_value=ParkedBoundaryAcknowledgement(False, False, "inactive")
+        )
+        suspension = MagicMock()
+        suspension.is_enabled = True
+        suspension.suspend_thread_workspace = AsyncMock(return_value=True)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/agents/threads/tid-drain-1/suspend",
+                "headers": [(b"x-internal-key", b"transport-authenticated")],
+            }
+        )
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(orch_main, "workspace_suspension_service", suspension),
+        ):
+            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+
+        assert result == {"suspended": True, "status": "suspended"}
+        suspension.suspend_thread_workspace.assert_awaited_once_with("tid-drain-1")
+        assert conn.fetchval.await_count == 1
 
     @pytest.mark.asyncio
     async def test_legacy_agent_end_closes_control_admission(self):

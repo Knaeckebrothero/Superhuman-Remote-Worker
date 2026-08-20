@@ -3206,6 +3206,20 @@ def format_officer_post(
             "Runtime authorization: UNAVAILABLE — autonomous planning is "
             "suppressed; server retry/incident handling is active."
         )
+    runtime_lifecycle = data.get("runtime_lifecycle") or {}
+    if runtime_lifecycle:
+        lines.append(
+            "Runtime lifecycle: "
+            f"{runtime_lifecycle.get('drift_state') or 'unknown'} | "
+            f"{runtime_lifecycle.get('recycle_phase') or 'idle'} | "
+            f"observed {runtime_lifecycle.get('observed_build_sha') or 'missing'} | "
+            f"expected {runtime_lifecycle.get('expected_build_sha') or 'unpinned'}"
+            + (
+                f" | failure {runtime_lifecycle['last_failure']}"
+                if runtime_lifecycle.get("last_failure")
+                else ""
+            )
+        )
     brain = officer.get("model") or "?"
     if officer.get("reasoning_level"):
         brain += f" (reasoning {officer['reasoning_level']})"

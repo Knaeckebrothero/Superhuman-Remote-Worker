@@ -3248,6 +3248,7 @@
       "sleepMin": "Minimum sleep in minutes",
       "sleepMax": "Maximum sleep in minutes",
       "holdNote": "Officer hold note",
+      "recycle": "Recycle Officer runtime",
       "routingPolicy": "Worker-question routing policy"
     },
     "actions": {
@@ -3264,6 +3265,7 @@
       "openLog": "Open log",
       "rejoinConference": "Rejoin conference",
       "release": "Release",
+      "recycle": "Recycle runtime",
       "save": "Save changes"
     },
     "backlog": {
@@ -3317,6 +3319,7 @@
       "hold": "Hold failed",
       "policy": "Could not change worker-question routing",
       "release": "Release failed",
+      "recycle": "Runtime recycle failed",
       "update": "Update failed",
       "withDetail": "{{fallback}}: {{detail}}"
     },
@@ -3361,7 +3364,36 @@
       "decommissioned": "Post decommissioned — kit, budgets, and fingerprints stay on the post for his successor.",
       "held": "Held — dispatches pause and the watchdog stands down; your input still reaches him.",
       "released": "Released — queued events drain within a tick.",
+      "recycleStarted": "Runtime recycle started — the maintenance hold remains until the replacement is healthy.",
       "updated": "Post updated — the next sitrep's capacity line carries the truth."
+    },
+    "runtimeLifecycle": {
+      "label": "Runtime lifecycle",
+      "missing": "missing",
+      "unpinned": "unpinned",
+      "automatic": {
+        "enabled": "automatic repair enabled",
+        "disabled": "automatic repair disabled"
+      },
+      "drift": {
+        "current": "current",
+        "drifted": "image drift",
+        "missing": "pod missing",
+        "unknown": "unknown"
+      },
+      "phase": {
+        "idle": "idle",
+        "awaiting-old-pod-exit": "waiting for the old runtime to drain",
+        "fencing-old-authority": "retiring old runtime authority",
+        "provisioning": "provisioning replacement",
+        "provisioning-claimed": "replacement provision in progress",
+        "awaiting-replacement": "waiting for replacement authority",
+        "failed-retryable": "retryable failure",
+        "complete": "current",
+        "blocked": "blocked",
+        "cancelled": "cancelled",
+        "unknown": "unknown"
+      }
     },
     "policy": {
       "title": "Worker questions",

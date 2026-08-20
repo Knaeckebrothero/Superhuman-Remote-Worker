@@ -38,10 +38,12 @@ from main import (
     decommission_project_officer,
     hold_project_officer,
     patch_project_officer,
+    recycle_project_officer,
     release_project_officer,
 )
 from orchestrator.database.postgres import PostgresDB
 from services import session_wake
+from services.persistent_recycler import PersistentRecycleResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
@@ -66,6 +68,7 @@ class TestRoutesRegistered:
             ("POST", "/api/projects/{project_id}/officer/decommission"),
             ("POST", "/api/projects/{project_id}/officer/hold"),
             ("POST", "/api/projects/{project_id}/officer/release"),
+            ("POST", "/api/projects/{project_id}/officer/recycle"),
             ("PATCH", "/api/projects/{project_id}/officer"),
             ("GET", "/api/projects/{project_id}/officer"),
         }
@@ -460,6 +463,7 @@ class TestAdminGate:
             lambda req: decommission_project_officer(req, PROJECT_ID, None),
             lambda req: hold_project_officer(req, PROJECT_ID, None),
             lambda req: release_project_officer(req, PROJECT_ID),
+            lambda req: recycle_project_officer(req, PROJECT_ID),
             lambda req: patch_project_officer(
                 req, PROJECT_ID, {"max_pages_per_day": 1}
             ),
@@ -575,6 +579,65 @@ class TestHoldRelease:
             await release_project_officer(MagicMock(), PROJECT_ID)
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_generic_release_cannot_clear_recycler_owned_hold(
+        self, db, as_project_admin, quiet_side_channels
+    ):
+        held = _officer_thread(
+            metadata={
+                "config_override": {
+                    "officer": {
+                        "enabled": True,
+                        "hold": {
+                            "kind": "maintenance",
+                            "_persistent_recycle_generation": "server-owned",
+                        },
+                    }
+                }
+            }
+        )
+        db.get_officer_thread_for_project = AsyncMock(return_value=held)
+        with pytest.raises(HTTPException) as exc:
+            await release_project_officer(MagicMock(), PROJECT_ID)
+        assert exc.value.status_code == 409
+        db.set_project_officer_hold.assert_not_awaited()
+
+
+class TestOfficerRecycle:
+    @pytest.mark.asyncio
+    async def test_owner_action_delegates_to_shared_recycler(
+        self, db, as_project_admin, monkeypatch
+    ):
+        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
+        recycler = MagicMock()
+        recycler.observe = AsyncMock(return_value=None)
+        recycler.request_and_reconcile = AsyncMock(
+            return_value=PersistentRecycleResult(
+                THREAD_ID, "recycling", "provisioning", "generation-hidden"
+            )
+        )
+        provisioner = MagicMock(is_available=True, expected_build_sha="new")
+        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
+        monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+        monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", False)
+
+        result = await recycle_project_officer(MagicMock(), PROJECT_ID)
+
+        assert result == {
+            "thread_id": THREAD_ID,
+            "state": "recycling",
+            "phase": "provisioning",
+            "failure_class": None,
+        }
+        assert "generation" not in result
+        recycler.request_and_reconcile.assert_awaited_once_with(
+            thread_id=THREAD_ID,
+            reason="operator_requested",
+            expected_build_sha="new",
+            observation=None,
+            expected_project_id=PROJECT_ID,
+        )
 
 
 class TestPatchEndpoint:
