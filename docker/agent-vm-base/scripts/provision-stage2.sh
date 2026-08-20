@@ -66,6 +66,42 @@ sudo chown agent-host:agent-host /home/agent-host/workspace
 sudo mkdir -p /etc/ssh/authorized_keys
 sudo chmod 755 /etc/ssh/authorized_keys
 
+# ---------------------------------------------------------------------------
+# Rootless podman for agent-host (engine + deps installed in stage 1).
+# ---------------------------------------------------------------------------
+# Rootless needs a subordinate uid/gid range; without one podman exits with
+# "cannot find UID/GID for user agent-host". useradd only writes these when
+# the distro default is configured, so set them explicitly and idempotently.
+if ! grep -q '^agent-host:' /etc/subuid; then
+    echo 'agent-host:100000:65536' | sudo tee -a /etc/subuid > /dev/null
+fi
+if ! grep -q '^agent-host:' /etc/subgid; then
+    echo 'agent-host:100000:65536' | sudo tee -a /etc/subgid > /dev/null
+fi
+
+# Keep a systemd user session alive without an interactive login. RemoteBackend
+# connects over SSH and sessions come and go; without lingering, /run/user/<uid>
+# disappears between them and long-running containers die with the session.
+sudo loginctl enable-linger agent-host || true
+
+# Enable the rootless podman API socket by writing the symlink `systemctl
+# --user enable` would create. Done by hand because there is no user D-Bus
+# during the image build. The socket is what Docker-API clients (compose v2,
+# testcontainers) talk to; the `docker` CLI shim does not need it.
+sudo -u agent-host mkdir -p /home/agent-host/.config/systemd/user/sockets.target.wants
+sudo -u agent-host ln -sf /usr/lib/systemd/user/podman.socket \
+    /home/agent-host/.config/systemd/user/sockets.target.wants/podman.socket
+
+# Point Docker-API clients at that socket for every shell agent-host opens.
+sudo tee /etc/profile.d/podman-docker-host.sh > /dev/null <<'PODMANEOF'
+# Rootless podman exposes a Docker-compatible API socket; DOCKER_HOST lets
+# compose v2, testcontainers and other Docker-API clients find it.
+if [ -z "${DOCKER_HOST:-}" ] && [ -S "/run/user/$(id -u)/podman/podman.sock" ]; then
+    export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
+fi
+PODMANEOF
+sudo chmod 0644 /etc/profile.d/podman-docker-host.sh
+
 # Agent runtime directory
 sudo mkdir -p /run/agent
 sudo chmod 755 /run/agent
@@ -299,6 +335,23 @@ sudo install -o root -g root -m 0755 /tmp/check-browser-stream.py /usr/local/bin
 _section "Asserting browser stack"
 sudo install -o root -g root -m 0755 /tmp/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
 sudo -u agent-host /usr/local/bin/assert-browser-stack
+
+# -----------------------------------------------------------------------------
+# 9. Container stack conformance gate (VM-only)
+# -----------------------------------------------------------------------------
+#
+# Same reasoning as the browser gate, same failure history: a capability that
+# is present but unreachable is worse than one that is absent, because nothing
+# reports it. Runs as agent-host so it checks the subuid/subgid ranges and PATH
+# of the user the agent actually SSHes in as.
+#
+# Static contract only — a real `podman run` needs a user session that does not
+# exist during the image build. On a live VM, `assert-container-stack --run`
+# completes the proof in five seconds.
+
+_section "Asserting container stack"
+sudo install -o root -g root -m 0755 /tmp/assert-container-stack.sh /usr/local/bin/assert-container-stack
+sudo -u agent-host /usr/local/bin/assert-container-stack
 
 _section_end
 echo "=== Stage 2 complete ==="

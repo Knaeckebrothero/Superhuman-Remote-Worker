@@ -118,6 +118,9 @@ build {
       "../browser-exec",
       "../check-browser-stream.py",
       "../assert-browser-stack.sh",
+      # VM-only, unlike its browser sibling: the sandbox tier cannot run
+      # containers at all, so there is no twin image to keep in step.
+      "../assert-container-stack.sh",
     ]
     destination = "/tmp/"
   }
