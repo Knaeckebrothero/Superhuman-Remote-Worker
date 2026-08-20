@@ -1577,6 +1577,98 @@ class PostgresDB:
     # JOB OPERATIONS
     # =========================================================================
 
+    def _job_filter_conditions(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+        statuses: list[str] | None = None,
+        project_ids: list[str] | None = None,
+        has_project: bool | None = None,
+        include_archived_projects: bool = False,
+        search: str | None = None,
+        as_of: datetime | None = None,
+        user_id: str | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        """Shared ``WHERE`` fragments for the jobs list and its facet counts.
+
+        Both must be built here rather than twice. The status chips are only
+        meaningful if their counts are computed over exactly the set the list
+        is paging, and a second hand-rolled copy of this drifts the first time
+        someone adds a filter to one caller and not the other.
+
+        Every fragment is AND-combined and assumes ``jobs j LEFT JOIN
+        projects p``. Returns ``(conditions, values)`` with ``$n`` numbering
+        starting at 1 — callers append their own trailing params (LIMIT,
+        OFFSET, a count cap) off ``len(values)``.
+
+        Callers validate filter *values*: ``statuses`` is assumed already
+        checked against :data:`KNOWN_JOB_STATUSES`, and the caller is assumed
+        authorized for every id in ``project_ids``.
+        """
+        conditions: list[str] = []
+        values: list[Any] = []
+
+        def add_condition(template: str, value: Any) -> None:
+            values.append(value)
+            conditions.append(template.format(param=f"${len(values)}"))
+
+        # Visibility goes first so it owns $1..$n; every filter added after
+        # it numbers itself off len(values), leaving no start_idx arithmetic
+        # to get wrong. A wrong-but-in-range index binds the wrong value and
+        # raises nothing.
+        visibility, vis_values, _ = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            table_alias="j",
+        )
+        if visibility:
+            conditions.append(visibility)
+            values.extend(vis_values)
+
+        if statuses:
+            add_condition("j.status = ANY({param}::text[])", list(statuses))
+
+        if project_ids:
+            add_condition(
+                "j.project_id = ANY({param}::uuid[])",
+                [UUID(value) for value in project_ids],
+            )
+
+        if has_project is True:
+            conditions.append("j.project_id IS NOT NULL")
+        elif has_project is False:
+            conditions.append("j.project_id IS NULL")
+
+        if not include_archived_projects:
+            # Fail toward showing, as the projects list does: only an explicit
+            # 'archived' hides a row, so a project-less job (p.status IS NULL)
+            # and any status we do not recognise both survive. Archived-ness
+            # lives on the parent row, so no partial index on jobs can help.
+            conditions.append(
+                "COALESCE(p.status, 'active') IS DISTINCT FROM 'archived'"
+            )
+
+        if search:
+            values.append(f"%{search}%")
+            description_param = f"${len(values)}"
+            values.append(f"{search}%")
+            id_param = f"${len(values)}"
+            conditions.append(
+                f"(j.description ILIKE {description_param} "
+                f"OR j.id::text LIKE {id_param})"
+            )
+
+        if as_of is not None:
+            add_condition("j.created_at <= {param}", as_of)
+
+        if user_id:
+            add_condition("j.user_id = {param}", UUID(user_id))
+
+        return conditions, values
+
     async def query_jobs(
         self,
         *,
@@ -1647,65 +1739,18 @@ class PostgresDB:
         Returns:
             A :class:`JobQueryResult`.
         """
-        conditions: list[str] = []
-        values: list[Any] = []
-
-        def add_condition(template: str, value: Any) -> None:
-            values.append(value)
-            conditions.append(template.format(param=f"${len(values)}"))
-
-        # Visibility goes first so it owns $1..$n; every filter added after
-        # it numbers itself off len(values), leaving no start_idx arithmetic
-        # to get wrong. A wrong-but-in-range index binds the wrong value and
-        # raises nothing.
-        visibility, vis_values, _ = self._visibility_clause(
+        conditions, values = self._job_filter_conditions(
             owner_user_id=owner_user_id,
             visible_project_ids=visible_project_ids,
             scope_project_id=scope_project_id,
-            table_alias="j",
+            statuses=statuses,
+            project_ids=project_ids,
+            has_project=has_project,
+            include_archived_projects=include_archived_projects,
+            search=search,
+            as_of=as_of,
+            user_id=user_id,
         )
-        if visibility:
-            conditions.append(visibility)
-            values.extend(vis_values)
-
-        if statuses:
-            add_condition("j.status = ANY({param}::text[])", list(statuses))
-
-        if project_ids:
-            add_condition(
-                "j.project_id = ANY({param}::uuid[])",
-                [UUID(value) for value in project_ids],
-            )
-
-        if has_project is True:
-            conditions.append("j.project_id IS NOT NULL")
-        elif has_project is False:
-            conditions.append("j.project_id IS NULL")
-
-        if not include_archived_projects:
-            # Fail toward showing, as the projects list does: only an explicit
-            # 'archived' hides a row, so a project-less job (p.status IS NULL)
-            # and any status we do not recognise both survive. Archived-ness
-            # lives on the parent row, so no partial index on jobs can help.
-            conditions.append(
-                "COALESCE(p.status, 'active') IS DISTINCT FROM 'archived'"
-            )
-
-        if search:
-            values.append(f"%{search}%")
-            description_param = f"${len(values)}"
-            values.append(f"{search}%")
-            id_param = f"${len(values)}"
-            conditions.append(
-                f"(j.description ILIKE {description_param} "
-                f"OR j.id::text LIKE {id_param})"
-            )
-
-        if as_of is not None:
-            add_condition("j.created_at <= {param}", as_of)
-
-        if user_id:
-            add_condition("j.user_id = {param}", UUID(user_id))
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -7418,41 +7463,79 @@ class PostgresDB:
         owner_user_id: str | None = None,
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
-    ) -> Dict[str, int]:
-        """Get overall job statistics.
+        project_ids: list[str] | None = None,
+        has_project: bool | None = None,
+        include_archived_projects: bool = False,
+        search: str | None = None,
+        as_of: datetime | None = None,
+        user_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Per-status job counts for the list's status chips.
+
+        Takes the same filters as :meth:`query_jobs` **except ``statuses``**,
+        and that omission is the whole point. These are *disjunctive* facet
+        counts: a multi-select facet's counts have to be computed with its own
+        filter removed, or the moment a user selects ``failed`` every other
+        chip reads ``(0)`` — no row is simultaneously ``failed`` and
+        ``paused`` — and the counts become worse than useless. The counts
+        therefore respect search, project, archived and the rest, but never
+        the status selection. It is the same reason Algolia issues a second
+        request per disjunctive facet.
+
+        Conditions come from :meth:`_job_filter_conditions`, shared with
+        ``query_jobs``, so a chip count is always computed over exactly the
+        set the list is paging.
 
         Args:
             owner_user_id / visible_project_ids / scope_project_id:
                 G5 visibility — see :meth:`get_daily_statistics` for the
                 semantics. ``None`` on all three = full fleet (admin view).
+            project_ids / has_project / include_archived_projects / search /
+            as_of / user_id: same meaning as on :meth:`query_jobs`.
 
         Returns:
-            Dict with job counts by status
+            ``total_jobs`` (the "All" chip — every status, filters otherwise
+            applied), one key per entry in :data:`KNOWN_JOB_STATUSES`
+            zero-filled, and ``by_status`` carrying whatever the database
+            actually returned, including any status outside the vocabulary.
         """
-        visibility, vis_vals, _next_idx = self._visibility_clause(
+        conditions, values = self._job_filter_conditions(
             owner_user_id=owner_user_id,
             visible_project_ids=visible_project_ids,
             scope_project_id=scope_project_id,
-            start_idx=1,
+            statuses=None,  # disjunctive: never the facet's own filter
+            project_ids=project_ids,
+            has_project=has_project,
+            include_archived_projects=include_archived_projects,
+            search=search,
+            as_of=as_of,
+            user_id=user_id,
         )
-        where_clause = f"WHERE {visibility}" if visibility else ""
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
+            rows = await conn.fetch(
                 f"""
-                SELECT
-                    COUNT(*) as total_jobs,
-                    COUNT(*) FILTER (WHERE status = 'created') as created,
-                    COUNT(*) FILTER (WHERE status = 'processing') as processing,
-                    COUNT(*) FILTER (WHERE status = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
-                FROM jobs
+                SELECT j.status AS status, count(*) AS n
+                FROM jobs j
+                LEFT JOIN projects p ON p.id = j.project_id
                 {where_clause}
+                GROUP BY j.status
                 """,
-                *vis_vals,
+                *values,
             )
 
-        return dict(row) if row else {}
+        # One GROUP BY rather than a COUNT(*) FILTER per status: adding a
+        # status to the vocabulary then needs no SQL edit, and a status we
+        # have never heard of still shows up in by_status instead of being
+        # silently dropped out of the total.
+        by_status = {str(row["status"]): int(row["n"]) for row in rows}
+        stats: Dict[str, Any] = {
+            "total_jobs": sum(by_status.values()),
+            "by_status": by_status,
+        }
+        for status in KNOWN_JOB_STATUSES:
+            stats[status] = by_status.get(status, 0)
+        return stats
 
     async def detect_stuck_jobs(
         self,
