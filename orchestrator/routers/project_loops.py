@@ -121,7 +121,9 @@ async def start_project_loop(
     from services.project_loops import validate_role_sequence
 
     caller = await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await require_project_member(
+        request, postgres_db, project_id, min_role="editor", allow_archived=False
+    )
     await _require_unattended_operations(postgres_db, caller, project_id)
 
     # Budget: at least one stop axis must be set (hard floor under runaway) —
@@ -349,7 +351,9 @@ async def resume_project_loop(request: Request, project_id: str) -> dict[str, An
     from main import _resume_project_loop, postgres_db  # late import: avoid circular
 
     caller = await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await require_project_member(
+        request, postgres_db, project_id, min_role="editor", allow_archived=False
+    )
     # Resume re-kicks the rotation, so it is a start, not a control action.
     await _require_unattended_operations(postgres_db, caller, project_id)
     loop = await postgres_db.get_active_project_loop(project_id)
@@ -386,7 +390,9 @@ async def convert_project_loop_scheduling(
     from services.session_wake import kick_event_drain, notify_officer
 
     caller = await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await require_project_member(
+        request, postgres_db, project_id, min_role="editor", allow_archived=False
+    )
     await _require_unattended_operations(postgres_db, caller, project_id)
 
     # Post commissioned? (officer_post.md §4 — row-backed via the flipped

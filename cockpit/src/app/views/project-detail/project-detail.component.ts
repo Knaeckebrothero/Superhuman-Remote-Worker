@@ -6,6 +6,7 @@ import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -13,6 +14,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
+import {AppDialogComponent} from '../../ui/dialog';
 import {AppInputComponent} from '../../ui/input';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -32,11 +34,13 @@ import {
     KnowledgeNoteDetail,
     KnowledgeSummary,
     Project,
+    ProjectArchiveReport,
     ProjectDatasource,
     ProjectMember,
     ProjectMemberRole,
     ProjectRepoRole,
     ProjectRepository,
+    ProjectStatus,
     User,
 } from '../../core/models/api.model';
 
@@ -53,6 +57,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppSpinnerComponent,
     AppButtonComponent,
     AppIconButtonComponent,
+    AppDialogComponent,
     AppInputComponent,
     AppInlineEditableTextComponent,
     AppTextareaComponent,
@@ -982,7 +987,33 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </p>
                 } @else {
                   <div class="danger-actions">
-                    @if (proj.status === 'active') {
+                    @if (lifecycleError(); as message) {
+                      <p class="lifecycle-error" role="alert">{{ message }}</p>
+                    }
+                    @if (archiveReport(); as report) {
+                      <p class="lifecycle-note" role="status">{{ report }}</p>
+                    }
+                    @if (proj.status === 'archived') {
+                      <!-- The way back. Reads, detaching and unarchiving all stay
+                           possible on an archived project; only new work is
+                           refused, or archiving would be a trap. -->
+                      <div class="danger-row">
+                        <div class="danger-info">
+                          <span class="danger-title">{{ 'projectDetail.settings.unarchiveTitle' | transloco }}</span>
+                          <span class="danger-desc">
+                            {{ 'projectDetail.settings.unarchiveDesc' | transloco }}
+                          </span>
+                        </div>
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          [disabled]="lifecycleBusy()"
+                          (clicked)="confirmUnarchive()"
+                        >
+                          {{ 'projectDetail.settings.unarchive' | transloco }}
+                        </app-button>
+                      </div>
+                    } @else {
                       <div class="danger-row">
                         <div class="danger-info">
                           <span class="danger-title">{{ 'projectDetail.settings.archiveTitle' | transloco }}</span>
@@ -990,7 +1021,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             {{ 'projectDetail.settings.archiveDesc' | transloco }}
                           </span>
                         </div>
-                        <app-button variant="ghost" size="sm" (clicked)="archiveProject()">
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          [disabled]="lifecycleBusy()"
+                          (clicked)="confirmArchive()"
+                        >
                           {{ 'projectDetail.settings.archive' | transloco }}
                         </app-button>
                       </div>
@@ -1013,6 +1049,33 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
         </div>
       }
+
+      <!-- Lifecycle confirmation. A native confirm() cannot be themed, cannot
+           be translated by the app's own catalogue, and is what the rest of the
+           app has already moved off. -->
+      <app-dialog
+        [open]="pendingLifecycle() !== null"
+        [title]="(pendingLifecycle() === 'archived'
+          ? 'projectDetail.settings.archiveConfirmTitle'
+          : 'projectDetail.settings.unarchiveConfirmTitle') | transloco"
+        (closed)="pendingLifecycle.set(null)"
+      >
+        <p>
+          {{ (pendingLifecycle() === 'archived'
+            ? 'projectDetail.settings.archiveConfirm'
+            : 'projectDetail.settings.unarchiveConfirm') | transloco }}
+        </p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="pendingLifecycle.set(null)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="primary" [disabled]="lifecycleBusy()" (clicked)="applyLifecycle()">
+            {{ (pendingLifecycle() === 'archived'
+              ? 'projectDetail.settings.archive'
+              : 'projectDetail.settings.unarchive') | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
   styles: [`
@@ -1405,6 +1468,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .danger-actions { display: flex; flex-direction: column; gap: 12px; }
 
+    .lifecycle-error {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    .lifecycle-note {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
     .danger-row {
       display: flex;
       align-items: center;
@@ -1763,10 +1845,19 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly capabilities = inject(CapabilitiesService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  private readonly errors = inject(ErrorMessageService);
   private readonly destroyRef = inject(DestroyRef);
   protected readonly viewport = inject(ViewportService);
 
   readonly project = signal<Project | null>(null);
+  /** Which lifecycle change the confirmation dialog is holding, if any. */
+  readonly pendingLifecycle = signal<ProjectStatus | null>(null);
+  readonly lifecycleBusy = signal(false);
+  /** The server's own refusal — for an archived project that is a 409 naming
+   *  the fix, which is exactly the sentence worth showing. */
+  readonly lifecycleError = signal<string | null>(null);
+  /** What archiving quiesced on the way through. */
+  readonly archiveReport = signal<string | null>(null);
   readonly jobs = signal<Job[]>([]);
   readonly repos = signal<ProjectRepository[]>([]);
   /** A project has at most one writable vault, and it is never replaced in
@@ -2377,11 +2468,75 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     });
   }
 
-  archiveProject(): void {
-    if (!confirm(this.transloco.translate('projectDetail.settings.archiveConfirm'))) return;
-    this.api.updateProject(this.projectId, { status: 'archived' }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+  confirmArchive(): void {
+    this.lifecycleError.set(null);
+    this.archiveReport.set(null);
+    this.pendingLifecycle.set('archived');
+  }
+
+  confirmUnarchive(): void {
+    this.lifecycleError.set(null);
+    this.archiveReport.set(null);
+    this.pendingLifecycle.set('active');
+  }
+
+  /**
+   * The one PATCH an archived project still accepts, and the one whose refusal
+   * the user has to be able to read: this went through `updateProject`, whose
+   * `catchError(() => of(null))` erased the body, under a subscribe with no
+   * error callback at all — so a 409 landed as a no-op that looked like a
+   * click that did not register.
+   */
+  applyLifecycle(): void {
+    const status = this.pendingLifecycle();
+    if (!status || this.lifecycleBusy()) return;
+    this.lifecycleBusy.set(true);
+    this.lifecycleError.set(null);
+    this.api.setProjectStatus(this.projectId, status).subscribe({
+      next: (report) => {
+        this.lifecycleBusy.set(false);
+        this.pendingLifecycle.set(null);
+        if (status === 'archived') this.archiveReport.set(this.describeArchive(report));
+        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+      },
+      error: (err: unknown) => {
+        this.lifecycleBusy.set(false);
+        this.pendingLifecycle.set(null);
+        this.lifecycleError.set(
+          this.errors.translate(
+            err,
+            status === 'archived'
+              ? 'errors.projects.archiveFailed'
+              : 'errors.projects.unarchiveFailed',
+          ),
+        );
+      },
     });
+  }
+
+  /** Archiving quiesces the project's unattended machinery rather than
+   *  refusing, so say what it stopped — a loop that silently paused is the
+   *  kind of thing a user finds out about a week later. */
+  private describeArchive(report: ProjectArchiveReport | null): string {
+    const parts = [this.transloco.translate('projectDetail.settings.archivedReportBase')];
+    if (report?.loop_paused) {
+      parts.push(this.transloco.translate('projectDetail.settings.archivedReportLoop'));
+    }
+    if (report?.officer_held) {
+      parts.push(this.transloco.translate('projectDetail.settings.archivedReportOfficer'));
+    }
+    const parked = report?.jobs_parked ?? 0;
+    if (parked > 0) {
+      parts.push(
+        this.transloco.translate(
+          parked === 1
+            ? 'projectDetail.settings.archivedReportJobsOne'
+            : 'projectDetail.settings.archivedReportJobs',
+          {count: parked},
+        ),
+      );
+    }
+    return parts.join(' ');
   }
 
   deleteProject(): void {
@@ -2518,7 +2673,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     switch (status) {
       case 'active': return 'success';
       case 'archived': return 'neutral';
-      case 'deleted': return 'danger';
       default: return 'neutral';
     }
   }

@@ -73,7 +73,11 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         <form (submit)="$event.preventDefault(); onSubmit()">
           <!-- Project Selector -->
           @if (projects().length > 0) {
-            <app-form-field [label]="'jobs.create.projectLabel' | transloco" [hint]="'jobs.create.projectHint' | transloco">
+            <app-form-field
+              [label]="'jobs.create.projectLabel' | transloco"
+              [hint]="'jobs.create.projectHint' | transloco"
+              [error]="selectedProjectIsArchived() ? ('jobs.create.projectArchivedWarning' | transloco) : ''"
+            >
               <app-select
                 [value]="selectedProjectId() ?? ''"
                 (changed)="onProjectIdChange($event)"
@@ -82,7 +86,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
                 <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
                 @for (proj of projects(); track proj.id) {
                   <option [value]="proj.id">
-                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}
+                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
                   </option>
                 }
               </app-select>
@@ -1199,6 +1203,14 @@ export class JobCreateComponent implements OnInit {
   readonly selectedProjectId = signal<string | null>(null);
 
   readonly cloudStorageOverride = signal<'inherit' | 'readonly' | 'readwrite'>('inherit');
+  /** A project reachable only through a `?project=` deep link can be archived;
+   *  the form says so instead of pretending the job will be accepted. */
+  readonly selectedProjectIsArchived = computed(() => {
+    const pid = this.selectedProjectId();
+    if (!pid) return false;
+    return this.projects().find((p) => p.id === pid)?.status === 'archived';
+  });
+
   readonly selectedProjectHasCloudStorage = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
@@ -1406,21 +1418,69 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
+  /** Only active projects are offered: an archived one cannot take new work,
+   *  so listing it is offering a guaranteed 409. The one exception is a project
+   *  named explicitly by `?project=` — see `resolveDeepLinkedProject`. */
   private loadProjects(userId: string): void {
-    this.api.getProjects(userId).subscribe((projects) => {
-      this.projects.set(projects);
-      const qp = this.route.snapshot.queryParamMap.get('project');
-      if (qp && projects.some((p) => p.id === qp)) {
-        this.selectedProjectId.set(qp);
-      } else {
-        const defaultProject = projects.find((p) => p.is_default);
-        this.selectedProjectId.set(defaultProject?.id ?? projects[0]?.id ?? null);
-      }
-      // Now that a project is selected, refresh eligible datasources so
-      // project-linked sources are included and pre-selected.
-      this.loadDatasources();
-      this.loadEffectiveDefault();
+    this.api.getProjects(userId, ['active']).subscribe({
+      next: (projects) => {
+        this.projects.set(projects);
+        const qp = this.route.snapshot.queryParamMap.get('project');
+        if (qp && projects.some((p) => p.id === qp)) {
+          this.selectedProjectId.set(qp);
+          this.afterProjectSelection();
+          return;
+        }
+        if (qp) {
+          this.resolveDeepLinkedProject(qp, projects);
+          return;
+        }
+        this.selectDefaultProject(projects);
+        this.afterProjectSelection();
+      },
+      error: () => {
+        // The picker is optional context, and the description field is where
+        // the work actually is — keep the form usable rather than blank.
+        this.projects.set([]);
+        this.selectedProjectId.set(null);
+        this.afterProjectSelection();
+      },
     });
+  }
+
+  /**
+   * A `?project=` the active list does not contain. Resolve it before falling
+   * back to the default: if it is merely archived, keep it selected and FLAG
+   * it, because quietly retargeting the job at the personal project is how a
+   * job ends up somewhere nobody asked for. (The create itself is refused
+   * server-side; the form shows that refusal verbatim.)
+   */
+  private resolveDeepLinkedProject(projectId: string, active: Project[]): void {
+    this.api.getProject(projectId).subscribe((project) => {
+      if (project && project.status === 'archived') {
+        this.projects.set([...active, project]);
+        this.selectedProjectId.set(project.id);
+      } else {
+        // Deleted, or no longer visible to this user — nothing to keep.
+        this.selectDefaultProject(active);
+      }
+      this.afterProjectSelection();
+    });
+  }
+
+  /** Never lands on an archived project by accident: one is only ever in this
+   *  list because the user named it explicitly. */
+  private selectDefaultProject(projects: Project[]): void {
+    const selectable = projects.filter((p) => p.status !== 'archived');
+    const defaultProject = selectable.find((p) => p.is_default);
+    this.selectedProjectId.set(defaultProject?.id ?? selectable[0]?.id ?? null);
+  }
+
+  /** Now that a project is selected, refresh eligible datasources so
+   *  project-linked sources are included and pre-selected. */
+  private afterProjectSelection(): void {
+    this.loadDatasources();
+    this.loadEffectiveDefault();
   }
 
   // ===== File Upload Methods =====
@@ -1621,10 +1681,8 @@ export class JobCreateComponent implements OnInit {
     this.selectedPriority.set(5);
     this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
-    const defaultProject = this.projects().find((p) => p.is_default);
-    this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
-    this.loadDatasources();
-    this.loadEffectiveDefault();
+    this.selectDefaultProject(this.projects());
+    this.afterProjectSelection();
     this.artifacts.reset();
   }
 

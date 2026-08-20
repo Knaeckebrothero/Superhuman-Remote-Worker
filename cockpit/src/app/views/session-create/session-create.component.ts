@@ -151,7 +151,11 @@ interface ExpertDetail extends Expert {
 
         <!-- Projects (multi-select chips) -->
         @if (projects().length > 0) {
-          <app-form-field [label]="'sessions.create.projectsLabel' | transloco" [hint]="'sessions.create.projectsHint' | transloco">
+          <app-form-field
+            [label]="'sessions.create.projectsLabel' | transloco"
+            [hint]="'sessions.create.projectsHint' | transloco"
+            [error]="archivedSelected() ? ('sessions.create.projectArchivedWarning' | transloco) : ''"
+          >
             <div class="project-chips">
               @for (project of projects(); track project.id) {
                 <app-chip
@@ -159,7 +163,7 @@ interface ExpertDetail extends Expert {
                   [disabled]="creating()"
                   [ariaLabel]="project.description || project.name"
                   (clicked)="toggleProject(project.id)"
-                >{{ project.name }}</app-chip>
+                >{{ project.name }}@if (project.status === 'archived') { {{ 'sessions.create.projectArchived' | transloco }}}</app-chip>
               }
             </div>
           </app-form-field>
@@ -454,6 +458,11 @@ export class SessionCreateComponent implements OnInit {
   readonly selectedProjects = computed(() =>
     this.projects().filter(p => this.selectedProjectIds().has(p.id)),
   );
+  /** An archived project can only be here because the source thread was on it;
+   *  say so rather than letting the create fail unexplained. */
+  readonly archivedSelected = computed(() =>
+    this.selectedProjects().some(p => p.status === 'archived'),
+  );
   readonly protectedCloud = signal(false);
   readonly protectedCloudVisible = computed(() =>
     protectedCloudToggleVisible(this.capabilities.protectedCloudAvailable(), this.selectedProjects()),
@@ -591,8 +600,12 @@ export class SessionCreateComponent implements OnInit {
     this.applyEffectiveDefault();
   }
 
+  /** `status=active`: an archived project cannot take a new session, so
+   *  offering one in this picker offers a guaranteed refusal. A project the
+   *  source thread was on is the one exception — see
+   *  `resolveArchivedPrefillProjects`. */
   private loadProjects(userId: string): void {
-    this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}`).subscribe({
+    this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}&status=active`).subscribe({
       next: (projects) => {
         this.projects.set(projects);
         this.projectsLoaded = true;
@@ -636,6 +649,12 @@ export class SessionCreateComponent implements OnInit {
       // accessible here — leave unselected. Faithful to what actually
       // survived on the source thread, rather than substituting the
       // unrelated account default.
+      //
+      // "Not in the list" now has one benign cause — merely archived — which
+      // is kept rather than dropped.
+      this.resolveArchivedPrefillProjects(
+        this.threadPrefill.projectIds.filter((id) => !survivors.includes(id)),
+      );
       return;
     }
     const defaultProject = projects.find(p => p.is_default);
@@ -643,6 +662,39 @@ export class SessionCreateComponent implements OnInit {
       this.selectedProjectIds.set(new Set([defaultProject.id]));
       // Refresh eligible datasources now that a project is selected.
       this.loadDatasourcesList();
+    }
+  }
+
+  /**
+   * Prefilled project ids the active list does not contain. Most are genuinely
+   * gone (deleted, membership revoked) and stay dropped; an ARCHIVED one is
+   * kept, flagged and still selected, because silently narrowing the session's
+   * scope is a change the user never asked for and would not see. Creating
+   * against it is refused server-side, and this form renders that refusal.
+   *
+   * Fires at most once per missing id, and only when there is one — the
+   * ordinary path issues no extra request at all.
+   */
+  private resolveArchivedPrefillProjects(missingIds: string[]): void {
+    for (const id of missingIds) {
+      this.api.getProject(id).subscribe((project) => {
+        if (project?.status !== 'archived') return;
+        if (this.projects().some((p) => p.id === project.id)) return;
+        // This form models a project more narrowly than the API does.
+        this.projects.update((list) => [...list, {
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          description: project.description ?? undefined,
+          is_default: project.is_default,
+          main_cloud_backend: project.main_cloud_backend,
+        }]);
+        if (this.projectSelectionTouched) return;
+        this.selectedProjectIds.update((ids) => new Set([...ids, project.id]));
+        this.loadDatasourcesList();
+        this.loadEffectiveDefault();
+        this.loadToolPreview();
+      });
     }
   }
 

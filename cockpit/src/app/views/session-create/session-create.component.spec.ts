@@ -37,6 +37,9 @@ function stubApi(
   return {
     previewToolGroups: vi.fn().mockReturnValue(of(preview)),
     getPersistentThread: vi.fn().mockReturnValue(thread),
+    // Only reached when a prefilled project is missing from the active list;
+    // `null` is "gone for good", which is the pre-archive behaviour.
+    getProject: vi.fn().mockReturnValue(of(null)),
   };
 }
 
@@ -914,6 +917,50 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     expect(component.selectedExpert()?.id).toBe('expert-1');
     expect(component.prefillDatasourceIds()).toBeNull();
     expect(setSessionModelOverride).not.toHaveBeenCalled();
+  });
+
+  it('asks the server for active projects only', () => {
+    // An archived project cannot take a new session, so offering one in this
+    // picker is offering a guaranteed refusal.
+    const {fixture, http} = setup(undefined, of(null));
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+
+    const projectReads = http.match((r) => r.url.includes('/projects'));
+    expect(projectReads).toHaveLength(1);
+    expect(projectReads[0].request.url).toContain('status=active');
+    projectReads[0].flush(PROJECTS);
+    drainAll(http);
+  });
+
+  it("keeps a source thread's now-archived project, flagged and still selected", () => {
+    // The alternative is silently creating the session with a narrower scope
+    // than the one being copied — a change the user never asked for and would
+    // not see. Creating against it is refused server-side; the form renders
+    // that refusal.
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http, api, setSessionModelOverride} = setup(
+      'thread-77',
+      subject.asObservable(),
+    );
+    api.getProject.mockReturnValue(
+      of({
+        id: 'proj-archived',
+        name: 'Better Resavio (pre-split archive)',
+        status: 'archived',
+        description: null,
+      }),
+    );
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+    attachAgentSettingsStub(component, setSessionModelOverride);
+
+    subject.next({...THREAD, project_ids: ['proj-archived']}); // absent from the active list
+    subject.complete();
+    drainAll(http);
+
+    expect(api.getProject).toHaveBeenCalledWith('proj-archived');
+    expect(component.projects().map((p) => p.id)).toContain('proj-archived');
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-archived']));
+    expect(component.archivedSelected()).toBe(true);
   });
 
   it('a project the source thread had, but this account can no longer see, is dropped rather than falling back to the account default', () => {

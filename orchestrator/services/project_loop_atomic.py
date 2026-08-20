@@ -38,7 +38,9 @@ from services.project_loops import (
 
 _TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled"})
 
-CreateLoopJob = Callable[..., Awaitable[dict[str, Any]]]
+# May return None: create_loop_job skips (and logs) rather than raising when
+# the loop's project has been archived.
+CreateLoopJob = Callable[..., Awaitable[dict[str, Any] | None]]
 
 
 class ProjectLoopHandoffAuthorityLost(RuntimeError):
@@ -892,7 +894,19 @@ async def materialize_loop_advance_atomic(
                     history_block=history_block,
                     park_until=mutation.park_until,
                 )
-                jobs.append(job)
+                if job is not None:
+                    jobs.append(job)
+            if roles and not jobs:
+                # create_loop_job skipped every role (archived project). Do
+                # not advance: return the same "did not win" shape a changed
+                # world produces, so the transaction commits nothing and the
+                # loop keeps pointing at the turn that just finished rather
+                # than at an empty stage it can never complete.
+                return _lost_result(
+                    loop_id=loop_id,
+                    member_job_id=member_job_id,
+                    reason="project_archived",
+                )
             ids = [str(job["id"]) for job in jobs]
             update_fields.update(
                 current_job_id=(ids[0] if len(ids) == 1 else None),

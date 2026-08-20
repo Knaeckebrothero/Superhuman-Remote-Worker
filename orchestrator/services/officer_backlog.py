@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
+from security.access import project_is_archived
 from services.datasource_policy import (
     DatasourceUnavailableError,
     default_datasource_selection,
@@ -917,6 +918,26 @@ async def tick_officer(
     meta = _officer_meta(officer_row)
     if officer_is_held(meta):
         logger.debug("officer backlog: %s held — skipping", thread_id[:8])
+        return counts
+
+    # An archived project takes no new work (§4.3 of
+    # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
+    # THIS is the path the 2026-08-15 incident ran on: an officer commissioned
+    # onto "Better Resavio (pre-split archive)" ran a full watch and dispatched
+    # three workers against a historical record. Placed beside the hold
+    # early-return because that is the established idiom for "this post is
+    # standing down this tick" — and, like a hold, it skips and logs rather
+    # than raising: a tick has no HTTP caller and a bad post must never stop
+    # the fleet. Archiving also holds the officer (§4.5); this is the backstop
+    # for a post held by neither.
+    project = await db.get_project(project_id)
+    if project_is_archived(project):
+        logger.info(
+            "officer=%s skip=project-archived project=%s",
+            thread_id[:8],
+            project_id[:8],
+        )
+        counts["skipped"] += 1
         return counts
 
     try:

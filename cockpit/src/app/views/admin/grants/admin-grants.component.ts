@@ -227,8 +227,12 @@ export class AdminGrantsComponent implements OnInit {
 
   ngOnInit(): void {
     this.users.loadUsers();
-    this.api.getProjects().subscribe((ps) =>
-      this.projects.set((ps ?? []).map((p) => ({id: p.id, name: p.name}))));
+    this.api.getProjects().subscribe({
+      next: (ps) => this.projects.set((ps ?? []).map((p) => ({id: p.id, name: p.name}))),
+      // A scope picker with no projects is honest about what it can offer; the
+      // grants table itself does not depend on this load.
+      error: () => this.projects.set([]),
+    });
     this.reload();
     this.loadApplicationDefaults();
   }

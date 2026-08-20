@@ -8,6 +8,7 @@ import {ErrorMessageService} from './error-message.service';
  *  the real service detects "no translation for this key". */
 const CATALOG: Record<string, string> = {
   'errors.http.4xx': "The request couldn't be completed.",
+  'errors.http.409': 'This action conflicts with the current state.',
   'errors.http.5xx': 'Something went wrong on our end.',
   'errors.code.job.not_found': 'That job no longer exists.',
   'errors.unknown': 'Unknown error.',
@@ -42,12 +43,44 @@ describe('ErrorMessageService', () => {
     expect(svc.translate(httpError(400, {detail}))).toBe(detail);
   });
 
-  it('still prefers a structured code over the raw detail', () => {
+  // Where the code actually lives. FastAPI serialises everything it sends
+  // under `detail`, so the old top-level read could never have matched a real
+  // response — `errors.code.*` was documented, wired and dead.
+  it('resolves a code nested under detail, as FastAPI sends it', () => {
     const svc = makeService();
 
     expect(
-      svc.translate(httpError(404, {code: 'job.not_found', detail: 'no row'})),
+      svc.translate(httpError(404, {detail: {code: 'job.not_found', message: 'no row'}})),
     ).toBe('That job no longer exists.');
+  });
+
+  // A code the catalogue does not know yet must not swallow the sentence the
+  // server sent with it.
+  it('falls back to the structured message when the code has no translation', () => {
+    const svc = makeService();
+    const message = 'This project is archived. Unarchive it before creating new work.';
+
+    expect(svc.translate(httpError(409, {detail: {code: 'project_archived', message}}))).toBe(
+      message,
+    );
+  });
+
+  // House style, and what the archived refusal actually sends: a bare sentence.
+  it('renders a plain-string 409 detail verbatim', () => {
+    const svc = makeService();
+    const detail = 'This project is archived. Unarchive it before creating new work.';
+
+    expect(svc.translate(httpError(409, {detail}))).toBe(detail);
+  });
+
+  // FastAPI's 422 body is `detail: [{loc, msg, type}]`. Rendering that as the
+  // message produces "[object Object]" in a box the user is meant to act on.
+  it('ignores a validation-array detail rather than stringifying it', () => {
+    const svc = makeService();
+
+    expect(
+      svc.translate(httpError(422, {detail: [{loc: ['body', 'status'], msg: 'bad', type: 'x'}]})),
+    ).toBe("The request couldn't be completed.");
   });
 
   // `create_thread`'s catch-all raises HTTPException(500, detail=str(e)), so a

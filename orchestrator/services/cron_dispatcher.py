@@ -213,16 +213,28 @@ async def _process_one_due_automation(db: Any) -> bool:
                         job = await create_job_from_automation(
                             db, row, trigger_kind="cron"
                         )
-                        await db.advance_automation_after_fire(
-                            conn,
-                            automation_id,
-                            next_run_at=next_run,
-                            scheduled_for=scheduled_for,
-                            job_id=str(job["id"]),
-                        )
-                        # Capture for post-commit Gitea provisioning — it
-                        # must run OUTSIDE this transaction (see below).
-                        created_job = job
+                        if job is None:
+                            # Archived project: skip this fire without
+                            # touching the automation's enabled state (it
+                            # logs its own reason). Advance the schedule the
+                            # same way the catch-up window does, so the row
+                            # is not re-claimed on every tick forever.
+                            await db.skip_automation_fire(
+                                conn,
+                                automation_id,
+                                next_run_at=next_run,
+                            )
+                        else:
+                            await db.advance_automation_after_fire(
+                                conn,
+                                automation_id,
+                                next_run_at=next_run,
+                                scheduled_for=scheduled_for,
+                                job_id=str(job["id"]),
+                            )
+                            # Capture for post-commit Gitea provisioning — it
+                            # must run OUTSIDE this transaction (see below).
+                            created_job = job
 
     # Post-commit side effects — these MUST run outside the transaction
     # above. provision_job_repo does external Gitea HTTP, opens its own

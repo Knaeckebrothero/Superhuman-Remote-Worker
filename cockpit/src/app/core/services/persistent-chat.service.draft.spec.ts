@@ -55,7 +55,7 @@ function createService(opts: {
 } = {}) {
     const mockHttp: any = {
         get: vi.fn().mockImplementation((url: string) => {
-            if (url.endsWith('/projects')) return of(opts.projects ?? []);
+            if (url.includes('/projects')) return of(opts.projects ?? []);
             return of({status: 'active', total_turns: 0, messages: [], total: 0});
         }),
         post: vi.fn().mockImplementation((url: string) => {

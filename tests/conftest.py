@@ -377,12 +377,26 @@ def fake_db(
     async def get_user_role_in_project(pid, uid):
         return memberships.get((_to_uuid(pid), _to_uuid(uid)))
 
-    async def get_projects_for_user(uid, limit=100):
+    async def get_projects_for_user(uid, limit=100, statuses=None):
         u = _to_uuid(uid)
-        return [
+        rows = [
             projects[pid]
             for (pid, member_uid), _role in memberships.items()
             if member_uid == u
+        ]
+        if statuses is None:
+            return rows
+        # Mirror project_status_filter_sql: requested statuses pass, and so
+        # does anything outside the known vocabulary (NULL included), so a row
+        # nobody can classify is never silently swallowed.
+        wanted = {str(s).lower() for s in statuses}
+        return [
+            row
+            for row in rows
+            if (str(row.get("status") or "active").lower() in wanted)
+            or (
+                str(row.get("status") or "active").lower() not in {"active", "archived"}
+            )
         ]
 
     async def get_datasource(dsid):

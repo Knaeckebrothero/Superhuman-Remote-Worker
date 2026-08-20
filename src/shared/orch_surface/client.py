@@ -2127,11 +2127,21 @@ class AsyncCockpitClient:
     # =========================================================================
 
     @_create_retry_decorator()
-    async def list_projects(self, user_id: str | None = None) -> list[dict[str, Any]]:
-        """List projects, optionally filtered by user membership.
+    async def list_projects(
+        self,
+        user_id: str | None = None,
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List projects, optionally filtered by user membership and status.
 
         Args:
             user_id: Filter to projects this user belongs to
+            statuses: Lifecycle statuses to include (repeatable ``?status=``).
+                ``None`` leaves the server default in place, which is
+                active-only — so a caller that wants archives must ask for
+                them explicitly. Without this the formatter's
+                ``include_archived`` is a no-op, because the server has
+                already dropped the rows it would have marked.
 
         Returns:
             List of project dicts
@@ -2139,6 +2149,8 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {}
         if user_id:
             params["user_id"] = user_id
+        if statuses:
+            params["status"] = list(statuses)
         resp = await self._client.get("/api/projects", params=params)
         resp.raise_for_status()
         return resp.json()

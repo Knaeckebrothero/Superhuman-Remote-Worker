@@ -1023,9 +1023,24 @@ export interface McpTokenCreateResponse extends McpToken {
 // =============================================================================
 
 /**
- * Project status types.
+ * Project lifecycle. `active | archived` is the whole vocabulary the API
+ * accepts and `GET /api/projects?status=` filters on; `deleted` used to be
+ * listed here but the DB CHECK rejects it (deletion is a hard row delete), so
+ * nothing could ever carry it.
  */
-export type ProjectStatus = 'active' | 'archived' | 'deleted';
+export type ProjectStatus = 'active' | 'archived';
+
+/**
+ * What archiving actually did. Archiving never refuses because children are in
+ * flight — it quiesces them and reports what it touched, so the UI can say so
+ * instead of leaving the user to discover a paused loop later.
+ */
+export interface ProjectArchiveReport {
+  archived: boolean;
+  loop_paused?: boolean;
+  officer_held?: boolean;
+  jobs_parked?: number;
+}
 
 /**
  * Project member role types.
