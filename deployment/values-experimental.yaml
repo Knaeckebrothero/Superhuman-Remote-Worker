@@ -63,7 +63,7 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-7170c2c
+    tag: sha-64ede95
   agent:
     tag: sha-7170c2c
   cockpit:
@@ -76,11 +76,11 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-7170c2cb3ad632729cf01ccf853ec1bfa6271b73"
+  releaseVersion: "0.0.0-dev.sha-64ede9534f025582ecf1efd0c7daa10f393cc814"
   components:
     orchestrator:
-      sourceRevision: 7170c2cb3ad632729cf01ccf853ec1bfa6271b73
-      releaseVersion: "0.0.0-dev.sha-7170c2cb3ad632729cf01ccf853ec1bfa6271b73"
+      sourceRevision: 64ede9534f025582ecf1efd0c7daa10f393cc814
+      releaseVersion: "0.0.0-dev.sha-64ede9534f025582ecf1efd0c7daa10f393cc814"
     agent:
       sourceRevision: 7170c2cb3ad632729cf01ccf853ec1bfa6271b73
       releaseVersion: "0.0.0-dev.sha-7170c2cb3ad632729cf01ccf853ec1bfa6271b73"
