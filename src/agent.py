@@ -677,8 +677,22 @@ class UniversalAgent:
 
         Uses auxiliary.model/base_url if configured, otherwise falls back
         to the summarization LLM (which itself falls back to strategic LLM).
+
+        Rebuild-safe: ``_setup_job_workspace`` recreates the phase LLMs for
+        every dispatched job (credential-injected ``config_override`` makes the
+        config dirty; the frozen-blob branch recreates too), which lands HERE
+        and used to replace ``self._auxiliary_llm`` with a fresh instance whose
+        ``set_job_context`` wiring was lost. process_job wires the archiver
+        BEFORE that rebuild, so every worker aux call (memory extraction,
+        assembly, the rest) ran with ``_archiver=None`` — real provider spend
+        with no ``llm_requests`` row and no metering. Found by the lane-ab-01
+        bench: pinned jobs stored observer memories with zero audited
+        extraction calls. Any rebuild must therefore carry the previous
+        instance's job wiring forward; ``_wire_aux_job_context`` below does.
         """
         from src.services.auxiliary import AuxiliaryLLM
+
+        _prev_aux = self._auxiliary_llm
 
         aux_config = self.config.auxiliary
         # The summarizer's budgeting authority: the aux model's own window when
@@ -701,6 +715,7 @@ class UniversalAgent:
                 max_context_tokens=main_window,
                 structured_output_method=summarization_structured_output_method,
             )
+            self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
             logger.info("AuxiliaryLLM disabled, using summarization LLM as fallback")
             return
 
@@ -758,6 +773,29 @@ class UniversalAgent:
             structured_output_method=aux_structured_output_method,
             fallback_structured_output_method=aux_fallback_method,
         )
+        self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
+
+    @staticmethod
+    def _wire_aux_job_context(prev, new) -> None:
+        """Copy a mid-job archiver wiring from a replaced AuxiliaryLLM.
+
+        No-op at boot (no previous instance / no wiring yet). During a per-job
+        LLM rebuild the previous instance carries the archiver + job identity
+        that ``process_job`` wired before the rebuild; without this copy the
+        replacement silently drops every auxiliary call from the audit trail
+        and the cost pipeline (both read ``llm_requests``).
+        """
+        if prev is None or new is None or prev is new:
+            return
+        archiver = getattr(prev, "_archiver", None)
+        job_id = getattr(prev, "_job_id", None)
+        if archiver is None or not job_id:
+            return
+        new.set_job_context(
+            archiver=archiver,
+            job_id=job_id,
+            agent_type=getattr(prev, "_agent_type", None) or "",
+        )
 
     def _initialize_citation_verifier(self, limits) -> None:
         """Build the citation-verification AuxiliaryLLM (D6) + load its prompt.
@@ -774,6 +812,7 @@ class UniversalAgent:
         from src.services.auxiliary import AuxiliaryLLM
 
         aux_cfg = self.config.auxiliary
+        _prev_verify = self._citation_verify_aux
         task_cfg = aux_cfg.tasks.get("verify_citations")
         if not aux_cfg.enabled or task_cfg is None or not task_cfg.enabled:
             self._citation_verify_aux = None
@@ -811,6 +850,8 @@ class UniversalAgent:
                     timeout=aux_cfg.timeout,
                     max_context_tokens=verify_cfg.model_max_context_tokens,
                 )
+                # Same mid-job rebuild hazard as _initialize_auxiliary_llm.
+                self._wire_aux_job_context(_prev_verify, self._citation_verify_aux)
                 prompt_model = citation_model
                 logger.info(f"Citation verifier: dedicated model {citation_model}")
             except Exception as e:
