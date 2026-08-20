@@ -18,6 +18,34 @@ inside `config/skills/app-guide/`, where the runtime skill could see them.
 This is a model evaluation, not an ordinary unit test; a skipped run is not
 release evidence.
 
+## What "held-out" means here — and what it does not
+
+The fence is `config/skills/app-guide/`. Prompts and expectations live in this
+package so the runtime skill cannot retrieve its own answer key while it is being
+evaluated. That is the whole of the invariant, and it holds regardless of who else
+can read these files.
+
+It is **not** a fence against public visibility. This repository is public and
+`cases.yaml` and `capability_cases.yaml` publish with it. Two consequences worth
+stating plainly:
+
+- **Assume these corpora reach training data eventually.** A model that has
+  memorised a case can pass it without routing correctly, and the harness cannot
+  tell the difference. Scores are a regression gate against a known model, not a
+  durable claim about model capability. Treat a large unexplained jump on an
+  unfamiliar model as suspect rather than as progress, and author fresh cases when
+  a result has to carry weight outside this repo.
+- **Privatising the YAML alone would not contain them.** `tests/test_app_guide_eval_harness.py`
+  and `tests/test_app_guide_capability_eval_harness.py` hard-code 16 case ids and
+  quote passing answer phrasings verbatim, because they exercise `score_case`
+  against real cases. Real containment would mean a synthetic public fixture plus
+  rewriting roughly 28 corpus-coupled tests; moving the corpus on its own pays most
+  of the cost for part of the benefit.
+
+Publishing them is a deliberate call, recorded with its reasoning in
+`release_transition_checklist.md`. A published harness whose corpus nobody can
+inspect is not evidence.
+
 ## Current release evidence
 
 As of the 2026-08-03 documentation reconciliation, M1 is closed and the M2

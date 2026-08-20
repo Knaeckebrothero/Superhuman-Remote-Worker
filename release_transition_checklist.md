@@ -411,15 +411,25 @@ All ordinary, reviewable, revertible commits. The public repo's root directory i
       justify `srw-cloud` is a proprietary *task distribution* — pilot-customer traces, eval sets built
       from usage paid for. None exists yet. When it does, that data goes to `srw-cloud` and the harness
       that reads it stays here.
-- [ ] **Sub-question left open: does `eval/app_guide/`'s corpus stay public?** `cases.yaml` (576 lines)
-      and `capability_cases.yaml` (230) carry prompts *and* scoring expectations. Their "held-out" fence
-      is stated in the file header as *outside `config/skills/app-guide/`* — held out from the runtime
-      skill's own retrieval surface, so the guide cannot read its own answer key at eval time. That fence
-      is intact and unaffected by GitHub visibility. The residual risk is only long-run training-data
-      contamination, and it is already partly moot: 16 real case ids and their passing phrasings are
-      hard-coded in the public `tests/test_app_guide_eval_harness.py`, so privatising the YAML alone
-      buys partial containment. Full containment means a synthetic public fixture plus rewriting ~28
-      corpus-coupled tests against it. Decide before the Phase 6 announcement.
+- [x] **`eval/app_guide/`'s corpus stays public too. Decided 2026-08-20.** `cases.yaml` (576 lines) and
+      `capability_cases.yaml` (230) carry prompts *and* scoring expectations, which reads at first glance
+      like something to withhold. It is not. The "held-out" fence is stated in the file header as
+      *outside `config/skills/app-guide/`* — held out from the runtime skill's own retrieval surface, so
+      the guide cannot read its own answer key at eval time. That fence is intact and has nothing to do
+      with GitHub visibility, so publishing breaches no invariant.
+
+      The only residual risk is long-run training-data contamination, and it is already partly moot:
+      `tests/test_app_guide_eval_harness.py` and `tests/test_app_guide_capability_eval_harness.py`
+      hard-code 16 real case ids and quote passing answer phrasings verbatim (they exercise `score_case`
+      against real cases), so privatising the YAML alone buys only partial containment. Full containment
+      would mean a synthetic validator-passing fixture plus rewriting ~28 corpus-coupled tests — and it
+      would cost the public repo its only coverage of the app-guide scorer.
+
+      Mitigation taken instead: `eval/app_guide/README.md` now carries a "What 'held-out' means here"
+      section stating the real fence, and the rule for reading results — a score is a regression gate
+      against a known model, not a durable capability claim; treat an unexplained jump on an unfamiliar
+      model as suspect, and author fresh cases when a result must carry weight outside this repo.
+      Revisit only if the Phase 6 announcement changes the exposure math materially.
 - [ ] **Pre-existing collision the `docs/` decision has to settle:** `docs/` holds **both**
       `research/` (30 files, `stateless_agents/` + the two trees added above) and `researches/`
       (15 PDFs). Same species, two names. Not created by this transition, but merging them is
