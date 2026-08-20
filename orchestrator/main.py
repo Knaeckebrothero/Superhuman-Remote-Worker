@@ -12383,8 +12383,9 @@ async def list_jobs(
         * Non-admins see jobs they own OR jobs in projects they're a member
           of, additionally narrowed by any MCP project scope.
         * A non-admin passing ``?user_id=`` for anyone other than themselves
-          is rejected (403). Self-query (``?user_id=<self>``) is allowed but
-          redundant — the visibility OR-clause already covers it.
+          is rejected (403). Self-query (``?user_id=<self>``) is accepted and
+          then ignored — AND-ing it onto the OR-clause would narrow the view
+          to own-jobs-only and silently drop the caller's project rows.
 
     Returns jobs enriched with audit_count from the audit store if available.
     """
@@ -12400,23 +12401,26 @@ async def list_jobs(
 
     try:
         if is_admin:
-            jobs = await postgres_db.get_jobs(
-                status=status,
-                user_id=user_id,
-                limit=limit,
-                scope_project_id=str(scope_pid) if scope_pid else None,
-            )
+            owner_user_id = None
+            project_ids = None
         else:
             visible = await user_visible_project_ids(user, postgres_db)
             # Non-admin always lands on a concrete set (never "all").
+            owner_user_id = str(user["id"])
             project_ids = [str(p) for p in visible] if visible != "all" else []
-            jobs = await postgres_db.get_visible_jobs(
-                owner_user_id=str(user["id"]),
-                visible_project_ids=project_ids,
-                status=status,
-                scope_project_id=str(scope_pid) if scope_pid else None,
-                limit=limit,
-            )
+
+        jobs = await postgres_db.query_jobs(
+            owner_user_id=owner_user_id,
+            visible_project_ids=project_ids,
+            scope_project_id=str(scope_pid) if scope_pid else None,
+            status=status,
+            # Admin-only cross-user filter. A non-admin's ?user_id= is
+            # validated above but deliberately NOT forwarded: the OR-clause
+            # already bounds them, and AND-ing it on would *narrow* the
+            # result to own-jobs-only, dropping their project rows.
+            user_id=user_id if is_admin else None,
+            limit=limit,
+        )
 
         if audit_reader.is_available:
             counts = await audit_reader.get_audit_counts(
@@ -47642,11 +47646,11 @@ async def list_my_active_jobs(
 
     Returns jobs visible to the caller (G1 visibility OR — own jobs OR
     project-member jobs) in any of the active statuses (created,
-    processing, paused, pending_review). The underlying ``get_jobs`` /
-    ``get_visible_jobs`` SELECT already excludes pod IPs and hostnames,
-    so this is safe to expose to non-admins. Admins still get the full
-    fleet via `/api/agents`; they can use this endpoint too if they want
-    a personal in-flight summary.
+    processing, paused, pending_review). The underlying ``query_jobs``
+    SELECT already excludes pod IPs and hostnames, so this is safe to
+    expose to non-admins. Admins still get the full fleet via
+    `/api/agents`; they can use this endpoint too if they want a personal
+    in-flight summary.
 
     Respects MCP ``project:<uuid>`` scope narrowing.
     """
@@ -47655,22 +47659,26 @@ async def list_my_active_jobs(
     scope_pid = mcp_scope_project_id(user)
     try:
         if is_admin:
-            jobs = await postgres_db.get_jobs(
-                status=None,
-                user_id=str(user["id"]),
-                limit=limit,
-                scope_project_id=str(scope_pid) if scope_pid else None,
-            )
+            # Admins get their own in-flight jobs here, not the fleet — the
+            # fleet view is /api/agents. Expressed as an owner filter rather
+            # than the visibility OR so it stays own-jobs-only.
+            owner_user_id = None
+            project_ids = None
+            owner_filter = str(user["id"])
         else:
             visible = await user_visible_project_ids(user, postgres_db)
+            owner_user_id = str(user["id"])
             project_ids = [str(p) for p in visible] if visible != "all" else []
-            jobs = await postgres_db.get_visible_jobs(
-                owner_user_id=str(user["id"]),
-                visible_project_ids=project_ids,
-                status=None,
-                scope_project_id=str(scope_pid) if scope_pid else None,
-                limit=limit,
-            )
+            owner_filter = None
+
+        jobs = await postgres_db.query_jobs(
+            owner_user_id=owner_user_id,
+            visible_project_ids=project_ids,
+            scope_project_id=str(scope_pid) if scope_pid else None,
+            status=None,
+            user_id=owner_filter,
+            limit=limit,
+        )
         return [j for j in jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
     except HTTPException:
         raise

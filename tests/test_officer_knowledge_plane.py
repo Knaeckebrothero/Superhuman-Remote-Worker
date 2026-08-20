@@ -825,7 +825,7 @@ class TestSitrepKnowledgeSection:
             fetch=AsyncMock(return_value=[]), fetchval=AsyncMock(return_value=0)
         )
         db = SimpleNamespace()
-        db.get_jobs = AsyncMock(return_value=[])
+        db.query_jobs = AsyncMock(return_value=[])
         db.acquire = lambda: self._Acquire(conn)
         db.get_officer_capacity_lineage = AsyncMock(return_value=[])
         return db

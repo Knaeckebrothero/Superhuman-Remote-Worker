@@ -13,7 +13,7 @@ approved user. G5:
 The underlying postgres methods (`get_job_statistics`,
 `get_daily_statistics`, `detect_stuck_jobs`) take optional
 ``owner_user_id`` / ``visible_project_ids`` / ``scope_project_id``
-kwargs that compose into the same OR-clause G1's `get_visible_jobs`
+kwargs that compose into the same OR-clause G1's `query_jobs`
 uses.
 """
 

@@ -47,7 +47,7 @@ def _fake_conn():
 def _fake_db(jobs=None, conn=None):
     conn = conn or _fake_conn()
     db = SimpleNamespace()
-    db.get_jobs = AsyncMock(return_value=jobs or [])
+    db.query_jobs = AsyncMock(return_value=jobs or [])
     db.acquire = lambda: _FakeAcquire(conn)
     # officer_post.md §4: the capacity section resolves the post's thread
     # lineage before counting; a lone thread's lineage is itself.
@@ -150,7 +150,7 @@ class TestSitrepBuild:
             "fingerprints": {JOB_A: {"status": "processing", "steps": 3}},
         }
         db = _fake_db()
-        db.get_jobs = AsyncMock(side_effect=RuntimeError("db down"))
+        db.query_jobs = AsyncMock(side_effect=RuntimeError("db down"))
         text, patch = await sitrep.build_wake_message(
             db,
             _officer_thread(prior_sitrep=prior),
