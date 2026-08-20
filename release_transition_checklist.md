@@ -375,12 +375,51 @@ All ordinary, reviewable, revertible commits. The public repo's root directory i
       `docs/` decision below turns out to be. If `docs/` goes private, so does it. That is the
       intent — none of it is something a self-hoster needs — but it is now one decision instead
       of four.
-- [ ] **`eval/` and `bench/` stay at the repo root — they are code, not documents.** `eval/` is a
+- [x] **`eval/` and `bench/` stay at the repo root, and they publish. Decided 2026-08-20.** `eval/` is a
       Python package importing `src.services.memory`, `src.core.loader`, `src.database.postgres_db`
       and `orchestrator.database.migrate` in 20+ places; it cannot leave `src/`'s side. `bench/`
       has no product imports (it talks HTTP to `SRW_API_URL`) so it *could* live anywhere, but it
-      is a live instrument and there is no `tools/` folder worth creating for one thing. Decide
-      only whether they publish, not where they live.
+      is a live instrument and there is no `tools/` folder worth creating for one thing.
+
+      The open half — *whether* they publish — was raised again as "move `eval/` into `srw-cloud` so
+      competitors cannot use it." The answer is no, for five reasons:
+
+      - **Dependency direction forbids it.** `tests/test_memory_eval_harness.py`,
+        `tests/test_app_guide_eval_harness.py` and `tests/test_app_guide_capability_eval_harness.py`
+        all import `eval.*`. Moving `eval/` leaves the *public* repo importing from the *private* one —
+        the exact inversion of the load-bearing rule above — or forces those three files (2,172 lines)
+        out of the public suite, deleting the public repo's coverage of its own memory and app-guide
+        seams. `eval/` also imports `src/` and `orchestrator/` in 20+ places, so the result is a
+        two-way coupling across a repo boundary.
+      - **The moat is not in the harness.** `eval/memory/README.md` is explicit that it drives the
+        production seam — `MemoryManager.assemble()` / `capture()` — directly. The system it measures,
+        `src/services/memory/`, publishes under FSL either way; the instrument adds nothing a competitor
+        holding that code would need. LongMemEval is a public benchmark (arXiv:2410.10813), and
+        `eval/memory/data/` + `eval/memory/runs/` are already gitignored, so datasets, judge labels and
+        results are not public regardless.
+      - **It contradicts the model already chosen.** Per the Sentry prior art in Reference below: the
+        licence does the protecting, not feature removal. Carving the eval out is a first step toward
+        the GitLab `ee/` shape this transition explicitly set out to avoid.
+      - **Cross-repo drift, on the highest-churn surface.** The chart drift gate already needed a weekly
+        scheduled CI run purely because the generator and the chart live in different repos. Memory
+        changes far more often than the chart; splitting the harness from its subject rebuilds that
+        problem somewhere it costs more.
+      - **The published eval is a credibility asset.** It is what turns a memory claim into something a
+        self-hoster, a technical buyer, or a thesis reader can check.
+
+      **The line to hold as this grows: harness public, customer-derived data private.** What would
+      justify `srw-cloud` is a proprietary *task distribution* — pilot-customer traces, eval sets built
+      from usage paid for. None exists yet. When it does, that data goes to `srw-cloud` and the harness
+      that reads it stays here.
+- [ ] **Sub-question left open: does `eval/app_guide/`'s corpus stay public?** `cases.yaml` (576 lines)
+      and `capability_cases.yaml` (230) carry prompts *and* scoring expectations. Their "held-out" fence
+      is stated in the file header as *outside `config/skills/app-guide/`* — held out from the runtime
+      skill's own retrieval surface, so the guide cannot read its own answer key at eval time. That fence
+      is intact and unaffected by GitHub visibility. The residual risk is only long-run training-data
+      contamination, and it is already partly moot: 16 real case ids and their passing phrasings are
+      hard-coded in the public `tests/test_app_guide_eval_harness.py`, so privatising the YAML alone
+      buys partial containment. Full containment means a synthetic public fixture plus rewriting ~28
+      corpus-coupled tests against it. Decide before the Phase 6 announcement.
 - [ ] **Pre-existing collision the `docs/` decision has to settle:** `docs/` holds **both**
       `research/` (30 files, `stateless_agents/` + the two trees added above) and `researches/`
       (15 PDFs). Same species, two names. Not created by this transition, but merging them is
