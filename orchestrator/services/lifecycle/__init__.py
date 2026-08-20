@@ -16,6 +16,7 @@ from .reconciler import (
     DisruptionBudget,
     InstanceLifecycleReconciler,
 )
+from .persistent_agent_manager import PersistentAgentInstanceManager
 from .types import (
     Instance,
     InstanceLifecycleManager,
@@ -37,6 +38,7 @@ __all__ = [
     "Instance",
     "InstanceLifecycleManager",
     "InstanceLifecycleReconciler",
+    "PersistentAgentInstanceManager",
     "ReapableInstanceManager",
     "StatefulInstanceManager",
     "VMInstanceManager",

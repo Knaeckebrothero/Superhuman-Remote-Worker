@@ -17,7 +17,9 @@ import asyncio
 import logging
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any, Dict, Optional
 
 from src.core.loader import canonical_config_name
@@ -25,6 +27,34 @@ from src.core.loader import canonical_config_name
 from .runtime_actor import issue_runtime_actor_bootstrap
 
 logger = logging.getLogger(__name__)
+
+
+class PersistentPodCreateStatus(StrEnum):
+    """Truthful outcomes for the deterministic persistent-pod name."""
+
+    CREATED = "created"
+    ALREADY_CURRENT = "already_current"
+    TERMINATING = "terminating"
+    CONFLICTING = "conflicting"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class PersistentPodCreateResult:
+    """Result of one create attempt without collapsing a 409 into success."""
+
+    status: PersistentPodCreateStatus
+    pod_name: str
+    pod_uid: str | None = None
+    build_sha: str | None = None
+    failure_class: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.status in {
+            PersistentPodCreateStatus.CREATED,
+            PersistentPodCreateStatus.ALREADY_CURRENT,
+        }
 
 
 def _normalize_config_name(config_name: str) -> str:
@@ -113,6 +143,12 @@ class PersistentProvisioner:
             return "k8s"
         return None
 
+    @property
+    def image_ref(self) -> str:
+        """Exact server-configured image used for a new persistent pod."""
+
+        return self._agent_image
+
     def connect(self, db: Any) -> None:
         """Initialize provisioner with database connection.
 
@@ -175,7 +211,9 @@ class PersistentProvisioner:
         memory_request: str = "512Mi",
         cpu_limit: str = "1000m",
         memory_limit: str = "2Gi",
-    ) -> bool:
+        lifecycle_generation: str | None = None,
+        target_image_ref: str | None = None,
+    ) -> PersistentPodCreateResult:
         """Create a K8s pod running a persistent agent for *thread_id*.
 
         Args:
@@ -186,10 +224,13 @@ class PersistentProvisioner:
             cpu_limit: CPU limit.
             memory_limit: Memory limit.
 
-        Returns:
-            True if pod was created (or already existed), False on error.
+        Returns a typed result. In particular, an existing terminating pod is
+        never reported as successful, and a live 409 is accepted only when
+        its server-owned labels describe this exact thread/build/generation.
         """
         config_name = _normalize_config_name(config_name)
+        image_ref = target_image_ref or self._agent_image
+        target_build_sha = self._build_sha(image_ref)
         if not self._k8s_available:
             logger.info(
                 "K8s not available — start agent manually: "
@@ -198,10 +239,34 @@ class PersistentProvisioner:
                 thread_id,
                 config_name,
             )
-            return False
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                f"persistent-{thread_id[:12]}",
+                failure_class="kubernetes_unavailable",
+            )
 
         pod_name = f"persistent-{thread_id[:12]}"
         pvc_name = f"pvc-persistent-{thread_id[:12]}"
+
+        # Avoid minting an unused bootstrap for the ordinary idempotent case.
+        # Kubernetes create remains the final concurrency CAS; a race after
+        # this read is classified again from the incumbent on 409.
+        try:
+            incumbent = await self._read_pod(pod_name)
+        except Exception as exc:
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                pod_name,
+                failure_class=f"observation_{type(exc).__name__}"[:128],
+            )
+        if incumbent is not None:
+            return self._classify_incumbent(
+                incumbent,
+                thread_id=thread_id,
+                pod_name=pod_name,
+                lifecycle_generation=lifecycle_generation,
+                expected_build_sha=target_build_sha,
+            )
 
         # Create PVC for agent workspace (idempotent — reuses existing on restore)
         pvc_ok = await self._create_pvc(
@@ -217,7 +282,11 @@ class PersistentProvisioner:
                     "updated_at": now_iso,
                 },
             )
-            return False
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                pod_name,
+                failure_class="pvc_creation_failed",
+            )
 
         try:
             runtime_actor_bootstrap = await issue_runtime_actor_bootstrap(
@@ -229,7 +298,11 @@ class PersistentProvisioner:
                 "refusing to provision an identity-less pod",
                 thread_id,
             )
-            return False
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                pod_name,
+                failure_class="runtime_bootstrap_failed",
+            )
 
         manifest = self._build_agent_pod_manifest(
             pod_name=pod_name,
@@ -242,10 +315,12 @@ class PersistentProvisioner:
             memory_limit=memory_limit,
             pvc_name=pvc_name,
             runtime_actor_bootstrap=runtime_actor_bootstrap,
+            lifecycle_generation=lifecycle_generation,
+            image_ref=image_ref,
         )
 
         try:
-            await asyncio.to_thread(
+            created_pod = await asyncio.to_thread(
                 self._core_api.create_namespaced_pod,
                 namespace=self._namespace,
                 body=manifest,
@@ -258,6 +333,7 @@ class PersistentProvisioner:
                     "status": "created",
                     "pod_name": pod_name,
                     "namespace": self._namespace,
+                    "expected_build_sha": target_build_sha,
                     "created_at": now_iso,
                     "updated_at": now_iso,
                 },
@@ -294,27 +370,77 @@ class PersistentProvisioner:
                     },
                 )
 
-            return True
-        except Exception as e:
-            # Handle pod already exists (409 Conflict)
-            if hasattr(e, "status") and e.status == 409:
-                logger.info(
-                    "Agent pod already exists: %s (thread %s)",
-                    pod_name,
-                    thread_id,
+            pod_uid = (
+                str(getattr(getattr(created_pod, "metadata", None), "uid", "") or "")
+                or None
+            )
+            if pod_uid is None:
+                observed = await self._read_pod(pod_name)
+                pod_uid = (
+                    str(getattr(getattr(observed, "metadata", None), "uid", "") or "")
+                    or None
                 )
-                return True
+            await self._set_thread_context(
+                thread_id,
+                {
+                    "pod_uid": pod_uid,
+                    "observed_build_sha": target_build_sha,
+                    "lifecycle_generation": lifecycle_generation,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.CREATED,
+                pod_name,
+                pod_uid=pod_uid,
+                build_sha=target_build_sha,
+            )
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                try:
+                    incumbent = await self._read_pod(pod_name)
+                except Exception as exc:
+                    return PersistentPodCreateResult(
+                        PersistentPodCreateStatus.FAILED,
+                        pod_name,
+                        failure_class=f"observation_{type(exc).__name__}"[:128],
+                    )
+                if incumbent is not None:
+                    return self._classify_incumbent(
+                        incumbent,
+                        thread_id=thread_id,
+                        pod_name=pod_name,
+                        lifecycle_generation=lifecycle_generation,
+                        expected_build_sha=target_build_sha,
+                    )
+                logger.info(
+                    "Persistent pod create conflicted but incumbent vanished: %s",
+                    pod_name,
+                )
+                return PersistentPodCreateResult(
+                    PersistentPodCreateStatus.CONFLICTING,
+                    pod_name,
+                    failure_class="conflict_without_incumbent",
+                )
 
-            logger.error("Failed to create agent pod for thread %s: %s", thread_id, e)
+            logger.error(
+                "Failed to create agent pod for thread %s (%s)",
+                thread_id,
+                type(e).__name__,
+            )
             await self._set_thread_context(
                 thread_id,
                 {
                     "status": "failed",
-                    "error": str(e),
+                    "error": "persistent pod creation failed",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            return False
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                pod_name,
+                failure_class=type(e).__name__[:128],
+            )
 
     async def delete_agent_pod(self, thread_id: str) -> bool:
         """Delete the agent pod for a persistent session.
@@ -327,7 +453,6 @@ class PersistentProvisioner:
         """
         if not self._k8s_available:
             return False
-
         pod_name = f"persistent-{thread_id[:12]}"
 
         try:
@@ -362,6 +487,30 @@ class PersistentProvisioner:
                 )
                 return True
             logger.error("Failed to delete agent pod for thread %s: %s", thread_id, e)
+            return False
+
+    async def delete_agent_pod_exact(
+        self, thread_id: str, *, expected_pod_uid: str
+    ) -> bool:
+        """Delete only the exact old pod object, never a same-name successor."""
+
+        if not self._k8s_available or not str(expected_pod_uid).strip():
+            return False
+        pod_name = f"persistent-{thread_id[:12]}"
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+                grace_period_seconds=30,
+                body={"preconditions": {"uid": str(expected_pod_uid)}},
+            )
+            return True
+        except Exception as exc:
+            if getattr(exc, "status", None) in {404, 409}:
+                # 409 is the UID precondition protecting a replacement.
+                return True
+            logger.warning("Exact persistent pod deletion failed for %s", pod_name)
             return False
 
     async def delete_agent_pvc(self, thread_id: str) -> bool:
@@ -400,9 +549,13 @@ class PersistentProvisioner:
             return {
                 "thread_id": thread_id,
                 "pod_name": pod_name,
+                "pod_uid": str(getattr(pod.metadata, "uid", "") or "") or None,
                 "phase": pod.status.phase,
                 "pod_ip": pod.status.pod_ip,
                 "ready": ready,
+                "terminating": bool(getattr(pod.metadata, "deletion_timestamp", None)),
+                "build_sha": (pod.metadata.labels or {}).get("srw/build-sha"),
+                "labels": dict(pod.metadata.labels or {}),
             }
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
@@ -413,6 +566,70 @@ class PersistentProvisioner:
     # =========================================================================
     # Internal helpers
     # =========================================================================
+
+    @property
+    def expected_build_sha(self) -> str | None:
+        return self._build_sha(self._agent_image)
+
+    @staticmethod
+    def _build_sha(image_ref: str) -> str | None:
+        if ":sha-" not in image_ref:
+            return None
+        return image_ref.rsplit(":sha-", 1)[-1]
+
+    async def _read_pod(self, pod_name: str) -> Any | None:
+        try:
+            return await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            logger.warning("Persistent pod observation failed for %s", pod_name)
+            raise
+
+    def _classify_incumbent(
+        self,
+        pod: Any,
+        *,
+        thread_id: str,
+        pod_name: str,
+        lifecycle_generation: str | None,
+        expected_build_sha: str | None,
+    ) -> PersistentPodCreateResult:
+        metadata = getattr(pod, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        pod_uid = str(getattr(metadata, "uid", "") or "") or None
+        build_sha = labels.get("srw/build-sha")
+        if getattr(metadata, "deletion_timestamp", None):
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.TERMINATING,
+                pod_name,
+                pod_uid=pod_uid,
+                build_sha=build_sha,
+            )
+        exact = (
+            labels.get("srw/component") == "persistent-agent"
+            and labels.get("srw/thread-id") == thread_id
+            and (expected_build_sha is None or build_sha == expected_build_sha)
+            and (
+                lifecycle_generation is None
+                or labels.get("srw/recycle-generation") == lifecycle_generation
+            )
+        )
+        return PersistentPodCreateResult(
+            (
+                PersistentPodCreateStatus.ALREADY_CURRENT
+                if exact
+                else PersistentPodCreateStatus.CONFLICTING
+            ),
+            pod_name,
+            pod_uid=pod_uid,
+            build_sha=build_sha,
+            failure_class=None if exact else "incumbent_authority_mismatch",
+        )
 
     async def _create_pvc(
         self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
@@ -492,6 +709,8 @@ class PersistentProvisioner:
         pvc_name: Optional[str] = None,
         expert_id: Optional[str] = None,
         runtime_actor_bootstrap: Optional[str] = None,
+        lifecycle_generation: Optional[str] = None,
+        image_ref: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -516,8 +735,12 @@ class PersistentProvisioner:
             labels["app.kubernetes.io/component"] = "agent"
         # Build SHA — lets the lifecycle reconciler enumerate stale pods by
         # selector, same convention as agent_provisioner.
-        if ":sha-" in self._agent_image:
-            labels["srw/build-sha"] = self._agent_image.rsplit(":sha-", 1)[-1]
+        selected_image = image_ref or self._agent_image
+        build_sha = self._build_sha(selected_image)
+        if build_sha:
+            labels["srw/build-sha"] = build_sha
+        if lifecycle_generation:
+            labels["srw/recycle-generation"] = str(lifecycle_generation)
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -552,7 +775,7 @@ class PersistentProvisioner:
                 "containers": [
                     {
                         "name": "agent",
-                        "image": self._agent_image,
+                        "image": selected_image,
                         "imagePullPolicy": "Always",
                         "command": [
                             "sh",

@@ -17,6 +17,7 @@ import pytest
 
 from orchestrator.services.persistent_provisioner import (
     PersistentProvisioner,
+    PersistentPodCreateStatus,
     persistent_provisioner,
 )
 
@@ -146,10 +147,11 @@ class TestCreateAgentPod:
     """Tests for create_agent_pod method."""
 
     @pytest.mark.asyncio
-    async def test_returns_false_when_k8s_not_available(self):
+    async def test_reports_failed_when_k8s_not_available(self):
         p = PersistentProvisioner()
         result = await p.create_agent_pod("tid-1")
-        assert result is False
+        assert result.status == PersistentPodCreateStatus.FAILED
+        assert result.failure_class == "kubernetes_unavailable"
 
     @pytest.mark.asyncio
     async def test_log_includes_thread_id_and_config(self):
@@ -172,7 +174,7 @@ class TestCreateAgentPod:
         p = PersistentProvisioner()
         # Just verify the method accepts defaults without error
         result = await p.create_agent_pod("tid-1")
-        assert result is False  # K8s not available
+        assert result.status == PersistentPodCreateStatus.FAILED
 
 
 # =============================================================================
@@ -273,6 +275,14 @@ class TestPodManifest:
         monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:latest")
         labels = self._build()["metadata"]["labels"]
         assert "srw/build-sha" not in labels
+
+    def test_generation_can_freeze_an_exact_target_image(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:sha-live")
+        manifest = self._build(image_ref="ghcr.io/x/agent:sha-frozen")
+        assert manifest["metadata"]["labels"]["srw/build-sha"] == "frozen"
+        assert manifest["spec"]["containers"][0]["image"] == (
+            "ghcr.io/x/agent:sha-frozen"
+        )
 
     def test_restart_policy_never(self):
         m = self._build()
@@ -481,8 +491,12 @@ class TestCreateAgentPodK8s:
         cs = MagicMock()
         cs.ready = True
         pod.status.container_statuses = [cs]
-        p._core_api.create_namespaced_pod.return_value = MagicMock()
-        p._core_api.read_namespaced_pod.return_value = pod
+        created = MagicMock()
+        created.metadata.uid = "pod-uid-new"
+        p._core_api.create_namespaced_pod.return_value = created
+        not_found = Exception("Not found")
+        not_found.status = 404
+        p._core_api.read_namespaced_pod.side_effect = [not_found, pod]
 
         with patch(
             "orchestrator.services.persistent_provisioner.asyncio.to_thread",
@@ -490,7 +504,8 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc123def456")
 
-        assert result is True
+        assert result.status == PersistentPodCreateStatus.CREATED
+        assert result.pod_uid == "pod-uid-new"
         p._core_api.create_namespaced_pod.assert_called_once()
 
     @pytest.mark.asyncio
@@ -500,6 +515,16 @@ class TestCreateAgentPodK8s:
         exc = Exception("Conflict")
         exc.status = 409
         p._core_api.create_namespaced_pod.side_effect = exc
+        not_found = Exception("Not found")
+        not_found.status = 404
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "existing-uid"
+        incumbent.metadata.deletion_timestamp = None
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+        }
+        p._core_api.read_namespaced_pod.side_effect = [not_found, incumbent]
 
         async def fake_to_thread(fn, *args, **kwargs):
             return fn(*args, **kwargs)
@@ -510,7 +535,32 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc")
 
-        assert result is True  # 409 is OK (pod already exists)
+        assert result.status == PersistentPodCreateStatus.ALREADY_CURRENT
+        assert result.pod_uid == "existing-uid"
+
+    @pytest.mark.asyncio
+    async def test_terminating_409_is_not_success(self):
+        p, _ = _make_provisioner_with_k8s()
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "old-uid"
+        incumbent.metadata.deletion_timestamp = "now"
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+        }
+        p._core_api.read_namespaced_pod.return_value = incumbent
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            result = await p.create_agent_pod("thread-abc")
+
+        assert result.status == PersistentPodCreateStatus.TERMINATING
+        p._core_api.create_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_returns_false_on_error(self):
@@ -519,6 +569,9 @@ class TestCreateAgentPodK8s:
         exc = Exception("Forbidden")
         exc.status = 403
         p._core_api.create_namespaced_pod.side_effect = exc
+        not_found = Exception("Not found")
+        not_found.status = 404
+        p._core_api.read_namespaced_pod.side_effect = not_found
 
         async def fake_to_thread(fn, *args, **kwargs):
             return fn(*args, **kwargs)
@@ -529,7 +582,8 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc")
 
-        assert result is False
+        assert result.status == PersistentPodCreateStatus.FAILED
+        assert result.failure_class == "Exception"
 
 
 class TestDeleteAgentPodK8s:

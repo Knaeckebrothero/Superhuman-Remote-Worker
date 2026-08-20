@@ -799,6 +799,17 @@ describe('ApiService officer post endpoints (knowledge-base/knowledge/features/o
     await pending;
   });
 
+  it('recycle POSTs the supported project-scoped operation', async () => {
+    const pending = firstValueFrom(api.recycleOfficer('p-1'));
+    const request = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/recycle'),
+    );
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual({});
+    request.flush({state: 'recycling', phase: 'awaiting_old_pod_exit'});
+    await pending;
+  });
+
   it('PATCHes partial kit fields and the row-only communication_policy', async () => {
     const body = {
       daily_token_ceiling: null,

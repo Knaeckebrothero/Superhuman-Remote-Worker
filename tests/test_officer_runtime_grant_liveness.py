@@ -279,6 +279,54 @@ async def test_failed_runtime_gate_records_turn_without_provider_spend():
 
 
 @pytest.mark.asyncio
+async def test_no_spend_callback_survives_model_tool_hot_swap_for_direct_and_queue():
+    """The callback belongs to the loop, not either rebuilt LLM instance."""
+
+    provider_calls = 0
+
+    async def _astream(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        yield AIMessage(content="must not run")
+
+    boot_llm = MagicMock(reasoning=None)
+    boot_llm.astream = _astream
+    rebuilt_llm = MagicMock(reasoning=None)
+    rebuilt_llm.astream = _astream
+    rebuilt_tool = MagicMock()
+    rebuilt_tool.name = "list_jobs"
+    gate = AsyncMock(return_value=(False, "maintenance unavailable"))
+    callbacks = _callbacks(
+        [
+            "direct input",
+            {"id": "queued-id", "role": "system", "content": "queued wake"},
+        ],
+        gate,
+        on_error=AsyncMock(),
+    )
+    context_manager = _context_manager()
+    get_current_tools = MagicMock(return_value=(rebuilt_llm, [rebuilt_tool]))
+
+    await run_persistent_loop(
+        llm_with_tools=boot_llm,
+        tools=[],
+        context_manager=context_manager,
+        config=_config(),
+        system_prompt="system",
+        callbacks=callbacks,
+        messages=[],
+        get_current_tools=get_current_tools,
+    )
+
+    assert get_current_tools.call_count == 2
+    assert gate.await_count == 2
+    assert callbacks.persist_message.await_count == 2
+    assert callbacks.on_turn_settled.await_count == 2
+    assert context_manager.ensure_within_limits.await_count == 0
+    assert provider_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_persistent_officer_gate_uses_the_maintenance_channel(monkeypatch):
     from src.api import persistent_app
 

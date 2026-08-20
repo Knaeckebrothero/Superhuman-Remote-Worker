@@ -143,6 +143,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
     decommissionOfficer: vi.fn().mockReturnValue(of({ status: 'decommissioned' })),
     holdOfficer: vi.fn().mockReturnValue(of({ status: 'held' })),
     releaseOfficer: vi.fn().mockReturnValue(of({ status: 'released' })),
+    recycleOfficer: vi.fn().mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
     updateOfficerPost: vi.fn().mockReturnValue(of({ status: 'updated' })),
   };
   const router = { navigate: vi.fn().mockResolvedValue(true) };
@@ -244,6 +245,7 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
     decommissionOfficer: vi.fn().mockReturnValue(of({ status: 'decommissioned' })),
     holdOfficer: vi.fn().mockReturnValue(of({ status: 'held' })),
     releaseOfficer: vi.fn().mockReturnValue(of({ status: 'released' })),
+    recycleOfficer: vi.fn().mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
     updateOfficerPost: vi.fn().mockReturnValue(of({ status: 'updated' })),
   };
   TestBed.overrideComponent(ProjectOfficerComponent, {
@@ -947,6 +949,7 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       expect(root.textContent).not.toContain(tr('officerCard.actions.rejoinConference'));
       expect(root.querySelector('[data-testid="officer-release"]')).toBeNull();
       expect(root.querySelector('[data-testid="officer-save"]')).toBeNull();
+      expect(root.querySelector('[data-testid="officer-recycle"]')).toBeNull();
       viewer.fixture.destroy();
       TestBed.resetTestingModule();
 
@@ -955,6 +958,7 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       expect(root.querySelector('[data-testid="officer-editor"]')).not.toBeNull();
       expect(root.querySelector('[data-testid="officer-save"]')).not.toBeNull();
       expect(root.querySelector('[data-testid="officer-release"]')).not.toBeNull();
+      expect(root.querySelector('[data-testid="officer-recycle"]')).not.toBeNull();
       expect(root.textContent).toContain(tr('officerCard.actions.rejoinConference'));
       expect(root.querySelector('[data-testid="officer-policy"] app-select')).not.toBeNull();
       expect(root.querySelector('input')?.getAttribute('aria-label')).toBe(
@@ -989,6 +993,30 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       );
       expect(alert?.textContent).toContain(tr('officerCard.runtimeAuthorization.unavailable'));
       expect(alert?.textContent).not.toContain('refresh_expired');
+      fixture.destroy();
+    });
+
+    it(`renders the ${lang} automatic-reconciliation rollout fence truthfully`, async () => {
+      const { fixture } = await renderComponent(
+        commissionedPost({
+          runtime_lifecycle: {
+            observed_build_sha: 'old-build',
+            expected_build_sha: 'new-build',
+            drift_state: 'drifted',
+            recycle_phase: 'idle',
+            automatic_reconciliation_enabled: false,
+          },
+        }),
+        lang,
+      );
+      const lifecycle = (fixture.nativeElement as HTMLElement).querySelector(
+        '[data-testid="officer-runtime-lifecycle"]',
+      );
+      expect(lifecycle?.textContent).toContain(
+        tr('officerCard.runtimeLifecycle.automatic.disabled'),
+      );
+      expect(lifecycle?.textContent).toContain('old-build');
+      expect(lifecycle?.textContent).toContain('new-build');
       fixture.destroy();
     });
 
@@ -1193,6 +1221,31 @@ describe('ProjectOfficerComponent lifecycle actions', () => {
     await component.release();
     expect(api.releaseOfficer).toHaveBeenCalledWith('p-1');
     expect(component.message()).toContain('drain within a tick');
+  });
+
+  it('starts one supported recycle and disables repeats while active', async () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    component.refresh();
+    await component.recycle();
+    expect(api.recycleOfficer).toHaveBeenCalledWith('p-1');
+    expect(component.message()).toContain('maintenance hold');
+
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          held: { kind: 'maintenance' },
+          runtime_lifecycle: {
+            drift_state: 'drifted',
+            recycle_phase: 'awaiting_old_pod_exit',
+          },
+        }),
+      ),
+    );
+    component.refresh(true);
+    expect(component.recycleActive()).toBe(true);
+    await component.recycle();
+    expect(api.recycleOfficer).toHaveBeenCalledTimes(1);
   });
 });
 

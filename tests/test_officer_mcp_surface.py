@@ -232,6 +232,30 @@ def test_the_post_surfaces_runtime_authorization_without_private_detail():
     assert "99" not in text
 
 
+def test_the_post_surfaces_safe_runtime_lifecycle_observations():
+    text = format_officer_post(
+        {
+            "commissioned": True,
+            "officer": {"thread_id": THREAD_ID, "status": "active"},
+            "runtime_lifecycle": {
+                "observed_build_sha": "old-build",
+                "expected_build_sha": "new-build",
+                "drift_state": "drifted",
+                "recycle_phase": "failed_retryable",
+                "last_failure": "replacement_not_ready",
+                "generation": "must-not-exist",
+                "old_pod_uid": "must-not-exist",
+            },
+        },
+        project_name="X",
+    )
+
+    assert "Runtime lifecycle: drifted" in text
+    assert "old-build" in text and "new-build" in text
+    assert "replacement_not_ready" in text
+    assert "must-not-exist" not in text
+
+
 def test_a_note_that_only_reached_the_queue_never_reads_as_delivered():
     text = format_officer_note_result(
         {

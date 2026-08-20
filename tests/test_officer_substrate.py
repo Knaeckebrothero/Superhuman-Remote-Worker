@@ -10,7 +10,6 @@ same split the attention-sleep suite uses.
 """
 
 import asyncio
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -24,8 +23,8 @@ from src.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
 
 
 @pytest.mark.asyncio
-async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
-    """Reactivating a dead officer cannot revive its prior owner credential."""
+async def test_officer_missing_pod_delegates_to_lifecycle_owner(monkeypatch):
+    """The watchdog observes; one shared recycler owns missing-pod repair."""
     from orchestrator import main as orch_main
 
     thread = {
@@ -35,21 +34,17 @@ async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
         "config_name": "session_base",
         "metadata": {"config_override": {"officer": {"enabled": True}}},
     }
-    conn = AsyncMock()
-
-    @asynccontextmanager
-    async def acquire():
-        yield conn
-
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=thread)
     db.get_pending_officer_timer = AsyncMock(return_value=None)
-    db.merge_thread_config_override = AsyncMock()
-    db.acquire = acquire
     wake = MagicMock()
     wake._resolve_live_agent = AsyncMock(return_value=None)
     provisioner = MagicMock()
-    provisioner.create_agent_pod = AsyncMock(return_value=True)
+    provisioner.is_available = True
+    provisioner.expected_build_sha = "current"
+    recycler = MagicMock()
+    recycler.observe = AsyncMock(return_value=None)
+    recycler.request_and_reconcile = AsyncMock()
     maintenance = AsyncMock(
         return_value=SimpleNamespace(
             authorized=False,
@@ -59,18 +54,120 @@ async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
     )
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
+    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", True)
     monkeypatch.setattr(
         orch_main, "_maintain_officer_runtime_authorization", maintenance
     )
 
     await orch_main._officer_watchdog_check_one(thread, wake)
 
-    sql = " ".join(conn.execute.await_args.args[0].split())
-    assert "agent_id = NULL" in sql
-    assert "status = 'active'" in sql
-    assert "control_admission_agent_id = NULL" in sql
     maintenance.assert_awaited_once_with(thread)
-    provisioner.create_agent_pod.assert_awaited_once()
+    recycler.request_and_reconcile.assert_awaited_once_with(
+        thread_id=thread["id"],
+        reason="missing_pod",
+        expected_build_sha="current",
+        observation=None,
+        expected_project_id="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_officer_watchdog_probe_miss_does_not_recycle_existing_pod(monkeypatch):
+    from orchestrator import main as orch_main
+    from orchestrator.services.persistent_recycler import PersistentPodObservation
+
+    thread = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "project_id": "22222222-2222-4222-8222-222222222222",
+        "status": "active",
+        "execution_lane": "pinned",
+        "metadata": {"config_override": {"officer": {"enabled": True}}},
+    }
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.get_pending_officer_timer = AsyncMock(return_value=None)
+    wake = MagicMock()
+    wake._resolve_live_agent = AsyncMock(return_value=None)
+    provisioner = MagicMock(is_available=True, expected_build_sha="current")
+    observation = PersistentPodObservation(
+        thread_id=thread["id"],
+        pod_name=f"persistent-{thread['id'][:12]}",
+        pod_uid="pod-still-live",
+        build_sha="current",
+        phase="Running",
+        ready=True,
+        terminating=False,
+        labels={
+            "srw/component": "persistent-agent",
+            "srw/thread-id": thread["id"],
+        },
+    )
+    recycler = MagicMock()
+    recycler.observe = AsyncMock(return_value=observation)
+    recycler.request_and_reconcile = AsyncMock()
+    maintenance = AsyncMock(
+        return_value=SimpleNamespace(
+            authorized=True,
+            state="authorized",
+            notification_due=False,
+        )
+    )
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
+    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main, "_maintain_officer_runtime_authorization", maintenance
+    )
+
+    await orch_main._officer_watchdog_check_one(thread, wake)
+
+    recycler.observe.assert_awaited_once_with(thread["id"])
+    recycler.request_and_reconcile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_officer_missing_pod_is_observation_only_while_rollout_fence_is_off(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    thread = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "project_id": "22222222-2222-4222-8222-222222222222",
+        "status": "suspended",
+        "execution_lane": "pinned",
+        "metadata": {"config_override": {"officer": {"enabled": True}}},
+    }
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.get_pending_officer_timer = AsyncMock(return_value=None)
+    wake = MagicMock()
+    wake._resolve_live_agent = AsyncMock(return_value=None)
+    provisioner = MagicMock(is_available=True, expected_build_sha="current")
+    recycler = MagicMock()
+    recycler.observe = AsyncMock(return_value=None)
+    recycler.request_and_reconcile = AsyncMock()
+    maintenance = AsyncMock(
+        return_value=SimpleNamespace(
+            authorized=False,
+            state="lifecycle_pending",
+            notification_due=False,
+        )
+    )
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
+    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", False)
+    monkeypatch.setattr(
+        orch_main, "_maintain_officer_runtime_authorization", maintenance
+    )
+
+    await orch_main._officer_watchdog_check_one(thread, wake)
+
+    recycler.observe.assert_not_awaited()
+    recycler.request_and_reconcile.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

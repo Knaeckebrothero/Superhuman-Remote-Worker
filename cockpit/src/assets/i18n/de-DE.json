@@ -3248,6 +3248,7 @@
       "sleepMin": "Minimale Schlafdauer in Minuten",
       "sleepMax": "Maximale Schlafdauer in Minuten",
       "holdNote": "Notiz zur Aussetzung des Offiziers",
+      "recycle": "Offizierslaufzeit neu starten",
       "routingPolicy": "Weiterleitung von Arbeiterfragen"
     },
     "actions": {
@@ -3264,6 +3265,7 @@
       "openLog": "Protokoll öffnen",
       "rejoinConference": "Konferenz wieder betreten",
       "release": "Freigeben",
+      "recycle": "Laufzeit neu starten",
       "save": "Änderungen speichern"
     },
     "backlog": {
@@ -3317,6 +3319,7 @@
       "hold": "Aussetzung fehlgeschlagen",
       "policy": "Weiterleitung der Arbeiterfragen konnte nicht geändert werden",
       "release": "Freigabe fehlgeschlagen",
+      "recycle": "Neustart der Laufzeit fehlgeschlagen",
       "update": "Aktualisierung fehlgeschlagen",
       "withDetail": "{{fallback}}: {{detail}}"
     },
@@ -3361,7 +3364,36 @@
       "decommissioned": "Posten abberufen — Ausrüstung, Budgets und Fingerabdrücke bleiben für den Nachfolger erhalten.",
       "held": "Ausgesetzt — Entsendungen pausieren und der Wächter tritt zurück; deine Anweisungen erreichen ihn weiterhin.",
       "released": "Freigegeben — wartende Ereignisse werden innerhalb eines Takts verarbeitet.",
+      "recycleStarted": "Neustart der Laufzeit begonnen — die Wartungsaussetzung bleibt bis zur gesunden Ablösung bestehen.",
       "updated": "Posten aktualisiert — die Kapazitätszeile des nächsten SITREP zeigt den neuen Stand."
+    },
+    "runtimeLifecycle": {
+      "label": "Laufzeit-Lebenszyklus",
+      "missing": "fehlt",
+      "unpinned": "nicht angeheftet",
+      "automatic": {
+        "enabled": "automatische Reparatur aktiviert",
+        "disabled": "automatische Reparatur deaktiviert"
+      },
+      "drift": {
+        "current": "aktuell",
+        "drifted": "Image-Abweichung",
+        "missing": "Pod fehlt",
+        "unknown": "unbekannt"
+      },
+      "phase": {
+        "idle": "inaktiv",
+        "awaiting-old-pod-exit": "wartet auf das Beenden der alten Laufzeit",
+        "fencing-old-authority": "alte Laufzeitberechtigung wird beendet",
+        "provisioning": "Ersatz wird bereitgestellt",
+        "provisioning-claimed": "Ersatzbereitstellung läuft",
+        "awaiting-replacement": "wartet auf die Berechtigung des Ersatzes",
+        "failed-retryable": "wiederholbarer Fehler",
+        "complete": "aktuell",
+        "blocked": "blockiert",
+        "cancelled": "abgebrochen",
+        "unknown": "unbekannt"
+      }
     },
     "policy": {
       "title": "Arbeiterfragen",

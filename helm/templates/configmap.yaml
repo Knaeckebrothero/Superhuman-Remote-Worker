@@ -368,6 +368,8 @@ data:
   # already accepted row after a restart or rollback.
   COMPLETION_STATUS_REORDER_ENABLED: {{ .Values.orchestrator.completionStatusReorderEnabled | default false | quote }}
   COMPLETION_FINALIZER_INLINE_DELAY_SECONDS: {{ .Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0 | quote }}
+  # Two-stage rollout fence for the interim dedicated Officer-pod owner.
+  PERSISTENT_AGENT_RECONCILIATION_ENABLED: {{ .Values.orchestrator.persistentAgentReconciliationEnabled | default false | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 
   # Reject pickle fallback in LangGraph checkpoint serialization. This is

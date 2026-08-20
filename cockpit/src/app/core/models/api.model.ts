@@ -1430,6 +1430,14 @@ export interface OfficerPost {
   incarnations?: OfficerIncarnation[] | null;
   while_vacant?: OfficerVacantLedger | null;
   runtime_authorization?: OfficerRuntimeAuthorization | null;
+  runtime_lifecycle?: {
+    observed_build_sha?: string | null;
+    expected_build_sha?: string | null;
+    drift_state?: 'current' | 'drifted' | 'missing' | 'unknown';
+    recycle_phase?: string | null;
+    last_failure?: string | null;
+    automatic_reconciliation_enabled?: boolean;
+  } | null;
   backlog?: OfficerBacklogState | null;
   conference?: {thread_id: string; status?: string | null} | null;
 }

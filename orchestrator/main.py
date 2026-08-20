@@ -483,6 +483,10 @@ from services.session_provisioner import (  # noqa: E402
 )
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
+from services.persistent_recycler import (  # noqa: E402
+    PersistentThreadRecycler,
+    persistent_recycle_view,
+)
 from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.runtime_actor import (  # noqa: E402
     RuntimeActorCredentialError,
@@ -524,6 +528,7 @@ from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
     AgentInstanceManager,
     InstanceLifecycleReconciler,
+    PersistentAgentInstanceManager,
     VMInstanceManager,
     WorkspaceInstanceManager,
 )
@@ -550,6 +555,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 postgres_db = PostgresDB()
+_persistent_thread_recycler: PersistentThreadRecycler | None = None
 gitea_client = GiteaClient()
 keycloak_groups = KeycloakGroupSync()
 main_cloud_router = MainCloudRouter(build_backend())
@@ -1592,6 +1598,13 @@ COMPLETION_COMMANDS_ENABLED = os.environ.get(
 # cannot change the ordering contract of work already in flight.
 COMPLETION_STATUS_REORDER_ENABLED = os.environ.get(
     "COMPLETION_STATUS_REORDER_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# First-rollout safety fence for the interim dedicated Officer-pod owner.
+# Read-only drift observation and the authorized manual recycle operation stay
+# available while automatic drift/missing-pod mutation is dark.
+PERSISTENT_AGENT_RECONCILIATION_ENABLED = os.environ.get(
+    "PERSISTENT_AGENT_RECONCILIATION_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
 # Local-only crash-recovery proof hook. Production/chart defaults keep this at
@@ -10422,6 +10435,7 @@ async def lifespan(app: FastAPI):
     global _completion_command_resolution_instance, _completion_monitor_instance
     global _session_memory_effect_drain_instance
     global _shutdown_event
+    global _persistent_thread_recycler
 
     # Reordering is an execution mode of durable completion commands, never a
     # standalone legacy-path feature. The admission bit is persisted, so this
@@ -11365,6 +11379,34 @@ async def lifespan(app: FastAPI):
     # Initialize persistent agent provisioner (legacy, kept for backward compat)
     persistent_provisioner.connect(db=postgres_db)
 
+    async def _persistent_recycle_failure_page(
+        project_id: str, thread_id: str, failure_class: str
+    ) -> bool:
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread or str(thread.get("project_id") or "") != project_id:
+            return False
+        return await _dispatch_officer_page(
+            thread,
+            thread_id,
+            subject="Officer runtime recycle requires attention",
+            message_md=(
+                "The dedicated Officer runtime is held while its bounded "
+                f"recycle retries (`{failure_class}`). Durable Post, thread, "
+                "and queued wakes remain intact."
+            ),
+        )
+
+    async def _persistent_recycle_complete(project_id: str, thread_id: str) -> None:
+        if project_id:
+            _kick_officer_event_drain(postgres_db)
+
+    _persistent_thread_recycler = PersistentThreadRecycler(
+        db=postgres_db,
+        provisioner=persistent_provisioner,
+        failure_notifier=_persistent_recycle_failure_page,
+        on_complete=_persistent_recycle_complete,
+    )
+
     # Initialize unified agent provisioner (on-demand pods for jobs + sessions)
     agent_provisioner.connect(db=postgres_db)
 
@@ -11810,6 +11852,14 @@ async def lifespan(app: FastAPI):
     lifecycle_reconciler = InstanceLifecycleReconciler()
     lifecycle_reconciler.register(
         AgentInstanceManager(provisioner=agent_provisioner, db=postgres_db)
+    )
+    lifecycle_reconciler.register(
+        PersistentAgentInstanceManager(
+            provisioner=persistent_provisioner,
+            db=postgres_db,
+            recycler=_persistent_thread_recycler,
+            automatic_enabled=PERSISTENT_AGENT_RECONCILIATION_ENABLED,
+        )
     )
     lifecycle_reconciler.register(
         WorkspaceInstanceManager(
@@ -36091,6 +36141,16 @@ async def get_project_officer_summary(
         "runtime_authorization": _officer_runtime_authorization_view(
             post.get("state"), commissioned=officer is not None
         ),
+        "runtime_lifecycle": {
+            "observed_build_sha": None,
+            "expected_build_sha": persistent_provisioner.expected_build_sha,
+            "drift_state": "unknown",
+            "recycle_phase": "idle",
+            "last_failure": None,
+            "automatic_reconciliation_enabled": (
+                PERSISTENT_AGENT_RECONCILIATION_ENABLED
+            ),
+        },
         # Always present so the card never has to branch on shape. A vacant
         # post has no live counters — only the setting the next incarnation
         # will boot with.
@@ -36144,6 +36204,25 @@ async def get_project_officer_summary(
     officer_state = metadata.get("officer_state") or {}
     if not isinstance(officer_state, dict):
         officer_state = {}
+    lifecycle_view = persistent_recycle_view(metadata)
+    lifecycle_view["expected_build_sha"] = persistent_provisioner.expected_build_sha
+    lifecycle_view["automatic_reconciliation_enabled"] = (
+        PERSISTENT_AGENT_RECONCILIATION_ENABLED
+    )
+    if persistent_provisioner.is_available:
+        pod_status = await persistent_provisioner.get_pod_status(officer_tid)
+        if pod_status:
+            lifecycle_view["observed_build_sha"] = pod_status.get("build_sha")
+            lifecycle_view["drift_state"] = (
+                "current"
+                if not persistent_provisioner.expected_build_sha
+                or pod_status.get("build_sha")
+                == persistent_provisioner.expected_build_sha
+                else "drifted"
+            )
+        elif lifecycle_view.get("recycle_phase") != "idle":
+            lifecycle_view["drift_state"] = "missing"
+    post_block["runtime_lifecycle"] = lifecycle_view
 
     timer = await postgres_db.get_pending_officer_timer(officer_tid)
     async with postgres_db.acquire() as conn:
@@ -36170,7 +36249,13 @@ async def get_project_officer_summary(
         digest = []
 
     # Hold is thread-scoped runtime state (officer_post.md §5) — read live.
-    post_block["held"] = officer_meta.get("hold") or None
+    raw_hold = officer_meta.get("hold")
+    public_hold = (
+        {k: v for k, v in raw_hold.items() if not str(k).startswith("_")}
+        if isinstance(raw_hold, dict)
+        else raw_hold
+    )
+    post_block["held"] = public_hold or None
 
     from services.officer_backlog import auto_pull_enabled, pools_from_meta
     from services.officer_backlog import ready_depth_by_pool as _ready_depth
@@ -36208,7 +36293,7 @@ async def get_project_officer_summary(
             "status": officer.get("status"),
             "title": officer.get("title"),
             "created_at": officer.get("created_at"),
-            "hold": officer_meta.get("hold") or None,
+            "hold": public_hold or None,
             # The brain HIS judgment runs on (explicit override only — a null
             # means he's on the resolved session default, which the card
             # renders as exactly that) + the full editor numerics, live from
@@ -36743,6 +36828,39 @@ class OfficerHoldRequest(BaseModel):
     note: str | None = Field(None, description="Shown on the card's held badge")
 
 
+@app.post("/api/projects/{project_id}/officer/recycle")
+async def recycle_project_officer(request: Request, project_id: str) -> dict[str, Any]:
+    """Recycle only the commissioned Officer's disposable runtime pod.
+
+    The existing project owner/admin policy is authoritative.  This is not an
+    Officer tool and runtime actors cannot use it to recycle themselves.
+    """
+
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if officer is None:
+        raise HTTPException(status_code=409, detail="The Officer Post is vacant")
+    recycler = _persistent_thread_recycler
+    if recycler is None or not persistent_provisioner.is_available:
+        raise HTTPException(
+            status_code=503, detail="Persistent runtime lifecycle is unavailable"
+        )
+    thread_id = str(officer["id"])
+    result = await recycler.request_and_reconcile(
+        thread_id=thread_id,
+        reason="operator_requested",
+        expected_build_sha=persistent_provisioner.expected_build_sha,
+        observation=await recycler.observe(thread_id),
+        expected_project_id=project_id,
+    )
+    if result.state in {"blocked", "cancelled"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Officer runtime recycle could not acquire current authority",
+        )
+    return {"thread_id": thread_id, **result.safe_view()}
+
+
 @app.post("/api/projects/{project_id}/officer/commission")
 async def commission_project_officer(
     request: Request,
@@ -37162,6 +37280,14 @@ async def release_project_officer(request: Request, project_id: str) -> dict[str
     hold = _thread_officer_meta(officer).get("hold")
     if not hold:
         raise HTTPException(status_code=400, detail="The officer is not held")
+    if isinstance(hold, dict) and hold.get("_persistent_recycle_generation"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The Officer runtime recycle owns this maintenance hold; "
+                "it releases only after replacement authority is healthy"
+            ),
+        )
     try:
         await postgres_db.set_project_officer_hold(
             project_id,
@@ -37596,6 +37722,24 @@ async def agent_update_thread_status(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
+    if (
+        body.status == "ended"
+        and body.agent_id is None
+        and _persistent_thread_recycler is not None
+    ):
+        recycle_boundary = (
+            await _persistent_thread_recycler.acknowledge_parked_boundary(
+                thread_id=thread_id,
+                agent_id=None,
+            )
+        )
+        if recycle_boundary.acknowledged:
+            return {"status": "suspended"}
+        if recycle_boundary.active_generation:
+            raise HTTPException(
+                status_code=409,
+                detail="Persistent recycle owns this thread transition",
+            )
     lane_thread = await postgres_db.get_thread(thread_id)
     if (
         lane_thread is not None
@@ -37799,11 +37943,12 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
 
     Called by a persistent agent that received ``intents.should_drain``
-    (stale build) while its loop is parked between turns. Converges on the
-    attention-sleep terminal state: workspace snapshotted to S3, workspace +
-    agent pods deleted, thread ``suspended`` with the agent binding cleared
-    so the next user input provisions a fresh (new-build) agent and walks
-    the existing suspended-restore path.
+    while its loop is parked between turns. An active dedicated-pod recycle
+    generation derives the exact old agent/UID/drain intent under the durable
+    locks and owns this request before any workspace action; this accepts the
+    headerless shape sent by pre-change runtimes. Without an active recycle,
+    the historical path converges on the attention-sleep state by snapshotting
+    the workspace and clearing the agent binding.
 
     Returns ``{"suspended": bool, "status": <thread status>}``. The agent
     falls back to the legacy 'ended' detach when ``suspended`` is false —
@@ -37811,6 +37956,30 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     past the point of suspending.
     """
     await require_internal(request)
+    requesting_agent_id = request.headers.get("X-Agent-ID", "").strip()
+    if _persistent_thread_recycler is not None:
+        acknowledgement = await _persistent_thread_recycler.acknowledge_parked_boundary(
+            thread_id=thread_id,
+            agent_id=requesting_agent_id or None,
+        )
+        if acknowledgement.acknowledged:
+            logger.info(
+                "Persistent recycle parked boundary acknowledged for thread %s",
+                thread_id,
+            )
+            return {
+                "suspended": True,
+                "status": "suspended",
+                "reason": "persistent_recycle",
+            }
+        if acknowledgement.active_generation:
+            # An active generation owns suspension exclusively. A mismatching
+            # optional agent header is a failed consistency assertion and can
+            # never fall into the workspace snapshot/delete legacy path.
+            raise HTTPException(
+                status_code=409,
+                detail="Persistent recycle boundary authority did not match",
+            )
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -43458,7 +43627,14 @@ async def resume_thread(
                     cur.get("execution_lane") if cur else None,
                 )
                 return
-            await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
+            result = await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
+            if not result.usable:
+                logger.warning(
+                    "Thread %s: legacy persistent resume is %s (%s)",
+                    tid,
+                    result.status.value,
+                    result.failure_class or "no-detail",
+                )
 
         asyncio.create_task(_reprovision_legacy(thread_id, config_name))
 
@@ -46086,6 +46262,25 @@ async def _phase5_wake_if_suspended(
                 metadata = json.loads(metadata)
             except (json.JSONDecodeError, TypeError):
                 metadata = {}
+        recycle = (metadata.get("agent_pod") or {}).get("recycle") or {}
+        if isinstance(recycle, dict) and recycle.get("phase") not in {
+            None,
+            "",
+            "complete",
+            "cancelled",
+        }:
+            if _persistent_thread_recycler is not None:
+                await _persistent_thread_recycler.request_and_reconcile(
+                    thread_id=thread_id,
+                    reason="resume_during_recycle",
+                    expected_build_sha=persistent_provisioner.expected_build_sha,
+                    expected_project_id=(
+                        str(thread.get("project_id"))
+                        if thread.get("project_id")
+                        else None
+                    ),
+                )
+            return
         ws_ctx = metadata.get("workspace_container") or {}
         ws_status = ws_ctx.get("status")
         if ws_status == "suspended" and workspace_suspension_service.is_enabled:
@@ -46125,10 +46320,21 @@ async def _phase5_wake_if_suspended(
             config_name = canonical_config_name(
                 thread.get("config_name", "session_base")
             )
-            asyncio.create_task(
-                persistent_provisioner.create_agent_pod(
+
+            async def _create_after_magic_link() -> None:
+                result = await persistent_provisioner.create_agent_pod(
                     thread_id, config_name=config_name
-                ),
+                )
+                if not result.usable:
+                    logger.warning(
+                        "magic-link persistent provisioning for thread %s is %s (%s)",
+                        thread_id,
+                        result.status.value,
+                        result.failure_class or "no-detail",
+                    )
+
+            asyncio.create_task(
+                _create_after_magic_link(),
                 name=f"phase5-create-agent-{thread_id[:8]}",
             )
     except Exception as e:
@@ -46262,9 +46468,6 @@ _ATTENTION_SLEEP_MINUTES: int = int(
 
 OFFICER_WATCHDOG_INTERVAL_S = int(os.getenv("OFFICER_WATCHDOG_INTERVAL_S", "60"))
 OFFICER_WAKE_GRACE_MINUTES = int(os.getenv("OFFICER_WAKE_GRACE_MINUTES", "10"))
-OFFICER_RESPAWN_COOLDOWN_MINUTES = int(
-    os.getenv("OFFICER_RESPAWN_COOLDOWN_MINUTES", "10")
-)
 
 
 async def _maintain_officer_runtime_authorization(
@@ -46415,98 +46618,44 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
                 session_wake_svc.kick_event_drain(postgres_db)
         return
 
-    # Duty 3: dead pod or drain-suspended thread — respawn, rate-limited.
-    # Deploys drain-suspend parked sessions, so 'suspended' is the officer's
-    # ROUTINE down-state, not an anomaly (centurion.md §4). The boot
-    # self-wake in _attach_session is the loop bootstrap after respawn.
-    #
-    # Boot grace first: a freshly provisioned pod that has not passed its
-    # readiness probe yet looks exactly like a dead one. Without this the
-    # watchdog respawns every young officer mid-boot (observed on the k3d
-    # smoke: respawn 25s after creation → double attach).
-    metadata = officer_row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    pod_created_raw = (metadata.get("agent_pod") or {}).get("created_at")
-    if pod_created_raw:
-        try:
-            pod_created = datetime.fromisoformat(str(pod_created_raw))
-            if (now - pod_created) < timedelta(
-                minutes=OFFICER_RESPAWN_COOLDOWN_MINUTES
-            ):
-                return
-        except ValueError:
-            pass
-    last_respawn_raw = officer_meta.get("last_respawn_at")
-    if last_respawn_raw:
-        try:
-            last_respawn = datetime.fromisoformat(str(last_respawn_raw))
-            if (now - last_respawn) < timedelta(
-                minutes=OFFICER_RESPAWN_COOLDOWN_MINUTES
-            ):
-                return
-        except ValueError:
-            pass
-    if persistent_provisioner is None:
+    # Duty 3: a missing pod is another observation for the same durable
+    # lifecycle owner used by image drift and the supported operator action.
+    # The watchdog no longer clears bindings or creates pods on its own.
+    recycler = _persistent_thread_recycler
+    if recycler is None or not persistent_provisioner.is_available:
         logger.warning(
-            "officer watchdog: officer thread %s is down and no persistent "
-            "provisioner is configured — cannot respawn",
+            "officer watchdog: lifecycle owner unavailable for thread %s",
             thread_id[:8],
         )
         return
-    logger.info(
-        "officer watchdog: respawning officer thread %s (thread status=%s, "
-        "agent live=%s)",
-        thread_id[:8],
-        thread.get("status"),
-        agent is not None,
-    )
-    await postgres_db.merge_thread_config_override(
-        thread_id, {"officer": {"last_respawn_at": now.isoformat()}}
-    )
-    # Clear the stale binding and surface the thread as active so the fresh
-    # pod's attach binds cleanly. Officers run the lite backend — there is no
-    # workspace snapshot to restore (mirrors the magic-link wake path).
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE threads "
-            "SET agent_id = NULL, status = 'active', "
-            "    awaiting_user_since = NULL, "
-            "    control_admission_agent_id = NULL "
-            "WHERE id = $1 AND status IN ('active', 'suspended')",
-            thread_id,
-        )
-    config_name = canonical_config_name(thread.get("config_name", "session_base"))
-    ok = await persistent_provisioner.create_agent_pod(
-        thread_id, config_name=config_name
-    )
-    if not ok:
-        logger.error(
-            "officer watchdog: respawn FAILED for officer thread %s — will "
-            "retry after cooldown",
+    if not PERSISTENT_AGENT_RECONCILIATION_ENABLED:
+        logger.info(
+            "officer watchdog: automatic persistent reconciliation disabled "
+            "for thread %s",
             thread_id[:8],
         )
-        # Page the owner (S5 notify contract). Deliberately OUTSIDE the page
-        # budget — a dead, unrespawnable officer cannot page for himself, and
-        # the respawn cooldown already rate-limits this to one page per
-        # window. Best-effort: a notifier outage must not break the watchdog.
-        try:
-            await _dispatch_officer_page(
-                thread,
-                thread_id,
-                subject="Centurion down — respawn failing",
-                message_md=(
-                    f"The officer session `{thread_id[:8]}` is down and the "
-                    "watchdog's respawn attempt failed. It will retry every "
-                    f"{OFFICER_RESPAWN_COOLDOWN_MINUTES} min; until one "
-                    "succeeds, no wakes are being processed."
-                ),
-            )
-        except Exception:
-            logger.exception("officer watchdog: respawn-failure page failed")
+        return
+    observation = await recycler.observe(thread_id)
+    if observation is not None:
+        # The session-wake probe is intentionally stricter than Kubernetes
+        # liveness and can bounce during attach or a transient network fault.
+        # A real pod observation is not "missing" authority. The registered
+        # lifecycle manager owns build/UID/agent reciprocity decisions and
+        # will submit an explicit drift/mismatch reason when appropriate.
+        logger.info(
+            "officer watchdog: live probe missed thread %s but pod UID %s "
+            "still exists; deferring to persistent lifecycle reconciliation",
+            thread_id[:8],
+            observation.pod_uid[:8],
+        )
+        return
+    await recycler.request_and_reconcile(
+        thread_id=thread_id,
+        reason="missing_pod",
+        expected_build_sha=persistent_provisioner.expected_build_sha,
+        observation=None,
+        expected_project_id=str(officer_row.get("project_id") or ""),
+    )
 
 
 async def officer_watchdog(shutdown_event: asyncio.Event) -> None:
@@ -46515,16 +46664,15 @@ async def officer_watchdog(shutdown_event: asyncio.Event) -> None:
     Three duties, none requiring judgment: file the implicit ``sleep_max``
     timer when an unheld officer has none pending; treat a pending timer
     overdue past ``fire_at + grace`` with a live pod as a delivery failure
-    and kick the drain; respawn dead/suspended officers (rate-limited).
-    Leader-gated — respawn must be single-flight across replicas.
+    and kick the drain; submit missing runtimes to the shared durable lifecycle
+    owner. Leader-gated; the recycler also carries a durable generation/claim.
     """
     from services import session_wake as session_wake_svc
 
     logger.info(
-        "Officer watchdog started (tick=%ds, grace=%dm, respawn_cooldown=%dm)",
+        "Officer watchdog started (tick=%ds, grace=%dm)",
         OFFICER_WATCHDOG_INTERVAL_S,
         OFFICER_WAKE_GRACE_MINUTES,
-        OFFICER_RESPAWN_COOLDOWN_MINUTES,
     )
     while not shutdown_event.is_set():
         try:

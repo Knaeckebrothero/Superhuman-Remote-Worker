@@ -1095,7 +1095,8 @@ class OrchestratorClient:
             return False
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/suspend"
         try:
-            r = await self._client.post(url, timeout=300.0)
+            headers = {"X-Agent-ID": self.agent_id} if self.agent_id else None
+            r = await self._client.post(url, timeout=300.0, headers=headers)
             if r.status_code != 200:
                 logger.warning(f"Thread suspend rejected: {r.status_code} - {r.text}")
                 return False
