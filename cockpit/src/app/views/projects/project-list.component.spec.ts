@@ -132,6 +132,7 @@ function stubApi(
     getDatasources: vi.fn().mockReturnValue(of(connectors)),
     createProject: vi.fn().mockReturnValue(of(createResult)),
     updateProject: vi.fn().mockReturnValue(of(null)),
+    updateProjectFields: vi.fn().mockReturnValue(of({status: 'updated'})),
     setProjectStatus: vi.fn().mockReturnValue(of({archived: false})),
   };
 }
@@ -562,6 +563,67 @@ describe('ProjectListPageComponent — archived lifecycle', () => {
     expect(fixture.nativeElement.querySelector('.empty-state')).toBeNull();
     expect((fixture.nativeElement.querySelector('.list-error') as HTMLElement).textContent?.trim())
       .toBe(en.errors.http['5xx']);
+  });
+
+  function renameControls(
+    fixture: ComponentFixture<ProjectListPageComponent>,
+  ): HTMLElement[] {
+    return Array.from(
+      fixture.nativeElement.querySelectorAll('.project-card .card-name app-inline-editable-text'),
+    );
+  }
+
+  it('offers no rename on an archived card, and still shows the name', async () => {
+    // An archived project takes a status-only PATCH; a rename is refused whole
+    // with a 409. Offering the control means the title can be typed into and
+    // then snap back, which is the failure this removes rather than reports.
+    const api = stubApi(undefined, [], {active: [project()], archived: [ARCHIVED]});
+    const fixture = await mount(api);
+    expect(renameControls(fixture)).toHaveLength(1);
+
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(renameControls(fixture)).toHaveLength(0);
+    // Read-only, not hidden.
+    expect(cardNames(fixture)).toEqual(['Better Resavio (pre-split archive)']);
+  });
+
+  it('sends no rename for an archived project even if one is emitted', async () => {
+    const api = stubApi(undefined, [], {archived: [ARCHIVED]});
+    const fixture = await mount(api);
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    fixture.componentInstance.onRenameProject(ARCHIVED, 'Something else');
+
+    expect(api.updateProjectFields).not.toHaveBeenCalled();
+    expect(api.updateProject).not.toHaveBeenCalled();
+    expect(cardNames(fixture)).toEqual(['Better Resavio (pre-split archive)']);
+  });
+
+  it("says why a rename snapped back when the project was archived elsewhere", async () => {
+    // Prevention loses this race: the card was rendered as active. The rename
+    // used to go through `updateProject`, whose `null` on error meant the name
+    // reverted and nothing said why.
+    const api = stubApi(undefined, [], {active: [project()]});
+    const detail =
+      'This project is archived and is read-only apart from its status. ' +
+      'Unarchive it before editing anything else.';
+    api.updateProjectFields = vi
+      .fn()
+      .mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail}})));
+    const fixture = await mount(api);
+
+    fixture.componentInstance.onRenameProject(project(), 'Renamed');
+    fixture.detectChanges();
+
+    expect(cardNames(fixture)).toEqual(['Better Resavio']);
+    expect(
+      (fixture.nativeElement.querySelector('.list-error') as HTMLElement).textContent?.trim(),
+    ).toBe(detail);
   });
 
   it('names the empty archived view for what it is', async () => {

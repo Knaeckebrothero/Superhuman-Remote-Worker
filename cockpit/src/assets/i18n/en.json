@@ -1210,6 +1210,7 @@
       "defaultConfig": "Default Config",
       "created": "Created",
       "edit": "Edit",
+      "archivedReadOnly": "This project is archived. Its description and goal are read-only — unarchive it to edit them.",
       "openFolder": "Open Project Folder",
       "manageAutomations": "Manage automations",
       "save": "Save",
@@ -1363,6 +1364,7 @@
       "unarchive": "Unarchive",
       "unarchiveConfirmTitle": "Unarchive project?",
       "unarchiveConfirm": "Unarchive this project? New work will be allowed against it again; the loop, officer and parked jobs stay paused.",
+      "archivedReadOnly": "This project is archived, so its settings are read-only. Unarchive it to edit them — everything below stays visible in the meantime.",
       "deleteTitle": "Delete Project",
       "deleteDesc": "Permanently delete this project and its managed repositories.",
       "delete": "Delete",
@@ -3145,7 +3147,9 @@
     "projects": {
       "loadFailed": "Couldn't load your projects.",
       "archiveFailed": "Couldn't archive the project.",
-      "unarchiveFailed": "Couldn't unarchive the project."
+      "unarchiveFailed": "Couldn't unarchive the project.",
+      "updateFailed": "Couldn't save the project.",
+      "renameFailed": "Couldn't rename the project."
     },
     "jobs": {
       "createFailed": "Couldn't create the job.",
@@ -3221,6 +3225,11 @@
     "title": "Centurion",
     "intro": "A standing officer for this project: he holds the charge, watches jobs and fleet, dispatches workers from his kit, and pages you only when something genuinely needs you. You talk to him in a conference; his background log is the session transcript. The post outlives him — kit, budgets, and memory stay with it between incarnations.",
     "readOnly": "You can view this Officer Post, but only a project owner or system administrator can manage it.",
+    "runtimeAuthorization": {
+      "label": "Runtime authorization",
+      "unavailable": "Unavailable — autonomous planning is paused while the server retries and alerts the project owner.",
+      "a11y": "Officer runtime authorization unavailable; autonomous planning is paused"
+    },
     "a11y": {
       "loading": "Loading Officer Post",
       "region": "Officer Post",

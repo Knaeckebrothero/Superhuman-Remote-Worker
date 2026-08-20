@@ -94,12 +94,19 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           </app-icon-button>
           <div class="header-info">
             <h1 class="page-title">
-              <app-inline-editable-text
-                [value]="proj.name"
-                [clickToEdit]="true"
-                [ariaLabel]="'common.rename' | transloco"
-                (save)="onRenameProject($event)"
-              />
+              @if (isArchived()) {
+                <!-- An archived project takes a status-only PATCH, so a rename
+                     is refused whole. Do not offer the control at all rather
+                     than let the title be typed into and then snap back. -->
+                <span class="page-title-static" [title]="proj.name">{{ proj.name }}</span>
+              } @else {
+                <app-inline-editable-text
+                  [value]="proj.name"
+                  [clickToEdit]="true"
+                  [ariaLabel]="'common.rename' | transloco"
+                  (save)="onRenameProject($event)"
+                />
+              }
             </h1>
             <div class="header-badges">
               @if (proj.is_default) {
@@ -113,6 +120,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             </div>
           </div>
         </div>
+
+        @if (renameError(); as message) {
+          <p class="edit-error" role="alert">{{ message }}</p>
+        }
 
         <!-- Tabs -->
         <div class="tab-bar">
@@ -186,6 +197,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <label>{{ 'projectDetail.overview.created' | transloco }}</label>
                 <p class="detail-value mono">{{ formatDate(proj.created_at) }}</p>
               </div>
+              @if (isArchived()) {
+                <p class="archived-note" role="note">
+                  {{ 'projectDetail.overview.archivedReadOnly' | transloco }}
+                </p>
+              }
+              @if (editError(); as message) {
+                <p class="edit-error" role="alert">{{ message }}</p>
+              }
               <div class="overview-actions">
                 @if (isEditingOverview()) {
                   <app-button variant="primary" size="md" (clicked)="saveOverview()">
@@ -195,9 +214,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     {{ 'projectDetail.overview.cancel' | transloco }}
                   </app-button>
                 } @else {
-                  <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
-                    {{ 'projectDetail.overview.edit' | transloco }}
-                  </app-button>
+                  @if (!isArchived()) {
+                    <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
+                      {{ 'projectDetail.overview.edit' | transloco }}
+                    </app-button>
+                  }
                   <app-button variant="ghost" size="md" (clicked)="openAutomationsForProject()">
                     {{ 'projectDetail.overview.manageAutomations' | transloco }}
                   </app-button>
@@ -888,13 +909,29 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
           @if (activeTab() === 'settings') {
             <div class="settings-section">
+              <!-- Archived is read-only, not hidden: every value below stays
+                   legible and stops being editable, and this names the one
+                   click that gives them back. Letting the user type and then
+                   eat a 409 is the failure this replaces. Only the Danger Zone
+                   stays live, because unarchiving is the way out. -->
+              @if (isArchived()) {
+                <p class="archived-note" role="note">
+                  {{ 'projectDetail.settings.archivedReadOnly' | transloco }}
+                </p>
+              }
+              <!-- Any of the four groups below can be refused, so the refusal
+                   belongs to the panel rather than to one of them. -->
+              @if (editError(); as message) {
+                <p class="edit-error" role="alert">{{ message }}</p>
+              }
+
               <!-- General -->
               <div class="settings-group">
                 <h3 class="settings-heading">{{ 'projectDetail.settings.general' | transloco }}</h3>
                 <app-form-field [label]="'projectDetail.settings.projectName' | transloco">
                   <app-input
                     [value]="settingsName()"
-                    [disabled]="proj.is_default"
+                    [disabled]="proj.is_default || isArchived()"
                     (changed)="settingsName.set($event)"
                   />
                 </app-form-field>
@@ -902,6 +939,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-input
                     [placeholder]="'projectDetail.settings.configPlaceholder' | transloco"
                     [value]="settingsConfigName()"
+                    [disabled]="isArchived()"
                     (changed)="settingsConfigName.set($event)"
                   />
                 </app-form-field>
@@ -910,7 +948,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     variant="primary"
                     size="sm"
                     [loading]="isSavingSettings()"
-                    [disabled]="isSavingSettings()"
+                    [disabled]="isSavingSettings() || isArchived()"
                     (clicked)="saveSettings()"
                   >
                     {{ 'projectDetail.settings.save' | transloco }}
@@ -923,6 +961,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <h3 class="settings-heading">{{ 'projectDetail.settings.memory' | transloco }}</h3>
                 <app-checkbox
                   [checked]="projectMemoryShared()"
+                  [disabled]="isArchived()"
                   (changed)="toggleProjectMemory($event)"
                 >
                   {{ 'projectDetail.settings.shareMemories' | transloco }}
@@ -939,6 +978,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-form-field [label]="'projectDetail.settings.networkTier' | transloco">
                     <app-select
                       [value]="settingsNetworkTier()"
+                      [disabled]="isArchived()"
                       (changed)="onNetworkTierChange($event ?? '')"
                     >
                       <option value="internet-only">{{ 'projectDetail.settings.networkTierInternetOnly' | transloco }}</option>
@@ -964,6 +1004,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </div>
                   <app-checkbox
                     [checked]="settingsCloudReadOnly()"
+                    [disabled]="isArchived()"
                     (changed)="toggleCloudReadOnly($event)"
                   >
                     {{ 'projectDetail.settings.readOnlyAgent' | transloco }}
@@ -1105,6 +1146,37 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .header-badges { display: flex; gap: 6px; }
+
+    /* The archived title: the same one-line, ellipsised shape the inline
+       rename control renders, minus the affordance. */
+    .page-title-static {
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: bottom;
+    }
+
+    /* A refused write, wherever the user was when it was refused. */
+    .edit-error {
+      margin: 0 0 12px 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    .archived-note {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.4;
+    }
 
     /* Tabs */
     .tab-bar {
@@ -1858,6 +1930,19 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly lifecycleError = signal<string | null>(null);
   /** What archiving quiesced on the way through. */
   readonly archiveReport = signal<string | null>(null);
+  /**
+   * Archived means read-only apart from `status`: the server accepts a
+   * status-only PATCH and refuses any other field whole with a 409. The UI
+   * prevents rather than reports — the fields stay visible and stop being
+   * editable — and the error signals below cover the case prevention cannot,
+   * which is another tab archiving the project while this form is open.
+   */
+  readonly isArchived = computed(() => this.project()?.status === 'archived');
+  /** A refused rename. Lives beside the header, where the rename is. */
+  readonly renameError = signal<string | null>(null);
+  /** A refused overview or settings save. The two panels are different tabs,
+   *  so one signal never renders twice at once. */
+  readonly editError = signal<string | null>(null);
   readonly jobs = signal<Job[]>([]);
   readonly repos = signal<ProjectRepository[]>([]);
   /** A project has at most one writable vault, and it is never replaced in
@@ -2302,6 +2387,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Overview
   startEditOverview(): void {
+    if (this.isArchived()) return;
     const p = this.project();
     this.editDescription.set(p?.description ?? '');
     this.editGoal.set(p?.goal ?? '');
@@ -2310,17 +2396,21 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   cancelEditOverview(): void {
     this.isEditingOverview.set(false);
+    this.editError.set(null);
   }
 
   saveOverview(): void {
-    this.api.updateProject(this.projectId, {
+    if (this.isArchived()) return;
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, {
       description: this.editDescription(),
       goal: this.editGoal(),
-    }).subscribe((res) => {
-      if (res) {
+    }).subscribe({
+      next: () => {
         this.isEditingOverview.set(false);
         this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
-      }
+      },
+      error: (err: unknown) => this.reportEditFailure(err),
     });
   }
 
@@ -2391,7 +2481,14 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   // Settings
+  //
+  // Every write below carries a field other than `status`, which is exactly
+  // what an archived project refuses (409, whole request). Each one is gated on
+  // `isArchived()` so it is never attempted, and each one goes through
+  // `updateProjectFields` so that the race prevention cannot cover — another
+  // tab archiving between load and save — is reported instead of swallowed.
   saveSettings(): void {
+    if (this.isArchived()) return;
     const update: Record<string, string> = {};
     const p = this.project();
     const name = this.settingsName().trim();
@@ -2402,70 +2499,89 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     }
     if (Object.keys(update).length === 0) return;
     this.isSavingSettings.set(true);
-    this.api.updateProject(this.projectId, update).subscribe({
-      next: (res) => {
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, update).subscribe({
+      next: () => {
         this.isSavingSettings.set(false);
-        if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
       },
-      error: () => this.isSavingSettings.set(false),
+      error: (err: unknown) => {
+        this.isSavingSettings.set(false);
+        this.reportEditFailure(err);
+      },
     });
   }
 
   onRenameProject(name: string): void {
     const p = this.project();
-    if (!p || !name || name === p.name) return;
+    if (!p || !name || name === p.name || this.isArchived()) return;
     const previous = p.name;
+    this.renameError.set(null);
     // Optimistic: reflect the new name immediately, revert if the PATCH fails.
     this.project.set({...p, name});
-    this.api.updateProject(this.projectId, {name}).subscribe({
-      next: (res) => {
-        if (!res) {
-          const cur = this.project();
-          if (cur) this.project.set({...cur, name: previous});
-        }
-      },
-      error: () => {
+    this.api.updateProjectFields(this.projectId, {name}).subscribe({
+      error: (err: unknown) => {
         const cur = this.project();
         if (cur) this.project.set({...cur, name: previous});
+        // A revert with no explanation is the bug this closes: the title used
+        // to snap back and say nothing.
+        this.renameError.set(this.errors.translate(err, 'errors.projects.renameFailed'));
       },
     });
   }
 
   toggleProjectMemory(checked: boolean): void {
     const p = this.project();
-    if (!p) return;
+    if (!p || this.isArchived()) return;
     const existing = (p.default_config_override ?? {}) as Record<string, any>;
     const override = {
       ...existing,
       memory: { ...(existing['memory'] ?? {}), project_scoped: checked },
     };
-    this.api.updateProject(this.projectId, { default_config_override: override }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { default_config_override: override }).subscribe({
+      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
+      error: (err: unknown) => this.reportEditFailure(err),
     });
   }
 
   toggleCloudReadOnly(checked: boolean): void {
+    if (this.isArchived()) return;
+    const previous = this.settingsCloudReadOnly();
     this.settingsCloudReadOnly.set(checked);
-    this.api.updateProject(this.projectId, { cloud_storage_read_only: checked }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { cloud_storage_read_only: checked }).subscribe({
+      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
+      error: (err: unknown) => {
+        this.settingsCloudReadOnly.set(previous);
+        this.reportEditFailure(err);
+      },
     });
   }
 
   onNetworkTierChange(value: string): void {
     if (value !== 'internet-only' && value !== 'home-allowed') return;
+    if (this.isArchived()) return;
     const previous = this.settingsNetworkTier();
     if (value === previous) return;
     this.settingsNetworkTier.set(value);
-    this.api.updateProject(this.projectId, { network_tier: value }).subscribe({
-      next: (res) => {
-        if (res) {
-          this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
-        }
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { network_tier: value }).subscribe({
+      next: () => {
+        this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
       },
-      error: () => {
+      error: (err: unknown) => {
         this.settingsNetworkTier.set(previous);
+        this.reportEditFailure(err);
       },
     });
+  }
+
+  /** One place for "the server refused this edit". The 409 an archived project
+   *  answers with is a plain-string `detail` naming the remedy, so it is
+   *  rendered verbatim; anything else falls back to a translated line. */
+  private reportEditFailure(err: unknown): void {
+    this.editError.set(this.errors.translate(err, 'errors.projects.updateFailed'));
   }
 
   confirmArchive(): void {

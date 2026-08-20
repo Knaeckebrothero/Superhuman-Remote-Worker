@@ -201,11 +201,19 @@ function errorDetail(err: unknown): string {
             <div class="project-card" (click)="openProject(project.id)">
               <div class="card-header">
                 <span class="card-name">
-                  <app-inline-editable-text
-                    [value]="project.name"
-                    [ariaLabel]="'common.rename' | transloco"
-                    (save)="onRenameProject(project, $event)"
-                  />
+                  @if (statusOf(project) === 'archived') {
+                    <!-- An archived project takes a status-only PATCH, so a
+                         rename is refused whole. The name stays readable; the
+                         control that could only ever fail is not offered.
+                         Unarchive (below) is the way back to editing it. -->
+                    {{ project.name }}
+                  } @else {
+                    <app-inline-editable-text
+                      [value]="project.name"
+                      [ariaLabel]="'common.rename' | transloco"
+                      (save)="onRenameProject(project, $event)"
+                    />
+                  }
                 </span>
                 <div class="card-badges">
                   @if (project.is_default) {
@@ -729,25 +737,25 @@ export class ProjectListPageComponent implements OnInit {
     this.router.navigate(['/projects', id]);
   }
 
+  /** A rename carries a field other than `status`, which an archived project
+   *  refuses whole with a 409. The card does not offer the control while
+   *  archived; this still goes through the propagating `updateProjectFields`
+   *  because another tab can archive the project between load and rename, and
+   *  a card that silently snaps back to its old name explains nothing. */
   onRenameProject(project: Project, name: string): void {
-    if (!name || name === project.name) return;
+    if (!name || name === project.name || this.statusOf(project) === 'archived') return;
     const previous = project.name;
+    this.actionError.set(null);
     // Optimistic: update the card immediately, revert if the PATCH fails.
     this.projects.update((list) =>
       list.map((p) => (p.id === project.id ? {...p, name} : p)),
     );
-    this.api.updateProject(project.id, {name}).subscribe({
-      next: (res) => {
-        if (!res) {
-          this.projects.update((list) =>
-            list.map((p) => (p.id === project.id ? {...p, name: previous} : p)),
-          );
-        }
-      },
-      error: () => {
+    this.api.updateProjectFields(project.id, {name}).subscribe({
+      error: (err: unknown) => {
         this.projects.update((list) =>
           list.map((p) => (p.id === project.id ? {...p, name: previous} : p)),
         );
+        this.actionError.set(this.errors.translate(err, 'errors.projects.renameFailed'));
       },
     });
   }
