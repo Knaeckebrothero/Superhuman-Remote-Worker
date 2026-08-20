@@ -603,6 +603,11 @@ async def admit_and_create_job_in_transaction(
         final_kwargs["job_id"] = admitted_job_id
     final_kwargs["authoritative_officer_admission"] = True
     final_kwargs["conn"] = conn
+    # Stamped at the last common funnel rather than in each caller: both the
+    # backlog tick and the manual "pull this ticket" click land here, and both
+    # are officer dispatches. If they ever need to differ, the stamp moves out
+    # to each caller's job_kwargs — it must not become an inference here.
+    final_kwargs["origin"] = "officer"
     return await db.create_job(**final_kwargs)
 
 

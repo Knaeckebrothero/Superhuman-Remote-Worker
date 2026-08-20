@@ -6075,6 +6075,7 @@ CREATE TABLE public.jobs (
     execution_lane text DEFAULT 'pinned'::text NOT NULL,
     completion_seq_hwm bigint DEFAULT 0 NOT NULL,
     completion_sweep_attempt_hwm bigint DEFAULT 0 NOT NULL,
+    origin text DEFAULT 'user'::text NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text, 'undeliverable'::text]))),
@@ -6164,6 +6165,13 @@ COMMENT ON COLUMN public.jobs.completion_seq_hwm IS 'Highest commit-ordered job_
 --
 
 COMMENT ON COLUMN public.jobs.completion_sweep_attempt_hwm IS 'Highest job_completion_sweep_actions.attempt allocated for this job. Routing increments it while holding the jobs row lock; the resulting (job_id, attempt) pair is the reap-action dedup key.';
+
+
+--
+-- Name: COLUMN jobs.origin; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.origin IS 'Where this job came from: user|session|automation|loop|officer|subjob|lifecycle|bench. Records the IMMEDIATE creator, not the root of the chain — a critic subjob of a loop iteration is ''subjob'', and the chain stays reconstructable through parent_job_id. Stamped explicitly by each caller of create_job() and validated there against KNOWN_JOB_ORIGINS; there is deliberately no CHECK constraint (see 0118 precedent). Distinct from runner_kind, which is the dispatch grant class.';
 
 
 --
@@ -11558,6 +11566,13 @@ CREATE INDEX idx_jobs_diff_status_pending ON public.jobs USING btree (id) WHERE 
 --
 
 CREATE INDEX idx_jobs_dispatchable ON public.jobs USING btree (priority DESC, created_at) WHERE ((assigned_agent_id IS NULL) AND (freeze_data IS NULL) AND ((status)::text = ANY ((ARRAY['created'::character varying, 'paused'::character varying])::text[])));
+
+
+--
+-- Name: idx_jobs_origin_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_origin_created ON public.jobs USING btree (origin, created_at DESC, id DESC);
 
 
 --

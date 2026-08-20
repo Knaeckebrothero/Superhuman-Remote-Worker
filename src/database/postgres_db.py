@@ -157,11 +157,8 @@ class PostgresDB:
         db = PostgresDB()
         await db.connect()
 
-        # Create a job
-        job_id = await db.jobs.create(
-            description="Extract requirements",
-            document_path="doc.pdf"
-        )
+        # Jobs are created by the orchestrator, not here — db.jobs is
+        # read/update only (see JobsNamespace.create).
 
         # Get pending jobs
         jobs = await db.jobs.get_pending()
@@ -1676,28 +1673,29 @@ class JobsNamespace:
         document_path: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> uuid.UUID:
-        """Create a new job.
+        """Refuses. Agents do not create jobs; the orchestrator does.
 
-        Args:
-            description: Job description - what the agent should accomplish
-            document_path: Path to document file (optional)
-            context: Additional context dictionary (optional)
+        This used to be a raw ``INSERT INTO jobs`` — the only one in the tree
+        outside tests — and it bypassed every invariant
+        ``orchestrator.database.postgres.create_job()`` maintains: the
+        ``origin`` stamp, execution-lane inheritance from the parent, the
+        authority columns, datasource linking and the policy-revision
+        snapshot. A row written here would be silently classified as
+        human-submitted work.
 
-        Returns:
-            UUID of the created job
+        It had no callers, but ``src/agent.py`` already holds this exact
+        object and calls sibling methods on it, so it sat one line away from
+        being used. Kept as an explicit refusal rather than deleted, so that
+        line fails loudly at the call instead of quietly writing a
+        half-initialised job.
+
+        Raises:
+            NotImplementedError: always.
         """
-        job_id = await self.db.fetchval(
-            """
-            INSERT INTO jobs (description, document_path, context)
-            VALUES ($1, $2, $3)
-            RETURNING id
-            """,
-            description,
-            document_path,
-            json.dumps(context or {}),
+        raise NotImplementedError(
+            "Agents must not insert jobs directly — POST /api/jobs through the "
+            "orchestrator, which stamps origin and the authority columns."
         )
-        logger.info(f"Created job {job_id}")
-        return job_id
 
     async def get(self, job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """Get job by ID.

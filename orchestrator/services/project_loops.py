@@ -1215,6 +1215,7 @@ async def create_loop_job(
         datasource_origin = "explicit"
 
     job = await db.create_job(
+        origin="loop",
         description=description,
         config_name=config_name,
         config_override=config_override,

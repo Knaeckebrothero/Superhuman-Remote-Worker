@@ -1,0 +1,39 @@
+-- migration:     0173_jobs_origin_idx.notx.sql
+-- description:   Composite index for the jobs list's dominant query shape,
+--                which after 0172 is "origin IN (...) ORDER BY created_at
+--                DESC, id DESC" — the default view hides system-created work,
+--                so the origin predicate is on nearly every read.
+--
+--                THE TRAILING id IS NOT OPTIONAL. The plan note for this
+--                column specified (origin, created_at DESC), which was
+--                written before the list query gained ", j.id DESC" as a
+--                pagination tiebreaker. Verified by EXPLAIN on 2026-08-20:
+--                with the two-column index the planner reaches the index and
+--                then sorts anyway, because created_at alone cannot satisfy
+--                an ORDER BY whose second key it does not carry — so the
+--                index looked healthy while the sort it was meant to remove
+--                stayed. Three columns, matching the ORDER BY exactly.
+--
+--                Verify through the ACTUAL list query rather than by the
+--                index existing — the vector-store lesson in
+--                knowledge-base/knowledge/db_migration.md is that six valid
+--                HNSW indexes were never reached from inside the search
+--                functions and every call sequentially scanned for ~60s
+--                while the index sat there looking healthy.
+--
+--                knowledge-base/knowledge/features/job_origin_provenance.md §3, §7.
+-- depends-on:    0172_jobs_origin.sql
+-- expected:      seconds. CONCURRENTLY build over jobs (~150 rows on k3d,
+--                ~800 on dev).
+-- locks:         no ACCESS EXCLUSIVE — CREATE INDEX CONCURRENTLY takes
+--                SHARE UPDATE EXCLUSIVE and blocks neither reads nor writes.
+-- transactional: NO (CREATE INDEX CONCURRENTLY cannot run inside one). ONE
+--                statement only, deliberately: a multi-statement file is sent
+--                as a simple query, which Postgres wraps in an implicit
+--                transaction block, and CONCURRENTLY refuses to run there.
+--                That bans even a SET lock_timeout or a COMMENT ON INDEX in
+--                this file — the comment lives in this header instead of
+--                costing a third migration.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_origin_created
+    ON jobs (origin, created_at DESC, id DESC);

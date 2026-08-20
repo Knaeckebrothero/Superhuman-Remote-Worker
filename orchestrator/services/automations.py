@@ -280,6 +280,7 @@ async def create_job_from_automation(
     )
 
     job = await db.create_job(
+        origin="automation",
         description=automation["prompt"],
         config_name=config_name,
         config_override=config_override,
