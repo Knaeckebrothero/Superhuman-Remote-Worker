@@ -2180,12 +2180,25 @@ export interface JobProgress {
  * Overall job statistics.
  */
 export interface JobStatistics {
+  /**
+   * The "All" chip: every status, with the list's other filters applied.
+   * Deliberately NOT narrowed by the status selection — these are
+   * disjunctive facet counts, so selecting `failed` must not drop every
+   * other chip to zero.
+   */
   total_jobs: number;
   created: number;
+  pending: number;
   processing: number;
   completed: number;
   failed: number;
   cancelled: number;
+  pending_review: number;
+  paused: number;
+  reviewing: number;
+  waiting: number;
+  /** Raw server counts, including any status outside the known vocabulary. */
+  by_status: Record<string, number>;
 }
 
 /**
