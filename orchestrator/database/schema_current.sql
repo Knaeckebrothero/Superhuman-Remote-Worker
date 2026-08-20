@@ -747,6 +747,66 @@ $$;
 
 
 --
+-- Name: enforce_officer_runtime_agent_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_officer_runtime_agent_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.caller_kind = 'officer'
+       AND OLD.agent_id IS NOT NULL
+       AND NEW.agent_id IS DISTINCT FROM OLD.agent_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'runtime_actor_grants_agent_provenance',
+            MESSAGE = 'Officer runtime grant agent provenance is immutable';
+    END IF;
+    IF NEW.caller_kind = 'officer'
+       AND NEW.agent_id IS NULL
+       AND NEW.revoked_at IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'runtime_actor_grants_officer_agent_binding',
+            MESSAGE = 'Officer runtime grants require an authoritative agent binding',
+            HINT = 'Drain pre-0171 orchestrator replicas before serving Officer attach or refresh traffic.';
+    END IF;
+    IF TG_OP = 'UPDATE'
+       AND OLD.caller_kind = 'officer'
+       AND OLD.refresh_rotation_required
+       AND NEW.refresh_rotation_required
+       AND NEW.last_refreshed_at IS DISTINCT FROM OLD.last_refreshed_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'runtime_actor_grants_recovery_rotation',
+            MESSAGE = 'Recovered Officer runtime grants require refresh rotation',
+            HINT = 'Drain pre-0171 orchestrator replicas before serving Officer refresh traffic.';
+    END IF;
+    IF TG_OP = 'UPDATE'
+       AND OLD.caller_kind = 'officer'
+       AND OLD.refresh_handoff_ciphertext IS NOT NULL
+       AND NEW.last_refreshed_at IS DISTINCT FROM OLD.last_refreshed_at
+       AND NEW.last_maintenance_at IS NOT DISTINCT FROM OLD.last_maintenance_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'runtime_actor_grants_rotation_acknowledgement',
+            MESSAGE = 'Officer refresh handoffs require acknowledged rotation semantics',
+            HINT = 'Drain pre-0171 orchestrator replicas before serving Officer refresh traffic.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION enforce_officer_runtime_agent_binding(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.enforce_officer_runtime_agent_binding() IS '0171 mixed-version fence: old replicas fail safely instead of minting or refreshing an unbound Officer authority, rewriting agent provenance, or bypassing acknowledged recovery rotation.';
+
+
+--
 -- Name: enforce_officer_ticket_claim_job_integrity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -3879,6 +3939,33 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: revoke_runtime_actor_grants_on_agent_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.revoke_runtime_actor_grants_on_agent_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- Preserve the UUID snapshot while making the deleted runtime's access
+    -- and refresh authority unusable even to a pre-0171 application replica.
+    UPDATE public.runtime_actor_grants
+       SET revoked_at = COALESCE(revoked_at, statement_timestamp())
+     WHERE caller_kind = 'officer'
+       AND agent_id = OLD.id
+       AND revoked_at IS NULL;
+    RETURN OLD;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION revoke_runtime_actor_grants_on_agent_delete(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.revoke_runtime_actor_grants_on_agent_delete() IS 'Revokes live Officer authority before operational agent deletion while retaining the immutable agent UUID snapshot for grant audit provenance.';
 
 
 --
@@ -7561,9 +7648,19 @@ CREATE TABLE public.runtime_actor_grants (
     revoked_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     last_refreshed_at timestamp with time zone,
+    agent_id uuid,
+    credential_generation bigint DEFAULT 1 NOT NULL,
+    previous_refresh_token_hash bytea,
+    previous_refresh_valid_until timestamp with time zone,
+    refresh_handoff_ciphertext text,
+    refresh_handoff_acknowledged_at timestamp with time zone,
+    last_maintenance_at timestamp with time zone,
+    refresh_rotation_required boolean DEFAULT false NOT NULL,
+    CONSTRAINT runtime_actor_grants_generation_check CHECK ((credential_generation > 0)),
     CONSTRAINT runtime_actor_grants_incarnation_check CHECK (((officer_incarnation IS NULL) OR (officer_incarnation >= 0))),
     CONSTRAINT runtime_actor_grants_kind_check CHECK ((caller_kind = ANY (ARRAY['worker'::text, 'human'::text, 'conference'::text, 'officer'::text]))),
     CONSTRAINT runtime_actor_grants_officer_shape_check CHECK (((caller_kind <> 'officer'::text) OR ((project_id IS NOT NULL) AND (thread_id IS NOT NULL) AND (officer_incarnation IS NOT NULL)))),
+    CONSTRAINT runtime_actor_grants_previous_refresh_shape_check CHECK ((((previous_refresh_token_hash IS NULL) = (previous_refresh_valid_until IS NULL)) AND ((previous_refresh_token_hash IS NULL) = (refresh_handoff_ciphertext IS NULL)) AND ((refresh_handoff_acknowledged_at IS NULL) OR (previous_refresh_token_hash IS NOT NULL)))),
     CONSTRAINT runtime_actor_grants_role_check CHECK (((project_role IS NULL) OR (project_role = ANY (ARRAY['admin'::text, 'owner'::text, 'editor'::text, 'viewer'::text]))))
 );
 
@@ -7573,6 +7670,55 @@ CREATE TABLE public.runtime_actor_grants (
 --
 
 COMMENT ON TABLE public.runtime_actor_grants IS 'Server-derived runtime identities. Opaque refresh credentials are hashed; every authorization re-checks current post/membership state.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.agent_id IS 'Immutable authoritative persistent-agent UUID snapshot for Officer grants. It intentionally has no agents FK so revoked-grant audit provenance survives agent deletion. NULL is only a pre-0171 grant awaiting unambiguous current-incarnation adoption.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.credential_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.credential_generation IS 'Server-owned refresh rotation generation. It is not exposed in model schemas or audit payloads.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.previous_refresh_token_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.previous_refresh_token_hash IS 'Predecessor refresh digest used only to re-deliver one encrypted, unacknowledged rotation or during its bounded acknowledged overlap.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.refresh_handoff_ciphertext; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.refresh_handoff_ciphertext IS 'APP_ENCRYPTION_KEY-protected current refresh bearer retained only for idempotent ambiguous-response recovery; plaintext is never persisted.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.refresh_handoff_acknowledged_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.refresh_handoff_acknowledged_at IS 'First presentation of the rotated current bearer. This acknowledgement starts the bounded predecessor overlap.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.last_maintenance_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.last_maintenance_at IS 'Last server watchdog or credential-bearing maintenance of this grant.';
+
+
+--
+-- Name: COLUMN runtime_actor_grants.refresh_rotation_required; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_grants.refresh_rotation_required IS 'Server-only handoff fence set when the watchdog recovers an expired current Officer grant. The next refresh rotates the bearer and clears it.';
 
 
 --
@@ -11737,6 +11883,13 @@ CREATE INDEX idx_runtime_actor_bootstrap_expiry ON public.runtime_actor_bootstra
 
 
 --
+-- Name: idx_runtime_actor_grants_officer_binding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_runtime_actor_grants_officer_binding ON public.runtime_actor_grants USING btree (project_id, thread_id, officer_incarnation, created_at DESC, id DESC) WHERE ((caller_kind = 'officer'::text) AND (revoked_at IS NULL));
+
+
+--
 -- Name: idx_runtime_actor_grants_refresh_expiry; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -12493,6 +12646,20 @@ CREATE UNIQUE INDEX uq_project_knowledge_repo ON public.project_repositories USI
 
 
 --
+-- Name: uq_runtime_actor_grants_live_officer_agent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_runtime_actor_grants_live_officer_agent ON public.runtime_actor_grants USING btree (agent_id) WHERE ((caller_kind = 'officer'::text) AND (revoked_at IS NULL) AND (agent_id IS NOT NULL));
+
+
+--
+-- Name: uq_runtime_actor_grants_previous_refresh_hash; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_runtime_actor_grants_previous_refresh_hash ON public.runtime_actor_grants USING btree (previous_refresh_token_hash) WHERE (previous_refresh_token_hash IS NOT NULL);
+
+
+--
 -- Name: uq_session_wake_events_pending; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13130,6 +13297,13 @@ CREATE TRIGGER thread_permission_notify_trigger AFTER UPDATE ON public.thread_pe
 
 
 --
+-- Name: agents trg_agents_revoke_runtime_actor_grants; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_agents_revoke_runtime_actor_grants BEFORE DELETE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.revoke_runtime_actor_grants_on_agent_delete();
+
+
+--
 -- Name: canvas_origin_sessions trg_canvas_origin_session_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -13155,6 +13329,13 @@ CREATE TRIGGER trg_canvas_revoke_retired_origin AFTER UPDATE OF origin_generatio
 --
 
 CREATE TRIGGER trg_canvas_revoke_user_admission AFTER UPDATE OF is_approved ON public.users FOR EACH ROW EXECUTE FUNCTION public.revoke_canvas_sessions_for_user_admission();
+
+
+--
+-- Name: runtime_actor_grants trg_runtime_actor_grants_officer_agent_binding; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_runtime_actor_grants_officer_agent_binding BEFORE INSERT OR UPDATE ON public.runtime_actor_grants FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_runtime_agent_binding();
 
 
 --

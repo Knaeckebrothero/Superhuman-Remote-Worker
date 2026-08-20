@@ -3200,6 +3200,12 @@ def format_officer_post(
         f"Thread: {officer.get('thread_id')}"
         + (f" — {officer['title']}" if officer.get("title") else ""),
     ]
+    runtime_authorization = data.get("runtime_authorization") or {}
+    if runtime_authorization.get("status") == "unavailable":
+        lines.append(
+            "Runtime authorization: UNAVAILABLE — autonomous planning is "
+            "suppressed; server retry/incident handling is active."
+        )
     brain = officer.get("model") or "?"
     if officer.get("reasoning_level"):
         brain += f" (reasoning {officer['reasoning_level']})"

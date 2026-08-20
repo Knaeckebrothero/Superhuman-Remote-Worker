@@ -11392,6 +11392,74 @@ class PostgresDB:
                     return None
                 await _fault("post_linked")
 
+                # A runtime-authorization incident belongs to one immutable
+                # Officer incarnation. Linking a successor resolves the old
+                # incident as superseded in the same Post transaction; it is
+                # never copied into the successor's model-visible metadata.
+                linked_state = row["state"]
+                if isinstance(linked_state, str):
+                    try:
+                        linked_state = json.loads(linked_state)
+                    except (TypeError, ValueError):
+                        linked_state = {}
+                if not isinstance(linked_state, dict):
+                    linked_state = {}
+                runtime_incident = linked_state.get("runtime_actor_incident")
+                incident_fields = (
+                    runtime_incident if isinstance(runtime_incident, dict) else {}
+                )
+                linked_incarnations = row["incarnations"]
+                if isinstance(linked_incarnations, str):
+                    try:
+                        linked_incarnations = json.loads(linked_incarnations)
+                    except (TypeError, ValueError):
+                        linked_incarnations = []
+                if not isinstance(linked_incarnations, list):
+                    linked_incarnations = []
+                try:
+                    incident_incarnation = int(
+                        incident_fields.get("officer_incarnation") or 0
+                    )
+                except (TypeError, ValueError):
+                    incident_incarnation = -1
+                if (
+                    isinstance(runtime_incident, dict)
+                    and runtime_incident.get("status") == "open"
+                    and (
+                        str(runtime_incident.get("thread_id") or "") != str(thread_uuid)
+                        or incident_incarnation != len(linked_incarnations)
+                    )
+                ):
+                    runtime_incident = {
+                        **runtime_incident,
+                        "status": "superseded",
+                        "resolved_at": datetime.now(timezone.utc).isoformat(),
+                        "next_retry_at": None,
+                        "resolution": "incarnation_changed",
+                    }
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET state = jsonb_set(
+                                   state,
+                                   '{runtime_actor_incident}',
+                                   $2::jsonb,
+                                   true),
+                               updated_at = now()
+                         WHERE project_id = $1
+                           AND thread_id = $3
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps(runtime_incident),
+                        thread_uuid,
+                    )
+                    if row is None:
+                        raise OfficerPostLifecycleConflict(
+                            "stale_incarnation",
+                            "Officer incarnation changed during incident handoff.",
+                        )
+
                 if commission_continuity:
                     state = row["state"]
                     if isinstance(state, str):
@@ -11404,7 +11472,14 @@ class PostgresDB:
                     state_restore = {
                         key: value
                         for key, value in state.items()
-                        if key not in ("while_vacant", "while_vacant_dropped")
+                        if key
+                        not in (
+                            "while_vacant",
+                            "while_vacant_dropped",
+                            # Server-owned authorization incident state never
+                            # enters model/runtime-authored thread metadata.
+                            "runtime_actor_incident",
+                        )
                     }
                     restored = await conn.fetchrow(
                         """
@@ -12145,6 +12220,15 @@ class PostgresDB:
                 officer_state = metadata.get("officer_state") or {}
                 if not isinstance(officer_state, dict):
                     officer_state = {}
+                else:
+                    # The runtime actor incident is Post-only server authority.
+                    # A thread projection must not create, replace, or settle it
+                    # during decommission harvesting.
+                    officer_state = {
+                        key: value
+                        for key, value in officer_state.items()
+                        if key != "runtime_actor_incident"
+                    }
                 if officer_state:
                     await conn.execute(
                         """
@@ -12485,6 +12569,11 @@ class PostgresDB:
             project_uuid = UUID(project_id)
         except (ValueError, TypeError):
             return None
+        patch = {
+            key: value
+            for key, value in patch.items()
+            if key != "runtime_actor_incident"
+        }
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -17767,7 +17856,10 @@ class PostgresDB:
         before), and keeping the row only bloats ``list_agents`` queries.
 
         FK behavior: ``threads.agent_id`` and ``jobs.assigned_agent_id`` are
-        both ``ON DELETE SET NULL``, so deletion is safe.
+        both ``ON DELETE SET NULL``. Migration 0171's agent-delete trigger
+        revokes live Officer runtime authority while retaining its non-FK
+        agent UUID provenance snapshot, so historical grants cannot wedge or
+        be erased by this operational GC batch.
 
         Args:
             retention_hours: How long offline agents are kept before deletion.

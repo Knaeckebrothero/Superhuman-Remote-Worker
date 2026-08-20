@@ -603,6 +603,15 @@ class PersistentLoopCallbacks:
         Callable[[List[Dict[str, Any]]], Awaitable[None]]
     ] = None
 
+    # P0 Officer runtime-grant gate. Called after the accepted input is added
+    # to truthful durable history but before retrieval, compaction, SITREP
+    # reasoning, or a provider request. ``(False, reason)`` persists a bounded
+    # turn error and parks again without LLM spend. Normal/user sessions leave
+    # it unset.
+    before_turn_authorization: Optional[Callable[[], Awaitable[tuple[bool, str]]]] = (
+        None
+    )
+
     # Deterministic LF-5 fault seam. Invoked only after an assistant response
     # containing tool calls has been appended and incrementally persisted, but
     # before permission announcement or tool execution starts. Returning a
@@ -1034,6 +1043,18 @@ async def run_persistent_loop(
         # by message id either way.
         if callbacks.persist_message is not None:
             await callbacks.persist_message(user_msg)
+        if callbacks.before_turn_authorization is not None:
+            authorized, reason = await callbacks.before_turn_authorization()
+            if not authorized:
+                await callbacks.on_error(
+                    "Officer runtime authorization is unavailable; this turn "
+                    "was durably recorded but no model request was made. "
+                    f"{reason}",
+                    turn_id=turn_id,
+                )
+                if callbacks.on_turn_settled is not None:
+                    await callbacks.on_turn_settled(turn_id)
+                continue
         tool_calls_this_turn = 0
         # Stateless terminal frames must not outrun the fenced transaction
         # that commits the transcript and durable memory obligation. The turn

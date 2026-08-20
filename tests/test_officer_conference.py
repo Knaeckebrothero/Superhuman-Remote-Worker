@@ -171,6 +171,27 @@ class TestConferenceConclude:
 
 
 class TestWatchdogHold:
+    @pytest.fixture(autouse=True)
+    def _runtime_authorization_is_healthy(self, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "_maintain_officer_runtime_authorization",
+            AsyncMock(return_value=SimpleNamespace(authorized=True)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_officer_still_maintains_runtime_authority(self, monkeypatch):
+        held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
+        db = SimpleNamespace()
+        db.get_thread = AsyncMock(return_value=_conference_row(status="active"))
+        monkeypatch.setattr(main, "postgres_db", db)
+        maintain = AsyncMock()
+        monkeypatch.setattr(main, "_maintain_officer_runtime_authorization", maintain)
+
+        await main._officer_watchdog_check_one(held, SimpleNamespace())
+
+        maintain.assert_awaited_once_with(held)
+
     @pytest.mark.asyncio
     async def test_live_conference_stands_watchdog_down(self, monkeypatch):
         held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})

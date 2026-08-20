@@ -468,6 +468,20 @@ export function nextWakeLabel(
                 }}</span>
               </div>
 
+              @if (post()?.runtime_authorization?.status === 'unavailable') {
+                <div
+                  class="officer-slots"
+                  data-testid="officer-runtime-authorization"
+                  role="alert"
+                  [attr.aria-label]="'officerCard.runtimeAuthorization.a11y' | transloco"
+                >
+                  <span class="k">{{ 'officerCard.runtimeAuthorization.label' | transloco }}</span>
+                  <span class="v officer-warn">
+                    {{ 'officerCard.runtimeAuthorization.unavailable' | transloco }}
+                  </span>
+                </div>
+              }
+
               <div class="officer-meta">
                 <div>
                   <span class="k">{{ 'officerCard.summary.nextWake' | transloco }}</span>

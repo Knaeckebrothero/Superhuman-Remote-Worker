@@ -747,6 +747,7 @@ def _ensure_persistent_loop_started(
             on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
             on_thinking_reset=_loop_on_thinking_reset,
+            before_turn_authorization=_loop_before_turn_authorization,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -2242,13 +2243,7 @@ async def _attach_session(
 
     _thread_id = thread_id
 
-    runtime_actor_context = RuntimeActorContext.from_payload(runtime_actor)
-    if runtime_actor is not None and runtime_actor_context is None:
-        raise RuntimeError("Malformed server-derived runtime actor context")
-    if runtime_actor_context is None and _orchestrator_client is not None:
-        # Dedicated runtime clients expose this property. Deliberately tiny
-        # dry-run/test adapters may not and therefore have no privileged actor.
-        runtime_actor_context = getattr(_orchestrator_client, "runtime_actor", None)
+    runtime_actor_context = _runtime_actor_context_for_attach(runtime_actor)
 
     # Determine the backend before polling: a lite (virtual/none) session has
     # NO workspace pod, so polling for one would always fail (WorkspaceNotReady).
@@ -3314,6 +3309,7 @@ async def _terminate_session_inner(
     # Clear session state
     _session = None
     _thread_id = None
+    _clear_attached_runtime_actor()
 
     # Clear headless input primitives + subscriber registry. The pump tasks
     # owned by each subscriber are cancelled by their ws_chat finally blocks
@@ -3364,6 +3360,40 @@ async def _detach_session() -> None:
     """
     logger.debug("_detach_session() called via back-compat shim")
     await _terminate_session("legacy")
+
+
+def _runtime_actor_context_for_attach(
+    payload: Optional[Dict[str, Any]],
+) -> RuntimeActorContext | None:
+    """Resolve one actor object shared by maintenance and every session tool."""
+
+    actor = RuntimeActorContext.from_payload(payload)
+    if payload is not None and actor is None:
+        raise RuntimeError("Malformed server-derived runtime actor context")
+    client = _orchestrator_client
+    if actor is None and client is not None:
+        # Dedicated runtime clients receive the actor during registration.
+        actor = getattr(client, "runtime_actor", None)
+    elif actor is not None and client is not None:
+        # Pool/stateless attach receives its actor in the server payload. The
+        # heartbeat maintenance channel and the session/tool bindings must
+        # share this exact mutable object so a rotation cannot leave tools on
+        # the predecessor bearer.
+        adopt = getattr(client, "adopt_runtime_actor", None)
+        if callable(adopt):
+            adopt(actor)
+        else:  # deliberately tiny dry-run/test adapters
+            client.runtime_actor = actor
+    return actor
+
+
+def _clear_attached_runtime_actor() -> None:
+    """Drop project authority at the common session teardown boundary."""
+
+    client = _orchestrator_client
+    clear = getattr(client, "clear_runtime_actor", None) if client else None
+    if callable(clear):
+        clear()
 
 
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
@@ -7342,6 +7372,26 @@ async def _run_subscriber_pump(
 # _loop_last_user_content, _orchestrator_client, _thread_id) and emit via
 # _broadcast() rather than writing to one ws.
 # ---------------------------------------------------------------------------
+
+
+async def _loop_before_turn_authorization() -> tuple[bool, str]:
+    """Maintain a commissioned Officer before any provider spend."""
+
+    if _officer_cfg() is None:
+        return True, "not an Officer session"
+    client = _orchestrator_client
+    if client is None:
+        return False, "orchestrator maintenance channel is unavailable"
+    try:
+        return await client.maintain_runtime_actor(force=True)
+    except Exception as exc:
+        # The durable server watchdog owns incident creation independently.
+        # This local fence owns only the immediate no-spend guarantee and may
+        # never expose a credential or response body in its error.
+        logger.error(
+            "Officer runtime authorization gate failed (%s)", type(exc).__name__
+        )
+        return False, "authorization maintenance failed before the turn"
 
 
 async def _loop_get_user_input() -> str:

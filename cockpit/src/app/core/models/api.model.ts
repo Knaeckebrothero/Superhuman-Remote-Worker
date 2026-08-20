@@ -1405,6 +1405,18 @@ export interface OfficerVacantLedger {
   dropped?: number;
 }
 
+/** Server-owned 24/7 runtime authorization health; no credential material. */
+export interface OfficerRuntimeAuthorization {
+  status: 'authorized' | 'unavailable' | 'not_applicable';
+  failure_class?: string | null;
+  since?: string | null;
+  last_attempted_at?: string | null;
+  next_retry_at?: string | null;
+  recovered_at?: string | null;
+  operator_notification?: 'pending' | 'delivered' | 'failed' | string;
+  planning_suppressed?: boolean;
+}
+
 /** `GET /api/projects/{id}/officer` — the post, always present. */
 export interface OfficerPost {
   /** Server-owned owner/admin capability for Officer mutations. */
@@ -1417,6 +1429,7 @@ export interface OfficerPost {
   communication_policy?: OfficerCommunicationPolicy | null;
   incarnations?: OfficerIncarnation[] | null;
   while_vacant?: OfficerVacantLedger | null;
+  runtime_authorization?: OfficerRuntimeAuthorization | null;
   backlog?: OfficerBacklogState | null;
   conference?: {thread_id: string; status?: string | null} | null;
 }

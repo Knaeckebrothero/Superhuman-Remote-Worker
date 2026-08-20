@@ -146,6 +146,18 @@ class RuntimeActorContext:
         now = datetime.now(timezone.utc)
         return (self.access_expires_at - now).total_seconds() <= skew_seconds
 
+    def refresh_needs_renewal(self, *, skew_seconds: int = 21600) -> bool:
+        """Whether liveness maintenance should run before the idle wall.
+
+        This is runtime scheduling only. The server remains authoritative and
+        re-derives the Post/thread/agent binding on every Officer renewal.
+        """
+
+        if not self.refresh_credential or self.refresh_expires_at is None:
+            return True
+        now = datetime.now(timezone.utc)
+        return (self.refresh_expires_at - now).total_seconds() <= skew_seconds
+
     def apply_refreshed_payload(self, payload: Any) -> bool:
         refreshed = self.from_payload(payload)
         if refreshed is None:

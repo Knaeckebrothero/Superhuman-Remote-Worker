@@ -188,6 +188,35 @@ class TestCeilingNotice:
 
 class TestDrainBrake:
     @pytest.mark.asyncio
+    async def test_runtime_incident_defers_before_sitrep_or_live_delivery(
+        self, monkeypatch
+    ):
+        project_id = str(uuid.uuid4())
+        rows = [
+            {"id": 1, "thread_id": THREAD_ID, "source": "timer", "dedup_key": "timer"}
+        ]
+        db = SimpleNamespace()
+        db.claim_pending_session_wake_events = AsyncMock(return_value=rows)
+        db.get_thread = AsyncMock(return_value={**_thread(), "project_id": project_id})
+        db.defer_session_wake_events = AsyncMock()
+        db.finish_session_wake_events = AsyncMock()
+        db.release_session_wake_events = AsyncMock()
+        retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        from services import runtime_actor
+
+        gate = AsyncMock(return_value=(False, retry_at))
+        monkeypatch.setattr(runtime_actor, "admit_officer_wake_for_runtime", gate)
+        resolve = AsyncMock()
+        monkeypatch.setattr(session_wake, "_resolve_live_agent", resolve)
+
+        delivered = await session_wake.drain_pending_event_wakes(db)
+
+        assert delivered == 0
+        gate.assert_awaited_once_with(db, project_id=project_id, thread_id=THREAD_ID)
+        db.defer_session_wake_events.assert_awaited_once_with([1], fire_at=retry_at)
+        resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_over_ceiling_defers_claimed_rows(self, monkeypatch):
         rows = [
             {"id": 1, "thread_id": THREAD_ID, "source": "timer", "dedup_key": "timer"},

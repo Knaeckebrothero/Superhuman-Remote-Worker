@@ -24,6 +24,7 @@ OFFICER_THREAD = str(uuid4())
 SUCCESSOR_THREAD = str(uuid4())
 USER_ID = str(uuid4())
 ACCESS_TOKEN = "sra_" + ("A" * 43)
+AGENT_ID = str(uuid4())
 
 
 def _request(*values: str) -> MagicMock:
@@ -403,6 +404,12 @@ def _grant_row(*, caller_kind="officer", thread_id=OFFICER_THREAD):
         "project_role": "owner",
         "thread_id": thread_id,
         "officer_incarnation": 0,
+        "agent_id": AGENT_ID if caller_kind == "officer" else None,
+        "credential_generation": 1,
+        "refresh_token_hash": service._digest("srr_" + "A" * 43),
+        "previous_refresh_token_hash": None,
+        "previous_refresh_valid_until": None,
+        "created_at": datetime.now(timezone.utc) - timedelta(hours=1),
         # Valid, but close to the wall — the case that used to kill the officer.
         "refresh_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
         "revoked_at": None,
@@ -438,7 +445,19 @@ async def test_refresh_slides_the_window_for_a_live_thread():
     before = row["refresh_expires_at"]
 
     with (
-        patch.object(service, "_current_actor", AsyncMock(side_effect=lambda d, a: a)),
+        patch.object(
+            service,
+            "_lock_officer_authority_for_grant",
+            AsyncMock(
+                return_value=(
+                    {"project_id": PROJECT_A, "state": {}},
+                    {"id": OFFICER_THREAD},
+                    {"id": AGENT_ID},
+                    row,
+                    "owner",
+                )
+            ),
+        ),
         patch.object(
             service,
             "_insert_access_token",

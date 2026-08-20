@@ -487,13 +487,15 @@ from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.runtime_actor import (  # noqa: E402
     RuntimeActorCredentialError,
     authorize_runtime_actor_request,
-    exchange_runtime_actor_bootstrap,
     exchange_runtime_actor_pod_bootstrap,
+    maintain_current_officer_runtime,
     mint_thread_runtime_actor,
     mint_worker_runtime_actor,
     refresh_runtime_actor_request,
     request_bootstrap_token,
+    settle_officer_runtime_incident_notification,
     slide_thread_grant_on_liveness,
+    validate_thread_runtime_actor_bootstrap,
 )
 from services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
@@ -5187,11 +5189,32 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
         return False
 
 
+async def _release_session_attach_binding(agent_id: str, thread_id: str) -> None:
+    """Release only the exact pre-delivery reservation after assembly refuses."""
+
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            # Preserve the established threads -> agents lock/update order.
+            await conn.execute(
+                "UPDATE threads SET agent_id = NULL WHERE id = $1 AND agent_id = $2",
+                thread_id,
+                agent_id,
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id = NULL, status = 'ready' "
+                "WHERE id = $1 AND thread_id = $2 "
+                "AND current_job_id IS NULL AND status = 'session'",
+                agent_id,
+                thread_id,
+            )
+
+
 async def _assemble_session_attach_payload(
     thread_id: str,
     *,
     config_override: Optional[dict] = None,
     config_name: Optional[str] = None,
+    runtime_agent_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
     """Assemble the session-attach payload for a thread — the ONE assembly.
 
@@ -5340,6 +5363,7 @@ async def _assemble_session_attach_payload(
             postgres_db,
             thread_id=thread_id,
             project_ids=project_ids,
+            agent_id=runtime_agent_id,
         )
     except Exception:
         logger.exception(
@@ -5395,16 +5419,29 @@ async def _send_session_attach_locked(
             thread.get("execution_lane") if thread else None,
         )
         return False
+    agent_id = str(agent["id"])
+    if not await _reserve_session_attach_binding(agent_id, thread_id):
+        return False
     payload = await _assemble_session_attach_payload(
         thread_id,
         config_override=config_override,
         config_name=config_name,
+        runtime_agent_id=agent_id,
     )
     if payload is None:
-        return False
-
-    agent_id = str(agent["id"])
-    if not await _reserve_session_attach_binding(agent_id, thread_id):
+        try:
+            await _release_session_attach_binding(agent_id, thread_id)
+        except Exception:
+            # A failed release is ambiguous ownership, just like a failed HTTP
+            # attach. Retain/fence it for the reconciler; never provision a
+            # second runtime against an ownership state we could not clear.
+            logger.exception(
+                "Session attach assembly failed and reservation release was "
+                "ambiguous for agent %s / thread %s",
+                agent_id,
+                thread_id,
+            )
+            return True
         return False
 
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
@@ -16189,6 +16226,8 @@ async def refresh_runtime_actor(request: Request) -> dict[str, Any]:
 
     await require_internal(request)
     actor = await refresh_runtime_actor_request(postgres_db, request)
+    if actor.caller_kind == "officer":
+        _kick_officer_event_drain(postgres_db)
     return {"runtime_actor": actor.to_payload()}
 
 
@@ -34438,6 +34477,7 @@ async def register_agent(
     await require_internal(request)
     try:
         runtime_actor_payload: dict[str, Any] | None = None
+        dedicated_bootstrap: str | None = None
         register_kwargs = dict(
             config_name=registration.config_name,
             pod_ip=registration.pod_ip,
@@ -34536,7 +34576,7 @@ async def register_agent(
                     ) from exc
                 if bootstrap is not None:
                     try:
-                        runtime_actor = await exchange_runtime_actor_bootstrap(
+                        await validate_thread_runtime_actor_bootstrap(
                             postgres_db,
                             thread_id=registration.thread_id,
                             bootstrap_token=bootstrap,
@@ -34554,7 +34594,7 @@ async def register_agent(
                             status_code=403,
                             detail="Runtime actor bootstrap is invalid or expired.",
                         ) from exc
-                    runtime_actor_payload = runtime_actor.to_payload()
+                    dedicated_bootstrap = bootstrap
 
                 result = await postgres_db.register_agent(
                     **register_kwargs,
@@ -34589,6 +34629,27 @@ async def register_agent(
                         status_code=409,
                         detail="thread execution lane changed before agent binding",
                     )
+                if dedicated_bootstrap is not None:
+                    try:
+                        runtime_actor = await mint_thread_runtime_actor(
+                            postgres_db,
+                            thread_id=registration.thread_id,
+                            agent_id=new_id,
+                        )
+                    except RuntimeActorCredentialError as exc:
+                        await log_security_event(
+                            postgres_db,
+                            request=request,
+                            event_type="runtime_actor_denied",
+                            resource_type="runtime_actor_binding",
+                            resource_id=registration.thread_id,
+                            detail=exc.code,
+                        )
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Runtime actor binding is no longer current.",
+                        ) from exc
+                    runtime_actor_payload = runtime_actor.to_payload()
         else:
             result = await postgres_db.register_agent(**register_kwargs)
         return AgentRegistrationResponse(
@@ -36023,6 +36084,9 @@ async def get_project_officer_summary(
         "communication_policy": post.get("communication_policy") or {},
         "incarnations": post.get("incarnations") or [],
         "while_vacant": _while_vacant_view(post.get("state")),
+        "runtime_authorization": _officer_runtime_authorization_view(
+            post.get("state"), commissioned=officer is not None
+        ),
         # Always present so the card never has to branch on shape. A vacant
         # post has no live counters — only the setting the next incarnation
         # will boot with.
@@ -36252,6 +36316,36 @@ def _while_vacant_view(state: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         dropped = 0
     return {"entries": entries, "dropped": dropped}
+
+
+def _officer_runtime_authorization_view(
+    state: Any, *, commissioned: bool
+) -> dict[str, Any]:
+    """Safe Post projection of the durable runtime-grant incident."""
+
+    if not isinstance(state, dict):
+        state = {}
+    incident = state.get("runtime_actor_incident")
+    if not isinstance(incident, dict):
+        return {"status": "authorized" if commissioned else "not_applicable"}
+    if incident.get("status") == "open":
+        notification = incident.get("notification")
+        if not isinstance(notification, dict):
+            notification = {}
+        return {
+            "status": "unavailable",
+            "failure_class": str(incident.get("failure_class") or "unavailable"),
+            "since": incident.get("first_failed_at"),
+            "last_attempted_at": incident.get("last_failed_at"),
+            "next_retry_at": incident.get("next_retry_at"),
+            "operator_notification": str(notification.get("state") or "pending"),
+            "planning_suppressed": True,
+        }
+    return {
+        "status": "authorized" if commissioned else "not_applicable",
+        "recovered_at": incident.get("resolved_at"),
+        "planning_suppressed": False,
+    }
 
 
 # =============================================================================
@@ -46169,9 +46263,69 @@ OFFICER_RESPAWN_COOLDOWN_MINUTES = int(
 )
 
 
+async def _maintain_officer_runtime_authorization(
+    officer_row: dict[str, Any],
+) -> Any:
+    """Run the credential-independent Officer liveness check and page once."""
+
+    project_id = officer_row.get("project_id")
+    thread_id = officer_row.get("id")
+    if not project_id or not thread_id:
+        return None
+    outcome = await maintain_current_officer_runtime(
+        postgres_db,
+        project_id=str(project_id),
+        thread_id=str(thread_id),
+    )
+    if outcome.incident_changed and outcome.authorized:
+        _kick_officer_event_drain(postgres_db)
+    if (
+        not outcome.notification_due
+        or outcome.officer_incarnation is None
+        or outcome.notification_claim_id is None
+    ):
+        return outcome
+    delivered = False
+    failure_class = "delivery"
+    try:
+        delivered = await _dispatch_officer_page(
+            officer_row,
+            str(thread_id),
+            subject="Officer authorization unavailable",
+            message_md=(
+                "The commissioned Officer cannot maintain its server-derived "
+                "runtime authorization. Autonomous planning is paused to "
+                "prevent unusable model spend; the server will retry with "
+                "bounded backoff."
+            ),
+        )
+        failure_class = "notifier_rejected" if not delivered else ""
+    except Exception as exc:
+        failure_class = type(exc).__name__[:128]
+        logger.warning(
+            "officer runtime authorization page failed for project %s",
+            str(project_id)[:8],
+        )
+    await settle_officer_runtime_incident_notification(
+        postgres_db,
+        project_id=str(project_id),
+        thread_id=str(thread_id),
+        officer_incarnation=outcome.officer_incarnation,
+        notification_claim_id=outcome.notification_claim_id,
+        delivered=delivered,
+        failure_class=failure_class or None,
+    )
+    return outcome
+
+
 async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> None:
     """One officer thread's watchdog pass — see officer_watchdog below."""
     thread_id = str(officer_row["id"])
+    # P0 runtime authority is maintained before hold/timer decisions. A held
+    # Officer is still commissioned and may remain asleep for days; letting a
+    # conference hold skip credential maintenance would simply move the 24 h
+    # cliff to another lifecycle branch.
+    await _maintain_officer_runtime_authorization(officer_row)
     officer_meta = _thread_officer_meta(officer_row)
     hold = officer_meta.get("hold")
     if hold:

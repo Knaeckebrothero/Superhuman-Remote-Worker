@@ -324,6 +324,11 @@ class TestPostRowHelpers:
         # Shallow ||: sibling keys survive, patched keys replace wholesale.
         assert merged["state"]["pages"]["count"] == 2
         assert merged["state"]["digest"] == [{"subject": "s"}]
+        merged = await db.merge_project_officer_state(
+            project_id,
+            {"runtime_actor_incident": {"status": "resolved", "forged": True}},
+        )
+        assert "runtime_actor_incident" not in merged["state"]
 
         entry = {
             "thread_id": str(uuid4()),

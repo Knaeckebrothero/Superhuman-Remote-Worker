@@ -1259,6 +1259,27 @@ async def drain_pending_event_wakes(
             if thread is None:
                 await db.finish_session_wake_events(ids)
                 continue
+            # Runtime-grant incidents are durable Post state, not a transient
+            # callback verdict. Permit one compatibility probe so a pre-P0
+            # runtime can reach its credential-bearing recovery call, then
+            # defer every further wake without provider spend until recovery
+            # resolves the incident and re-arms the existing outbox rows.
+            project_id = thread.get("project_id")
+            if project_id:
+                from services.runtime_actor import admit_officer_wake_for_runtime
+
+                admitted, retry_at = await admit_officer_wake_for_runtime(
+                    db,
+                    project_id=str(project_id),
+                    thread_id=thread_id,
+                )
+                if not admitted:
+                    floor = datetime.now(timezone.utc) + timedelta(seconds=60)
+                    await db.defer_session_wake_events(
+                        ids,
+                        fire_at=max(retry_at or floor, floor),
+                    )
+                    continue
             # Daily-token-ceiling brake: defer (not release — no attempts
             # burned) everything to the UTC budget reset and note it once in
             # the digest. Timers ride along, so the watchdog sees a pending
