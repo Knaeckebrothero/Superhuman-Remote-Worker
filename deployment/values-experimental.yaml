@@ -110,6 +110,7 @@ mcp:
 # dev in first to soak before the default is bumped (Phase 5 / M4).
 # -----------------------------------------------------------------------------
 orchestrator:
+  persistentAgentReconciliationEnabled: true
   replicas: 2
   pdb:
     minAvailable: 1
