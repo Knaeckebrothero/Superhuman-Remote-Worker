@@ -19,6 +19,8 @@ import pytest
 
 from services import session_wake, sitrep
 
+from database.postgres import JobQueryResult
+
 THREAD_ID = str(uuid.uuid4())
 PROJECT_ID = str(uuid.uuid4())
 JOB_A = str(uuid.uuid4())
@@ -47,7 +49,7 @@ def _fake_conn():
 def _fake_db(jobs=None, conn=None):
     conn = conn or _fake_conn()
     db = SimpleNamespace()
-    db.query_jobs = AsyncMock(return_value=jobs or [])
+    db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=list(jobs or [])))
     db.acquire = lambda: _FakeAcquire(conn)
     # officer_post.md §4: the capacity section resolves the post's thread
     # lineage before counting; a lone thread's lineage is itself.

@@ -25,6 +25,8 @@ from services.job_liveness import (
 from services import sitrep
 from src.shared.orch_surface import formatters as fmt
 
+from database.postgres import JobQueryResult
+
 JOB_ID = str(uuid.uuid4())
 AGENT_ID = str(uuid.uuid4())
 PROJECT_ID = str(uuid.uuid4())
@@ -95,7 +97,7 @@ class TestSingleFixtureEverySurface:
     @pytest.mark.asyncio
     async def test_sitrep_active_line_carries_the_same_state_and_reason(self):
         db = SimpleNamespace()
-        db.query_jobs = AsyncMock(return_value=[_stalled_job()])
+        db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[_stalled_job()]))
         db.get_agent = AsyncMock(
             return_value={"id": AGENT_ID, "last_heartbeat": NOW - timedelta(seconds=30)}
         )
@@ -284,7 +286,7 @@ class TestThresholdAndBatch:
         assert verdict["threshold_source"] == "deployment_default"
 
         db = SimpleNamespace(
-            query_jobs=AsyncMock(return_value=[_stalled_job()]),
+            query_jobs=AsyncMock(return_value=JobQueryResult(jobs=[_stalled_job()])),
             get_agent=AsyncMock(
                 return_value={
                     "id": AGENT_ID,

@@ -134,19 +134,74 @@ def format_job_list_item(job: dict[str, Any]) -> list[str]:
     return lines
 
 
-def format_jobs(jobs: list[dict[str, Any]], status: str | None = None) -> str:
+def _applied_filter_phrases(
+    status: str | None, filters: dict[str, Any] | None
+) -> tuple[str, list[str]]:
+    """What narrowed a jobs query, as (status phrase, other phrases).
+
+    Includes the server-side defaults, not just what the caller typed. An
+    agent that reads "no jobs found" without being told archived-project
+    jobs were excluded will conclude the job does not exist instead of
+    widening the query — hiding must never be silent. Status stays separate
+    so the long-standing "No jobs found with status='failed'." wording is
+    preserved verbatim when it is the only filter in play.
+    """
+    filters = filters or {}
+    phrases: list[str] = []
+
+    statuses = filters.get("status") or ([status] if status else [])
+    status_phrase = ""
+    if statuses:
+        rendered = ", ".join(f"'{value}'" for value in statuses)
+        status_phrase = f"status={rendered}"
+    if filters.get("search"):
+        phrases.append(f"search='{filters['search']}'")
+    if filters.get("project_id"):
+        phrases.append(f"{len(filters['project_id'])} project filter(s)")
+    if filters.get("has_project") is False:
+        phrases.append("only jobs with no project")
+    elif filters.get("has_project") is True:
+        phrases.append("only jobs with a project")
+    if filters.get("include_archived_projects") is False:
+        phrases.append("archived-project jobs excluded")
+    return status_phrase, phrases
+
+
+def format_jobs(
+    jobs: list[dict[str, Any]],
+    status: str | None = None,
+    *,
+    total: int | None = None,
+    total_is_capped: bool = False,
+    filters: dict[str, Any] | None = None,
+) -> str:
     """Format job list for display.
 
     E1/F5: restores the decision-grade per-job rendering (description,
     project/parent lineage, agent, freeze summaries) that the session lane
-    always had. An empty result names the filter so "no jobs with
-    status='failed'" is distinguishable from "no jobs at all".
-    """
-    if not jobs:
-        filter_msg = f" with status='{status}'" if status else ""
-        return f"No jobs found{filter_msg}."
+    always had. An empty result names the filters — including the ones the
+    server applied by default — so "no jobs with status='failed', archived
+    excluded" is distinguishable from "no jobs at all".
 
-    lines = [f"Found {len(jobs)} job(s):\n"]
+    ``jobs`` is a plain list; callers unwrap the ``/api/jobs`` envelope and
+    pass ``total``/``filters`` through so the rendering can say how much of
+    the result set is on screen and what was filtered out.
+    """
+    status_phrase, phrases = _applied_filter_phrases(status, filters)
+    suffix = f" with {status_phrase}" if status_phrase else ""
+    if phrases:
+        suffix += f" ({'; '.join(phrases)})"
+
+    if not jobs:
+        return f"No jobs found{suffix}."
+
+    if total is not None and total > len(jobs):
+        counted = f"{total}+" if total_is_capped else str(total)
+        header = f"Found {len(jobs)} of {counted} job(s){suffix}"
+    else:
+        header = f"Found {len(jobs)} job(s){suffix}"
+
+    lines = [f"{header}:\n"]
     for job in jobs:
         lines.extend(format_job_list_item(job))
         lines.append("")

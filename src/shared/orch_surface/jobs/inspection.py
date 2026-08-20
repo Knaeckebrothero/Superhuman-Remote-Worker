@@ -75,13 +75,22 @@ async def list_jobs(
     # 100; a request beyond the cap gets an explicit notice appended.
     requested = limit
     limit = min(max(limit, 1), 500)
-    jobs, source = await observe(
+    page, source = await observe(
         "control_db", client.list_jobs(status=status, limit=limit)
     )
-    envelope = build_envelope(scope=_scope_for(caller), sources=[source], data=jobs)
+    page = page or {}
+    envelope = build_envelope(
+        scope=_scope_for(caller), sources=[source], data=page.get("jobs") or []
+    )
     if source.status == "unavailable":
         return f"Failed to list jobs:\n{source.reason}"
-    rendered = fmt.format_jobs(envelope["data"], status=status)
+    rendered = fmt.format_jobs(
+        envelope["data"],
+        status=status,
+        total=page.get("total"),
+        total_is_capped=bool(page.get("total_is_capped")),
+        filters=page.get("filters"),
+    )
     if requested > 500:
         rendered += f"\n(limit {requested} exceeds the server cap; showing at most 500)"
     return rendered

@@ -50,17 +50,28 @@ class _StubHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
         if path == "/api/jobs":
+            # Must mirror the real envelope: a stub that keeps producing the
+            # old bare array would let CI smoke go on validating a contract
+            # the server no longer serves.
             self._json(
                 200,
-                [
-                    {
-                        "id": "job-read-1",
-                        "status": "paused",
-                        "config_name": "worker_base",
-                        "created_at": "2026-08-03T00:00:00Z",
-                        "audit_count": 0,
-                    }
-                ],
+                {
+                    "jobs": [
+                        {
+                            "id": "job-read-1",
+                            "status": "paused",
+                            "config_name": "worker_base",
+                            "created_at": "2026-08-03T00:00:00Z",
+                            "audit_count": 0,
+                        }
+                    ],
+                    "total": 1,
+                    "total_is_capped": False,
+                    "has_more": False,
+                    "limit": 100,
+                    "offset": 0,
+                    "filters": {"include_archived_projects": False},
+                },
             )
             return
         if path == "/api/jobs/job-degraded/repo/file":

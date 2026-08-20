@@ -52,6 +52,30 @@ def _create_safe_read_retry_decorator():
 _create_retry_decorator = _create_safe_read_retry_decorator
 
 
+def _as_jobs_envelope(payload: Any) -> dict[str, Any]:
+    """Normalise a ``/api/jobs`` response into the paging envelope.
+
+    The endpoint returns an envelope; a bare array means we are talking to an
+    orchestrator older than that change. Wrapping it here keeps a lagging
+    deploy degraded-but-correct instead of iterating dict keys and rendering
+    "Found 8 job(s)" over the *field names* — the failure mode this shape
+    change is most likely to produce, and a silent one.
+    """
+    if isinstance(payload, dict):
+        payload.setdefault("jobs", [])
+        return payload
+    rows = list(payload or [])
+    return {
+        "jobs": rows,
+        "total": len(rows),
+        "total_is_capped": False,
+        "has_more": False,
+        "limit": len(rows),
+        "offset": 0,
+        "filters": {},
+    }
+
+
 class MutationOutcomeUnknown(RuntimeError):
     """A mutation may have committed, but its response was not received.
 
@@ -169,7 +193,7 @@ class CockpitClient:
         self,
         status: str | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """List jobs with optional status filter.
 
         Args:
@@ -177,14 +201,16 @@ class CockpitClient:
             limit: Maximum number of jobs to return (1-500)
 
         Returns:
-            List of job dicts with id, status, config, timestamps, audit_count
+            The ``/api/jobs`` envelope: ``jobs``, ``total``,
+            ``total_is_capped``, ``has_more``, ``limit``, ``offset``,
+            ``as_of`` and a ``filters`` echo. Read the rows off ``["jobs"]``.
         """
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
         resp = self._client.get("/api/jobs", params=params)
         resp.raise_for_status()
-        return resp.json()
+        return _as_jobs_envelope(resp.json())
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         """Get a single job by ID.
@@ -695,7 +721,7 @@ class AsyncCockpitClient:
         self,
         status: str | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """List jobs with optional status filter.
 
         Args:
@@ -703,14 +729,16 @@ class AsyncCockpitClient:
             limit: Maximum number of jobs to return (1-500)
 
         Returns:
-            List of job dicts with id, status, config, timestamps, audit_count
+            The ``/api/jobs`` envelope: ``jobs``, ``total``,
+            ``total_is_capped``, ``has_more``, ``limit``, ``offset``,
+            ``as_of`` and a ``filters`` echo. Read the rows off ``["jobs"]``.
         """
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
         resp = await self._client.get("/api/jobs", params=params)
         resp.raise_for_status()
-        return resp.json()
+        return _as_jobs_envelope(resp.json())
 
     @_create_retry_decorator()
     async def get_job(self, job_id: str) -> dict[str, Any]:

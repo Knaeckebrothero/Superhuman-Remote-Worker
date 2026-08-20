@@ -166,6 +166,48 @@ class OrphanRecoveryBatch:
         return bool(self.count)
 
 
+#: Every lifecycle status a job row may carry. Mirrors the cockpit's
+#: ``JobStatus`` union; the jobs list validates ``?status=`` against it and
+#: 422s on anything else, because silently returning zero rows for a typo
+#: produces bug reports that read as data loss.
+KNOWN_JOB_STATUSES: tuple[str, ...] = (
+    "created",
+    "pending",
+    "processing",
+    "completed",
+    "failed",
+    "cancelled",
+    "pending_review",
+    "paused",
+    "reviewing",
+    "waiting",
+)
+
+#: Ceiling for the filtered job count. An exact ``COUNT(*)`` over a filtered
+#: set costs more than all the paging it accompanies and cannot be made cheap
+#: — MVCC means there is no stored row count — so the count is computed inside
+#: a ``LIMIT`` and reported as "N+" once it reaches this. GitLab caps at 1000
+#: for the same reason; Stripe and Azure decline to return a total at all.
+JOB_COUNT_CAP = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class JobQueryResult:
+    """One page of jobs plus the counts a paging UI needs.
+
+    ``total`` is a *capped* exact count: ``None`` when the caller opted out
+    via ``include_total=False``, and paired with ``total_is_capped=True`` when
+    the real total reached :data:`JOB_COUNT_CAP`. ``has_more`` is exact in
+    every case, because it comes from fetching one row past the page rather
+    than from comparing against ``total``.
+    """
+
+    jobs: list[dict[str, Any]]
+    total: int | None = None
+    total_is_capped: bool = False
+    has_more: bool = False
+
+
 def _completion_sweep_exclusion_clause(
     enabled: bool, *, job_alias: str = "jobs"
 ) -> str:
@@ -1541,11 +1583,18 @@ class PostgresDB:
         owner_user_id: str | None = None,
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
-        status: str | None = None,
+        statuses: list[str] | None = None,
+        project_ids: list[str] | None = None,
+        has_project: bool | None = None,
+        include_archived_projects: bool = False,
+        search: str | None = None,
+        as_of: datetime | None = None,
         user_id: str | None = None,
         limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """Get the jobs visible to one caller, with optional filters.
+        offset: int = 0,
+        include_total: bool = True,
+    ) -> JobQueryResult:
+        """Get one page of the jobs visible to a caller, with filters.
 
         The single entry point for the jobs list. Visibility is declared by
         the caller and rendered by :meth:`_visibility_clause`:
@@ -1565,17 +1614,38 @@ class PostgresDB:
         *not* the visibility owner — routes reject a non-admin asking about
         anyone but themselves before reaching this method.
 
+        Every filter is AND-combined. Callers validate filter *values*; this
+        method assumes ``statuses`` has already been checked against
+        :data:`KNOWN_JOB_STATUSES` and that the caller is authorized for every
+        id in ``project_ids``.
+
         Args:
             owner_user_id: Visibility owner, or None for the admin view.
             visible_project_ids: Caller's project memberships (consulted only
                 when ``owner_user_id`` is set).
             scope_project_id: MCP ``project:<uuid>`` narrowing.
-            status: Optional status filter (e.g. 'completed', 'processing').
+            statuses: Keep only these lifecycle statuses.
+            project_ids: Keep only jobs in these projects.
+            has_project: ``False`` keeps only project-less jobs, ``True`` only
+                jobs that have one, ``None`` does not filter. Plenty of recent
+                jobs have no project, so this bucket is not niche.
+            include_archived_projects: When False (the default), jobs whose
+                project is archived are hidden. Project-less jobs are kept.
+            search: Matched against the description (substring, case
+                insensitive) OR the job id (prefix) — the UI shows a short
+                8-character id and that is what users paste.
+            as_of: Freeze the window at this creation-time high-watermark.
+                Without it, rows inserted while the user pages shift the
+                offset underneath them and rows are skipped or repeated.
             user_id: Optional owner filter, AND-combined.
-            limit: Maximum number of jobs to return.
+            limit: Page size.
+            offset: Rows to skip. Cost is O(offset), not O(table); callers
+                clamp it so a runaway loop cannot table-scan the fleet.
+            include_total: Compute the capped count. Pass False when paging a
+                set whose total the client already carries.
 
         Returns:
-            List of job dicts ordered newest-first.
+            A :class:`JobQueryResult`.
         """
         conditions: list[str] = []
         values: list[Any] = []
@@ -1598,18 +1668,55 @@ class PostgresDB:
             conditions.append(visibility)
             values.extend(vis_values)
 
-        if status:
-            add_condition("j.status = {param}", status)
+        if statuses:
+            add_condition("j.status = ANY({param}::text[])", list(statuses))
+
+        if project_ids:
+            add_condition(
+                "j.project_id = ANY({param}::uuid[])",
+                [UUID(value) for value in project_ids],
+            )
+
+        if has_project is True:
+            conditions.append("j.project_id IS NOT NULL")
+        elif has_project is False:
+            conditions.append("j.project_id IS NULL")
+
+        if not include_archived_projects:
+            # Fail toward showing, as the projects list does: only an explicit
+            # 'archived' hides a row, so a project-less job (p.status IS NULL)
+            # and any status we do not recognise both survive. Archived-ness
+            # lives on the parent row, so no partial index on jobs can help.
+            conditions.append(
+                "COALESCE(p.status, 'active') IS DISTINCT FROM 'archived'"
+            )
+
+        if search:
+            values.append(f"%{search}%")
+            description_param = f"${len(values)}"
+            values.append(f"{search}%")
+            id_param = f"${len(values)}"
+            conditions.append(
+                f"(j.description ILIKE {description_param} "
+                f"OR j.id::text LIKE {id_param})"
+            )
+
+        if as_of is not None:
+            add_condition("j.created_at <= {param}", as_of)
 
         if user_id:
             add_condition("j.user_id = {param}", UUID(user_id))
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        values.append(limit)
-        limit_param = f"${len(values)}"
+
+        # One row beyond the page makes has_more exact even when the total is
+        # capped or was not computed at all.
+        page_values = [*values, limit + 1, offset]
+        limit_param = f"${len(page_values) - 1}"
+        offset_param = f"${len(page_values)}"
 
         async with self.acquire() as conn:
-            rows = await conn.fetch(
+            fetched = await conn.fetch(
                 f"""
                 SELECT j.id, j.description, j.status,
                        j.config_name, j.assigned_agent_id, j.user_id,
@@ -1633,13 +1740,50 @@ class PostgresDB:
                     LIMIT 1
                 ) pa ON TRUE
                 {where_clause}
-                ORDER BY j.created_at DESC
-                LIMIT {limit_param}
+                ORDER BY j.created_at DESC, j.id DESC
+                LIMIT {limit_param} OFFSET {offset_param}
                 """,
-                *values,
+                *page_values,
             )
 
-        return [dict(row) for row in rows]
+            total: int | None = None
+            total_is_capped = False
+            if include_total:
+                # Counting inside a LIMIT bounds the work: past the cap we
+                # stop counting and say "N+". The projects join stays because
+                # the archived filter references it; the LATERAL sudo lookup
+                # goes, since it is ON TRUE with an inner LIMIT 1 and so
+                # cannot change the count.
+                count_values = [*values, JOB_COUNT_CAP + 1]
+                cap_param = f"${len(count_values)}"
+                counted = await conn.fetchval(
+                    f"""
+                    SELECT count(*) FROM (
+                        SELECT 1
+                        FROM jobs j
+                        LEFT JOIN projects p ON p.id = j.project_id
+                        {where_clause}
+                        LIMIT {cap_param}
+                    ) capped
+                    """,
+                    *count_values,
+                )
+                total = int(counted or 0)
+                if total > JOB_COUNT_CAP:
+                    total = JOB_COUNT_CAP
+                    total_is_capped = True
+
+        rows = [dict(row) for row in fetched]
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+
+        return JobQueryResult(
+            jobs=rows,
+            total=total,
+            total_is_capped=total_is_capped,
+            has_more=has_more,
+        )
 
     async def get_job(self, job_id: str) -> Dict[str, Any] | None:
         """Get a single job by ID.

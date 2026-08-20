@@ -34,6 +34,8 @@ from src.tools.registry import (
     officer_ceiling_active,
 )
 
+from database.postgres import JobQueryResult
+
 PROJECT_A = str(uuid.uuid4())
 PROJECT_B = str(uuid.uuid4())
 EXTERNAL_KB = str(uuid.uuid4())
@@ -825,7 +827,7 @@ class TestSitrepKnowledgeSection:
             fetch=AsyncMock(return_value=[]), fetchval=AsyncMock(return_value=0)
         )
         db = SimpleNamespace()
-        db.query_jobs = AsyncMock(return_value=[])
+        db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         db.acquire = lambda: self._Acquire(conn)
         db.get_officer_capacity_lineage = AsyncMock(return_value=[])
         return db

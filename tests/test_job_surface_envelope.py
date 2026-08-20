@@ -221,6 +221,116 @@ class TestListJobs:
         assert observed == [300, 500]
         assert "limit 900 exceeds the server cap; showing at most 500" in over
 
+    @pytest.mark.asyncio
+    async def test_paging_envelope_reaches_the_rendering(self):
+        """The other cases in this class hand back a bare array, which the
+        client normalises — so they would keep passing against a server that
+        no longer speaks that shape. This one serves the real envelope.
+        """
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [FULL_JOB],
+                    "total": 806,
+                    "total_is_capped": False,
+                    "has_more": True,
+                    "limit": 1,
+                    "offset": 0,
+                    "as_of": "2026-08-20T12:00:00+00:00",
+                    "filters": {
+                        "status": [],
+                        "include_archived_projects": False,
+                    },
+                },
+            )
+
+        client = _client(handler)
+        try:
+            output = await _invoke("list_jobs", client)()
+        finally:
+            await client.close()
+
+        # How much of the set is on screen, and what was filtered away.
+        assert "Found 1 of 806 job(s)" in output
+        assert "archived-project jobs excluded" in output
+        assert f"--- {JOB_ID} (short: {JOB_ID[:8]}) ---" in output
+
+    @pytest.mark.asyncio
+    async def test_capped_total_renders_as_n_plus(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [FULL_JOB],
+                    "total": 10000,
+                    "total_is_capped": True,
+                    "has_more": True,
+                    "limit": 1,
+                    "offset": 0,
+                    "filters": {},
+                },
+            )
+
+        client = _client(handler)
+        try:
+            output = await _invoke("list_jobs", client)()
+        finally:
+            await client.close()
+
+        assert "Found 1 of 10000+ job(s)" in output
+
+    @pytest.mark.asyncio
+    async def test_empty_envelope_names_the_server_side_default(self):
+        """An agent told only "no jobs found" concludes the job does not
+        exist. It has to be told the server hid a category."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [],
+                    "total": 0,
+                    "total_is_capped": False,
+                    "has_more": False,
+                    "limit": 20,
+                    "offset": 0,
+                    "filters": {
+                        "status": ["failed"],
+                        "include_archived_projects": False,
+                    },
+                },
+            )
+
+        client = _client(handler)
+        try:
+            output = await _invoke("list_jobs", client)(status="failed")
+        finally:
+            await client.close()
+
+        assert output == (
+            "No jobs found with status='failed' (archived-project jobs excluded)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_bare_array_from_an_older_orchestrator_still_renders(self):
+        """Agent images can lag the orchestrator across a rollout. Degrade to
+        the old shape rather than iterating a dict and rendering field names.
+        """
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[FULL_JOB])
+
+        client = _client(handler)
+        try:
+            output = await _invoke("list_jobs", client)()
+        finally:
+            await client.close()
+
+        assert "Found 1 job(s)" in output
+        assert f"--- {JOB_ID} (short: {JOB_ID[:8]}) ---" in output
+
 
 # ---------------------------------------------------------------------------
 # F6 — steer_job must surface the response body (409 reason)
