@@ -1210,6 +1210,7 @@
       "defaultConfig": "Standard-Konfiguration",
       "created": "Erstellt",
       "edit": "Bearbeiten",
+      "archivedReadOnly": "Dieses Projekt ist archiviert. Beschreibung und Ziel sind schreibgeschützt — heben Sie die Archivierung auf, um sie zu bearbeiten.",
       "openFolder": "Projektordner öffnen",
       "manageAutomations": "Automationen verwalten",
       "save": "Speichern",
@@ -1363,6 +1364,7 @@
       "unarchive": "Archivierung aufheben",
       "unarchiveConfirmTitle": "Archivierung aufheben?",
       "unarchiveConfirm": "Archivierung dieses Projekts aufheben? Neue Arbeit ist danach wieder möglich; Schleife, Officer und geparkte Aufträge bleiben pausiert.",
+      "archivedReadOnly": "Dieses Projekt ist archiviert, seine Einstellungen sind daher schreibgeschützt. Heben Sie die Archivierung auf, um sie zu bearbeiten — bis dahin bleibt unten alles sichtbar.",
       "deleteTitle": "Projekt löschen",
       "deleteDesc": "Dieses Projekt und seine verwalteten Repositorys dauerhaft löschen.",
       "delete": "Löschen",
@@ -3145,7 +3147,9 @@
     "projects": {
       "loadFailed": "Projekte konnten nicht geladen werden.",
       "archiveFailed": "Projekt konnte nicht archiviert werden.",
-      "unarchiveFailed": "Archivierung des Projekts konnte nicht aufgehoben werden."
+      "unarchiveFailed": "Archivierung des Projekts konnte nicht aufgehoben werden.",
+      "updateFailed": "Projekt konnte nicht gespeichert werden.",
+      "renameFailed": "Projekt konnte nicht umbenannt werden."
     },
     "jobs": {
       "createFailed": "Job konnte nicht erstellt werden.",
@@ -3221,6 +3225,11 @@
     "title": "Centurio",
     "intro": "Ein ständiger Offizier für dieses Projekt: Er führt den Auftrag, überwacht Jobs und Flotte, entsendet Arbeiter aus seiner Ausrüstung und meldet sich nur, wenn du wirklich gebraucht wirst. In einer Konferenz sprichst du mit ihm; sein Hintergrundprotokoll ist das Sitzungsprotokoll. Der Posten überdauert ihn — Ausrüstung, Budgets und Gedächtnis bleiben zwischen Inkarnationen erhalten.",
     "readOnly": "Du kannst diesen Offiziersposten ansehen, aber nur ein Projekteigentümer oder Systemadministrator darf ihn verwalten.",
+    "runtimeAuthorization": {
+      "label": "Laufzeitautorisierung",
+      "unavailable": "Nicht verfügbar — die autonome Planung ist pausiert, während der Server erneut versucht und den Projekteigentümer benachrichtigt.",
+      "a11y": "Laufzeitautorisierung des Offiziers nicht verfügbar; autonome Planung ist pausiert"
+    },
     "a11y": {
       "loading": "Offiziersposten wird geladen",
       "region": "Offiziersposten",

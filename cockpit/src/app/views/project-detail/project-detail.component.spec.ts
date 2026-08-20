@@ -55,6 +55,11 @@ function createComponent(policyAvailable = true) {
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
     getProject: vi.fn().mockReturnValue(of({id: 'project-a', status: 'archived'})),
     setProjectStatus: vi.fn().mockReturnValue(of({archived: true})),
+    updateProject: vi.fn().mockReturnValue(of({status: 'updated'})),
+    updateProjectFields: vi.fn().mockReturnValue(of({status: 'updated'})),
+    getProjectJobs: vi.fn().mockReturnValue(of([])),
+    getProjectMembers: vi.fn().mockReturnValue(of([])),
+    getProjectExperts: vi.fn().mockReturnValue(of([])),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -401,5 +406,144 @@ describe('ProjectDetailPageComponent archive lifecycle', () => {
     expect(component.lifecycleError()).toBe(detail);
     expect(component.lifecycleBusy()).toBe(false);
     expect(component.pendingLifecycle()).toBeNull();
+  });
+});
+
+describe('ProjectDetailPageComponent archived read-only settings', () => {
+  const ARCHIVED = {
+    id: 'project-a',
+    name: 'Better Resavio',
+    description: 'A description',
+    goal: 'A goal',
+    status: 'archived' as const,
+    is_default: false,
+    default_config_name: 'developer',
+    cloud_storage_read_only: false,
+    network_tier: 'internet-only' as const,
+  };
+
+  function archived() {
+    const made = createComponent();
+    made.component.project.set(ARCHIVED as never);
+    return made;
+  }
+
+  it('reads the archived lock off the project, not off a separate flag', () => {
+    const {component} = archived();
+    expect(component.isArchived()).toBe(true);
+
+    component.project.set({...ARCHIVED, status: 'active'} as never);
+    expect(component.isArchived()).toBe(false);
+  });
+
+  it('keeps the settings values loaded and readable while archived', () => {
+    // Archived is read-only, not hidden. The panel still has to show what the
+    // project is configured to do, so the load path seeds every field
+    // regardless of status; only the writes are refused.
+    const {api, component} = archived();
+    api.getProject.mockReturnValue(of(ARCHIVED));
+
+    component.loadAll();
+
+    expect(component.settingsName()).toBe('Better Resavio');
+    expect(component.settingsConfigName()).toBe('developer');
+    expect(component.settingsNetworkTier()).toBe('internet-only');
+    expect(component.isArchived()).toBe(true);
+  });
+
+  it('attempts no field write at all while the project is archived', () => {
+    // Prevention over reporting: the server would refuse each of these whole
+    // with a 409, so none of them is sent.
+    const {api, component} = archived();
+    component.settingsName.set('Renamed');
+    component.settingsConfigName.set('scholar');
+
+    component.saveSettings();
+    component.onRenameProject('Renamed');
+    component.toggleProjectMemory(true);
+    component.toggleCloudReadOnly(true);
+    component.onNetworkTierChange('home-allowed');
+
+    expect(api.updateProjectFields).not.toHaveBeenCalled();
+    expect(api.updateProject).not.toHaveBeenCalled();
+    // The name the header shows is still the stored one — no optimistic edit
+    // was applied and then rolled back.
+    expect(component.project()?.name).toBe('Better Resavio');
+    expect(component.settingsNetworkTier()).toBe('internet-only');
+  });
+
+  it('offers no way into overview edit mode while archived', () => {
+    const {api, component} = archived();
+
+    component.startEditOverview();
+
+    expect(component.isEditingOverview()).toBe(false);
+    component.saveOverview();
+    expect(api.updateProjectFields).not.toHaveBeenCalled();
+  });
+
+  it('writes through the propagating call once the project is active again', () => {
+    const {api, component} = archived();
+    component.project.set({...ARCHIVED, status: 'active'} as never);
+    component.settingsName.set('Renamed');
+    component.settingsConfigName.set('developer');
+
+    component.saveSettings();
+
+    expect(api.updateProjectFields).toHaveBeenCalledWith('project-a', {name: 'Renamed'});
+    // Never the swallowing one: its `null` on error is what hid the 409.
+    expect(api.updateProject).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's refusal when a save races an archive in another tab", () => {
+    // Prevention cannot cover this: the form was opened on an active project.
+    const {api, component} = archived();
+    component.project.set({...ARCHIVED, status: 'active'} as never);
+    const detail =
+      'This project is archived and is read-only apart from its status. ' +
+      'Unarchive it before editing anything else.';
+    api.updateProjectFields.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 409, error: {detail}})),
+    );
+    component.settingsName.set('Renamed');
+
+    component.saveSettings();
+
+    expect(component.editError()).toBe(detail);
+    expect(component.isSavingSettings()).toBe(false);
+  });
+
+  it('says why an inline rename snapped back instead of silently reverting', () => {
+    // The old path was `updateProject` under a `next` that saw `null`: the
+    // title reverted and nothing explained it.
+    const {api, component} = archived();
+    component.project.set({...ARCHIVED, status: 'active'} as never);
+    const detail =
+      'This project is archived and is read-only apart from its status. ' +
+      'Unarchive it before editing anything else.';
+    api.updateProjectFields.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 409, error: {detail}})),
+    );
+
+    component.onRenameProject('Renamed');
+
+    expect(component.project()?.name).toBe('Better Resavio');
+    expect(component.renameError()).toBe(detail);
+  });
+
+  it('rolls back a refused toggle so the control never lies about the server', () => {
+    const {api, component} = archived();
+    api.getProject.mockReturnValue(of({...ARCHIVED, status: 'active'}));
+    component.loadAll();
+    api.updateProjectFields.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'refused'}})),
+    );
+
+    component.toggleCloudReadOnly(true);
+    component.onNetworkTierChange('home-allowed');
+
+    expect(component.settingsCloudReadOnly()).toBe(false);
+    expect(component.settingsNetworkTier()).toBe('internet-only');
+    expect(component.editError()).toBe('refused');
   });
 });

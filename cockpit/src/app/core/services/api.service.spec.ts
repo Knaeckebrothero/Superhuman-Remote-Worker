@@ -1035,4 +1035,32 @@ describe('ApiService project lifecycle', () => {
     );
     await expect(refused).rejects.toBeInstanceOf(HttpErrorResponse);
   });
+
+  it('propagates a refused field edit, where `updateProject` swallows it', async () => {
+    // Same endpoint, same body, opposite error contract. `updateProject` maps
+    // every failure to `null`, so the archived-project 409 — whose sentence is
+    // the whole point — reaches nobody. A sibling rather than a change to it:
+    // `null`-on-error is a published shape, and this pins both halves.
+    const saved = firstValueFrom(api.updateProjectFields('p-1', {name: 'Renamed'}));
+    const write = httpMock.expectOne((r) => r.url.endsWith('/projects/p-1'));
+    expect(write.request.method).toBe('PATCH');
+    expect(write.request.body).toEqual({name: 'Renamed'});
+    write.flush({status: 'updated'});
+    await expect(saved).resolves.toEqual({status: 'updated'});
+
+    const detail =
+      'This project is archived and is read-only apart from its status. ' +
+      'Unarchive it before editing anything else.';
+    const refused = firstValueFrom(api.updateProjectFields('p-1', {name: 'Renamed'}));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/projects/p-1'))
+      .flush({detail}, {status: 409, statusText: 'Conflict'});
+    await expect(refused).rejects.toBeInstanceOf(HttpErrorResponse);
+
+    const swallowed = firstValueFrom(api.updateProject('p-1', {name: 'Renamed'}));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/projects/p-1'))
+      .flush({detail}, {status: 409, statusText: 'Conflict'});
+    await expect(swallowed).resolves.toBeNull();
+  });
 });

@@ -2281,6 +2281,29 @@ export class ApiService {
     return this.http.patch<ProjectArchiveReport>(`${this.baseUrl}/projects/${id}`, { status });
   }
 
+  /**
+   * The other half of the same PATCH: everything that is *not* `status`.
+   *
+   * Same endpoint and body as `updateProject`, and the only difference is the
+   * one that matters here — errors propagate. An archived project accepts a
+   * status-only body and refuses any other field whole, with a 409 whose
+   * sentence names the remedy; `updateProject`'s `catchError(() => of(null))`
+   * erases that body, so the save reads as a click that did not register and
+   * an optimistic rename visibly reverts with no explanation. Every caller can
+   * be writing to a project that is archived — another tab can archive it while
+   * a form is open — so every caller uses this one and renders the refusal.
+   *
+   * `updateProject` below keeps its swallowing contract untouched rather than
+   * being loosened: `null`-on-error is a published shape, and a caller that
+   * genuinely wants "did it stick?" and nothing more can still have it.
+   */
+  updateProjectFields(id: string, body: ProjectUpdateRequest): Observable<{ status: string }> {
+    return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}`, body);
+  }
+
+  /** The same PATCH with failures flattened to `null`. Nothing calls it today —
+   *  every project write now needs the refusal — but the contract is kept so a
+   *  caller that wants a bare success/failure does not have to re-derive it. */
   updateProject(id: string, body: ProjectUpdateRequest): Observable<{ status: string } | null> {
     return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}`, body).pipe(
       catchError(() => of(null)),
