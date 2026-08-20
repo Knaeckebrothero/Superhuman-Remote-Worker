@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-e598135"
+  version: "0.0.0-dev.sha-0bdba97"
   takeOwnership: true
   values:
     license:
@@ -30,8 +30,7 @@ helm:
     # pods hold the private side of (matches the previously-hardcoded value
     # in the old deployment-vms/srw-vm-controller/vm-controller.yaml).
     ssh:
-      publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY
-        srw-agent-vm-access"
+      publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access"
     # Headscale API access — pulled from Vault by ESO (same path the old
     # standalone ExternalSecret in 01-eso.yaml used).
     headscale:
@@ -50,7 +49,7 @@ helm:
       orchestrator:
         # Independently-built component identity; CI updates this from
         # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
-        tag: "sha-e598135"
+        tag: "sha-0bdba97"
         digest: ""
       vmController:
         tag: "sha-bfb11e9"
