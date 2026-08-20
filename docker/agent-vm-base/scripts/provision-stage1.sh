@@ -128,7 +128,56 @@ sudo eatmydata apt-get install -y \
     python3 \
     python3-venv \
     python3-dev \
-    python3-pip
+    python3-pip \
+    podman \
+    podman-docker \
+    podman-compose \
+    uidmap \
+    slirp4netns \
+    passt \
+    netavark \
+    aardvark-dns \
+    catatonit \
+    dbus-user-session
+
+# Podman: the VM tier's reason for existing is that the agent has real sudo
+# and a real kernel, so containerised work (a postgres beside the app, a
+# compose stack, an image build) happens here rather than in the sandbox tier
+# where it is impossible. Rootless by default for agent-host (see stage 2);
+# `sudo podman` remains available for the rare privileged case.
+#
+# Every dependency above is listed EXPLICITLY because this image sets
+# `APT::Install-Recommends "false"` — podman's Recommends would otherwise be
+# skipped and the failures are non-obvious:
+#   uidmap        newuidmap/newgidmap; without it rootless refuses to start
+#   slirp4netns   } rootless networking; passt/pasta is the newer path and
+#   passt         } podman picks whichever it finds
+#   netavark      the network backend podman 4.x actually uses
+#   aardvark-dns  container-to-container NAME RESOLUTION. Without it a compose
+#                 stack starts but services cannot resolve each other, which
+#                 looks like an application bug rather than a missing package
+#   catatonit     init process for `--init` / PID-1 reaping
+#   dbus-user-session  user D-Bus, needed for the lingering systemd user
+#                 session that keeps the rootless podman socket alive
+# fuse-overlayfs is already installed above and is what keeps rootless storage
+# off the slow vfs driver.
+
+# Short-name resolution: Ubuntu ships registries.conf with
+# `unqualified-search-registries` commented out, so `podman run postgres:16`
+# fails with a short-name prompt that never gets answered in a non-interactive
+# agent shell. Set it explicitly — this is the single most common way a
+# baked-in podman looks broken to a worker.
+sudo mkdir -p /etc/containers
+if ! grep -qs '^unqualified-search-registries' /etc/containers/registries.conf 2>/dev/null; then
+    echo 'unqualified-search-registries = ["docker.io"]' \
+        | sudo tee -a /etc/containers/registries.conf > /dev/null
+fi
+
+# podman-docker installs a /usr/bin/docker shim, which by default prints
+# "Emulate Docker CLI using podman..." to stderr on EVERY invocation. Agents
+# read stderr as evidence, so silence it rather than teaching every worker to
+# ignore a banner.
+sudo touch /etc/containers/nodocker
 
 # -----------------------------------------------------------------------------
 # 3. Datasource CLI clients (psql, mongosh, cypher-shell)
