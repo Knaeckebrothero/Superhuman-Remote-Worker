@@ -6821,8 +6821,15 @@ CREATE TABLE public.projects (
     main_cloud_folder_handle text,
     network_tier text DEFAULT 'internet-only'::text NOT NULL,
     CONSTRAINT projects_network_tier_check CHECK ((network_tier = ANY (ARRAY['internet-only'::text, 'home-allowed'::text]))),
-    CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'paused'::character varying, 'completed'::character varying, 'archived'::character varying])::text[])))
+    CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'archived'::character varying])::text[])))
 );
+
+
+--
+-- Name: COLUMN projects.status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.projects.status IS 'Project lifecycle: active|archived, enforced by valid_project_status since 0169. Archiving is an explicit owner action and hides the project from the default GET /api/projects list (?status= opts it back in); deletion is a hard row delete, never a status. The column remains NULLABLE on purpose — a CHECK passes on NULL, and the API fails toward showing an unclassifiable row rather than hiding it.';
 
 
 --

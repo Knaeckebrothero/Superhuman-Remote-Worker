@@ -215,7 +215,7 @@ APP_JOB_COMPLETION_STATUS_REORDER = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "orchestrator/database/migrations/app/0167_message_delivery_quota_intents.sql"
+    / "orchestrator/database/migrations/app/0170_project_status_validate.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
