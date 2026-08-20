@@ -12,7 +12,7 @@ Example:
     # PostgreSQL (async)
     postgres_db = PostgresDB()
     await postgres_db.connect()
-    job_id = await postgres_db.jobs.create(description="Task description")
+    job = await postgres_db.jobs.get(job_id)  # creation is orchestrator-side
 
     # Neo4j (sync) - connection details from datasource connector
     neo4j_db = Neo4jDB(uri="bolt://...", username="neo4j", password="...")

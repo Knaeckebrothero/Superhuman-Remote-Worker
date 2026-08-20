@@ -71,6 +71,7 @@ def _scoped(user: dict, scope: str) -> dict:
 #: instead of an edit to every case.
 _LIST_JOBS_DEFAULTS: dict = {
     "status": None,
+    "origin": None,
     "project_id": None,
     "has_project": None,
     "include_archived_projects": False,

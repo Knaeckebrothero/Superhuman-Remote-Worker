@@ -117,6 +117,7 @@ from database import (  # noqa: E402
     MIGRATIONS_AUDIT_DIR,
 )
 from database.postgres import (  # noqa: E402
+    KNOWN_JOB_ORIGINS,
     KNOWN_JOB_STATUSES,
     DatasourceCatalogCursorError,
     DatasourceMaterializationAuthorizationError,
@@ -12424,6 +12425,38 @@ async def workspace_status(request: Request) -> dict[str, Any]:
 JOBS_MAX_OFFSET = 50_000
 
 
+def _resolve_submitted_job_origin(
+    *,
+    context: dict[str, Any] | None,
+    parent_job_id: Any,
+    thread_id: Any,
+) -> str:
+    """Classify a job arriving through ``POST /api/jobs``.
+
+    That endpoint is not "the user path". It is the shared funnel for human
+    submissions, session launches, delegation/critic children forwarded over
+    the internal key, and the job bench — all of which arrive with the same
+    request shape, which is why origin has to be resolved here rather than
+    assumed. (Officer admissions also pass through, but they branch earlier
+    and are stamped by ``admit_and_create_job``.)
+
+    Bench is recognised by ``context['bench']``, which
+    ``services/bench.py::build_bench_job_payload`` already sets — otherwise
+    benchmark traffic is byte-identical to a normal internal submission and
+    would land in every user's job list and spend attribution.
+
+    The order mirrors migration 0172's backfill so historic rows and new ones
+    are classified the same way.
+    """
+    if context and "bench" in context:
+        return "bench"
+    if parent_job_id:
+        return "subjob"
+    if thread_id:
+        return "session"
+    return "user"
+
+
 @dataclass(frozen=True)
 class _JobProjectFilters:
     """Parsed ``?project_id=`` for the jobs list and its facet counts."""
@@ -12533,6 +12566,14 @@ async def list_jobs(
         default=None,
         description="Lifecycle status(es) to keep (repeatable)",
     ),
+    origin: list[str] | None = Query(
+        default=None,
+        description=(
+            "Where the job came from (repeatable): user, session, automation, "
+            "loop, officer, subjob, lifecycle, bench. No server-side default — "
+            "omit it and every origin is returned."
+        ),
+    ),
     project_id: list[str] | None = Query(
         default=None,
         description=(
@@ -12618,6 +12659,17 @@ async def list_jobs(
             ),
         )
 
+    origins = list(dict.fromkeys(origin or []))
+    unknown_origins = [value for value in origins if value not in KNOWN_JOB_ORIGINS]
+    if unknown_origins:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown job origin(s): {', '.join(sorted(unknown_origins))}. "
+                f"Valid values: {', '.join(sorted(KNOWN_JOB_ORIGINS))}"
+            ),
+        )
+
     if offset > JOBS_MAX_OFFSET:
         raise HTTPException(
             status_code=400,
@@ -12661,6 +12713,7 @@ async def list_jobs(
             visible_project_ids=visible_ids,
             scope_project_id=str(scope_pid) if scope_pid else None,
             statuses=statuses or None,
+            origins=origins or None,
             project_ids=filters.project_ids or None,
             has_project=filters.has_project,
             include_archived_projects=include_archived_projects,
@@ -12700,6 +12753,7 @@ async def list_jobs(
             "as_of": as_of_wire,
             "filters": {
                 "status": statuses,
+                "origin": origins,
                 "project_id": filters.project_ids,
                 "has_project": filters.has_project,
                 "include_archived_projects": include_archived_projects,
@@ -13719,6 +13773,11 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 target_project_ids if effective_user_id else None
             ),
             "execution_lane": execution_lane,
+            "origin": _resolve_submitted_job_origin(
+                context=context,
+                parent_job_id=job.parent_job_id,
+                thread_id=creating_thread_id,
+            ),
         }
         if officer_admission_preparation is not None:
             from services.officer_admission import (
@@ -19411,6 +19470,7 @@ async def _spawn_scholar_subjob(
     await postgres_db.update_job_status(job_id, status="waiting")
     try:
         scholar_job = await postgres_db.create_job(
+            origin="subjob",
             description=scholar_description,
             config_name=scholar_config_name,
             config_override=scholar_override,
@@ -21146,6 +21206,7 @@ async def _trigger_verification_on_complete(
     critic_was_reconciled = False
     try:
         critic_job = await postgres_db.create_job(
+            origin="subjob",
             description=verification_description,
             config_name=critic_config,
             config_override=config_override,
@@ -21503,6 +21564,7 @@ async def _materialize_verification_critic_transactional(
             # policy transaction of its own.
             async with conn.transaction():
                 critic_job = await postgres_db.create_job(
+                    origin="subjob",
                     description=verification_description,
                     config_name=critic_config,
                     config_override=critic_override,
@@ -31616,6 +31678,10 @@ async def _visibility_kwargs_for_stats(user: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/stats/jobs")
 async def get_job_statistics(
     request: Request,
+    origin: list[str] | None = Query(
+        default=None,
+        description="Origin(s) to count within (repeatable).",
+    ),
     project_id: list[str] | None = Query(
         default=None,
         description="Project(s) to count within (repeatable). 'none' for no project.",
@@ -31644,6 +31710,16 @@ async def get_job_statistics(
     ``by_status`` for anything outside that vocabulary.
     """
     user = await require_approved_user(request, postgres_db)
+    origins = list(dict.fromkeys(origin or []))
+    unknown_origins = [value for value in origins if value not in KNOWN_JOB_ORIGINS]
+    if unknown_origins:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown job origin(s): {', '.join(sorted(unknown_origins))}. "
+                f"Valid values: {', '.join(sorted(KNOWN_JOB_ORIGINS))}"
+            ),
+        )
     vis = await _visibility_kwargs_for_stats(user)
     filters = _parse_job_project_filters(
         project_id=project_id,
@@ -31655,6 +31731,7 @@ async def get_job_statistics(
     try:
         return await postgres_db.get_job_statistics(
             **vis,
+            origins=origins or None,
             project_ids=filters.project_ids or None,
             has_project=filters.has_project,
             include_archived_projects=include_archived_projects,

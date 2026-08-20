@@ -183,6 +183,30 @@ KNOWN_JOB_STATUSES: tuple[str, ...] = (
     "waiting",
 )
 
+#: Where a job came from. Stamped explicitly by every caller of
+#: :meth:`PostgresDB.create_job` — never inferred at write time, because the
+#: caller always knows and a guess is how unattended work gets mislabelled as
+#: human work. There is deliberately no CHECK constraint (0118's precedent on
+#: this same hot table); validation lives here so a typo fails loudly in tests
+#: and a new value costs no migration.
+#:
+#: ``lifecycle`` currently has no owner: scholar and critic children pass
+#: ``runner_kind='lifecycle'``, but that column is the dispatch grant class,
+#: not a provenance record, so those rows are ``subjob``. The value is
+#: reserved for a real system-lifecycle creator.
+KNOWN_JOB_ORIGINS: frozenset[str] = frozenset(
+    {
+        "user",
+        "session",
+        "automation",
+        "loop",
+        "officer",
+        "subjob",
+        "lifecycle",
+        "bench",
+    }
+)
+
 #: Ceiling for the filtered job count. An exact ``COUNT(*)`` over a filtered
 #: set costs more than all the paging it accompanies and cannot be made cheap
 #: — MVCC means there is no stored row count — so the count is computed inside
@@ -1584,6 +1608,7 @@ class PostgresDB:
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
         statuses: list[str] | None = None,
+        origins: list[str] | None = None,
         project_ids: list[str] | None = None,
         has_project: bool | None = None,
         include_archived_projects: bool = False,
@@ -1631,6 +1656,9 @@ class PostgresDB:
         if statuses:
             add_condition("j.status = ANY({param}::text[])", list(statuses))
 
+        if origins:
+            add_condition("j.origin = ANY({param}::text[])", list(origins))
+
         if project_ids:
             add_condition(
                 "j.project_id = ANY({param}::uuid[])",
@@ -1676,6 +1704,7 @@ class PostgresDB:
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
         statuses: list[str] | None = None,
+        origins: list[str] | None = None,
         project_ids: list[str] | None = None,
         has_project: bool | None = None,
         include_archived_projects: bool = False,
@@ -1717,6 +1746,10 @@ class PostgresDB:
                 when ``owner_user_id`` is set).
             scope_project_id: MCP ``project:<uuid>`` narrowing.
             statuses: Keep only these lifecycle statuses.
+            origins: Keep only jobs from these creators (see
+                :data:`KNOWN_JOB_ORIGINS`). This is what makes "hide
+                system-created work" one predicate instead of five special
+                cases.
             project_ids: Keep only jobs in these projects.
             has_project: ``False`` keeps only project-less jobs, ``True`` only
                 jobs that have one, ``None`` does not filter. Plenty of recent
@@ -1744,6 +1777,7 @@ class PostgresDB:
             visible_project_ids=visible_project_ids,
             scope_project_id=scope_project_id,
             statuses=statuses,
+            origins=origins,
             project_ids=project_ids,
             has_project=has_project,
             include_archived_projects=include_archived_projects,
@@ -1763,7 +1797,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             fetched = await conn.fetch(
                 f"""
-                SELECT j.id, j.description, j.status,
+                SELECT j.id, j.description, j.status, j.origin,
                        j.config_name, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
@@ -1889,6 +1923,7 @@ class PostgresDB:
         delegation_context: str | None = None,
         expert_id: str | None = None,
         runner_kind: str = "user",
+        origin: str = "user",
         status: str = "created",
         freeze_data: Dict[str, Any] | None = None,
         created_by_thread_id: str | None = None,
@@ -1946,6 +1981,9 @@ class PostgresDB:
                 only for trusted ownerless system work.
             authority_project_ids: Complete target project set whose current
                 memberships are required at the insertion linearization point.
+            origin: Where this job came from — one of
+                :data:`KNOWN_JOB_ORIGINS`. Every caller passes its own value;
+                the default only covers a human REST/MCP submission.
             execution_lane: Explicit execution plane, or None to inherit an
                 authoritative parent job's lane. Root jobs default to pinned.
             job_id: Optional preallocated UUID. Officer admission uses this to
@@ -1972,6 +2010,11 @@ class PostgresDB:
         parent_uuid = UUID(parent_job_id) if parent_job_id else None
         if execution_lane not in (None, "pinned", "stateless"):
             raise ValueError(f"Unsupported job execution lane: {execution_lane!r}")
+        if origin not in KNOWN_JOB_ORIGINS:
+            # Loudly, because the failure this guards is silent: a new
+            # creation path that forgets to stamp keeps the 'user' default and
+            # quietly files unattended work as something a human asked for.
+            raise ValueError(f"Unsupported job origin: {origin!r}")
         thread_uuid = UUID(created_by_thread_id) if created_by_thread_id else None
         job_uuid = UUID(str(job_id)) if job_id is not None else uuid4()
         datasource_uuids = _uuid_list(datasource_ids)
@@ -2046,18 +2089,18 @@ class PostgresDB:
             )
             written = await active_conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, execution_lane, id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, origin, execution_lane, id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
                         COALESCE(
-                            $21::text,
+                            $22::text,
                             (SELECT parent.execution_lane
                                FROM jobs parent
                               WHERE parent.id = $10
                               FOR SHARE),
                             'pinned'
                         ),
-                        $22)
-                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, execution_lane
+                        $23)
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, origin, execution_lane
                 """,
                 description,
                 document_path or document_dir,
@@ -2079,6 +2122,7 @@ class PostgresDB:
                 json.dumps(freeze_data) if freeze_data else None,
                 thread_uuid,
                 wake_on_complete,
+                origin,
                 execution_lane,
                 job_uuid,
             )
@@ -7463,6 +7507,7 @@ class PostgresDB:
         owner_user_id: str | None = None,
         visible_project_ids: list[str] | None = None,
         scope_project_id: str | None = None,
+        origins: list[str] | None = None,
         project_ids: list[str] | None = None,
         has_project: bool | None = None,
         include_archived_projects: bool = False,
@@ -7504,6 +7549,7 @@ class PostgresDB:
             visible_project_ids=visible_project_ids,
             scope_project_id=scope_project_id,
             statuses=None,  # disjunctive: never the facet's own filter
+            origins=origins,
             project_ids=project_ids,
             has_project=has_project,
             include_archived_projects=include_archived_projects,

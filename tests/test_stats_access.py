@@ -54,6 +54,7 @@ def _scoped(user: dict, scope: str) -> dict:
 #: Calling a FastAPI handler directly leaves unpassed parameters as ``Query``
 #: objects rather than their defaults, so tests supply the full signature.
 _STATS_JOBS_DEFAULTS: dict = {
+    "origin": None,
     "project_id": None,
     "has_project": None,
     "include_archived_projects": False,
