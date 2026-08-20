@@ -657,7 +657,7 @@ async def require_approved_user(request: Request, db) -> dict:
 
     Admin shadow ("view as user"): when an admin request carries
     ``X-Admin-View-As: user``, the returned dict has ``is_admin=False`` so
-    visibility helpers (``user_visible_project_ids``, ``get_visible_jobs``,
+    visibility helpers (``user_visible_project_ids``, ``query_jobs``,
     ``user_can_access_datasource``) narrow as if the caller were a regular
     user. The un-shadowed privilege flag is preserved on ``real_is_admin``
     so ``_require_admin`` keeps admin-only endpoints reachable while the

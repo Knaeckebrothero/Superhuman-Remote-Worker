@@ -281,7 +281,7 @@ async def _jobs_section(
     if not project_id:
         return ["Jobs: no project bound to this officer thread."], dict(prev_prints)
     try:
-        jobs = await db.get_jobs(scope_project_id=project_id, limit=200)
+        jobs = await db.query_jobs(scope_project_id=project_id, limit=200)
     except Exception:
         logger.warning("sitrep: jobs query failed", exc_info=True)
         return ["Jobs: (section unavailable — jobs query failed)"], dict(prev_prints)

@@ -95,7 +95,7 @@ class TestSingleFixtureEverySurface:
     @pytest.mark.asyncio
     async def test_sitrep_active_line_carries_the_same_state_and_reason(self):
         db = SimpleNamespace()
-        db.get_jobs = AsyncMock(return_value=[_stalled_job()])
+        db.query_jobs = AsyncMock(return_value=[_stalled_job()])
         db.get_agent = AsyncMock(
             return_value={"id": AGENT_ID, "last_heartbeat": NOW - timedelta(seconds=30)}
         )
@@ -284,7 +284,7 @@ class TestThresholdAndBatch:
         assert verdict["threshold_source"] == "deployment_default"
 
         db = SimpleNamespace(
-            get_jobs=AsyncMock(return_value=[_stalled_job()]),
+            query_jobs=AsyncMock(return_value=[_stalled_job()]),
             get_agent=AsyncMock(
                 return_value={
                     "id": AGENT_ID,

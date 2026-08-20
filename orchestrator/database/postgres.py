@@ -1093,7 +1093,7 @@ class PostgresDB:
 
         # Job operations
         job = await db.create_job(description="Extract requirements")
-        jobs = await db.get_jobs(status="processing")
+        jobs = await db.query_jobs(status="processing")
 
         # Agent operations
         result = await db.register_agent(config_name="creator", pod_ip="10.0.0.1")
@@ -1535,141 +1535,78 @@ class PostgresDB:
     # JOB OPERATIONS
     # =========================================================================
 
-    async def get_jobs(
+    async def query_jobs(
         self,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
         status: str | None = None,
         user_id: str | None = None,
         limit: int = 100,
-        *,
-        scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Get list of jobs with optional status, owner, and scope filters.
+        """Get the jobs visible to one caller, with optional filters.
 
-        AND-style filtering — used by the admin path (full fleet view, with
-        optional ``?user_id=`` and/or MCP ``project:<uuid>`` scope narrowing).
-        Non-admin callers must go through :meth:`get_visible_jobs` instead so
-        the visibility OR-clause is applied.
+        The single entry point for the jobs list. Visibility is declared by
+        the caller and rendered by :meth:`_visibility_clause`:
+
+        * **Admin** — pass ``owner_user_id=None``. No OR-clause is emitted, so
+          the caller sees the full fleet.
+        * **Non-admin** — pass the caller's own id as ``owner_user_id`` plus
+          their project memberships (from
+          :func:`security.access.user_visible_project_ids`) as
+          ``visible_project_ids``. Emits the G1 OR-clause ``(user_id = $u OR
+          project_id = ANY($p))``. An empty ``visible_project_ids`` is fine —
+          the clause then restricts to the caller's own jobs.
+        * ``scope_project_id`` is the MCP token's ``project:<uuid>``
+          narrowing, AND-combined on top of either of the above.
+
+        ``user_id`` is the separate admin cross-user filter (``?user_id=``),
+        *not* the visibility owner — routes reject a non-admin asking about
+        anyone but themselves before reaching this method.
 
         Args:
-            status: Optional status filter (e.g., 'completed', 'processing')
-            user_id: Optional user ID filter (admin cross-user query)
-            limit: Maximum number of jobs to return
-            scope_project_id: MCP token ``project:<uuid>`` narrowing. When
-                set, an additional ``project_id = $scope`` filter is appended.
+            owner_user_id: Visibility owner, or None for the admin view.
+            visible_project_ids: Caller's project memberships (consulted only
+                when ``owner_user_id`` is set).
+            scope_project_id: MCP ``project:<uuid>`` narrowing.
+            status: Optional status filter (e.g. 'completed', 'processing').
+            user_id: Optional owner filter, AND-combined.
+            limit: Maximum number of jobs to return.
 
         Returns:
-            List of job dicts with id, description, status, config_name, created_at, user_id
-        """
-        conditions = []
-        values = []
-        param_count = 0
-
-        if status:
-            param_count += 1
-            conditions.append(f"j.status = ${param_count}")
-            values.append(status)
-
-        if user_id:
-            param_count += 1
-            conditions.append(f"j.user_id = ${param_count}")
-            values.append(UUID(user_id))
-
-        if scope_project_id:
-            param_count += 1
-            conditions.append(f"j.project_id = ${param_count}")
-            values.append(UUID(scope_project_id))
-
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        param_count += 1
-        values.append(limit)
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT j.id, j.description, j.status,
-                       j.config_name, j.assigned_agent_id, j.user_id,
-                       j.project_id, j.parent_job_id, j.priority,
-                       j.repo_name, j.branch_name, j.merge_status,
-                       j.diff_status, j.exported_at, j.exported_folder_handle,
-                       j.error_message,
-                       j.created_at, j.created_by_thread_id,
-                       j.context->'snapshot'->>'status' AS snapshot_status,
-                       p.name AS project_name,
-                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
-                       (pa.id IS NOT NULL) AS pending_approval,
-                       pa.id AS pending_approval_request_id
-                FROM jobs j
-                LEFT JOIN projects p ON p.id = j.project_id
-                LEFT JOIN LATERAL (
-                    SELECT s.id FROM sudo_approval_requests s
-                    WHERE s.job_id = j.id AND s.status = 'pending'
-                      AND s.expires_at > NOW()
-                    ORDER BY s.requested_at DESC
-                    LIMIT 1
-                ) pa ON TRUE
-                {where_clause}
-                ORDER BY j.created_at DESC
-                LIMIT ${param_count}
-                """,
-                *values,
-            )
-
-        return [dict(row) for row in rows]
-
-    async def get_visible_jobs(
-        self,
-        *,
-        owner_user_id: str,
-        visible_project_ids: list[str],
-        status: str | None = None,
-        scope_project_id: str | None = None,
-        limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """Get list of jobs visible to a non-admin caller (G1 visibility OR).
-
-        Applies the user-visibility model: ``(user_id = $owner OR
-        project_id = ANY($projects))``. ``owner_user_id`` is the caller's own
-        id; ``visible_project_ids`` is the list of project ids the caller is a
-        member of (from
-        :func:`security.access.user_visible_project_ids`). An empty
-        ``visible_project_ids`` is fine — the OR-clause then just restricts to
-        the caller's own jobs.
-
-        ``scope_project_id`` is the MCP token's ``project:<uuid>`` narrowing
-        (if any); AND-combined on top, which intersects the visibility set
-        down to that one project.
-
-        Admin callers must NOT use this helper — they go through
-        :meth:`get_jobs` so the OR-clause isn't applied (admins see the full
-        fleet, possibly with explicit ``?user_id=`` or scope filters).
+            List of job dicts ordered newest-first.
         """
         conditions: list[str] = []
         values: list[Any] = []
-        param_count = 0
+
+        def add_condition(template: str, value: Any) -> None:
+            values.append(value)
+            conditions.append(template.format(param=f"${len(values)}"))
+
+        # Visibility goes first so it owns $1..$n; every filter added after
+        # it numbers itself off len(values), leaving no start_idx arithmetic
+        # to get wrong. A wrong-but-in-range index binds the wrong value and
+        # raises nothing.
+        visibility, vis_values, _ = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            table_alias="j",
+        )
+        if visibility:
+            conditions.append(visibility)
+            values.extend(vis_values)
 
         if status:
-            param_count += 1
-            conditions.append(f"j.status = ${param_count}")
-            values.append(status)
+            add_condition("j.status = {param}", status)
 
-        param_count += 1
-        user_idx = param_count
-        param_count += 1
-        projects_idx = param_count
-        conditions.append(
-            f"(j.user_id = ${user_idx} OR j.project_id = ANY(${projects_idx}::uuid[]))"
-        )
-        values.append(UUID(owner_user_id))
-        values.append([UUID(p) for p in visible_project_ids])
+        if user_id:
+            add_condition("j.user_id = {param}", UUID(user_id))
 
-        if scope_project_id:
-            param_count += 1
-            conditions.append(f"j.project_id = ${param_count}")
-            values.append(UUID(scope_project_id))
-
-        where_clause = f"WHERE {' AND '.join(conditions)}"
-        param_count += 1
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         values.append(limit)
+        limit_param = f"${len(values)}"
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -1697,7 +1634,7 @@ class PostgresDB:
                 ) pa ON TRUE
                 {where_clause}
                 ORDER BY j.created_at DESC
-                LIMIT ${param_count}
+                LIMIT {limit_param}
                 """,
                 *values,
             )
