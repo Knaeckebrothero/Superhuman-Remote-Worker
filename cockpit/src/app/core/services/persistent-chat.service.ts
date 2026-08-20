@@ -1298,11 +1298,13 @@ export class PersistentChatService {
     this.draftDefaultsError.set(false);
     this.error.set(null);
     try {
-      // Use the raw read rather than ApiService.getProjects(), whose
-      // legacy catchError([]) would turn a security-relevant failure into
-      // a believable "no project" context.
+      // A raw read, kept deliberately: this context is fail-closed, and the
+      // try/catch below is what turns a failure into "defaults unavailable"
+      // rather than a believable "no project". `status=active` matches the
+      // other create pickers — a draft can only ever target the account
+      // default, which is never archivable anyway.
       const projects = await firstValueFrom(
-        this.http.get<Project[]>(`${environment.apiUrl}/projects`),
+        this.http.get<Project[]>(`${environment.apiUrl}/projects?status=active`),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       const defaultProject = projects.find((project) => project.is_default);

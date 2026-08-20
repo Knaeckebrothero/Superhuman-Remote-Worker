@@ -17,11 +17,17 @@ from typing import Any
 GENERIC_CONNECTOR_LABEL = "a connector you no longer have access to"
 GENERIC_PROJECT_LABEL = "a project you no longer have access to"
 DELETED_PROJECT_LABEL = "a project that no longer exists"
+#: Archived is not a permission loss and the caller is still a member, so this
+#: one names the state plainly instead of using the generic label.
+ARCHIVED_PROJECT_LABEL = "a project that has been archived"
 
 #: Verdict reasons that an acknowledgment can resolve. ``workspace_tier`` is
 #: absent on purpose — a lite-tier repository conflict is a config
-#: incompatibility that keeps raising 400.
-ACKNOWLEDGEABLE_REASONS = frozenset({"deleted", "revoked", "out_of_scope"})
+#: incompatibility that keeps raising 400. ``archived`` IS acknowledgeable:
+#: a project archived under a live session is a lifecycle change the owner can
+#: accept and continue without, whereas leaving it out of this set would route
+#: it through :func:`blocking_denials` and refuse the resume as *corrupt*.
+ACKNOWLEDGEABLE_REASONS = frozenset({"deleted", "revoked", "out_of_scope", "archived"})
 
 
 @dataclass(frozen=True)
@@ -78,11 +84,10 @@ async def collect_config_drift(
     for verdict in project_ids:
         if not verdict.denied or verdict.reason not in ACKNOWLEDGEABLE_REASONS:
             continue
-        label = (
-            DELETED_PROJECT_LABEL
-            if verdict.reason == "deleted"
-            else GENERIC_PROJECT_LABEL
-        )
+        label = {
+            "deleted": DELETED_PROJECT_LABEL,
+            "archived": ARCHIVED_PROJECT_LABEL,
+        }.get(verdict.reason, GENERIC_PROJECT_LABEL)
         items.append(
             DriftItem(
                 id=f"project:{verdict.project_id}",

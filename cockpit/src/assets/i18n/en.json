@@ -430,10 +430,23 @@
     "reposCountOne": "{{count}} repo",
     "membersCount": "{{count}} members",
     "membersCountOne": "{{count}} member",
+    "emptyArchived": "No archived projects",
+    "emptyArchivedHint": "Archiving keeps a finished project out of lists and pickers without deleting anything",
+    "archivedNotice": "Archived projects are hidden from this list and from the New Job and New Session pickers. Unarchive one to create new work in it.",
     "status": {
       "active": "active",
-      "archived": "archived",
-      "deleted": "deleted"
+      "archived": "archived"
+    },
+    "filter": {
+      "active": "Active ({{count}})",
+      "archived": "Archived ({{count}})"
+    },
+    "action": {
+      "unarchive": "Unarchive",
+      "unarchiving": "Unarchiving..."
+    },
+    "tooltip": {
+      "unarchive": "Make this project active again so new jobs and sessions can target it"
     },
     "error": {
       "noAccess": "You don't have access to that project."
@@ -552,6 +565,8 @@
       "modelConfigDefault": "Config default",
       "projectsLabel": "Projects",
       "projectsEmpty": "No projects available",
+      "projectArchived": "(archived)",
+      "projectArchivedWarning": "An archived project is still selected — creating a session against it will be refused. Deselect it, or unarchive the project.",
       "projectsHint": "Select projects for shared knowledge access",
       "permissionLabel": "Permission Mode",
       "permissionSupervised": "Supervised",
@@ -701,6 +716,8 @@
       "projectLabel": "Project",
       "projectNone": "No project",
       "projectPersonal": "(Personal)",
+      "projectArchived": "(archived)",
+      "projectArchivedWarning": "This project is archived — creating a job in it will be refused. Unarchive it, or pick another project.",
       "projectHint": "Select which project this job belongs to",
       "descriptionLabel": "Description",
       "descriptionPlaceholder": "Describe what the agent should accomplish...",
@@ -1332,9 +1349,20 @@
       "dangerZone": "Danger Zone",
       "defaultProjectWarning": "This is your default personal project and cannot be archived or deleted.",
       "archiveTitle": "Archive Project",
-      "archiveDesc": "Mark this project as archived. Jobs will no longer be created.",
+      "archiveDesc": "Mark this project as archived. It leaves the project list and the New Job and New Session pickers, its loop and officer stop, and pending jobs are parked. Work already running finishes.",
       "archive": "Archive",
+      "archiveConfirmTitle": "Archive project?",
       "archiveConfirm": "Are you sure you want to archive this project?",
+      "archivedReportBase": "Project archived.",
+      "archivedReportLoop": "The project loop was paused.",
+      "archivedReportOfficer": "The officer was put on hold.",
+      "archivedReportJobs": "{{count}} pending jobs were parked.",
+      "archivedReportJobsOne": "{{count}} pending job was parked.",
+      "unarchiveTitle": "Unarchive Project",
+      "unarchiveDesc": "Make this project active again so new jobs and sessions can target it. Anything archiving paused stays paused until you resume it.",
+      "unarchive": "Unarchive",
+      "unarchiveConfirmTitle": "Unarchive project?",
+      "unarchiveConfirm": "Unarchive this project? New work will be allowed against it again; the loop, officer and parked jobs stay paused.",
       "deleteTitle": "Delete Project",
       "deleteDesc": "Permanently delete this project and its managed repositories.",
       "delete": "Delete",
@@ -3111,7 +3139,13 @@
       "agent.unavailable": "No agents are available right now.",
       "agent.offline": "The assigned agent is offline.",
       "project.not_found": "That project no longer exists.",
+      "project_archived": "This project is archived. Unarchive it before creating new work.",
       "permission.denied": "You don't have permission to do that."
+    },
+    "projects": {
+      "loadFailed": "Couldn't load your projects.",
+      "archiveFailed": "Couldn't archive the project.",
+      "unarchiveFailed": "Couldn't unarchive the project."
     },
     "jobs": {
       "createFailed": "Couldn't create the job.",

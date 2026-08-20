@@ -67,6 +67,7 @@ import {
     ProjectBacklog,
     ProjectLoop,
     ProjectLoopStartRequest,
+    ProjectArchiveReport,
     ProjectCreateRequest,
     ExternalKnowledgeBaseRequest,
     ProjectDatasource,
@@ -76,6 +77,7 @@ import {
     ProjectRepository,
     ProjectRepositoryCreateRequest,
     ProjectRepositoryUpdateRequest,
+    ProjectStatus,
     ProjectUpdateRequest,
     PullRequestStatus,
     PromoteRequest,
@@ -2210,12 +2212,21 @@ export class ApiService {
 
   // ===== Project Endpoints =====
 
-  getProjects(userId?: string): Observable<Project[]> {
+  /**
+   * `status` is repeatable and the server defaults it to `active`, so an
+   * omitted argument no longer means "every project" — archived ones are
+   * excluded unless asked for. Pass `['active', 'archived']` for both.
+   *
+   * Errors propagate. The old blanket `catchError(() => of([]))` turned every
+   * failure — including a refusal the user needs to read — into a believable
+   * "you have no projects", which is the worst possible lie for a list that
+   * decides where work goes.
+   */
+  getProjects(userId?: string, status?: ProjectStatus[]): Observable<Project[]> {
     let params = new HttpParams();
     if (userId) params = params.set('user_id', userId);
-    return this.http.get<Project[]>(`${this.baseUrl}/projects`, { params }).pipe(
-      catchError(() => of([])),
-    );
+    for (const value of status ?? []) params = params.append('status', value);
+    return this.http.get<Project[]>(`${this.baseUrl}/projects`, { params });
   }
 
   getProject(id: string): Observable<Project | null> {
@@ -2256,6 +2267,18 @@ export class ApiService {
       `${this.baseUrl}/projects/${projectId}/knowledge/repository`,
       body,
     );
+  }
+
+  /**
+   * Archive / unarchive. Separate from `updateProject` for two reasons: the
+   * response is a report of what archiving quiesced (`loop_paused`,
+   * `jobs_parked`), not a bare `{status}`; and errors must propagate — a PATCH
+   * carrying a status alongside any other field on an archived project is
+   * refused with 409 and a sentence the user needs to read, which
+   * `updateProject`'s `catchError(() => of(null))` would erase.
+   */
+  setProjectStatus(id: string, status: ProjectStatus): Observable<ProjectArchiveReport> {
+    return this.http.patch<ProjectArchiveReport>(`${this.baseUrl}/projects/${id}`, { status });
   }
 
   updateProject(id: string, body: ProjectUpdateRequest): Observable<{ status: string } | null> {

@@ -967,3 +967,72 @@ describe('ApiService.getStuckJobs (server-owned OC-08 policy)', () => {
     }
   });
 });
+
+describe('ApiService project lifecycle', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('sends `status` as a repeatable param, and omits it when unasked', async () => {
+    // The server defaults to `active`; asking for both is how a caller says
+    // "everything", and there is deliberately no `include_archived` flag.
+    const both = firstValueFrom(api.getProjects('user-1', ['active', 'archived']));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/projects'));
+    expect(req.request.params.getAll('status')).toEqual(['active', 'archived']);
+    expect(req.request.params.get('user_id')).toBe('user-1');
+    req.flush([]);
+    await both;
+
+    const bare = firstValueFrom(api.getProjects());
+    const plain = httpMock.expectOne((r) => r.url.endsWith('/projects'));
+    expect(plain.request.params.has('status')).toBe(false);
+    plain.flush([]);
+    await bare;
+  });
+
+  it('propagates a failed project list instead of resolving to an empty one', async () => {
+    // The old `catchError(() => of([]))` made a 500 indistinguishable from an
+    // account with no projects.
+    const pending = firstValueFrom(api.getProjects('user-1'));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/projects'))
+      .flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
+
+    await expect(pending).rejects.toBeInstanceOf(HttpErrorResponse);
+  });
+
+  it('patches status alone, and surfaces the archived refusal', async () => {
+    // Status-only body: on an archived project the server accepts nothing else,
+    // and refuses the whole request if another field rides along.
+    const archiving = firstValueFrom(api.setProjectStatus('p-1', 'archived'));
+    const write = httpMock.expectOne((r) => r.url.endsWith('/projects/p-1'));
+    expect(write.request.method).toBe('PATCH');
+    expect(write.request.body).toEqual({status: 'archived'});
+    write.flush({archived: true, loop_paused: true, officer_held: false, jobs_parked: 3});
+    await expect(archiving).resolves.toMatchObject({archived: true, jobs_parked: 3});
+
+    const refused = firstValueFrom(api.setProjectStatus('p-1', 'active'));
+    httpMock.expectOne((r) => r.url.endsWith('/projects/p-1')).flush(
+      {detail: 'This project is archived. Unarchive it before creating new work.'},
+      {status: 409, statusText: 'Conflict'},
+    );
+    await expect(refused).rejects.toBeInstanceOf(HttpErrorResponse);
+  });
+});

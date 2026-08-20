@@ -430,10 +430,23 @@
     "reposCountOne": "{{count}} Repo",
     "membersCount": "{{count}} Mitglieder",
     "membersCountOne": "{{count}} Mitglied",
+    "emptyArchived": "Keine archivierten Projekte",
+    "emptyArchivedHint": "Archivieren hält ein abgeschlossenes Projekt aus Listen und Auswahlfeldern heraus, ohne etwas zu löschen",
+    "archivedNotice": "Archivierte Projekte sind in dieser Liste sowie in den Auswahlfeldern für neue Aufträge und Sitzungen ausgeblendet. Heben Sie die Archivierung auf, um wieder Arbeit darin anzulegen.",
     "status": {
       "active": "aktiv",
-      "archived": "archiviert",
-      "deleted": "gelöscht"
+      "archived": "archiviert"
+    },
+    "filter": {
+      "active": "Aktiv ({{count}})",
+      "archived": "Archiviert ({{count}})"
+    },
+    "action": {
+      "unarchive": "Archivierung aufheben",
+      "unarchiving": "Wird aufgehoben..."
+    },
+    "tooltip": {
+      "unarchive": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können"
     },
     "error": {
       "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
@@ -552,6 +565,8 @@
       "modelConfigDefault": "Konfigurations-Standard",
       "projectsLabel": "Projekte",
       "projectsEmpty": "Keine Projekte verfügbar",
+      "projectArchived": "(archiviert)",
+      "projectArchivedWarning": "Ein archiviertes Projekt ist weiterhin ausgewählt — eine Sitzung darauf wird abgelehnt. Wählen Sie es ab oder heben Sie die Archivierung auf.",
       "projectsHint": "Projekte für gemeinsamen Wissenszugriff auswählen",
       "permissionLabel": "Berechtigungsmodus",
       "permissionSupervised": "Beaufsichtigt",
@@ -701,6 +716,8 @@
       "projectLabel": "Projekt",
       "projectNone": "Kein Projekt",
       "projectPersonal": "(Persönlich)",
+      "projectArchived": "(archiviert)",
+      "projectArchivedWarning": "Dieses Projekt ist archiviert — ein Auftrag darin wird abgelehnt. Heben Sie die Archivierung auf oder wählen Sie ein anderes Projekt.",
       "projectHint": "Wählen Sie das Projekt, zu dem dieser Auftrag gehört",
       "descriptionLabel": "Beschreibung",
       "descriptionPlaceholder": "Beschreiben Sie, was der Agent erreichen soll...",
@@ -1332,9 +1349,20 @@
       "dangerZone": "Gefahrenzone",
       "defaultProjectWarning": "Dies ist Ihr persönliches Standardprojekt und kann nicht archiviert oder gelöscht werden.",
       "archiveTitle": "Projekt archivieren",
-      "archiveDesc": "Dieses Projekt als archiviert markieren. Es können keine neuen Aufträge erstellt werden.",
+      "archiveDesc": "Dieses Projekt als archiviert markieren. Es verschwindet aus der Projektliste und aus den Auswahlfeldern für neue Aufträge und Sitzungen, Schleife und Officer werden gestoppt und ausstehende Aufträge werden geparkt. Bereits laufende Arbeit wird zu Ende geführt.",
       "archive": "Archivieren",
+      "archiveConfirmTitle": "Projekt archivieren?",
       "archiveConfirm": "Sind Sie sicher, dass Sie dieses Projekt archivieren möchten?",
+      "archivedReportBase": "Projekt archiviert.",
+      "archivedReportLoop": "Die Projektschleife wurde pausiert.",
+      "archivedReportOfficer": "Der Officer wurde angehalten.",
+      "archivedReportJobs": "{{count}} ausstehende Aufträge wurden geparkt.",
+      "archivedReportJobsOne": "{{count}} ausstehender Auftrag wurde geparkt.",
+      "unarchiveTitle": "Archivierung aufheben",
+      "unarchiveDesc": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können. Was beim Archivieren pausiert wurde, bleibt pausiert, bis Sie es fortsetzen.",
+      "unarchive": "Archivierung aufheben",
+      "unarchiveConfirmTitle": "Archivierung aufheben?",
+      "unarchiveConfirm": "Archivierung dieses Projekts aufheben? Neue Arbeit ist danach wieder möglich; Schleife, Officer und geparkte Aufträge bleiben pausiert.",
       "deleteTitle": "Projekt löschen",
       "deleteDesc": "Dieses Projekt und seine verwalteten Repositorys dauerhaft löschen.",
       "delete": "Löschen",
@@ -3111,7 +3139,13 @@
       "agent.unavailable": "Derzeit sind keine Agenten verfügbar.",
       "agent.offline": "Der zugewiesene Agent ist offline.",
       "project.not_found": "Dieses Projekt existiert nicht mehr.",
+      "project_archived": "Dieses Projekt ist archiviert. Heben Sie die Archivierung auf, bevor Sie neue Arbeit anlegen.",
       "permission.denied": "Dafür fehlt dir die Berechtigung."
+    },
+    "projects": {
+      "loadFailed": "Projekte konnten nicht geladen werden.",
+      "archiveFailed": "Projekt konnte nicht archiviert werden.",
+      "unarchiveFailed": "Archivierung des Projekts konnte nicht aufgehoben werden."
     },
     "jobs": {
       "createFailed": "Job konnte nicht erstellt werden.",

@@ -216,6 +216,7 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
             postgres_db,
             requested_project,
             min_role="editor",
+            allow_archived=False,
         )
     payload["project_id"] = requested_project
 

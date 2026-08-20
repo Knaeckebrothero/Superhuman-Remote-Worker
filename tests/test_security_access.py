@@ -537,3 +537,229 @@ class TestApplyMcpScope:
         # An unsatisfiable bind — caller's outer query returns no rows.
         assert "project_id" in clause
         assert params["scope_project"] is None
+
+
+# =============================================================================
+# Project lifecycle — archived projects refuse new work
+# =============================================================================
+#
+# knowledge-base/knowledge/features/project_and_job_list_filtering.md §4.2/§4.3.
+# The guard flag is layer 1 of two: good errors at the HTTP edge. Layer 2
+# (the five creation seams an X-Internal-Key caller reaches without ever
+# touching these guards) is pinned in
+# tests/test_archived_projects_refuse_new_work.py.
+
+
+@pytest.fixture
+def archived_project(project_a):
+    project_a["status"] = "archived"
+    return project_a
+
+
+class TestProjectIsArchived:
+    def test_archived_status(self):
+        assert access.project_is_archived({"status": "archived"}) is True
+
+    def test_case_is_not_load_bearing(self):
+        assert access.project_is_archived({"status": "Archived"}) is True
+        assert access.project_is_archived({"status": " ARCHIVED "}) is True
+
+    def test_active_is_not_archived(self):
+        assert access.project_is_archived({"status": "active"}) is False
+
+    def test_missing_null_and_unknown_status_fail_toward_live(self):
+        # Fail toward showing: a project whose status we cannot classify must
+        # keep working rather than silently becoming read-only.
+        assert access.project_is_archived({}) is False
+        assert access.project_is_archived({"status": None}) is False
+        assert access.project_is_archived({"status": "paused"}) is False
+        assert access.project_is_archived(None) is False
+
+
+class TestNormalizeProjectStatuses:
+    def test_none_defaults_to_active_only(self):
+        assert access.normalize_project_statuses(None) == ["active"]
+
+    def test_empty_list_defaults_to_active_only(self):
+        # Omission must never widen to "everything".
+        assert access.normalize_project_statuses([]) == ["active"]
+        assert access.normalize_project_statuses(["", "   "]) == ["active"]
+
+    def test_lowercases_trims_and_dedupes_preserving_order(self):
+        assert access.normalize_project_statuses(
+            [" Archived ", "ACTIVE", "archived"]
+        ) == ["archived", "active"]
+
+    def test_non_sequence_is_treated_as_unsupplied(self):
+        # Handlers get called directly (without the param) all over this
+        # suite, leaving the unresolved fastapi Query default in place.
+        assert access.normalize_project_statuses(object()) == ["active"]
+
+
+class TestProjectStatusFilterSql:
+    def test_requested_statuses_bind_to_the_param(self):
+        sql = access.project_status_filter_sql("$1")
+        assert "$1::text[]" in sql
+        assert "COALESCE(status, 'active')" in sql
+
+    def test_unknown_statuses_always_survive(self):
+        # The default filter must hide exactly `archived`, not every row whose
+        # state we cannot classify.
+        sql = access.project_status_filter_sql("$1")
+        assert "NOT IN ('active', 'archived')" in sql
+
+    def test_column_is_qualifiable(self):
+        sql = access.project_status_filter_sql("$3", column="p.status")
+        assert "COALESCE(p.status, 'active')" in sql
+
+
+class TestRequireProjectMemberArchived:
+    @pytest.mark.asyncio
+    async def test_default_allows_archived(
+        self, user_a, archived_project, fake_db, fake_request
+    ):
+        # ~30 read endpoints ride this default. An archive you cannot open is
+        # a trap, not a lifecycle state.
+        with _patch_caller(user_a):
+            user, project = await access.require_project_member(
+                fake_request, fake_db, str(archived_project["id"])
+            )
+        assert user is user_a
+        assert project is archived_project
+
+    @pytest.mark.asyncio
+    async def test_write_site_gets_409_with_a_plain_sentence(
+        self, user_a, archived_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_a):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    min_role="editor",
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 409
+        # Plain string, not a {code, message} dict — the cockpit's generic
+        # error path types `detail` as a string.
+        assert isinstance(exc.value.detail, str)
+        assert exc.value.detail == access.PROJECT_ARCHIVED_DETAIL
+        assert "Unarchive it" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_refusal_is_not_logged_as_an_access_denial(
+        self, user_a, archived_project, fake_db, fake_request
+    ):
+        # `security_events` exists to detect UUID-probing. An archived refusal
+        # handed to an authorized member is a lifecycle conflict, and filing it
+        # under access_denied would blunt that detector.
+        with _patch_caller(user_a):
+            with pytest.raises(HTTPException):
+                await access.require_project_member(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    allow_archived=False,
+                )
+        fake_db.record_security_event.assert_awaited_once()
+        kwargs = fake_db.record_security_event.await_args.kwargs
+        assert kwargs["event_type"] == "project_archived_write"
+
+    @pytest.mark.asyncio
+    async def test_authorization_ranks_above_lifecycle(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        # A non-member must not be able to use the 409/403 split as an oracle
+        # for whether a project exists and what state it is in.
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_missing_project_still_404s_before_the_lifecycle_check(
+        self, user_a, fake_db, fake_request
+    ):
+        with _patch_caller(user_a):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request,
+                    fake_db,
+                    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_admin_is_refused_too(
+        self, user_admin, archived_project, fake_db, fake_request
+    ):
+        # Admin bypasses *authorization*, not the lifecycle: creating new work
+        # on a historical record is the mistake, whoever is asking.
+        with _patch_caller(user_admin):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_passes_a_write_gate(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        project_a["status"] = None
+        with _patch_caller(user_a):
+            _, project = await access.require_project_member(
+                fake_request, fake_db, str(project_a["id"]), allow_archived=False
+            )
+        assert project is project_a
+
+
+class TestRequireProjectOwnerArchived:
+    @pytest.mark.asyncio
+    async def test_default_allows_archived_for_teardown(
+        self, user_a, archived_project, fake_db, fake_request
+    ):
+        # DELETE, detach, decommission and the unarchive PATCH all ride this.
+        with _patch_caller(user_a):
+            _, project = await access.require_project_owner(
+                fake_request, fake_db, str(archived_project["id"])
+            )
+        assert project is archived_project
+
+    @pytest.mark.asyncio
+    async def test_write_site_gets_409(
+        self, user_a, archived_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_a):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_owner(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_non_owner_still_gets_403(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_owner(
+                    fake_request,
+                    fake_db,
+                    str(archived_project["id"]),
+                    allow_archived=False,
+                )
+        assert exc.value.status_code == 403

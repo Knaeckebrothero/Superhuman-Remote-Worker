@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from security.access import project_is_archived
+
 # The legacy name remains the loop path's import surface while the safe
 # migration lands. It now inserts a structured PostgreSQL record; it does not
 # write a retro file into an agent-visible repository.
@@ -969,8 +971,11 @@ async def create_loop_job(
     backlog_block: str | None = None,
     history_block: str | None = None,
     park_until: datetime | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Materialize ONE bare loop job for the given role + iteration.
+
+    Returns ``None`` when the loop's project is archived — see the archived
+    check below.
 
     DB-only (job row + materialized datasource links), mirroring
     ``create_job_from_automation``. The caller provisions the Gitea repo and
@@ -1007,6 +1012,26 @@ async def create_loop_job(
     """
     loop_id = str(loop["id"])
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
+
+    # An archived project takes no new work (§4.3 of
+    # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
+    # This is a pure service path with no HTTP caller, so it skips and logs
+    # rather than raising. It is a backstop, not the primary control: archiving
+    # pauses the loop (§4.5) and the loop start/resume/scheduling endpoints
+    # already 409 at the guard, so reaching here means the archive landed
+    # mid-advance.
+    if project_id:
+        project = await db.get_project(project_id)
+        if project_is_archived(project):
+            logger.warning(
+                "loop %s: project %s is archived — not materializing the %s "
+                "job for iteration %s",
+                loop_id[:8],
+                project_id,
+                role,
+                iteration,
+            )
+            return None
 
     # Bare config: the loop is the orchestration, so disable the per-job
     # lifecycle hooks that would otherwise fight it — a verification critic that

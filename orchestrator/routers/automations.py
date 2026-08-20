@@ -19,7 +19,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from security.access import require_project_member
+from security.access import PROJECT_ARCHIVED_DETAIL, require_project_member
 from security.auth import require_approved_user
 from services.automations import (
     create_job_from_automation,
@@ -170,8 +170,14 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
     if body.project_id:
         # Editor or higher needed to scope an automation to a project —
         # an automation creates jobs that show up on the project page.
+        # allow_archived=False for the same reason: this is a standing order
+        # to create future work, which is exactly what archiving withdraws.
         await require_project_member(
-            request, postgres_db, body.project_id, min_role="editor"
+            request,
+            postgres_db,
+            body.project_id,
+            min_role="editor",
+            allow_archived=False,
         )
 
     try:
@@ -369,6 +375,12 @@ async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
     )
 
     job = await create_job_from_automation(postgres_db, row, trigger_kind="manual")
+    if job is None:
+        # The service skips-and-logs rather than raising, because its other
+        # caller is a cron tick with nobody to answer. Run-now DOES have a
+        # caller, and an owner clicking a button that silently does nothing
+        # is worse than a 409 naming the one lever that fixes it.
+        raise HTTPException(status_code=409, detail=PROJECT_ARCHIVED_DETAIL)
 
     # Provision the job's Gitea repo/branch + creator access grant (parity
     # with the POST /api/jobs handler). Best-effort — a Gitea outage logs

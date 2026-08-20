@@ -11,6 +11,12 @@ Two properties are pinned here and they pull against each other: the archive
 must not appear where someone is choosing a target, and it must not vanish
 so completely that a caller hunting a project they know exists concludes it
 was deleted.
+
+This file covers the PRESENTATION half only — it was the whole of the 08-15
+mitigation, and the server went on accepting every write. The server half (the
+commission endpoint refusing, the auto-pull tick standing down, and the other
+paths that create work) is pinned in
+``tests/test_archived_projects_refuse_new_work.py``.
 """
 
 from src.shared.orch_surface.formatters import format_project_detail, format_projects

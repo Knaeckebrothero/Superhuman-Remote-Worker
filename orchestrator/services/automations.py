@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from security.access import project_is_archived
+
 from .datasource_policy import default_datasource_selection
 from .default_experts import ExpertSelectionError, resolve_root_expert
 from src.core.loader import canonical_config_name, deep_merge
@@ -113,7 +115,7 @@ async def create_job_from_automation(
     automation: dict[str, Any],
     *,
     trigger_kind: str = "cron",
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Materialize a job from an automation template.
 
     Copies ``expert`` → ``config_name``, ``prompt`` → ``description``,
@@ -133,8 +135,34 @@ async def create_job_from_automation(
 
     Returns:
         The created job dict (as ``db.create_job`` returns it), with at
-        minimum ``id``, ``status``, and the template-derived fields.
+        minimum ``id``, ``status``, and the template-derived fields — or
+        ``None`` when the automation's project is archived and the fire was
+        skipped.
+
+    Archived projects (§4.3 of
+    knowledge-base/knowledge/features/project_and_job_list_filtering.md): this
+    is the seam, not ``_resolve_automation_or_404``, because that guard runs
+    only for non-owner, non-admin callers — the common case (cron, and the
+    owner's own "Run now") bypasses it entirely. Skip and log rather than
+    raise: a cron tick has no HTTP caller to receive a 409, and
+    auto-disabling the automation would silently destroy the owner's
+    configuration. The cron dispatcher turns ``None`` into a schedule
+    advance; the ``run-now`` endpoint turns it into the 409 its caller can
+    actually act on.
     """
+    project_id_for_gate = automation.get("project_id")
+    if project_id_for_gate:
+        project = await db.get_project(str(project_id_for_gate))
+        if project_is_archived(project):
+            logger.info(
+                "Automation %s skipped (%s): project %s is archived — "
+                "the automation stays enabled; unarchive to resume firing",
+                automation.get("id"),
+                trigger_kind,
+                project_id_for_gate,
+            )
+            return None
+
     # config_override starts as a copy of the automation's template; we
     # then layer the autonomy choice on top. Templates that explicitly
     # set autonomy via config_override take precedence (callers can

@@ -136,11 +136,15 @@ from security.auth import (  # noqa: E402
     ensure_user_provisioned,
 )
 from security.access import (  # noqa: E402
+    PROJECT_ARCHIVED_DETAIL,
     externalize_gitea_url,
     filter_visible_datasources,
     is_internal_call,
     log_security_event,
     mcp_scope_project_id,
+    normalize_project_statuses,
+    project_is_archived,
+    project_status_filter_sql,
     redact_config_override,
     redact_datasource,
     redact_datasources,
@@ -10210,7 +10214,13 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     goal: str | None = None
-    status: str | None = None
+    # One vocabulary, validated here rather than only at the DB CHECK (§4.1 of
+    # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
+    # `paused`/`completed` are still permitted by the constraint but nothing
+    # has ever written them, and the cockpit's `deleted` was always rejected
+    # by it — a 422 naming the field beats a 500 out of asyncpg. Tightening
+    # the constraint itself (and sweeping NULL rows) is phase 1b.
+    status: Literal["active", "archived"] | None = None
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
     cloud_storage_read_only: bool | None = None
@@ -12546,6 +12556,14 @@ async def _resolve_internal_job_creation_scope(
                 thread, thread_projects
             )
         except HTTPException as exc:
+            # An archived project is the one refusal worth naming here. The
+            # generic ``denied()`` exists so a caller cannot learn WHY internal
+            # scope resolution failed, but the archived 409 only ever reaches a
+            # caller who is already a member of that project, so it discloses
+            # nothing — and the agent on the other end can act on "unarchive
+            # it" where "scope is unavailable" leaves it guessing.
+            if exc.status_code == 409:
+                raise
             raise denied() from exc
         except Exception as exc:
             raise denied() from exc
@@ -12871,6 +12889,17 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 raise HTTPException(
                     status_code=404, detail=f"Project '{project_id}' not found"
                 )
+            # Layer 2 of the archived-project refusal (§4.3 of
+            # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
+            # It has to be HERE and not on the guard above: an X-Internal-Key
+            # caller — all MCP traffic, all agent delegation, the bench
+            # sweeper — skips require_project_member entirely, so the flag
+            # would only ever cover the cockpit. This load is unconditional
+            # across both paths. Critic/scholar/curator subjobs call
+            # postgres_db.create_job directly and stay exempt by construction:
+            # finishing in-flight work is not new work.
+            if project_is_archived(project):
+                raise HTTPException(status_code=409, detail=PROJECT_ARCHIVED_DETAIL)
             project_default_override = project.get("default_config_override")
             if project_default_override:
                 # asyncpg may return JSONB as a string — parse it
@@ -21407,8 +21436,12 @@ async def _spawn_loop_job(
     disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
     park_until: datetime | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Create + provision + dispatch one bare project-loop job.
+
+    Returns ``None`` when ``create_loop_job`` skipped the spawn (archived
+    project); ``_spawn_loop_stage`` turns an entirely-skipped stage into the
+    same halt the revoked-grant path uses.
 
     Shared by the loop start endpoint and the ``_advance_project_loop`` hook
     (both via ``_spawn_loop_stage``). Mirrors the automation run-now path:
@@ -21488,6 +21521,9 @@ async def _spawn_loop_job(
         history_block=history_block,
         park_until=park_until,
     )
+    if job is None:
+        # Skipped (archived project) — nothing to provision or dispatch.
+        return None
 
     try:
         await provision_job_repo(
@@ -21588,7 +21624,17 @@ async def _spawn_loop_stage(
             extra_context=extra_context,
             park_until=park_until,
         )
-        jobs.append(job)
+        if job is not None:
+            jobs.append(job)
+    if roles and not jobs:
+        # Every role skipped — today that means the project was archived under
+        # the running loop. Raise into the same halt the revoked-grant check
+        # above uses: both advance callers catch it and stop the loop with the
+        # reason in ``last_error``. Returning an empty stage instead would
+        # leave a "running" loop with nothing in flight, which never advances.
+        raise PermissionError(
+            "project archived: the loop's project no longer accepts new work"
+        )
     return jobs, new_total
 
 
@@ -30070,7 +30116,9 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             detail="Access denied by MCP token scope",
         )
     for project_id in project_ids:
-        await require_project_owner(request, postgres_db, project_id)
+        await require_project_owner(
+            request, postgres_db, project_id, allow_archived=False
+        )
 
     # Publish gate — is_global hands the publisher's stored credentials to
     # every user's agents (knowledge-base/knowledge/features/public_datasources.md).
@@ -30307,7 +30355,9 @@ async def update_datasource(
                 detail="Access denied by MCP token scope",
             )
         for project_id in sorted(desired_project_ids - existing_project_ids):
-            await require_project_owner(request, postgres_db, project_id)
+            await require_project_owner(
+                request, postgres_db, project_id, allow_archived=False
+            )
     if (
         scope_project_id
         and "scope_mode" in body.model_fields_set
@@ -36615,7 +36665,9 @@ async def commission_project_officer(
                 "project knowledge base (officer_knowledge_plane.md §3.1)."
             ),
         )
-    user, project = await require_project_owner(request, postgres_db, project_id)
+    user, project = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
 
     # Capability gate, BEFORE anything mutates. The config PDP would also catch
     # this downstream (``evaluate`` refuses ``officer.enabled`` without the
@@ -36982,7 +37034,7 @@ async def release_project_officer(request: Request, project_id: str) -> dict[str
     fence) treats as unheld. Queued events drain within one ~20s tick; the
     kick below just makes it immediate.
     """
-    await require_project_owner(request, postgres_db, project_id)
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
     officer = await postgres_db.get_officer_thread_for_project(project_id)
     if not officer:
         raise HTTPException(
@@ -37057,7 +37109,9 @@ async def send_project_officer_note(
     that must lift first. A note reported as sent when it only reached a
     table would be worse than an error.
     """
-    user, _project = await require_project_owner(request, postgres_db, project_id)
+    user, _project = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     message = (body.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="message must not be empty")
@@ -37119,7 +37173,7 @@ async def patch_project_officer(
     lives at the next dispatch, running jobs are untouched.
     ``communication_policy`` is row-only and never touches the thread.
     """
-    await require_project_owner(request, postgres_db, project_id)
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
     fragment, comm_patch, effects = _validated_officer_post_patch(body)
     if not fragment and comm_patch is None:
         raise HTTPException(
@@ -39183,7 +39237,19 @@ async def _classify_thread_project_ids(
     user: dict[str, Any], project_ids: list[str] | None
 ) -> list[ProjectVerdict]:
     """Per-item project verdicts. Reporting half of
-    :func:`_authorize_thread_project_ids`, which wraps this."""
+    :func:`_authorize_thread_project_ids`, which wraps this.
+
+    ``archived`` is the lifecycle verdict (§4.3 of
+    knowledge-base/knowledge/features/project_and_job_list_filtering.md). This
+    funnel is the only path thread creation takes, and — for free — the one
+    ``_resolve_internal_job_creation_scope`` takes for agent-spawned subjobs,
+    so extending it here covers both rather than inventing a parallel check.
+    It ranks BELOW authorization: a caller with no membership still learns
+    only ``revoked``, never that the project happens to be archived. The
+    reason is acknowledgeable (``ACKNOWLEDGEABLE_REASONS``), so an existing
+    session attached to a project that gets archived surfaces a drift item the
+    owner can accept and resume without, instead of hard-failing at attach.
+    """
     selected = list(dict.fromkeys(str(value) for value in project_ids or []))
     verdicts: list[ProjectVerdict] = []
     for project_id in selected:
@@ -39191,12 +39257,15 @@ async def _classify_thread_project_ids(
         if not project:
             verdicts.append(ProjectVerdict(project_id, True, "deleted"))
             continue
-        if user.get("is_admin"):
-            verdicts.append(ProjectVerdict(project_id, False, None))
-            continue
-        role = await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
-        if not role:
-            verdicts.append(ProjectVerdict(project_id, True, "revoked"))
+        if not user.get("is_admin"):
+            role = await postgres_db.get_user_role_in_project(
+                project_id, str(user["id"])
+            )
+            if not role:
+                verdicts.append(ProjectVerdict(project_id, True, "revoked"))
+                continue
+        if project_is_archived(project):
+            verdicts.append(ProjectVerdict(project_id, True, "archived"))
             continue
         verdicts.append(ProjectVerdict(project_id, False, None))
     return verdicts
@@ -39205,12 +39274,22 @@ async def _classify_thread_project_ids(
 async def _authorize_thread_project_ids(
     user: dict[str, Any], project_ids: list[str] | None
 ) -> list[str]:
-    """Authorize project attachments without disclosing which ID failed."""
+    """Authorize project attachments without disclosing which ID failed.
+
+    One exception to the non-disclosure: when *every* denial is ``archived``
+    the caller is by definition an authorized member of each one, so nothing
+    is leaked by saying so — and the generic sentence would strand them with
+    no idea which lever to pull. Any other denial in the mix keeps the
+    original 403, which must not become an oracle for project existence.
+    """
     selected = list(dict.fromkeys(str(value) for value in project_ids or []))
     if not selected:
         return []
     verdicts = await _classify_thread_project_ids(user, selected)
-    if any(v.denied for v in verdicts):
+    denials = [v for v in verdicts if v.denied]
+    if denials:
+        if all(v.reason == "archived" for v in denials):
+            raise HTTPException(status_code=409, detail=PROJECT_ARCHIVED_DETAIL)
         raise HTTPException(
             status_code=403,
             detail="One or more attached projects are unavailable",
@@ -48985,7 +49064,9 @@ async def set_project_expert_default(
     body: ExpertDefaultSetRequest,
 ) -> dict[str, Any]:
     _require_experts_db()
-    user, _project = await require_project_owner(request, postgres_db, project_id)
+    user, _project = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     visible = await postgres_db.get_expert_visible_by_id(
         body.expert_id,
         user_id=str(user["id"]),
@@ -53389,7 +53470,9 @@ async def attach_project_knowledge_repository(
     Replacing or migrating an existing knowledge-role repository is
     deliberately not implicit: v1 has no approved note/history migration.
     """
-    caller, project = await require_project_owner(request, postgres_db, project_id)
+    caller, project = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     existing = await postgres_db.get_project_repositories(project_id, role="knowledge")
     if existing:
         raise HTTPException(
@@ -53423,6 +53506,14 @@ async def attach_project_knowledge_repository(
 async def list_projects(
     request: Request,
     user_id: str | None = Query(default=None),
+    status: list[str] | None = Query(
+        default=None,
+        description=(
+            "Project lifecycle status(es) to include (repeatable). "
+            "Defaults to 'active' — archived projects are excluded unless "
+            "asked for, e.g. ?status=archived or ?status=active&status=archived"
+        ),
+    ),
 ) -> list[dict[str, Any]]:
     """List projects visible to the caller.
 
@@ -53433,10 +53524,23 @@ async def list_projects(
           (``get_projects_for_user(caller)``), narrowed by any MCP scope.
         * A non-admin passing ``?user_id=`` for anyone other than themselves
           is rejected (403). Self-query is allowed but redundant.
+
+    Lifecycle (knowledge-base/knowledge/features/project_and_job_list_filtering.md
+    §4.2): archived projects are excluded by default on BOTH branches. The
+    server does this, not the client — a filter applied in Angular still pays
+    for the rows in Postgres and leaves every other consumer unprotected.
+    The old admin-branch ``status != 'deleted'`` predicate was dead code:
+    ``valid_project_status`` has no such value (deletion is a hard row
+    delete), so it never excluded anything.
+
+    ``get_projects_for_user`` keeps its LIMIT 100. With archived excluded that
+    ceiling stops being reachable for realistic accounts; if it ever is, the
+    projects grid needs paging too (out of scope, phase 1).
     """
     caller = await require_approved_user(request, postgres_db)
     is_admin = bool(caller.get("is_admin"))
     scope_pid = mcp_scope_project_id(caller)
+    statuses = normalize_project_statuses(status)
 
     if user_id is not None and not is_admin and str(user_id) != str(caller["id"]):
         raise HTTPException(
@@ -53448,14 +53552,20 @@ async def list_projects(
         if is_admin and user_id is None:
             async with postgres_db.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT * FROM projects WHERE status != 'deleted' "
-                    "ORDER BY updated_at DESC LIMIT 100"
+                    "SELECT * FROM projects WHERE "
+                    f"{project_status_filter_sql('$1')} "
+                    "ORDER BY updated_at DESC LIMIT 100",
+                    statuses,
                 )
                 projects = [dict(r) for r in rows]
         elif user_id is not None:
-            projects = await postgres_db.get_projects_for_user(user_id)
+            projects = await postgres_db.get_projects_for_user(
+                user_id, statuses=statuses
+            )
         else:
-            projects = await postgres_db.get_projects_for_user(str(caller["id"]))
+            projects = await postgres_db.get_projects_for_user(
+                str(caller["id"]), statuses=statuses
+            )
 
         if scope_pid:
             projects = [p for p in projects if str(p.get("id", "")) == str(scope_pid)]
@@ -53555,17 +53665,122 @@ async def get_project(request: Request, project_id: str) -> dict[str, Any]:
     return project
 
 
+async def _quiesce_archived_project(project_id: str) -> dict[str, Any]:
+    """Stop a project's unattended machinery after it is archived (§4.5).
+
+    Never refuses and never raises: across GitHub, GitLab, Jira, Asana, Linear
+    and Slack, no product refuses an archive because children are in flight —
+    refusing makes archive un-completable exactly when you most want it, i.e.
+    when something is wedged and you want it to stop mattering. So the archive
+    has already been written by the time we get here; each step below is
+    best-effort and reports what it managed to do.
+
+    Three children, matching Slack's deterministic-deactivation tier rather
+    than Jira's "your automation rules just start failing":
+
+    * a *running* loop is paused (a paused one is left alone),
+    * the officer is held — the same one key the maintenance-hold endpoint
+      stamps, with NO ``thread_id``, which is what stops the watchdog's
+      stale-hold self-heal from releasing it,
+    * jobs the dispatcher has not claimed yet are parked.
+
+    ``processing`` jobs are deliberately untouched: in-flight work, not new
+    work. Unarchive does NOT undo any of this — implicitly re-animating
+    automation is where the surprises live.
+    """
+    report: dict[str, Any] = {
+        "loop_paused": False,
+        "officer_held": False,
+        "jobs_parked": 0,
+    }
+
+    try:
+        loop = await postgres_db.get_active_project_loop(project_id)
+        if loop and loop.get("status") == "running":
+            await postgres_db.update_project_loop(str(loop["id"]), status="paused")
+            report["loop_paused"] = True
+    except Exception:
+        logger.exception(
+            "archive %s: failed to pause the project loop (archive stands)",
+            project_id,
+        )
+
+    try:
+        officer = await postgres_db.get_officer_thread_for_project(project_id)
+        if officer and not _thread_officer_meta(officer).get("hold"):
+            await postgres_db.set_project_officer_hold(
+                project_id,
+                expected_thread_id=str(officer["id"]),
+                hold={
+                    "kind": "project_archived",
+                    "since": datetime.now(timezone.utc).isoformat(),
+                    "note": "The project was archived.",
+                },
+                route_reason="officer_hold",
+            )
+            report["officer_held"] = True
+    except Exception:
+        logger.exception(
+            "archive %s: failed to hold the officer (archive stands)", project_id
+        )
+
+    try:
+        report["jobs_parked"] = await postgres_db.park_project_jobs_for_archive(
+            project_id
+        )
+    except Exception:
+        logger.exception(
+            "archive %s: failed to park pending jobs (archive stands)", project_id
+        )
+
+    logger.info(
+        "archive %s: quiesced (loop_paused=%s officer_held=%s jobs_parked=%s)",
+        project_id,
+        report["loop_paused"],
+        report["officer_held"],
+        report["jobs_parked"],
+    )
+    return report
+
+
 @app.patch("/api/projects/{project_id}")
 async def update_project(
     project_id: str, body: ProjectUpdate, request: Request
-) -> dict[str, str]:
-    """Update a project. Caller must be a project owner or admin."""
+) -> dict[str, Any]:
+    """Update a project. Caller must be a project owner or admin.
+
+    ALLOW-listed for archived projects because it is the unarchive path — but
+    **status-only** while archived (§4.3a). The handler is generic: it also
+    covers ``name``, ``goal`` and ``default_config_override``, and that last
+    one is merged under *every job in the project*, so leaving it open would
+    stop "archived" meaning read-only in the way the shipped UI copy promises.
+    The guard flag cannot express this — it fires before the body is
+    inspected — so it is a body-level check here. Renaming an archived project
+    is a legitimate want; it just needs an unarchive first, which is one click.
+
+    Setting ``status='archived'`` additionally quiesces the project's children
+    and reports what it stopped (§4.5).
+    """
     # H5: pre-fix, anyone could rename any project, change its goal, or
     # toggle cloud-storage settings.
-    await require_project_owner(request, postgres_db, project_id)
+    # Indexed, not unpacked: several existing tests stand the whole gate up as
+    # a bare AsyncMock, which returns a MagicMock rather than a 2-tuple, and
+    # `a, b = ...` would blow up on it. Same reasoning as routers/contacts.py.
+    project = (await require_project_owner(request, postgres_db, project_id))[1]
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
+    if project_is_archived(project) and set(kwargs) - {"status"}:
+        # Refuse the WHOLE request rather than applying the status half and
+        # dropping the rest: a partially-applied PATCH is the worst outcome
+        # here, since the caller has no way to tell which half landed.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This project is archived and is read-only apart from its "
+                "status. Unarchive it before editing anything else."
+            ),
+        )
     # Write-only, same rationale as create_project: this layer is merged under
     # every job in the project, so a tools block here escapes the runner's
     # grants. Only fires when the field is explicitly sent — the cockpit's
@@ -53604,6 +53819,15 @@ async def update_project(
                 f"Failed to sync cloud_storage_read_only to datasource "
                 f"for project {project_id}: {e}"
             )
+
+    # Archiving quiesces the children and says so (§4.5). Only on the
+    # transition INTO archived: re-PATCHing an already-archived project must
+    # not re-hold an officer the owner deliberately released. Unarchive
+    # (status='active') resumes nothing — that stays explicit.
+    archiving_now = str(kwargs.get("status") or "").lower() == "archived"
+    if archiving_now and not project_is_archived(project):
+        quiesced = await _quiesce_archived_project(project_id)
+        return {"status": "updated", "archived": True, **quiesced}
 
     return {"status": "updated"}
 
@@ -53691,7 +53915,9 @@ async def add_project_member(
     # H3: pre-fix, anyone could invite themselves as owner of any project
     # and then access everything in it. This is the foundational
     # privilege-escalation path that opens every other gate.
-    _, project = await require_project_owner(request, postgres_db, project_id)
+    _, project = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     try:
         result = await postgres_db.add_project_member(
             project_id=project_id,
@@ -53736,7 +53962,7 @@ async def update_project_member(
 ) -> dict[str, str]:
     """Update a member's role in a project. Caller must be a project owner or admin."""
     # H3: role changes are sensitive — restrict to owners/admins.
-    await require_project_owner(request, postgres_db, project_id)
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
     success = await postgres_db.update_project_member_role(
         project_id=project_id, user_id=user_id, role=body.role
     )
@@ -53824,7 +54050,7 @@ async def add_project_repository(
     request: Request, project_id: str, body: ProjectRepositoryCreate
 ) -> dict[str, Any]:
     """Attach a repository to a project. Owner or admin only (creates managed Gitea repo)."""
-    await require_project_owner(request, postgres_db, project_id)
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
 
     repo_url = body.repo_url
     is_managed = False
@@ -53865,7 +54091,7 @@ async def update_project_repository(
     request: Request, project_id: str, repo_id: str, body: ProjectRepositoryUpdate
 ) -> dict[str, str]:
     """Update a project repository. Owner or admin only."""
-    await require_project_owner(request, postgres_db, project_id)
+    await require_project_owner(request, postgres_db, project_id, allow_archived=False)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -53956,7 +54182,9 @@ async def link_datasource_to_project(
     Optionally pass project-level overrides (read_only, description).
     Also creates a knowledge entry so agents discover the connector.
     """
-    user, _ = await require_project_owner(request, postgres_db, project_id)
+    user, _ = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
@@ -54018,7 +54246,9 @@ async def update_project_datasource(
 
     Pass null to clear an override and fall back to connector defaults.
     """
-    user, _ = await require_project_owner(request, postgres_db, project_id)
+    user, _ = await require_project_owner(
+        request, postgres_db, project_id, allow_archived=False
+    )
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
@@ -54102,7 +54332,9 @@ async def create_project_job(
     request: Request, project_id: str, job: JobCreate
 ) -> dict[str, Any]:
     """Create a job within a project — delegates to create_job. Requires editor or higher."""
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await require_project_member(
+        request, postgres_db, project_id, min_role="editor", allow_archived=False
+    )
     job.project_id = project_id
     return await create_job(request, job)
 
@@ -55332,7 +55564,9 @@ async def update_knowledge_note(
     body: KnowledgeNoteUpdate,
 ) -> dict[str, Any]:
     """Update a knowledge note's status or tags. F5: member-only."""
-    await require_project_member(request, postgres_db, project_id)
+    # An archived project is read-only, and a note edit is a content mutation
+    # rather than teardown — deleting a note stays allowed, editing one does not.
+    await require_project_member(request, postgres_db, project_id, allow_archived=False)
     valid_statuses = {"active", "resolved", "superseded", "archived"}
     if body.status and body.status not in valid_statuses:
         raise HTTPException(

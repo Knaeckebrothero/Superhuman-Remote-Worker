@@ -1,4 +1,13 @@
-import {signal, ɵresolveComponentResources} from '@angular/core';
+import {
+  Component,
+  EventEmitter,
+  Input,
+  Output,
+  inject,
+  signal,
+  ɵresolveComponentResources,
+} from '@angular/core';
+import {HttpErrorResponse} from '@angular/common/http';
 import {TestBed} from '@angular/core/testing';
 import {ComponentFixture} from '@angular/core/testing';
 import {Router} from '@angular/router';
@@ -10,13 +19,83 @@ import {SessionService} from '../../core/services/session.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
-import {Datasource, ProjectCreateRequest} from '../../core/models/api.model';
+import {Datasource, Project, ProjectCreateRequest, ProjectStatus} from '../../core/models/api.model';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
+import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {ProjectListPageComponent} from './project-list.component';
 
 // The real catalogue, so the specs also prove the `projects.externalKb.*`
 // keys exist (a missing key renders as the key itself, which is asserted
 // against below).
 import en from '../../../assets/i18n/en.json';
+
+/**
+ * Test doubles for `ui/tab-bar`, swapped in via `overrideComponent`.
+ *
+ * NOT a preference — a constraint of this test environment. Specs here run the
+ * JIT compiler over the decorator metadata, and JIT cannot see initializer-based
+ * inputs (`input()`, `model()`), so property-binding one is NG0303 "isn't a
+ * known property" and a required one then throws NG0950 on first change
+ * detection. That applies to every signal-input component in `ui/`, not just
+ * these two; the real bar is exercised by AOT in the browser. The doubles use
+ * decorator inputs, which JIT does see, and keep the contract this page depends
+ * on: the selected value in, a click on a tab out.
+ */
+@Component({
+  selector: 'app-tab-bar',
+  standalone: true,
+  template: `<ng-content></ng-content>`,
+})
+class TabBarStub {
+  @Input() value: string | null = null;
+  @Output() valueChange = new EventEmitter<string>();
+}
+
+@Component({
+  selector: 'app-tab',
+  standalone: true,
+  template: `<ng-content></ng-content>`,
+  host: {
+    '(click)': 'select()',
+    '[attr.data-value]': 'value',
+    '[attr.data-active]': 'bar?.value === value || null',
+  },
+})
+class TabStub {
+  @Input() value = '';
+  protected readonly bar = inject(TabBarStub, {optional: true});
+  select(): void {
+    this.bar?.valueChange.emit(this.value);
+  }
+}
+
+/** Same JIT constraint as the tab doubles: `app-inline-editable-text` takes a
+ *  required signal input, so a rendered project card cannot mount the real one
+ *  here. Renders the name, which is all these specs read off a card. */
+@Component({
+  selector: 'app-inline-editable-text',
+  standalone: true,
+  template: `{{ value }}`,
+})
+class InlineEditableTextStub {
+  @Input() value = '';
+  @Input() ariaLabel = '';
+  @Output() save = new EventEmitter<string>();
+}
+
+function project(overrides: Partial<Project> = {}): Project {
+  return {
+    id: 'proj-1',
+    name: 'Better Resavio',
+    description: null,
+    goal: null,
+    status: 'active',
+    is_default: false,
+    created_at: '',
+    updated_at: '',
+    ...overrides,
+  } as Project;
+}
 
 /** Order of `input.form-input` inside `.create-form`. The connector picker is
  *  a `<select>` and the toggle a checkbox, so neither shifts these. */
@@ -37,15 +116,23 @@ function connector(overrides: Partial<Datasource> = {}): Datasource {
   } as Datasource;
 }
 
+/** `getProjects` answers per requested status, which is the whole point of the
+ *  lifecycle filter: the tab is the query, not a client-side `.filter()`. */
 function stubApi(
   createResult: unknown = {id: 'proj-1', name: 'Vault'},
   connectors: Datasource[] = [connector()],
+  lists: {active?: Project[]; archived?: Project[]} = {},
 ) {
   return {
-    getProjects: vi.fn().mockReturnValue(of([])),
+    getProjects: vi
+      .fn()
+      .mockImplementation((_userId?: string, status?: ProjectStatus[]) =>
+        of(status?.[0] === 'archived' ? lists.archived ?? [] : lists.active ?? []),
+      ),
     getDatasources: vi.fn().mockReturnValue(of(connectors)),
     createProject: vi.fn().mockReturnValue(of(createResult)),
     updateProject: vi.fn().mockReturnValue(of(null)),
+    setProjectStatus: vi.fn().mockReturnValue(of({archived: false})),
   };
 }
 
@@ -67,6 +154,10 @@ async function mount(api: ReturnType<typeof stubApi>, router = {navigate: vi.fn(
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: SidebarService, useValue: {collapsed: signal(false), expand: vi.fn()}},
     ],
+  });
+  TestBed.overrideComponent(ProjectListPageComponent, {
+    remove: {imports: [AppTabBarComponent, AppTabComponent, AppInlineEditableTextComponent]},
+    add: {imports: [TabBarStub, TabStub, InlineEditableTextStub]},
   });
   await TestBed.compileComponents();
   const fixture = TestBed.createComponent(ProjectListPageComponent);
@@ -317,5 +408,170 @@ describe('ProjectListPageComponent — external knowledge base', () => {
     expect(connectorSelect(fixture)!.querySelector('option')!.textContent?.trim()).toBe(
       en.projects.externalKb.selectPlaceholder,
     );
+  });
+});
+
+describe('ProjectListPageComponent — archived lifecycle', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  afterEach(() => TestBed.resetTestingModule());
+
+  const ARCHIVED = project({
+    id: 'proj-archived',
+    name: 'Better Resavio (pre-split archive)',
+    status: 'archived',
+  });
+
+  function statusesRequested(api: ReturnType<typeof stubApi>): string[][] {
+    return api.getProjects.mock.calls.map((call) => (call[1] as ProjectStatus[]) ?? []);
+  }
+
+  function tabs(fixture: ComponentFixture<ProjectListPageComponent>): HTMLElement[] {
+    return Array.from(fixture.nativeElement.querySelectorAll('app-tab'));
+  }
+
+  function clickTab(
+    fixture: ComponentFixture<ProjectListPageComponent>,
+    value: ProjectStatus,
+  ): void {
+    const tab = tabs(fixture).find((el) => el.getAttribute('data-value') === value)!;
+    tab.click();
+    fixture.detectChanges();
+  }
+
+  function cardNames(fixture: ComponentFixture<ProjectListPageComponent>): string[] {
+    return Array.from(
+      fixture.nativeElement.querySelectorAll('.project-card .card-name'),
+    ).map((el) => (el as HTMLElement).textContent?.trim() ?? '');
+  }
+
+  function unarchiveButtons(
+    fixture: ComponentFixture<ProjectListPageComponent>,
+  ): HTMLButtonElement[] {
+    return Array.from(fixture.nativeElement.querySelectorAll('.project-card .card-action'));
+  }
+
+  it('asks the server for active projects only, and for the archived count beside it', async () => {
+    // The filter is server-side. A client-side `.filter()` would still pay for
+    // the rows in Postgres and leave every other consumer unprotected.
+    const api = stubApi(undefined, [], {active: [project()], archived: [ARCHIVED]});
+    const fixture = await mount(api);
+
+    expect(statusesRequested(api)).toEqual([['active'], ['archived']]);
+    expect(cardNames(fixture)).toEqual(['Better Resavio']);
+  });
+
+  it('re-queries with ?status=archived when the Archived tab is chosen', async () => {
+    const api = stubApi(undefined, [], {active: [project()], archived: [ARCHIVED]});
+    const fixture = await mount(api);
+    api.getProjects.mockClear();
+
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(statusesRequested(api)).toContainEqual(['archived']);
+    expect(cardNames(fixture)).toEqual(['Better Resavio (pre-split archive)']);
+    // Hiding is never silent: the tab says how many are over there, and the
+    // view says where they went.
+    expect(fixture.nativeElement.querySelector('.list-notice')?.textContent?.trim()).toBe(
+      en.projects.archivedNotice,
+    );
+  });
+
+  it('counts the archived tab while the active one is showing', async () => {
+    const api = stubApi(undefined, [], {
+      active: [project(), project({id: 'p-2', name: 'Second'})],
+      archived: [ARCHIVED],
+    });
+    const fixture = await mount(api);
+
+    const labels = tabs(fixture).map((el) => el.textContent?.trim());
+    expect(labels).toEqual(['Active (2)', 'Archived (1)']);
+    // Rendered from the catalogue, not hardcoded English.
+    expect(labels[1]).toBe(en.projects.filter.archived.replace('{{count}}', '1'));
+  });
+
+  it('offers Unarchive on archived cards and on those only', async () => {
+    const api = stubApi(undefined, [], {active: [project()], archived: [ARCHIVED]});
+    const fixture = await mount(api);
+    expect(unarchiveButtons(fixture)).toHaveLength(0);
+
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const [button] = unarchiveButtons(fixture);
+    expect(button.textContent?.trim()).toBe(en.projects.action.unarchive);
+    button.click();
+
+    expect(api.setProjectStatus).toHaveBeenCalledWith('proj-archived', 'active');
+  });
+
+  it('does not open the project when the card action is clicked', async () => {
+    const router = {navigate: vi.fn()};
+    const api = stubApi(undefined, [], {archived: [ARCHIVED]});
+    const fixture = await mount(api, router);
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    unarchiveButtons(fixture)[0].click();
+
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's own sentence when an unarchive is refused", async () => {
+    // The 409 body is a plain-string `detail`, which is what house style sends
+    // and what the error service renders verbatim. Before this change the PATCH
+    // went through `updateProject`, which mapped every failure to `null`, under
+    // a subscribe with no error callback — the refusal reached nobody.
+    const api = stubApi(undefined, [], {archived: [ARCHIVED]});
+    const detail = 'This project is archived. Unarchive it before creating new work.';
+    api.setProjectStatus = vi
+      .fn()
+      .mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail}})));
+    const fixture = await mount(api);
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    unarchiveButtons(fixture)[0].click();
+    fixture.detectChanges();
+
+    const error = fixture.nativeElement.querySelector('.list-error') as HTMLElement;
+    expect(error.textContent?.trim()).toBe(detail);
+    // The row is still there to try again on.
+    expect(cardNames(fixture)).toHaveLength(1);
+  });
+
+  it('reports a failed load instead of rendering "no projects yet"', async () => {
+    // `getProjects` used to funnel every error into `of([])`, which renders as
+    // an empty account — the one reading a user must never be given wrongly.
+    const api = stubApi(undefined, [], {active: [project()]});
+    const fixture = await mount(api);
+    api.getProjects = vi
+      .fn()
+      .mockReturnValue(throwError(() => new HttpErrorResponse({status: 500, error: {}})));
+
+    (fixture.nativeElement.querySelector('.header-actions .btn-ghost') as HTMLButtonElement).click();
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('.empty-state')).toBeNull();
+    expect((fixture.nativeElement.querySelector('.list-error') as HTMLElement).textContent?.trim())
+      .toBe(en.errors.http['5xx']);
+  });
+
+  it('names the empty archived view for what it is', async () => {
+    const fixture = await mount(stubApi(undefined, [], {active: [project()]}));
+    clickTab(fixture, 'archived');
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const empty = fixture.nativeElement.querySelector('.empty-state') as HTMLElement;
+    expect(empty.textContent).toContain(en.projects.emptyArchived);
+    expect(empty.textContent).not.toContain('projects.empty');
   });
 });

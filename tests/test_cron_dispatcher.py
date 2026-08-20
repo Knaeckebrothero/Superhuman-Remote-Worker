@@ -173,6 +173,10 @@ def _make_mock_db(due_row: dict | None) -> MagicMock:
     db.create_job = AsyncMock(
         return_value={"id": "11111111-1111-1111-1111-111111111111"}
     )
+    # An automation carrying a project_id is gated on that project's lifecycle
+    # state before the fire (see TestArchivedProjectSkipsTheFire). None reads
+    # as "no such project", which is not archived.
+    db.get_project = AsyncMock(return_value=None)
     return db
 
 
@@ -200,12 +204,13 @@ def _make_row(
     max_fires_per_day: int = 100,
     autonomy: str = "review",
     config_override: dict | None = None,
+    project_id: str | None = None,
 ) -> dict:
     """Mimics ``db.fetch_next_due_cron_automation`` output."""
     return {
         "id": "22222222-2222-2222-2222-222222222222",
         "owner_id": "33333333-3333-3333-3333-333333333333",
-        "project_id": None,
+        "project_id": project_id,
         "name": "test-automation",
         "cron_expr": cron_expr,
         "timezone": timezone_name,
@@ -559,4 +564,82 @@ class TestPostCommitProvisioning:
 
         assert out is True
         provision.assert_awaited_once()
+        db.advance_automation_after_fire.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Archived project — the fire is skipped, the automation stays enabled
+# ---------------------------------------------------------------------------
+#
+# knowledge-base/knowledge/features/project_and_job_list_filtering.md §4.3:
+# background paths skip and log, they never raise. A cron tick has no HTTP
+# caller to receive a 409, and auto-disabling the automation would silently
+# destroy the owner's configuration — the failure mode Jira's docs warn about,
+# where archiving a project makes its automation rules start failing.
+
+
+PROJECT_ARCHIVED = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"
+
+
+class TestArchivedProjectSkipsTheFire:
+    def _archived_db(self, row):
+        db = _make_mock_db(due_row=row)
+        db.get_project = AsyncMock(
+            return_value={"id": PROJECT_ARCHIVED, "status": "archived"}
+        )
+        return db
+
+    @pytest.mark.asyncio
+    async def test_no_job_is_created(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_automation_is_not_disabled(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        # Disabling would destroy the owner's configuration for a condition
+        # they can reverse in one click.
+        db.auto_disable_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_schedule_advances_so_the_row_is_not_reclaimed_forever(
+        self,
+    ) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        # Same lever the catch-up-window skip pulls: move next_run_at forward
+        # without recording a fire.
+        db.skip_automation_fire.assert_awaited_once()
+        db.advance_automation_after_fire.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_live_project_still_fires(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = _make_mock_db(due_row=row)
+        db.get_project = AsyncMock(
+            return_value={"id": PROJECT_ARCHIVED, "status": "active"}
+        )
+
+        await _process_one_due_automation(db)
+
+        db.create_job.assert_awaited_once()
         db.advance_automation_after_fire.assert_awaited_once()

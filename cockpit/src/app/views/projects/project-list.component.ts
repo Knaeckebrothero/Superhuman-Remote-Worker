@@ -1,13 +1,15 @@
 import {Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {SessionService} from '../../core/services/session.service';
-import {Datasource, Project, ProjectCreateRequest} from '../../core/models/api.model';
+import {Datasource, Project, ProjectCreateRequest, ProjectStatus} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
+import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {ViewportService} from '../../core/services/viewport.service';
 
 /** The API's own explanation, when it gave one. Connector refusals name the
@@ -21,7 +23,14 @@ function errorDetail(err: unknown): string {
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
-  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent, AppInlineEditableTextComponent],
+  imports: [
+    SidebarToggleComponent,
+    TranslocoPipe,
+    AppSpinnerComponent,
+    AppInlineEditableTextComponent,
+    AppTabBarComponent,
+    AppTabComponent,
+  ],
   template: `
     <div class="page-container">
       <!-- Header -->
@@ -134,6 +143,35 @@ function errorDetail(err: unknown): string {
         </div>
       }
 
+      <!-- Lifecycle filter. Archived is a real server-side state, not a badge:
+           the tab drives ?status=, so an archived project is not merely hidden
+           here, it is absent from the response. The count is what keeps that
+           from being a silent omission. -->
+      <app-tab-bar
+        class="filter-tabs"
+        [value]="statusFilter()"
+        (valueChange)="onStatusFilterChange($event)"
+      >
+        <app-tab [value]="'active'">
+          {{ 'projects.filter.active' | transloco:{ count: counts().active } }}
+        </app-tab>
+        <app-tab [value]="'archived'">
+          {{ 'projects.filter.archived' | transloco:{ count: counts().archived } }}
+        </app-tab>
+      </app-tab-bar>
+
+      @if (statusFilter() === 'archived') {
+        <p class="list-notice">{{ 'projects.archivedNotice' | transloco }}</p>
+      }
+
+      @if (loadError(); as message) {
+        <div class="form-error list-error" role="alert">{{ message }}</div>
+      }
+
+      @if (actionError(); as message) {
+        <div class="form-error list-error" role="alert">{{ message }}</div>
+      }
+
       <!-- Loading -->
       @if (isLoading() && projects().length === 0) {
         <div class="loading-state">
@@ -143,11 +181,16 @@ function errorDetail(err: unknown): string {
       }
 
       <!-- Empty -->
-      @if (!isLoading() && projects().length === 0) {
+      @if (!isLoading() && !loadError() && projects().length === 0) {
         <div class="empty-state">
           <span class="empty-icon material-symbols-outlined">folder_off</span>
-          <span>{{ 'projects.empty' | transloco }}</span>
-          <span class="empty-hint">{{ 'projects.emptyHint' | transloco }}</span>
+          @if (statusFilter() === 'archived') {
+            <span>{{ 'projects.emptyArchived' | transloco }}</span>
+            <span class="empty-hint">{{ 'projects.emptyArchivedHint' | transloco }}</span>
+          } @else {
+            <span>{{ 'projects.empty' | transloco }}</span>
+            <span class="empty-hint">{{ 'projects.emptyHint' | transloco }}</span>
+          }
         </div>
       }
 
@@ -168,8 +211,8 @@ function errorDetail(err: unknown): string {
                   @if (project.is_default) {
                     <span class="badge badge-personal">{{ 'projects.badgePersonal' | transloco }}</span>
                   }
-                  <span class="badge" [class]="'badge-' + project.status">
-                    {{ 'projects.status.' + project.status | transloco }}
+                  <span class="badge" [class]="'badge-' + statusOf(project)">
+                    {{ 'projects.status.' + statusOf(project) | transloco }}
                   </span>
                 </div>
               </div>
@@ -180,6 +223,18 @@ function errorDetail(err: unknown): string {
                 <span class="chip">{{ ((project.job_count ?? 0) === 1 ? 'projects.jobsCountOne' : 'projects.jobsCount') | transloco:{ count: project.job_count ?? 0 } }}</span>
                 <span class="chip">{{ ((project.repo_count ?? 0) === 1 ? 'projects.reposCountOne' : 'projects.reposCount') | transloco:{ count: project.repo_count ?? 0 } }}</span>
                 <span class="chip">{{ ((project.member_count ?? 0) === 1 ? 'projects.membersCountOne' : 'projects.membersCount') | transloco:{ count: project.member_count ?? 0 } }}</span>
+                @if (statusOf(project) === 'archived') {
+                  <!-- The way back out. Opening the card still works, so this is
+                       a shortcut rather than the only route. -->
+                  <button
+                    class="btn btn-ghost card-action"
+                    [attr.title]="'projects.tooltip.unarchive' | transloco"
+                    [disabled]="unarchivingId() === project.id"
+                    (click)="unarchiveProject(project, $event)"
+                  >
+                    {{ (unarchivingId() === project.id ? 'projects.action.unarchiving' : 'projects.action.unarchive') | transloco }}
+                  </button>
+                }
               </div>
             </div>
           }
@@ -305,6 +360,18 @@ function errorDetail(err: unknown): string {
       font-size: 12px;
     }
 
+    /* Filter + notices */
+    .filter-tabs { margin-bottom: 16px; }
+
+    .list-notice {
+      margin: 0 0 16px;
+      font-size: 12px;
+      color: var(--text-muted, var(--text-muted));
+      line-height: 1.4;
+    }
+
+    .list-error { margin-bottom: 16px; }
+
     .form-actions { display: flex; justify-content: flex-end; }
 
     /* Loading & Empty */
@@ -368,7 +435,6 @@ function errorDetail(err: unknown): string {
 
     .badge-active { background: var(--success-tint); color: var(--success); }
     .badge-archived { background: color-mix(in srgb, var(--text-muted) 25%, transparent); color: var(--text-muted); }
-    .badge-deleted { background: var(--danger-tint); color: var(--danger); }
     .badge-personal { background: color-mix(in srgb, var(--accent-color) 20%, transparent); color: var(--accent-color); }
 
     .card-desc {
@@ -378,7 +444,13 @@ function errorDetail(err: unknown): string {
       line-height: 1.4;
     }
 
-    .card-footer { display: flex; gap: 8px; }
+    .card-footer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    .card-action {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 11px;
+    }
 
     .chip {
       padding: 3px 8px;
@@ -396,6 +468,7 @@ function errorDetail(err: unknown): string {
 })
 export class ProjectListPageComponent implements OnInit {
   private readonly api = inject(ApiService);
+  private readonly errors = inject(ErrorMessageService);
   private readonly userService = inject(UserService);
   private readonly session = inject(SessionService);
   private readonly router = inject(Router);
@@ -405,6 +478,25 @@ export class ProjectListPageComponent implements OnInit {
   readonly isLoading = signal(false);
   readonly showCreateForm = signal(false);
   readonly isCreating = signal(false);
+
+  /** Which lifecycle the grid is showing — and, more to the point, which
+   *  `?status=` the request carries. */
+  readonly statusFilter = signal<ProjectStatus>('active');
+  /** Per-tab totals. The archived one is the whole reason this control has
+   *  counts: a project that left the grid must still be findable, and a number
+   *  on the tab is what says "there are five over here" without a click. */
+  readonly counts = signal<Record<ProjectStatus, number>>({active: 0, archived: 0});
+  /** The list load's own failure. Errors used to be swallowed into an empty
+   *  array by `ApiService.getProjects`, which is indistinguishable from "you
+   *  have no projects" — the one reading a user must never be given wrongly. */
+  readonly loadError = signal<string | null>(null);
+  /** A refused unarchive (409 on an archived project is the whole point of
+   *  phase 1, so it has to be legible). */
+  readonly actionError = signal<string | null>(null);
+  readonly unarchivingId = signal<string | null>(null);
+  /** Two requests are in flight per load (the shown tab, plus the other tab's
+   *  count); a fast double tab-switch must not let a stale one win. */
+  private loadSerial = 0;
 
   readonly formName = signal('');
   readonly formDescription = signal('');
@@ -436,11 +528,13 @@ export class ProjectListPageComponent implements OnInit {
   });
 
     constructor() {
-        // Load projects reactively — waits for currentUserId on F5 refresh
+        // Load projects reactively — waits for currentUserId on F5 refresh, and
+        // re-runs when the lifecycle tab changes, because the tab IS the query.
         effect(() => {
             const userId = this.userService.currentUserId();
+            const status = this.statusFilter();
             if (userId) {
-                this.fetchProjects(userId);
+                this.fetchProjects(userId, status);
             }
         });
     }
@@ -452,15 +546,73 @@ export class ProjectListPageComponent implements OnInit {
   refresh(): void {
       const userId = this.userService.currentUserId();
       if (userId) {
-          this.fetchProjects(userId);
+          this.fetchProjects(userId, this.statusFilter());
       }
   }
 
-    private fetchProjects(userId: string): void {
+  onStatusFilterChange(status: ProjectStatus | null): void {
+    // The tab bar's value model is nullable; these tabs always carry one.
+    if (!status || status === this.statusFilter()) return;
+    this.actionError.set(null);
+    this.statusFilter.set(status);
+  }
+
+    private fetchProjects(userId: string, status: ProjectStatus): void {
+    const serial = ++this.loadSerial;
     this.isLoading.set(true);
-        this.api.getProjects(userId).subscribe((projects) => {
-      this.projects.set(projects);
-      this.isLoading.set(false);
+    this.loadError.set(null);
+        this.api.getProjects(userId, [status]).subscribe({
+      next: (projects) => {
+        if (serial !== this.loadSerial) return;
+        this.projects.set(projects);
+        this.counts.update((counts) => ({...counts, [status]: projects.length}));
+        this.isLoading.set(false);
+      },
+      error: (err: unknown) => {
+        if (serial !== this.loadSerial) return;
+        this.projects.set([]);
+        this.loadError.set(this.errors.translate(err, 'errors.projects.loadFailed'));
+        this.isLoading.set(false);
+      },
+    });
+    this.fetchCount(userId, status === 'active' ? 'archived' : 'active', serial);
+  }
+
+  /** The other tab's label. A count is not load-bearing — if it fails the tab
+   *  keeps its last number rather than taking the page with it. */
+  private fetchCount(userId: string, status: ProjectStatus, serial: number): void {
+    this.api.getProjects(userId, [status]).subscribe({
+      next: (projects) => {
+        if (serial !== this.loadSerial) return;
+        this.counts.update((counts) => ({...counts, [status]: projects.length}));
+      },
+      error: () => {},
+    });
+  }
+
+  /** Anything that is not explicitly archived is treated as active, including
+   *  a NULL the database still permits — a row with an unrecognised status
+   *  must stay visible and usable rather than vanish into an unnamed state. */
+  statusOf(project: Project): ProjectStatus {
+    return project.status === 'archived' ? 'archived' : 'active';
+  }
+
+  unarchiveProject(project: Project, event: Event): void {
+    // The card itself navigates; this button must not.
+    event.stopPropagation();
+    if (this.unarchivingId()) return;
+    this.actionError.set(null);
+    this.unarchivingId.set(project.id);
+    this.api.setProjectStatus(project.id, 'active').subscribe({
+      next: () => {
+        this.unarchivingId.set(null);
+        // Both tab counts move, so reload rather than splicing the row out.
+        this.refresh();
+      },
+      error: (err: unknown) => {
+        this.unarchivingId.set(null);
+        this.actionError.set(this.errors.translate(err, 'errors.projects.unarchiveFailed'));
+      },
     });
   }
 
@@ -552,7 +704,13 @@ export class ProjectListPageComponent implements OnInit {
           // groups from the JWT stay out of sync until the next natural
           // refresh.
           void this.session.forceRefresh();
-          this.refresh();
+          if (this.statusFilter() === 'active') {
+            this.refresh();
+          } else {
+            // A new project is active; staying on the archived tab would hide
+            // the thing that was just created. Setting the tab reloads.
+            this.statusFilter.set('active');
+          }
         } else {
           // ApiService maps HTTP failures to `null` for every caller; keep
           // that contract and report it here instead of failing silently.

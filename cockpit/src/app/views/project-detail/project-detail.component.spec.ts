@@ -1,4 +1,5 @@
 import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {HttpErrorResponse} from '@angular/common/http';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoService} from '@jsverse/transloco';
 import {of, Subject, throwError} from 'rxjs';
@@ -7,6 +8,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {Datasource, ProjectDatasource} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ProjectDetailPageComponent} from './project-detail.component';
@@ -51,6 +53,8 @@ function createComponent(policyAvailable = true) {
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
+    getProject: vi.fn().mockReturnValue(of({id: 'project-a', status: 'archived'})),
+    setProjectStatus: vi.fn().mockReturnValue(of({archived: true})),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -70,6 +74,9 @@ function createComponent(policyAvailable = true) {
         provide: TranslocoService,
         useValue: {translate: (key: string) => key, getActiveLang: () => 'en'},
       },
+      // The real service, so the lifecycle specs below prove the whole chain:
+      // a 409 body reaching the sentence the user reads.
+      {provide: ErrorMessageService, useClass: ErrorMessageService, deps: []},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
     ],
   });
@@ -327,5 +334,72 @@ describe('ProjectDetailPageComponent external knowledge base', () => {
 
     expect(component.kbAttachError()).toBe('Set its note root to knowledge first');
     expect(component.isAttachingKb()).toBe(false);
+  });
+});
+
+describe('ProjectDetailPageComponent archive lifecycle', () => {
+  it('writes nothing until the confirmation is accepted', () => {
+    // The raw confirm() this replaced was a browser dialog the app could
+    // neither theme nor translate; what has to survive the swap is that the
+    // write still waits for an answer.
+    const {api, component} = createComponent();
+
+    component.confirmArchive();
+
+    expect(component.pendingLifecycle()).toBe('archived');
+    expect(api.setProjectStatus).not.toHaveBeenCalled();
+  });
+
+  it('archives with a status-only body and says what it quiesced', () => {
+    const {api, component} = createComponent();
+    api.setProjectStatus.mockReturnValue(
+      of({archived: true, loop_paused: true, officer_held: true, jobs_parked: 3}),
+    );
+
+    component.confirmArchive();
+    component.applyLifecycle();
+
+    expect(api.setProjectStatus).toHaveBeenCalledWith('project-a', 'archived');
+    // Never refused because children are in flight — they are stopped, and the
+    // user is told which ones.
+    expect(component.archiveReport()).toContain(
+      'projectDetail.settings.archivedReportLoop',
+    );
+    expect(component.archiveReport()).toContain(
+      'projectDetail.settings.archivedReportJobs',
+    );
+    expect(component.pendingLifecycle()).toBeNull();
+    expect(component.lifecycleError()).toBeNull();
+  });
+
+  it('unarchives through the same path', () => {
+    const {api, component} = createComponent();
+    api.setProjectStatus.mockReturnValue(of({archived: false}));
+
+    component.confirmUnarchive();
+    component.applyLifecycle();
+
+    expect(api.setProjectStatus).toHaveBeenCalledWith('project-a', 'active');
+    // Unarchiving reports nothing: it deliberately resumes none of what
+    // archiving paused.
+    expect(component.archiveReport()).toBeNull();
+  });
+
+  it("surfaces the server's refusal instead of failing silently", () => {
+    // This subscribe had no error callback at all, and the PATCH went through
+    // `updateProject`, whose catchError erased the body first. A 409 landed
+    // as a click that appeared to do nothing.
+    const {api, component} = createComponent();
+    const detail = 'This project is archived. Unarchive it before creating new work.';
+    api.setProjectStatus.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 409, error: {detail}})),
+    );
+
+    component.confirmArchive();
+    component.applyLifecycle();
+
+    expect(component.lifecycleError()).toBe(detail);
+    expect(component.lifecycleBusy()).toBe(false);
+    expect(component.pendingLifecycle()).toBeNull();
   });
 });

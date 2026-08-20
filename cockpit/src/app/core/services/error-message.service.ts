@@ -6,8 +6,11 @@ import {TranslocoService} from '@jsverse/transloco';
  * Translates HTTP/runtime errors into user-facing messages.
  *
  * Resolution order:
- *   1. `error.code` (structured code from the orchestrator, e.g. `job.not_found`)
- *      looked up under `errors.code.<code>`
+ *   1. A structured code from the orchestrator (e.g. `job.not_found`) looked up
+ *      under `errors.code.<code>`. FastAPI puts everything it serialises under
+ *      `detail`, so the code is read from `detail.code` — reading it at the top
+ *      level (as this did until 2026-08-19) meant the branch never fired for a
+ *      single real response.
  *   2. A structured `error.detail` the server chose to send (see below)
  *   3. HTTP status → `errors.http.<status>` (generic per-status message)
  *   4. Caller-provided fallback key
@@ -80,27 +83,52 @@ export class ErrorMessageService {
     structuredDetail?: string;
   } {
     if (err instanceof HttpErrorResponse) {
-      const body = err.error as {code?: string; detail?: string} | string | null;
-      if (body && typeof body === 'object') {
-        return {
-          status: err.status,
-          code: body.code,
-          detail: body.detail,
-          structuredDetail: body.detail,
-        };
-      }
-      return {status: err.status, detail: typeof body === 'string' ? body : undefined};
+      return {status: err.status, ...this.fromBody(err.error)};
     }
-    const maybe = err as {status?: number; error?: {code?: string; detail?: string}} | null;
+    const maybe = err as {status?: number; error?: unknown} | null;
     if (maybe && typeof maybe === 'object') {
-      return {
-        status: maybe.status ?? 0,
-        code: maybe.error?.code,
-        detail: maybe.error?.detail,
-        structuredDetail: maybe.error?.detail,
-      };
+      return {status: maybe.status ?? 0, ...this.fromBody(maybe.error)};
     }
     return {status: 0};
+  }
+
+  /**
+   * Read a response body in either shape the API can produce.
+   *
+   * House style is a plain-string `detail` ("This project is archived.
+   * Unarchive it before creating new work."), which renders verbatim. The
+   * structured form — `detail: {code, message}` — is the extension point:
+   * `code` resolves a translated message, and `message` is the server's own
+   * English behind it if no translation exists yet.
+   *
+   * A top-level `code` is still honoured for anything that is not FastAPI, but
+   * nothing in this product emits one, which is exactly why the code branch
+   * had never fired.
+   */
+  private fromBody(body: unknown): {code?: string; detail?: string; structuredDetail?: string} {
+    if (typeof body === 'string') return {detail: body};
+    if (!body || typeof body !== 'object') return {};
+
+    const envelope = body as {code?: unknown; detail?: unknown};
+    const topCode = typeof envelope.code === 'string' ? envelope.code : undefined;
+    const detail = envelope.detail;
+
+    if (typeof detail === 'string') {
+      return {code: topCode, detail, structuredDetail: detail};
+    }
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      const nested = detail as {code?: unknown; message?: unknown};
+      const message = typeof nested.message === 'string' ? nested.message : undefined;
+      return {
+        code: typeof nested.code === 'string' ? nested.code : topCode,
+        detail: message,
+        structuredDetail: message,
+      };
+    }
+    // Anything else (notably FastAPI's 422 validation array) carries no
+    // sentence a user could act on — better a generic line than "[object
+    // Object]".
+    return {code: topCode};
   }
 
   private statusKey(status: number): string | null {

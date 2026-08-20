@@ -41,6 +41,7 @@ try:
 except ImportError:
     asyncpg = None
 
+from security.access import project_status_filter_sql
 from security.crypto import (
     DecryptionError,
     decrypt,
@@ -24177,13 +24178,20 @@ class PostgresDB:
         return row["network_tier"] if row else None
 
     async def get_projects_for_user(
-        self, user_id: str, limit: int = 100
+        self, user_id: str, limit: int = 100, statuses: List[str] | None = None
     ) -> List[Dict[str, Any]]:
         """Get all projects a user is a member of.
 
         Args:
             user_id: User UUID as string
             limit: Maximum projects to return
+            statuses: Lifecycle statuses to include. ``None`` (the default)
+                applies NO filter — every existing caller, including
+                ``user_visible_project_ids``, resolves *visibility* and must
+                keep seeing archived projects. ``GET /api/projects`` is the
+                one caller that narrows, and it passes ``['active']`` unless
+                the client asked otherwise. Unknown/NULL statuses always
+                survive the filter (see ``project_status_filter_sql``).
 
         Returns:
             List of project dicts with aggregate counts, ordered by
@@ -24194,9 +24202,15 @@ class PostgresDB:
         except ValueError:
             return []
 
+        status_clause = ""
+        params: List[Any] = [uuid_val, limit]
+        if statuses is not None:
+            params.append(list(statuses))
+            status_clause = f" AND {project_status_filter_sql('$3', column='p.status')}"
+
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
                        p.nextcloud_folder_id, p.cloud_storage_read_only,
@@ -24208,15 +24222,65 @@ class PostgresDB:
                        (SELECT COUNT(*) FROM project_members pm2 WHERE pm2.project_id = p.id) AS member_count
                 FROM projects p
                 JOIN project_members pm ON p.id = pm.project_id
-                WHERE pm.user_id = $1
+                WHERE pm.user_id = $1{status_clause}
                 ORDER BY p.is_default DESC, p.updated_at DESC
                 LIMIT $2
                 """,
-                uuid_val,
-                limit,
+                *params,
             )
 
         return [dict(row) for row in rows]
+
+    async def park_project_jobs_for_archive(self, project_id: str) -> int:
+        """Park every not-yet-started job in ``project_id``. Returns the count.
+
+        Archiving a project quiesces its children rather than refusing
+        (§4.5 of
+        knowledge-base/knowledge/features/project_and_job_list_filtering.md).
+        A job the dispatcher has not claimed yet is *new work*: it is parked
+        by setting ``freeze_data``, which ``claim_job_for_agent`` and
+        ``get_dispatchable_jobs`` both require to be NULL. ``processing``
+        jobs are deliberately untouched — they are in-flight work, and
+        killing them is not what "archive" means.
+
+        ``project_archived`` is intentionally absent from every set in
+        ``src/shared/job_freeze_types.py``, so no sweeper auto-redispatches
+        these: unarchiving reactivates the container and leaves the parked
+        children parked, awaiting an explicit resume.
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except (ValueError, TypeError):
+            return 0
+
+        freeze = json.dumps(
+            {
+                "freeze_type": "project_archived",
+                "origin": "project_archive",
+                "frozen_at": datetime.now(timezone.utc).isoformat(),
+                "error_summary": (
+                    "Parked: this job's project was archived before the job "
+                    "started. Unarchive the project and resume the job to run it."
+                ),
+            }
+        )
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE jobs
+                   SET status = 'paused',
+                       freeze_data = $2::jsonb,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE project_id = $1
+                   AND status IN ('created', 'paused')
+                   AND assigned_agent_id IS NULL
+                   AND freeze_data IS NULL
+                RETURNING id
+                """,
+                uuid_val,
+                freeze,
+            )
+        return len(rows)
 
     async def update_project(self, project_id: str, **kwargs) -> bool:
         """Update a project.

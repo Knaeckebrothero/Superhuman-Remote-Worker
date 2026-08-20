@@ -274,9 +274,14 @@ export class ContactsPageComponent implements OnInit {
   }
 
   private loadProjects(): void {
-    // House projects listing (ApiService.getProjects) — already catches errors
-    // and resolves to [] on failure, so no separate error handler is needed here.
-    this.projectsApi.getProjects().subscribe(rows => this.projects.set(rows));
+    // Only the project names shown against a contact; a failure here leaves the
+    // rest of the page usable, so it degrades to an empty list rather than
+    // taking the view down with it. (`getProjects` no longer swallows errors
+    // of its own — see ApiService.)
+    this.projectsApi.getProjects().subscribe({
+      next: rows => this.projects.set(rows),
+      error: () => this.projects.set([]),
+    });
   }
 
   openNew(): void { this.saveError.set(null); this.editing.set(null); this.showForm.set(true); }

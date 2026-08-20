@@ -240,7 +240,9 @@ async def link_contact_to_project(
     # unpacking so a test double that stands in for the whole gate (a bare
     # AsyncMock, not configured to return a 2-tuple) doesn't blow up on
     # `a, b = ...` unpacking. Real calls still get the real user dict.
-    member = await require_project_member(request, db, project_id, min_role="editor")
+    member = await require_project_member(
+        request, db, project_id, min_role="editor", allow_archived=False
+    )
     user = member[0]
     if not await db.user_can_see_contact(user["id"], contact_id):
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -281,7 +283,9 @@ async def add_project_contact(
     # unpacking so a test double that stands in for the whole gate (a bare
     # AsyncMock, not configured to return a 2-tuple) doesn't blow up on
     # `a, b = ...` unpacking. Real calls still get the real user dict.
-    member = await require_project_member(request, db, project_id, min_role="editor")
+    member = await require_project_member(
+        request, db, project_id, min_role="editor", allow_archived=False
+    )
     user = member[0]
     normalized = [
         (a.channel, _normalize_address(a.channel, a.address), a.is_primary)

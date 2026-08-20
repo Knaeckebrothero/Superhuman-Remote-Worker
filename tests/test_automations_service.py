@@ -34,9 +34,21 @@ def _empty_datasource_selection(monkeypatch):
     return resolver
 
 
-def _mock_db_returning_job(job_id: str = "j0000001-0000-0000-0000-000000000000"):
+def _mock_db_returning_job(
+    job_id: str = "j0000001-0000-0000-0000-000000000000",
+    *,
+    project_status: str = "active",
+):
     db = MagicMock()
     db.create_job = AsyncMock(return_value={"id": job_id, "status": "created"})
+    # An automation with a project_id is now gated on that project's lifecycle
+    # state (a fire against an archived project is skipped, not created).
+    db.get_project = AsyncMock(
+        return_value={
+            "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "status": project_status,
+        }
+    )
     return db
 
 

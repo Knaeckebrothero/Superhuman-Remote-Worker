@@ -1251,7 +1251,12 @@ async def list_projects(
         Formatted list of projects
     """
     client = _get_client()
-    projects = await client.list_projects(user_id=user_id)
+    # The server now default-excludes archived rows, so the archives have to be
+    # requested explicitly — otherwise `include_archived=True` marks nothing,
+    # because there is nothing left to mark. The formatter still owns the
+    # hide-and-report behaviour; this only widens what it is given.
+    statuses = ["active", "archived"] if include_archived else None
+    projects = await client.list_projects(user_id=user_id, statuses=statuses)
     return fmt.format_projects(projects, include_archived=include_archived)
 
 

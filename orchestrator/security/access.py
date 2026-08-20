@@ -200,6 +200,124 @@ async def _denied(
 
 
 # =============================================================================
+# Project lifecycle — archived projects refuse new work
+# =============================================================================
+#
+# ``archived`` is a real lifecycle state, not a badge: reads stay open, new
+# work is refused, teardown stays possible. Design + the full WRITE/ALLOW/READ
+# call-site classification live in
+# ``knowledge-base/knowledge/features/project_and_job_list_filtering.md`` §4.3.
+
+#: The only two statuses this product writes. ``paused``/``completed`` are
+#: permitted by the DB CHECK but nothing sets them, and the column is nullable
+#: (a CHECK passes on NULL). Anything outside this tuple is *unclassifiable*,
+#: not archived — see :func:`project_is_archived` and
+#: :func:`project_status_filter_sql`, which both fail toward showing.
+KNOWN_PROJECT_STATUSES: tuple[str, ...] = ("active", "archived")
+
+#: What ``GET /api/projects`` returns when the caller passes no ``?status=``.
+DEFAULT_PROJECT_STATUSES: tuple[str, ...] = ("active",)
+
+#: Refusal body. A bare sentence, not a ``{code, message}`` dict: house style
+#: is overwhelmingly plain-string ``detail`` and the cockpit's generic error
+#: path types it as a string (a dict renders as ``[object Object]``).
+PROJECT_ARCHIVED_DETAIL = (
+    "This project is archived. Unarchive it before creating new work."
+)
+
+
+def project_is_archived(project: Any) -> bool:
+    """Whether ``project`` (a row dict) is in the archived lifecycle state.
+
+    Case-insensitive, and deliberately narrow: only the literal ``archived``
+    counts. A NULL, empty or unrecognised status is treated as live, so a row
+    nobody can classify keeps working rather than silently becoming read-only.
+    """
+    if not isinstance(project, dict):
+        return False
+    return str(project.get("status") or "").strip().lower() == "archived"
+
+
+def normalize_project_statuses(values: Any) -> list[str]:
+    """Normalise a repeatable ``?status=`` query param.
+
+    Lower-cases, trims, drops blanks and dedupes while preserving order (the
+    ``dict.fromkeys`` idiom ``GET /api/datasources/eligible`` already uses).
+    ``None`` — and a list that normalises to nothing — yields the default
+    (``['active']``); omission must never widen to "everything".
+
+    ``values`` is typed loosely on purpose. FastAPI hands the handler a list
+    or ``None``; anything else means an in-process caller invoked the handler
+    directly without supplying the parameter, so it still holds the unresolved
+    ``Query(...)`` default. Half this repo's endpoint tests call handlers that
+    way, and a total function beats making every one of them pass the param.
+    """
+    if not isinstance(values, (list, tuple, set)):
+        values = []
+    normalized = list(
+        dict.fromkeys(
+            str(value).strip().lower() for value in values if str(value).strip()
+        )
+    )
+    return normalized or list(DEFAULT_PROJECT_STATUSES)
+
+
+def project_status_filter_sql(param: str, *, column: str = "status") -> str:
+    """``WHERE`` fragment keeping rows whose status was requested — or unknown.
+
+    ``param`` is the caller's placeholder for the requested status array
+    (e.g. ``"$1"``); ``column`` is the (already qualified) status column.
+
+    Fail toward showing (§4.2): NULL collapses to ``active``, and a status
+    outside :data:`KNOWN_PROJECT_STATUSES` always survives the filter. The
+    default filter therefore hides exactly one thing — ``archived`` — instead
+    of quietly swallowing every row whose state we cannot classify. The known
+    vocabulary is interpolated from a module constant of literal identifiers,
+    never from caller input.
+    """
+    known = ", ".join(f"'{value}'" for value in KNOWN_PROJECT_STATUSES)
+    return (
+        f"(COALESCE({column}, 'active') = ANY({param}::text[]) "
+        f"OR COALESCE({column}, 'active') NOT IN ({known}))"
+    )
+
+
+async def _archived_conflict(
+    request: Any,
+    db,
+    user: dict[str, Any] | None,
+    *,
+    resource_id: str | None,
+    detail: str = PROJECT_ARCHIVED_DETAIL,
+) -> HTTPException:
+    """Log an archived-write refusal and return the 409 to raise.
+
+    Sibling of :func:`_denied`, deliberately NOT a reuse of it. ``_denied``
+    hardcodes 403 and writes an ``access_denied`` row into the table that
+    exists to detect UUID-probing; a refusal handed to an *authorized* member
+    because the project is archived is a lifecycle conflict, not an intrusion
+    signal, and polluting that table would blunt the detector. Same
+    raise-and-log-in-one-expression discipline: ``raise await
+    _archived_conflict(...)``.
+
+    409 rather than the 403 GitHub/GitLab use for archived-repo writes: the
+    closest in-house analogue (the Officer Post admission gate — durable row
+    state blocking new work) already returns 409, and 403 here would collide
+    with the authorization meaning ``_denied`` owns.
+    """
+    await log_security_event(
+        db,
+        event_type="project_archived_write",
+        user=user,
+        resource_type="project",
+        resource_id=resource_id,
+        detail=detail,
+        request=request,
+    )
+    return HTTPException(status_code=409, detail=detail)
+
+
+# =============================================================================
 # MCP scope guards — applied on top of identity-based visibility
 # =============================================================================
 #
@@ -355,6 +473,7 @@ async def require_project_member(
     project_id: str,
     *,
     min_role: Role = "viewer",
+    allow_archived: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Require caller to be a project member at ``min_role`` or higher.
 
@@ -362,6 +481,13 @@ async def require_project_member(
     token with a ``project:<uuid>`` scope must match ``project_id`` or
     the call is denied. Raises 404 if the project doesn't exist, 403
     otherwise.
+
+    ``allow_archived=False`` additionally refuses (409) when the project is
+    archived — pass it from endpoints that create new work. It defaults to
+    True so the ~30 read endpoints on this guard keep serving archived
+    projects: an archive you cannot open is a trap, not a lifecycle state.
+    The lifecycle assertion runs LAST, after authorization, so it can never
+    tell a non-member that the project exists.
     """
     user = await require_approved_user(request, db)
     project = await db.get_project(project_id)
@@ -376,18 +502,19 @@ async def require_project_member(
             resource_id=project_id,
             detail="Access denied by MCP token scope",
         )
-    if user.get("is_admin"):
-        return user, project
-    role = await db.get_user_role_in_project(project_id, str(user["id"]))
-    if not _role_satisfies(role, min_role):
-        raise await _denied(
-            request,
-            db,
-            user,
-            resource_type="project",
-            resource_id=project_id,
-            detail=f"Project role '{min_role}' or higher required",
-        )
+    if not user.get("is_admin"):
+        role = await db.get_user_role_in_project(project_id, str(user["id"]))
+        if not _role_satisfies(role, min_role):
+            raise await _denied(
+                request,
+                db,
+                user,
+                resource_type="project",
+                resource_id=project_id,
+                detail=f"Project role '{min_role}' or higher required",
+            )
+    if not allow_archived and project_is_archived(project):
+        raise await _archived_conflict(request, db, user, resource_id=project_id)
     return user, project
 
 
@@ -395,6 +522,8 @@ async def require_project_owner(
     request: Request,
     db,
     project_id: str,
+    *,
+    allow_archived: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Owner-or-admin gate on a project. Returns ``(user, project)``.
 
@@ -402,6 +531,10 @@ async def require_project_owner(
     project mutations). Equivalent to
     ``require_project_member(min_role='owner')`` but with a more specific
     error string. MCP scope is enforced like ``require_project_member``.
+
+    ``allow_archived`` behaves exactly as on :func:`require_project_member`:
+    default True, so teardown (DELETE, detach, decommission) and the
+    unarchive PATCH keep working on an archived project.
     """
     user = await require_approved_user(request, db)
     project = await db.get_project(project_id)
@@ -416,18 +549,19 @@ async def require_project_owner(
             resource_id=project_id,
             detail="Access denied by MCP token scope",
         )
-    if user.get("is_admin"):
-        return user, project
-    role = await db.get_user_role_in_project(project_id, str(user["id"]))
-    if role != "owner":
-        raise await _denied(
-            request,
-            db,
-            user,
-            resource_type="project",
-            resource_id=project_id,
-            detail="Project owner role required",
-        )
+    if not user.get("is_admin"):
+        role = await db.get_user_role_in_project(project_id, str(user["id"]))
+        if role != "owner":
+            raise await _denied(
+                request,
+                db,
+                user,
+                resource_type="project",
+                resource_id=project_id,
+                detail="Project owner role required",
+            )
+    if not allow_archived and project_is_archived(project):
+        raise await _archived_conflict(request, db, user, resource_id=project_id)
     return user, project
 
 

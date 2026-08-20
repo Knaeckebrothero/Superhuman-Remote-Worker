@@ -2539,7 +2539,12 @@ export class SettingsComponent implements OnInit {
       if (userId) {
         this.apiService
             .getProjects(userId)
-            .subscribe((p) => this.projects.set(p));
+            .subscribe({
+              next: (p) => this.projects.set(p),
+              // Settings has many independent panels; the project-scoped ones
+              // degrade to empty rather than failing the whole page.
+              error: () => this.projects.set([]),
+            });
       }
     });
 
