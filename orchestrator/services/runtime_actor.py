@@ -39,6 +39,16 @@ BOOTSTRAP_TTL_SECONDS = int(
 POD_BOOTSTRAP_TTL_SECONDS = int(
     os.environ.get("RUNTIME_ACTOR_POD_BOOTSTRAP_TTL_SECONDS", str(7 * 24 * 3600))
 )
+# Heartbeat-driven slide throttle: a grant is only pushed forward once it is
+# inside the *second half* of its window. A 60s heartbeat therefore costs one
+# UPDATE per grant per half-TTL (two a day at the default 24h) instead of one
+# per beat, while still leaving a full half-TTL of runway to recover from an
+# orchestrator outage before anything expires.
+LIVENESS_SLIDE_BELOW_SECONDS = int(
+    os.environ.get(
+        "RUNTIME_ACTOR_LIVENESS_SLIDE_BELOW_SECONDS", str(REFRESH_TTL_SECONDS // 2)
+    )
+)
 
 _TOKEN_RE = re.compile(r"^sr(?:a|r|b)_[A-Za-z0-9_-]{32,128}$")
 _SENSITIVE_ACTIONS = frozenset({"machine_tags", "charter"})
@@ -728,3 +738,91 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
             project_id=error.actor.project_id if error.actor else None,
         )
         raise _http_denial(error, action=action) from error
+
+
+async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
+    """Slide a live thread's grants forward because the thread is still ALIVE.
+
+    ``refresh_runtime_actor_request`` already slides the window, but only from
+    inside a refresh — and the runtime only refreshes when it needs an access
+    token for a PRIVILEGED call. That keys an IDLE timeout on MUTATIONS rather
+    than on liveness, which inverts the risk: a busy officer is safe and a quiet
+    one starves. Officer 6ce5bc4c woke every 10 minutes for 24h reading SITREPs,
+    made no privileged call, never refreshed, and so walked into the wall while
+    demonstrably alive (knowledge/issues/
+    officer_runtime_grant_expires_after_24h_and_dies_silently.md).
+
+    An agent heartbeat from a thread-bound runtime is exactly the liveness
+    signal the refresh-path comment describes, so it licenses the same
+    extension. This is deliberately server-side: persistent thread pods are
+    bare pods no rollout ever updates, so an agent-side fix would never reach
+    an officer that is already running.
+
+    Nothing here widens the documented threat model. The window bounds only how
+    long a *stolen* refresh token stays useful, and the refresh path already
+    licenses "no absolute cap while its thread lives"; authority itself is never
+    cached — it is recomputed on every access and every refresh.
+
+    Returns True when at least one grant was slid.
+    """
+
+    now = datetime.now(timezone.utc)
+    async with db.acquire() as conn:
+        # Everything that must NOT be slid is excluded in SQL, so the common
+        # case (a grant nowhere near its wall) costs one indexed read and no
+        # write at all:
+        #   * workers — job-scoped, no thread liveness to claim (the refresh
+        #     path excludes them identically);
+        #   * revoked grants;
+        #   * ALREADY-EXPIRED grants: expiry stays terminal. This fix prevents
+        #     reaching the wall, it never resurrects a credential past it;
+        #   * grants still in the first half of their window — the throttle.
+        rows = await conn.fetch(
+            """
+            SELECT id, caller_kind, user_id, project_id, project_role,
+                   thread_id, officer_incarnation, refresh_expires_at,
+                   revoked_at
+              FROM runtime_actor_grants
+             WHERE thread_id = $1::uuid
+               AND revoked_at IS NULL
+               AND caller_kind <> 'worker'
+               AND refresh_expires_at > now()
+               AND refresh_expires_at < now() + make_interval(secs => $2::int)
+            """,
+            str(thread_id),
+            LIVENESS_SLIDE_BELOW_SECONDS,
+        )
+    if not rows:
+        return False
+
+    next_refresh_expires_at = now + timedelta(seconds=REFRESH_TTL_SECONDS)
+    slid = False
+    for row in rows:
+        actor = _actor_from_row(row)
+        try:
+            # The SAME authority the refresh path applies before it slides:
+            # _current_actor re-derives from durable state via
+            # derive_runtime_actor, which refuses an `ended` thread and any
+            # grant that no longer matches current post/membership. A heartbeat
+            # is evidence of a live POD; this is what makes it evidence of a
+            # live, still-authorized THREAD.
+            await _current_actor(db, actor)
+        except RuntimeActorCredentialError:
+            # Fail closed: a grant the refresh path would refuse is a grant
+            # this path must leave to expire.
+            continue
+        async with db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE runtime_actor_grants
+                   SET last_refreshed_at = now(),
+                       refresh_expires_at = $2
+                 WHERE id = $1
+                   AND revoked_at IS NULL
+                   AND refresh_expires_at > now()
+                """,
+                row["id"],
+                next_refresh_expires_at,
+            )
+        slid = True
+    return slid
