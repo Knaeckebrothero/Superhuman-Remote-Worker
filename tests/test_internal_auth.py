@@ -762,6 +762,100 @@ class TestPureInternalEndpoints:
             aux_degraded=None,
         )
 
+    # -- runtime-actor liveness slide ------------------------------------
+    # A heartbeat from a thread-bound runtime IS the liveness signal that
+    # licenses extending its actor grant. Before this, the grant only slid
+    # inside a refresh, and the runtime only refreshes for a PRIVILEGED
+    # call — so officer 6ce5bc4c, awake every 10 minutes for 24h reading
+    # SITREPs, hit the 24h wall while running.
+    # knowledge/issues/officer_runtime_grant_expires_after_24h_and_dies_silently.md
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_slides_the_bound_threads_grant(self, fake_request):
+        from main import AgentHeartbeat, agent_heartbeat
+
+        thread_id = "22222222-2222-2222-2222-222222222222"
+        hb = AgentHeartbeat(status="ready")
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={
+                "previous_status": "ready",
+                "effective_status": "ready",
+                "thread_id": thread_id,
+            }
+        )
+        slide = AsyncMock(return_value=True)
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main.slide_thread_grant_on_liveness", slide),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        assert result["status"] == "ok"
+        slide.assert_awaited_once_with(fake_db, thread_id)
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_without_a_bound_thread_slides_nothing(
+        self, fake_request
+    ):
+        """A stateless worker agent has no thread and so no liveness claim."""
+        from main import AgentHeartbeat, agent_heartbeat
+
+        hb = AgentHeartbeat(status="ready")
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={
+                "previous_status": "ready",
+                "effective_status": "ready",
+                "thread_id": None,
+            }
+        )
+        slide = AsyncMock(return_value=False)
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main.slide_thread_grant_on_liveness", slide),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        assert result["status"] == "ok"
+        slide.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_survives_a_failing_liveness_slide(
+        self, fake_request
+    ):
+        """Best-effort by construction: the credential window is never worth
+        failing the liveness channel itself over."""
+        from main import AgentHeartbeat, agent_heartbeat
+
+        hb = AgentHeartbeat(status="ready")
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={
+                "previous_status": "ready",
+                "effective_status": "ready",
+                "thread_id": "22222222-2222-2222-2222-222222222222",
+            }
+        )
+        slide = AsyncMock(side_effect=Exception("db down"))
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main.slide_thread_grant_on_liveness", slide),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        assert result["status"] == "ok"
+        slide.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_complete_job_without_key_401(self, fake_request, job_a):
         from main import JobCompleteRequest, complete_job

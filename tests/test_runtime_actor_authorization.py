@@ -478,3 +478,270 @@ async def test_refresh_does_not_slide_a_worker_grant():
     assert actor.refresh_expires_at == before, "worker grants keep their fixed wall"
     sql = " ".join(s for s, _ in conn.executed)
     assert "refresh_expires_at" not in sql
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat liveness slide — the same issue seen from the other side. The
+# refresh-path slide above only runs when the runtime needs an access token for
+# a PRIVILEGED call, which keys the idle timeout on MUTATIONS rather than on
+# liveness: a busy officer is safe and a quiet one starves. Officer 6ce5bc4c
+# woke every 10 minutes for 24h reading SITREPs, made no privileged call, and
+# hit the wall while demonstrably alive.
+# ---------------------------------------------------------------------------
+
+
+class _LivenessConn:
+    """In-memory ``runtime_actor_grants`` mirroring the production predicate.
+
+    ``fetch`` applies the same filter the production SELECT issues, so the
+    tests exercise real behaviour rather than SQL text. Each test ALSO asserts
+    its guard is present in the issued SQL, so deleting a clause from the query
+    fails a test instead of silently widening the slide.
+    """
+
+    def __init__(self, grants):
+        self.grants = grants
+        self.fetched: list[tuple] = []
+        self.executed: list[tuple] = []
+
+    @property
+    def select_sql(self) -> str:
+        return " ".join(sql for sql, _ in self.fetched)
+
+    async def fetch(self, sql, *args):
+        from datetime import datetime, timedelta, timezone
+
+        self.fetched.append((sql, args))
+        thread_id, below_seconds = args
+        now = datetime.now(timezone.utc)
+        horizon = now + timedelta(seconds=below_seconds)
+        return [
+            grant
+            for grant in self.grants
+            if str(grant["thread_id"]) == str(thread_id)
+            and grant["revoked_at"] is None
+            and grant["caller_kind"] != "worker"
+            and now < grant["refresh_expires_at"] < horizon
+        ]
+
+    async def execute(self, sql, *args):
+        self.executed.append((sql, args))
+        grant_id, next_expires_at = args
+        for grant in self.grants:
+            if grant["id"] == grant_id and grant["revoked_at"] is None:
+                grant["refresh_expires_at"] = next_expires_at
+        return "UPDATE 1"
+
+
+class _LivenessDB(_CurrentStateDB):
+    """Durable state for ``_current_actor`` plus the grant table."""
+
+    def __init__(self, grants, *, thread_status: str = "active") -> None:
+        super().__init__()
+        self.conn = _LivenessConn(grants)
+        self.thread_status = thread_status
+
+    async def get_thread(self, thread_id):
+        thread = await super().get_thread(thread_id)
+        thread["status"] = self.thread_status
+        return thread
+
+    def acquire(self):
+        conn = self.conn
+
+        class _Acquire:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Acquire()
+
+
+def _liveness_grant(
+    *,
+    expires_in_seconds: int,
+    caller_kind: str = "officer",
+    thread_id: str | None = OFFICER_THREAD,
+    revoked: bool = False,
+):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uuid4(),
+        "caller_kind": caller_kind,
+        "user_id": USER_ID,
+        "project_id": PROJECT_A,
+        "project_role": "owner",
+        "thread_id": thread_id,
+        "officer_incarnation": 0,
+        "refresh_expires_at": now + timedelta(seconds=expires_in_seconds),
+        "revoked_at": now if revoked else None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_slides_a_grant_inside_the_throttle_window():
+    """Liveness alone — no privileged call — must push the wall forward."""
+    from datetime import datetime, timedelta, timezone
+
+    grant = _liveness_grant(expires_in_seconds=3600)
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is True
+    assert grant["refresh_expires_at"] > before
+    assert grant["refresh_expires_at"] > datetime.now(timezone.utc) + timedelta(
+        seconds=service.REFRESH_TTL_SECONDS - 60
+    )
+    assert len(db.conn.executed) == 1
+    assert "refresh_expires_at = $2" in db.conn.executed[0][0]
+    # Stamp what the refresh path stamps, so both slides look alike in the row.
+    assert "last_refreshed_at = now()" in db.conn.executed[0][0]
+    # Belt-and-braces against a grant expiring between the SELECT and the
+    # UPDATE — even that race must not revive it.
+    assert "refresh_expires_at > now()" in db.conn.executed[0][0]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_write_when_the_grant_is_far_from_expiry():
+    """The throttle: ~one write per grant per half-TTL, not one per beat."""
+
+    grant = _liveness_grant(expires_in_seconds=service.REFRESH_TTL_SECONDS - 60)
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.executed == [], "a far-from-expiry grant must cost no write"
+    assert "make_interval(secs => $2::int)" in db.conn.select_sql
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_never_slides_a_worker_grant():
+    """Workers are job-scoped; the refresh path excludes them identically."""
+
+    grant = _liveness_grant(expires_in_seconds=3600, caller_kind="worker")
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.executed == []
+    assert "caller_kind <> 'worker'" in db.conn.select_sql
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_never_slides_a_revoked_grant():
+    """Revocation is immediate and a heartbeat must not soften it."""
+
+    grant = _liveness_grant(expires_in_seconds=3600, revoked=True)
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.executed == []
+    assert "revoked_at IS NULL" in db.conn.select_sql
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_never_revives_an_already_expired_grant():
+    """Expiry stays TERMINAL: this fix prevents reaching the wall, it does not
+    resurrect a credential that already hit it."""
+
+    grant = _liveness_grant(expires_in_seconds=-60)
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.executed == []
+    assert "refresh_expires_at > now()" in db.conn.select_sql
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_slide_a_grant_whose_thread_ended():
+    """A live POD is not a live THREAD. The slide reuses ``_current_actor``,
+    so it inherits ``derive_runtime_actor``'s refusal of an ended thread."""
+
+    grant = _liveness_grant(expires_in_seconds=3600)
+    db = _LivenessDB([grant], thread_status="ended")
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.executed == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_slide_a_grant_the_refresh_path_would_refuse():
+    """Recommission invalidates the old incarnation for BOTH slide paths."""
+
+    grant = _liveness_grant(expires_in_seconds=3600)
+    db = _LivenessDB([grant])
+    db.post = {
+        "thread_id": SUCCESSOR_THREAD,
+        "incarnations": [{"thread_id": OFFICER_THREAD}],
+    }
+
+    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+
+    assert slid is False
+    assert db.conn.executed == []
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_officer_alive_for_days_never_loses_its_grant():
+    """Regression for the real failure.
+
+    Officer 6ce5bc4c spent 24h waking every 10 minutes, reading a SITREP and
+    sleeping. That makes no privileged call, so the refresh path never ran, so
+    the grant never slid and died at the 24h wall while the thread was alive —
+    after which the officer burned wake cycles being refused
+    ``expired_credential``.
+
+    Simulated on the throttle rather than in real time: each tick moves every
+    expiry one tick closer, which is exactly "time passed", and the only thing
+    that happens on a tick is a heartbeat.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    tick_seconds = 600  # the officer's wake cadence
+    days = 3
+    ticks = (days * 24 * 3600) // tick_seconds
+
+    grant = _liveness_grant(expires_in_seconds=service.REFRESH_TTL_SECONDS)
+    db = _LivenessDB([grant])
+
+    for tick in range(1, ticks + 1):
+        for row in db.conn.grants:
+            row["refresh_expires_at"] -= timedelta(seconds=tick_seconds)
+        await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+        elapsed_hours = tick * tick_seconds / 3600
+        assert grant["refresh_expires_at"] > datetime.now(timezone.utc), (
+            f"grant expired after {elapsed_hours:.1f}h of an alive, quiet "
+            "thread — the officer is now being refused expired_credential"
+        )
+
+    # Write amplification: the throttle allows roughly two writes per grant per
+    # day. A band, not an exact count — which tick crosses the half-TTL
+    # boundary depends on sub-second real-clock drift during the loop.
+    writes_per_day = len(db.conn.executed) / days
+    assert 1 <= writes_per_day <= 3, (
+        f"expected ~2 writes/grant/day, got {writes_per_day:.1f}"
+    )

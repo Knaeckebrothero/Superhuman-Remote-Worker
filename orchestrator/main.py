@@ -493,6 +493,7 @@ from services.runtime_actor import (  # noqa: E402
     mint_worker_runtime_actor,
     refresh_runtime_actor_request,
     request_bootstrap_token,
+    slide_thread_grant_on_liveness,
 )
 from services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
@@ -38680,6 +38681,26 @@ async def agent_heartbeat(
         ):
             logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
             _trigger_dispatch()
+
+        # A heartbeat from a thread-bound runtime IS the liveness signal that
+        # licenses extending its actor grant. The grant's lifetime is an IDLE
+        # timeout, but it only ever slid inside a refresh — and the runtime
+        # only refreshes to make a PRIVILEGED call, so a quiet-but-alive
+        # officer (6ce5bc4c: 24h of wake/read-SITREP/sleep, no privileged call)
+        # hit the wall while running. Best-effort by construction: never fail
+        # or meaningfully delay a heartbeat over it. The service throttles the
+        # write to the grant's second half, so this is a no-write read on the
+        # overwhelming majority of beats.
+        # knowledge/issues/officer_runtime_grant_expires_after_24h_and_dies_silently.md
+        _hb_thread_id = result.get("thread_id")
+        if _hb_thread_id:
+            try:
+                await slide_thread_grant_on_liveness(postgres_db, str(_hb_thread_id))
+            except Exception as exc:
+                logger.warning(
+                    f"Runtime actor liveness slide failed for thread "
+                    f"{_hb_thread_id}: {exc}"
+                )
 
         # Track workspace container activity for idle suspension
         if heartbeat.current_job_id and heartbeat.status == "working":

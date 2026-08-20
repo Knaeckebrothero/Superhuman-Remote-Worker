@@ -7643,7 +7643,7 @@ class PostgresDB:
             # (orchestrator-set drain/upgrade hints that the agent reads
             # from the heartbeat response and reacts to).
             prev = await conn.fetchrow(
-                "SELECT status, intents, metadata FROM agents WHERE id = $1",
+                "SELECT status, intents, metadata, thread_id FROM agents WHERE id = $1",
                 uuid_val,
             )
             if not prev:
@@ -7773,10 +7773,15 @@ class PostgresDB:
                 effective_status = "offline"
             else:
                 effective_status = status
+            # The agent's bound thread rides the same row read at zero
+            # marginal DB cost; the handler needs it to slide a thread-bound
+            # runtime-actor grant on liveness. None for stateless workers.
+            bound_thread_id = prev["thread_id"] if "thread_id" in prev else None
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
                 "intents": intents,
+                "thread_id": str(bound_thread_id) if bound_thread_id else None,
             }
 
     async def list_agents(

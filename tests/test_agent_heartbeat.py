@@ -284,6 +284,34 @@ class TestHeartbeatGraphProgress:
         assert "graph_progress_seen_at" not in latest
 
 
+class TestHeartbeatReturnsBoundThread:
+    """The handler slides a thread-bound runtime-actor grant on liveness, so
+    it needs the agent's bound thread. It rides the row heartbeat already
+    reads, at zero marginal DB cost.
+    knowledge/issues/officer_runtime_grant_expires_after_24h_and_dies_silently.md
+    """
+
+    @pytest.mark.asyncio
+    async def test_bound_thread_is_selected_and_returned(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        conn.fetchrow.return_value["thread_id"] = "22222222-2222-2222-2222-222222222222"
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["thread_id"] == "22222222-2222-2222-2222-222222222222"
+        assert "thread_id" in conn.fetchrow.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_thread_id_is_none_for_a_stateless_worker_agent(self):
+        db, _ = _make_db_with_mocked_acquire(prev_status="ready")
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["thread_id"] is None
+
+
 class TestHeartbeatReturnsIntents:
     """Phase 1c: heartbeat result includes orchestrator-set intents so
     the FastAPI handler can surface them to the agent in the response."""
