@@ -4437,6 +4437,45 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
+    async def get_job_descendant_ids(
+        self, job_id: str, *, max_depth: int = 20
+    ) -> List[str]:
+        """Every descendant job id, terminal ones included.
+
+        Deliberately not :meth:`get_descendant_jobs`, which filters to
+        non-terminal rows because its callers are cancelling live work. Cost
+        roll-up wants the opposite: a finished critic subjob is precisely the
+        spend you are trying to account for. Depth-capped like its sibling so a
+        cycle (which the schema permits) cannot spin.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id, 0 AS depth
+                    FROM jobs
+                    WHERE parent_job_id = $1
+
+                    UNION ALL
+
+                    SELECT j.id, d.depth + 1
+                    FROM jobs j
+                    JOIN descendants d ON j.parent_job_id = d.id
+                    WHERE d.depth < $2
+                )
+                SELECT DISTINCT id FROM descendants
+                """,
+                uuid_val,
+                max_depth,
+            )
+
+        return [str(row["id"]) for row in rows]
+
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]
     ) -> bool:

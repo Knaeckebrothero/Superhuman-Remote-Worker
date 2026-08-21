@@ -63,6 +63,10 @@ V1_USAGE_COMPAT_PREDICATE = (
 )
 
 
+# Distinguishes "memoized as None" from "never looked up" in the caches below.
+_UNSET = object()
+
+
 def _dec(x: Any) -> Optional[Decimal]:
     """Coerce to Decimal for asyncpg's ``numeric`` codec (None stays None)."""
     return None if x is None else Decimal(str(x))
@@ -692,6 +696,9 @@ class UsageLedger:
     def __init__(self, audit_pool: Optional[asyncpg.Pool], rates: UsageRates):
         self._pool = audit_pool
         self._rates = rates
+        # source -> first ts ever recorded; see earliest_event_ts. Only non-NULL
+        # results land here, so an empty ledger keeps re-asking.
+        self._earliest_ts_cache: Dict[str, datetime] = {}
 
     @property
     def is_available(self) -> bool:
@@ -1227,6 +1234,112 @@ class UsageLedger:
             }
             for r in rows
         ]
+
+    async def query_ref_usage(
+        self,
+        *,
+        ref_kind: str,
+        ref_ids: Sequence[str],
+        from_ts: datetime,
+        to_ts: datetime,
+    ) -> List[Dict[str, Any]]:
+        """Per-(category, resource, unit) usage for one job/thread, or a subtree.
+
+        The read behind ``GET /api/jobs/{job_id}/usage``. Three deliberate
+        departures from :meth:`query_usage`, each one so that "what did this
+        cost?" can be answered without lying:
+
+        * **No** ``V1_USAGE_COMPAT_PREDICATE``. That fragment freezes the v1
+          cards to LLM/TTS/STT plus the original workspace CPU/RAM tuple, but the
+          infrastructure materializer stamps ``ref_kind`` in {job, thread} on
+          typed VM / volume / agent rows too (``infrastructure_metering/
+          materializer.py`` — customer-attributed intervals). Applying the compat
+          scope here would silently drop a VM-backed job's machine cost, which is
+          the exact failure this endpoint exists to prevent. Grouping by
+          ``resource`` keeps anything new visible rather than folded away.
+        * ``SUM(cost_usd)`` is **not** ``COALESCE``-d to zero. NULL means *not
+          priced* (no rate card for that model or resource) and unpriced is not
+          free; ``priced_events`` vs ``events`` is what lets a caller tell a fully
+          priced group from a partially priced one. ``/api/usage`` collapses both
+          into 0.0 and therefore reports unpriced compute as costing nothing.
+        * Grouped by ``resource``, so the per-model split falls out for free.
+
+        ``ref_ids`` is required, and an empty set matches no rows rather than
+        degrading to "everything" (the officer's spend ceiling has the same rule
+        for the same reason). Visibility is the caller's problem: for a job,
+        ``require_job_access`` has already settled it, and a ref filter is not
+        itself a G5 scope.
+        """
+        if self._pool is None or not ref_ids:
+            return []
+        sql = (
+            "SELECT category, resource, unit, "
+            "SUM(quantity) AS quantity, "
+            "SUM(cost_usd) AS cost_usd, "
+            "COUNT(*) FILTER (WHERE cost_usd IS NOT NULL) AS priced_events, "
+            "COUNT(*) AS events, "
+            "MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+            "FROM usage_events "
+            "WHERE ref_kind = $1 AND ref_id = ANY($2::uuid[]) "
+            "AND ts >= $3 AND ts < $4 "
+            "GROUP BY category, resource, unit "
+            "ORDER BY category, resource, unit"
+        )
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    sql, ref_kind, [_uuid(r) for r in ref_ids], from_ts, to_ts
+                )
+        except Exception:
+            logger.warning("usage ref query failed (non-fatal)", exc_info=True)
+            return []
+        return [
+            {
+                "category": r["category"],
+                "resource": r["resource"],
+                "unit": r["unit"],
+                "quantity": float(r["quantity"]) if r["quantity"] is not None else 0.0,
+                # Preserved as None when nothing in the group carried a rate.
+                "cost_usd": None if r["cost_usd"] is None else float(r["cost_usd"]),
+                "priced_events": int(r["priced_events"]),
+                "events": int(r["events"]),
+                "first_ts": r["first_ts"],
+                "last_ts": r["last_ts"],
+            }
+            for r in rows
+        ]
+
+    async def earliest_event_ts(self, *, source: str = "audit") -> Optional[datetime]:
+        """First ``ts`` the ledger ever recorded for ``source`` (memoized).
+
+        The materializer's cursor is forward-only and anchored the first time it
+        ran, so LLM requests older than that are never backfilled. A job created
+        before this floor therefore has no usage rows *by construction* — which is
+        a different answer from "this job spent nothing", and the only way the API
+        can tell those two apart.
+
+        Memoized for the process lifetime: no index leads with ``source``, so the
+        honest query is a seq scan of every partition, and the value is a
+        historical constant that only an operator-driven backfill moves (a
+        restart-worthy act). A NULL result is *not* cached — an empty ledger is
+        cheap to re-scan and will eventually have a floor.
+        """
+        if self._pool is None:
+            return None
+        cached = self._earliest_ts_cache.get(source, _UNSET)
+        if cached is not _UNSET:
+            return cached  # type: ignore[return-value]
+        try:
+            async with self._pool.acquire() as conn:
+                value = await conn.fetchval(
+                    "SELECT MIN(ts) FROM usage_events WHERE source = $1", source
+                )
+        except Exception:
+            logger.warning("usage ledger floor query failed (non-fatal)", exc_info=True)
+            return None
+        if value is not None:
+            self._earliest_ts_cache[source] = value
+        return value
 
 
 __all__ = [

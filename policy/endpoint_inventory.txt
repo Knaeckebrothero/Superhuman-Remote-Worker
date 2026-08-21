@@ -261,6 +261,7 @@ GET    /api/jobs/{job_id}/todos/archives                                        
 GET    /api/jobs/{job_id}/todos/archives/{filename}                                     gated:require_job_access
 GET    /api/jobs/{job_id}/todos/current                                                 gated:require_job_access
 POST   /api/jobs/{job_id}/upgrade-to-vm                                                 gated:require_job_access
+GET    /api/jobs/{job_id}/usage                                                         gated:require_job_access
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
