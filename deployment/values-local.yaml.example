@@ -246,8 +246,9 @@ agent:
 # Resource trims — keep chart defaults for everything not listed
 # -----------------------------------------------------------------------------
 orchestrator:
-  # Chart default is 2 (HA). One replica on k3d: half the footprint, one pod
-  # to roll per rebuild, no leader-election noise.
+  # One replica on k3d: half the footprint, one pod to roll per rebuild, no
+  # leader-election noise. This now MATCHES the chart default (1) — kept
+  # explicit so a future default change cannot silently double the footprint.
   replicas: 1
   resources:
     requests:

@@ -120,11 +120,15 @@ provenance:
 # Orchestrator
 # =============================================================================
 orchestrator:
-  # 2 replicas by default: leader election (M1) makes this correctness-safe and
-  # removes the orchestrator as a hard SPOF — one pod can fail or drain with zero
-  # serving blackout. Live-verified on dev 2026-06-26. Drop to 1 for a minimal
-  # single-node install (the PDB below follows automatically).
-  replicas: 2
+  # -- 1 replica by default. NOT a statement about what HA needs: leader
+  # election (M1) makes replicas:2 correctness-safe and removes the
+  # orchestrator as a hard SPOF — one pod can fail or drain with zero serving
+  # blackout, live-verified on dev 2026-06-26. The default optimises for the
+  # single-node self-host on a mini PC, whose operator is the least likely to
+  # edit this file and for whom a second replica is pure overhead. Raise it to
+  # 2+ on any cluster with more than one node; the PDB below follows
+  # automatically, and `databases.profile: ha` is the data-tier counterpart.
+  replicas: 1
   resources:
     requests:
       memory: "256Mi"
