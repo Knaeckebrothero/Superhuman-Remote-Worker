@@ -30,6 +30,9 @@ GET    /api/admin/families/detect                                               
 GET    /api/admin/grants                                                                admin:_require_admin
 DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
 PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
+GET    /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
+POST   /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
+POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} admin:_require_admin
 GET    /api/admin/providers/codex/availability                                          admin:_require_admin
 GET    /api/admin/providers/defaults                                                    admin:_require_admin
 PUT    /api/admin/providers/defaults/{kind}                                             admin:_require_admin

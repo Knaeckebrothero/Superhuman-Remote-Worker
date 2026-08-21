@@ -373,6 +373,9 @@ data:
   COMPLETION_FINALIZER_INLINE_DELAY_SECONDS: {{ .Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0 | quote }}
   # Two-stage rollout fence for the interim dedicated Officer-pod owner.
   PERSISTENT_AGENT_RECONCILIATION_ENABLED: {{ .Values.orchestrator.persistentAgentReconciliationEnabled | default false | quote }}
+  # Admin-only exact-binding longevity/fault verification seam. Dark in every
+  # normal profile and consumed only by the orchestrator.
+  OFFICER_RUNTIME_VERIFICATION_ENABLED: {{ .Values.orchestrator.officerRuntimeVerificationEnabled | default false | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 
   # Reject pickle fallback in LangGraph checkpoint serialization. This is

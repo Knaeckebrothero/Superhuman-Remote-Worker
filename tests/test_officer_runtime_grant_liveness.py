@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -13,6 +14,8 @@ from langchain_core.messages import AIMessage
 from src.api.orchestrator_client import OrchestratorClient
 from src.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 from src.shared.runtime_actor import (
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,
 )
@@ -52,6 +55,15 @@ def _client(actor: RuntimeActorContext) -> tuple[OrchestratorClient, AsyncMock]:
     http = AsyncMock()
     client._client = http
     return client, http
+
+
+def _pre_turn_headers(refresh_token: str) -> dict[str, str]:
+    return {
+        RUNTIME_ACTOR_REFRESH_HEADER: refresh_token,
+        RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER: (
+            RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -195,7 +207,55 @@ async def test_two_lost_refresh_responses_retry_with_the_still_known_bearer():
     assert actor.refresh_credential == rotated
     assert http.post.await_count == 3
     assert all(
-        call.kwargs["headers"] == {RUNTIME_ACTOR_REFRESH_HEADER: original}
+        call.kwargs["headers"] == _pre_turn_headers(original)
+        for call in http.post.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_verification_loss_response_keeps_predecessor_for_redelivery():
+    actor = _actor(expires_in=timedelta(seconds=-1))
+    original = actor.refresh_credential
+    client, http = _client(actor)
+    rotated = "srr_" + "V" * 43
+    http.post.side_effect = [
+        MagicMock(
+            status_code=503,
+            json=lambda: {
+                "detail": {
+                    "code": "runtime_maintenance_unavailable",
+                    "retryable": True,
+                }
+            },
+        ),
+        MagicMock(
+            status_code=200,
+            json=lambda: {
+                "runtime_actor": {
+                    **actor.audit_payload(),
+                    "access_credential": "sra_" + "W" * 43,
+                    "refresh_credential": rotated,
+                    "access_expires_at": (
+                        datetime.now(timezone.utc) + timedelta(minutes=5)
+                    ).isoformat(),
+                    "refresh_expires_at": (
+                        datetime.now(timezone.utc) + timedelta(hours=24)
+                    ).isoformat(),
+                }
+            },
+        ),
+    ]
+
+    maintained, reason = await client.maintain_runtime_actor(force=True)
+    assert not maintained and reason == "RuntimeError"
+    assert actor.refresh_credential == original
+    client._runtime_actor_retry_at = 0.0
+
+    maintained, _ = await client.maintain_runtime_actor(force=True)
+    assert maintained
+    assert actor.refresh_credential == rotated
+    assert all(
+        call.kwargs["headers"] == _pre_turn_headers(original)
         for call in http.post.await_args_list
     )
 
@@ -323,6 +383,103 @@ async def test_no_spend_callback_survives_model_tool_hot_swap_for_direct_and_que
     assert callbacks.persist_message.await_count == 2
     assert callbacks.on_turn_settled.await_count == 2
     assert context_manager.ensure_within_limits.await_count == 0
+    assert provider_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
+    """Exercise persistent_app's shipped config-update rebuild, not a fake swap."""
+
+    from src.api import persistent_app
+    from src.core.loader import load_agent_config
+
+    provider_calls = 0
+
+    async def _astream(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        yield AIMessage(content="must not run")
+
+    boot_llm = MagicMock(reasoning=None)
+    boot_llm.astream = _astream
+    rebuilt_llm = MagicMock(reasoning=None)
+    rebuilt_llm.astream = _astream
+    config = load_agent_config("config/persistent_defaults.yaml")
+    config.officer.enabled = True
+    session = SimpleNamespace(
+        config=config,
+        _llm=boot_llm,
+        tools=[],
+        messages=[],
+        permission_mode="auto_accept",
+        narration_mode="auto",
+        auxiliary_llm=None,
+        memory_service=None,
+        memory_extraction_prompt=None,
+        _bind_tools=MagicMock(),
+        refresh_context_limits=MagicMock(),
+    )
+    client = SimpleNamespace(
+        update_thread_config=AsyncMock(return_value={}),
+        maintain_runtime_actor=AsyncMock(),
+    )
+    monkeypatch.setattr(persistent_app, "_session", session)
+    monkeypatch.setattr(persistent_app, "_thread_id", THREAD_ID)
+    monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
+    monkeypatch.setattr(persistent_app, "_broadcast", MagicMock())
+    monkeypatch.setattr(persistent_app, "_runtime_authorization_admission_open", True)
+    monkeypatch.setattr("src.core.loader.create_llm", lambda *_args: rebuilt_llm)
+
+    gate_calls = 0
+
+    async def _failed_maintenance_with_live_rebuild(*, force: bool):
+        nonlocal gate_calls
+        assert force is True
+        gate_calls += 1
+        if gate_calls == 1:
+            # Rebuild while this already-running loop owns the callback. The
+            # next queued input must pick up the replacement model while
+            # retaining the same pre-turn authorization fence.
+            await persistent_app._handle_config_update(
+                MagicMock(),
+                {"llm": {"temperature": 0.2}},
+                request_id="rebuild-proof",
+            )
+        return False, "verification maintenance failed"
+
+    client.maintain_runtime_actor.side_effect = _failed_maintenance_with_live_rebuild
+    callbacks = _callbacks(
+        [
+            "direct durable wake",
+            {"id": "queued-id", "role": "system", "content": "queued wake"},
+        ],
+        persistent_app._loop_before_turn_authorization,
+        on_error=AsyncMock(),
+    )
+    context_manager = _context_manager()
+    current_tools = MagicMock(side_effect=lambda: (session._llm, session.tools))
+    await run_persistent_loop(
+        llm_with_tools=boot_llm,
+        tools=[],
+        context_manager=context_manager,
+        config=session.config,
+        system_prompt="system",
+        callbacks=callbacks,
+        messages=[],
+        get_current_tools=current_tools,
+    )
+
+    assert gate_calls == 2
+    assert client.maintain_runtime_actor.await_count == 2
+    assert all(
+        call.kwargs == {"force": True}
+        for call in client.maintain_runtime_actor.await_args_list
+    )
+    assert current_tools.call_count == 2
+    assert callbacks.persist_message.await_count == 2
+    assert context_manager.ensure_within_limits.await_count == 0
+    assert session._llm is rebuilt_llm
+    assert persistent_app._runtime_authorization_admission_open is False
     assert provider_calls == 0
 
 

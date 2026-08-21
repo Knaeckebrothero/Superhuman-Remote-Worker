@@ -128,6 +128,7 @@ from database.postgres import (  # noqa: E402
     OfficerPostLifecycleConflict,
     _completion_control_active_sql,
     _completion_control_owned_active_sql,
+    project_officer_harvested_state,
 )
 from security.auth import (  # noqa: E402
     get_current_user,
@@ -497,11 +498,17 @@ from services.runtime_actor import (  # noqa: E402
     maintain_current_officer_runtime,
     mint_thread_runtime_actor,
     mint_worker_runtime_actor,
-    refresh_runtime_actor_request,
+    refresh_runtime_actor_exchange,
     request_bootstrap_token,
     settle_officer_runtime_incident_notification,
     slide_thread_grant_on_liveness,
     validate_thread_runtime_actor_bootstrap,
+)
+from services.runtime_actor_verification import (  # noqa: E402
+    RuntimeVerificationPlanError,
+    create_plan as create_runtime_verification_plan,
+    get_plan as get_runtime_verification_plan,
+    transition_plan as transition_runtime_verification_plan,
 )
 from services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
@@ -1607,6 +1614,13 @@ COMPLETION_STATUS_REORDER_ENABLED = os.environ.get(
 # available while automatic drift/missing-pod mutation is dark.
 PERSISTENT_AGENT_RECONCILIATION_ENABLED = os.environ.get(
     "PERSISTENT_AGENT_RECONCILIATION_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# Dark-by-default, admin-only deployed verification seam for the exact current
+# Officer runtime binding. The service performs no lookup or hot-path work
+# unless this rollout flag is explicitly enabled through Helm.
+OFFICER_RUNTIME_VERIFICATION_ENABLED = os.environ.get(
+    "OFFICER_RUNTIME_VERIFICATION_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
 # Local-only crash-recovery proof hook. Production/chart defaults keep this at
@@ -16560,10 +16574,164 @@ async def refresh_runtime_actor(request: Request) -> dict[str, Any]:
     """Refresh a short-lived actor access token after revalidating identity."""
 
     await require_internal(request)
-    actor = await refresh_runtime_actor_request(postgres_db, request)
+    exchange = await refresh_runtime_actor_exchange(
+        postgres_db,
+        request,
+        verification_enabled=OFFICER_RUNTIME_VERIFICATION_ENABLED,
+    )
+    if exchange.retryable_failure_code or exchange.response_lost:
+        # The authoritative refresh transaction has either been deliberately
+        # refused before mutation or committed with its credential payload
+        # intentionally withheld. Never echo plan/binding/credential details
+        # onto the runtime transport.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "runtime_maintenance_unavailable",
+                "retryable": True,
+            },
+        )
+    actor = exchange.actor
+    if actor is None:  # defensive: every non-fault exchange carries an actor
+        raise HTTPException(status_code=503, detail="Runtime maintenance unavailable")
     if actor.caller_kind == "officer":
         _kick_officer_event_drain(postgres_db)
     return {"runtime_actor": actor.to_payload()}
+
+
+class OfficerRuntimeVerificationPlanRequest(BaseModel):
+    """Bounded admin-only runtime verification parameters."""
+
+    idempotency_key: UUID
+    exercise: Literal["longevity", "response_loss", "maintenance_failure"]
+    expires_in_seconds: int = Field(default=900, ge=120, le=3600)
+    logical_window_seconds: int | None = Field(default=None, ge=30, le=600)
+    response_losses: int | None = Field(default=None, ge=1, le=2)
+    response_loss_gap_seconds: int | None = Field(default=None, ge=0, le=300)
+
+
+def _runtime_verification_http_error(
+    exc: RuntimeVerificationPlanError,
+) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+async def _audit_runtime_verification_action(
+    *,
+    request: Request,
+    admin: dict[str, Any],
+    project_id: str,
+    plan: dict[str, Any],
+    action: Literal["create", "recover", "disarm"],
+) -> None:
+    """Record a successful secret-free admin verification action."""
+
+    event_type = {
+        "create": "officer_runtime_verification_created",
+        "recover": "officer_runtime_verification_recovery_requested",
+        "disarm": "officer_runtime_verification_disarmed",
+    }[action]
+    await log_security_event(
+        postgres_db,
+        event_type=event_type,
+        user=admin,
+        resource_type="officer_runtime_verification",
+        resource_id=str(plan.get("plan_id") or ""),
+        detail=(
+            f"project_id={project_id} plan_id={plan.get('plan_id')} "
+            f"exercise={plan.get('exercise')} action={action} "
+            f"replayed={str(bool(plan.get('replayed'))).lower()}"
+        ),
+        request=request,
+    )
+
+
+@app.post("/api/admin/projects/{project_id}/officer/runtime-verification")
+async def create_officer_runtime_verification(
+    project_id: str,
+    body: OfficerRuntimeVerificationPlanRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Arm one exact commissioned-Officer verification plan (admin only)."""
+
+    admin = await _require_admin(request)
+    try:
+        plan = await create_runtime_verification_plan(
+            postgres_db,
+            enabled=OFFICER_RUNTIME_VERIFICATION_ENABLED,
+            project_id=project_id,
+            idempotency_key=str(body.idempotency_key),
+            exercise=body.exercise,
+            created_by=str(admin["id"]),
+            expires_in_seconds=body.expires_in_seconds,
+            logical_window_seconds=body.logical_window_seconds,
+            response_losses=body.response_losses,
+            response_loss_gap_seconds=body.response_loss_gap_seconds,
+        )
+    except RuntimeVerificationPlanError as exc:
+        raise _runtime_verification_http_error(exc) from exc
+    await _audit_runtime_verification_action(
+        request=request,
+        admin=admin,
+        project_id=project_id,
+        plan=plan,
+        action="create",
+    )
+    return {"enabled": True, "plan": plan}
+
+
+@app.get("/api/admin/projects/{project_id}/officer/runtime-verification")
+async def read_officer_runtime_verification(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Read the secret-free durable plan projection (admin only)."""
+
+    await _require_admin(request)
+    try:
+        plan = await get_runtime_verification_plan(
+            postgres_db,
+            enabled=OFFICER_RUNTIME_VERIFICATION_ENABLED,
+            project_id=project_id,
+        )
+    except RuntimeVerificationPlanError as exc:
+        raise _runtime_verification_http_error(exc) from exc
+    return {"enabled": True, "plan": plan}
+
+
+@app.post(
+    "/api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action}"
+)
+async def transition_officer_runtime_verification(
+    project_id: str,
+    plan_id: str,
+    action: Literal["recover", "disarm"],
+    request: Request,
+) -> dict[str, Any]:
+    """Recover or disarm the exact plan; neither operation carries identity."""
+
+    admin = await _require_admin(request)
+    try:
+        plan = await transition_runtime_verification_plan(
+            postgres_db,
+            enabled=OFFICER_RUNTIME_VERIFICATION_ENABLED,
+            project_id=project_id,
+            plan_id=plan_id,
+            action=action,
+            actor_id=str(admin["id"]),
+        )
+    except RuntimeVerificationPlanError as exc:
+        raise _runtime_verification_http_error(exc) from exc
+    await _audit_runtime_verification_action(
+        request=request,
+        admin=admin,
+        project_id=project_id,
+        plan=plan,
+        action=action,
+    )
+    return {"enabled": True, "plan": plan}
 
 
 class OfficerMessageReplyRequest(BaseModel):
@@ -37518,13 +37686,7 @@ async def decommission_project_officer(
         "status": "decommissioned",
         "thread_id": linked_tid,
         "in_flight_jobs": handoff.get("in_flight_jobs") or [],
-        "harvested": bool(
-            {
-                k: v
-                for k, v in (fresh_post.get("state") or {}).items()
-                if k not in ("while_vacant", "while_vacant_dropped")
-            }
-        ),
+        "harvested": bool(project_officer_harvested_state(fresh_post.get("state"))),
         "incarnations": fresh_post.get("incarnations") or [],
     }
 
@@ -46837,6 +46999,7 @@ async def _maintain_officer_runtime_authorization(
         postgres_db,
         project_id=str(project_id),
         thread_id=str(thread_id),
+        verification_enabled=OFFICER_RUNTIME_VERIFICATION_ENABLED,
     )
     if outcome.incident_changed and outcome.authorized:
         _kick_officer_event_drain(postgres_db)

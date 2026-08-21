@@ -22,6 +22,8 @@ from fastapi import HTTPException
 from src.shared.runtime_actor import (
     RUNTIME_ACTOR_BOOTSTRAP_HEADER,
     RUNTIME_ACTOR_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
     SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
     RuntimeActorContext,
@@ -104,6 +106,16 @@ class OfficerRuntimeMaintenance:
     notification_due: bool = False
     notification_claim_id: str | None = None
     incident_changed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeActorRefreshExchange:
+    """Private refresh-route result, including a bearer-delivery fault decision."""
+
+    actor: RuntimeActorContext | None
+    response_lost: bool = False
+    retryable_failure_code: str | None = None
+    verification_plan_id: str | None = None
 
 
 def _token(prefix: str) -> str:
@@ -1338,7 +1350,13 @@ def _refresh_digest_matches(grant: Any, presented_digest: bytes, now: datetime) 
     )
 
 
-async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorContext:
+async def refresh_runtime_actor_exchange(
+    db: Any,
+    request: Any,
+    *,
+    verification_enabled: bool = False,
+    now: datetime | None = None,
+) -> RuntimeActorRefreshExchange:
     """Maintain one actor and mint a fresh short-lived access credential.
 
     Workers retain 0161's fixed refresh lifetime. A current Officer may renew
@@ -1354,6 +1372,10 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
     try:
         token = _required_request_token(request, RUNTIME_ACTOR_REFRESH_HEADER, "srr")
         presented_digest = _digest(token)
+        verification_pre_turn = (
+            str(request.headers.get(RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER, ""))
+            == RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN
+        )
         async with db.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -1380,7 +1402,7 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                 "invalid_credential", "Runtime actor refresh is not recognized."
             )
         actor = _actor_from_row(row)
-        now = datetime.now(timezone.utc)
+        observed_at = now or datetime.now(timezone.utc)
         if row.get("revoked_at") is not None:
             raise RuntimeActorCredentialError(
                 "revoked_credential", "Runtime actor grant was revoked.", actor=actor
@@ -1394,8 +1416,12 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         agent,
                         grant,
                         _role,
-                    ) = await _lock_officer_authority_for_grant(conn, row, now=now)
-                    if not _refresh_digest_matches(grant, presented_digest, now):
+                    ) = await _lock_officer_authority_for_grant(
+                        conn, row, now=observed_at
+                    )
+                    if not _refresh_digest_matches(
+                        grant, presented_digest, observed_at
+                    ):
                         raise RuntimeActorCredentialError(
                             "invalid_credential",
                             "Runtime actor refresh is no longer current.",
@@ -1403,10 +1429,55 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         )
                     expired = (
                         _as_utc(grant.get("refresh_expires_at")) is None
-                        or _as_utc(grant.get("refresh_expires_at")) <= now
+                        or _as_utc(grant.get("refresh_expires_at")) <= observed_at
                     )
                     using_previous = grant.get("refresh_token_hash") != presented_digest
-                    next_refresh = now + timedelta(seconds=REFRESH_TTL_SECONDS)
+                    verification_decision = None
+                    if verification_enabled:
+                        try:
+                            from orchestrator.services.runtime_actor_verification import (
+                                prepare_refresh_on_conn,
+                            )
+                        except ImportError:  # pragma: no cover - top-level imports
+                            from services.runtime_actor_verification import (
+                                prepare_refresh_on_conn,
+                            )
+
+                        verification_decision = await prepare_refresh_on_conn(
+                            conn,
+                            post=post,
+                            thread=_thread,
+                            agent=agent,
+                            grant=grant,
+                            pre_turn=verification_pre_turn,
+                            now=observed_at,
+                        )
+                        if verification_decision.block_code:
+                            return RuntimeActorRefreshExchange(
+                                actor=None,
+                                retryable_failure_code=(
+                                    verification_decision.block_code
+                                ),
+                                verification_plan_id=(verification_decision.plan_id),
+                            )
+                        if verification_decision.inject_maintenance_failure:
+                            await _write_runtime_incident_on_conn(
+                                conn,
+                                post,
+                                thread_id=str(grant["thread_id"]),
+                                incarnation=int(grant["officer_incarnation"]),
+                                failure_code="verification_maintenance_failure",
+                                now=observed_at,
+                            )
+                            return RuntimeActorRefreshExchange(
+                                actor=None,
+                                retryable_failure_code=(
+                                    "verification_maintenance_failure"
+                                ),
+                                verification_plan_id=(verification_decision.plan_id),
+                            )
+
+                    next_refresh = observed_at + timedelta(seconds=REFRESH_TTL_SECONDS)
                     refresh_token = token
                     generation = int(grant.get("credential_generation") or 1)
                     previous_hash = grant.get("previous_refresh_token_hash")
@@ -1428,7 +1499,14 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                                 "Runtime actor refresh handoff is unavailable.",
                                 actor=_actor_from_row(grant),
                             )
-                    elif expired or bool(grant.get("refresh_rotation_required")):
+                    elif (
+                        expired
+                        or bool(grant.get("refresh_rotation_required"))
+                        or bool(
+                            verification_decision
+                            and verification_decision.force_rotation
+                        )
+                    ):
                         refresh_token = _token("srr")
                         previous_hash = grant.get("refresh_token_hash")
                         # No deadline runs while delivery is ambiguous. The
@@ -1442,11 +1520,11 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         acknowledged = _as_utc(handoff_acknowledged_at)
                         overlap_until = _as_utc(previous_until)
                         if acknowledged is None:
-                            handoff_acknowledged_at = now
-                            previous_until = now + timedelta(
+                            handoff_acknowledged_at = observed_at
+                            previous_until = observed_at + timedelta(
                                 seconds=max(1, REFRESH_ROTATION_OVERLAP_SECONDS)
                             )
-                        elif overlap_until is None or overlap_until <= now:
+                        elif overlap_until is None or overlap_until <= observed_at:
                             previous_hash = None
                             previous_until = None
                             handoff_ciphertext = None
@@ -1475,7 +1553,7 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         handoff_acknowledged_at,
                         agent["id"],
                         generation,
-                        now,
+                        observed_at,
                         next_refresh,
                     )
                     # Access credentials never straddle a renewal/recovery.
@@ -1486,29 +1564,61 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         grant["id"],
                     )
                     access_token, access_expires_at = await _insert_access_token(
-                        conn, grant["id"], now=now
+                        conn, grant["id"], now=observed_at
                     )
                     await _resolve_runtime_incident_on_conn(
                         conn,
                         post,
                         thread_id=str(grant["thread_id"]),
                         incarnation=int(grant["officer_incarnation"]),
-                        now=now,
+                        now=observed_at,
                     )
+                    response_lost = False
+                    if verification_enabled and verification_decision is not None:
+                        try:
+                            from orchestrator.services.runtime_actor_verification import (
+                                finish_refresh_on_conn,
+                            )
+                        except ImportError:  # pragma: no cover - top-level imports
+                            from services.runtime_actor_verification import (
+                                finish_refresh_on_conn,
+                            )
+
+                        response_lost = await finish_refresh_on_conn(
+                            conn,
+                            post=post,
+                            thread=_thread,
+                            agent=agent,
+                            grant=grant,
+                            decision=verification_decision,
+                            resulting_generation=generation,
+                            using_previous=using_previous,
+                            now=observed_at,
+                        )
             actor.access_credential = access_token
             actor.refresh_credential = refresh_token
             actor.access_expires_at = access_expires_at
             actor.refresh_expires_at = next_refresh
-            return actor
+            return RuntimeActorRefreshExchange(
+                actor=actor,
+                response_lost=response_lost,
+                verification_plan_id=(
+                    verification_decision.plan_id
+                    if verification_decision is not None
+                    else None
+                ),
+            )
 
         # Non-Officer actors keep their existing authority and expiry rules.
-        if actor.refresh_expires_at is None or actor.refresh_expires_at <= now:
+        if actor.refresh_expires_at is None or actor.refresh_expires_at <= observed_at:
             raise RuntimeActorCredentialError(
                 "expired_credential", "Runtime actor refresh has expired.", actor=actor
             )
         await _current_actor(db, actor)
         slides = actor.caller_kind != "worker" and bool(row["thread_id"])
-        next_refresh = now + timedelta(seconds=REFRESH_TTL_SECONDS) if slides else None
+        next_refresh = (
+            observed_at + timedelta(seconds=REFRESH_TTL_SECONDS) if slides else None
+        )
         async with db.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -1516,7 +1626,7 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                     row["id"],
                 )
                 access_token, access_expires_at = await _insert_access_token(
-                    conn, row["id"], now=now
+                    conn, row["id"], now=observed_at
                 )
                 if next_refresh is not None:
                     await conn.execute(
@@ -1524,7 +1634,7 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         "last_maintenance_at = $2, refresh_expires_at = $3 "
                         "WHERE id = $1",
                         row["id"],
-                        now,
+                        observed_at,
                         next_refresh,
                     )
                 else:
@@ -1532,14 +1642,14 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                         "UPDATE runtime_actor_grants SET last_refreshed_at = $2, "
                         "last_maintenance_at = $2 WHERE id = $1",
                         row["id"],
-                        now,
+                        observed_at,
                     )
         actor.access_credential = access_token
         actor.refresh_credential = token
         actor.access_expires_at = access_expires_at
         if next_refresh is not None:
             actor.refresh_expires_at = next_refresh
-        return actor
+        return RuntimeActorRefreshExchange(actor=actor)
     except RuntimeActorCredentialError as error:
         await _audit_denial(
             db,
@@ -1549,6 +1659,16 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
             project_id=error.actor.project_id if error.actor else None,
         )
         raise _http_denial(error, action=action) from error
+
+
+async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorContext:
+    """Compatibility wrapper for callers that do not enable verification."""
+
+    exchange = await refresh_runtime_actor_exchange(
+        db, request, verification_enabled=False
+    )
+    assert exchange.actor is not None
+    return exchange.actor
 
 
 async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
@@ -1645,6 +1765,7 @@ async def maintain_current_officer_runtime(
     project_id: str,
     thread_id: str,
     now: datetime | None = None,
+    verification_enabled: bool = False,
 ) -> OfficerRuntimeMaintenance:
     """Renew or recover the exact current live Officer grant.
 
@@ -1872,6 +1993,53 @@ async def maintain_current_officer_runtime(
                     )
 
                 assert grant is not None and agent is not None
+                verification_decision = None
+                if verification_enabled:
+                    try:
+                        from orchestrator.services.runtime_actor_verification import (
+                            observe_maintenance_on_conn,
+                        )
+                    except ImportError:  # pragma: no cover - top-level imports
+                        from services.runtime_actor_verification import (
+                            observe_maintenance_on_conn,
+                        )
+
+                    verification_decision = await observe_maintenance_on_conn(
+                        conn,
+                        post=post,
+                        thread=thread,
+                        agent=agent,
+                        grant=grant,
+                        now=observed_at,
+                    )
+                    if verification_decision.inject_maintenance_failure:
+                        incident, changed, _ = await _write_runtime_incident_on_conn(
+                            conn,
+                            post,
+                            thread_id=str(thread["id"]),
+                            incarnation=incarnation,
+                            failure_code="verification_maintenance_failure",
+                            now=observed_at,
+                        )
+                        notification_claim_id = (
+                            await _claim_runtime_incident_notification_on_conn(
+                                conn, post, incident, now=observed_at
+                            )
+                        )
+                        return OfficerRuntimeMaintenance(
+                            False,
+                            "failed",
+                            project_id=str(post["project_id"]),
+                            thread_id=str(thread["id"]),
+                            officer_incarnation=incarnation,
+                            failure_code="verification_maintenance_failure",
+                            retry_at=_parse_incident_time(
+                                incident.get("next_retry_at")
+                            ),
+                            notification_due=notification_claim_id is not None,
+                            notification_claim_id=notification_claim_id,
+                            incident_changed=changed,
+                        )
                 # Make every losing grant for this immutable incarnation
                 # unusable even to a pre-0171 replica. Never invent agent
                 # provenance for unbound legacy losers: NULL truthfully means
@@ -1894,8 +2062,14 @@ async def maintain_current_officer_runtime(
                     grant["id"],
                 )
                 recovered = expired
-                renewed = recovered or expiry <= observed_at + timedelta(
-                    seconds=max(1, OFFICER_RENEW_BEFORE_SECONDS)
+                renewed = (
+                    recovered
+                    or bool(
+                        verification_decision and verification_decision.force_renewal
+                    )
+                    or expiry
+                    <= observed_at
+                    + timedelta(seconds=max(1, OFFICER_RENEW_BEFORE_SECONDS))
                 )
                 next_expiry = (
                     observed_at + timedelta(seconds=REFRESH_TTL_SECONDS)

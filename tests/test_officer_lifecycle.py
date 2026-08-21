@@ -1150,6 +1150,41 @@ class TestDecommissionEndpoint:
         assert flow.await_args.kwargs["officer_retire_reason"] == "decommissioned"
 
     @pytest.mark.asyncio
+    async def test_server_owned_runtime_state_is_not_reported_as_harvested_memory(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        db.get_or_create_project_officer = AsyncMock(
+            return_value=_post_row(thread_id=THREAD_ID)
+        )
+        db.get_thread = AsyncMock(return_value=_officer_thread())
+        db.get_project_officer = AsyncMock(
+            return_value={
+                "state": {
+                    "runtime_actor_incident": {"status": "resolved"},
+                    "runtime_actor_verification": {"state": "completed"},
+                    "while_vacant": [{"kind": "wake"}],
+                    "while_vacant_dropped": 1,
+                },
+                "incarnations": [{"thread_id": THREAD_ID}],
+            }
+        )
+        monkeypatch.setattr(
+            orch_main,
+            "_end_thread_flow",
+            AsyncMock(
+                return_value={
+                    "status": "ended",
+                    "_officer_handoff": {"in_flight_jobs": []},
+                }
+            ),
+        )
+
+        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+
+        assert out["status"] == "decommissioned"
+        assert out["harvested"] is False
+
+    @pytest.mark.asyncio
     async def test_already_ended_link_folds_without_the_end_flow(
         self, db, as_project_admin, quiet_side_channels, monkeypatch
     ):

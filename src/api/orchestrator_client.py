@@ -17,6 +17,8 @@ from src.core.product_capabilities import ProductComponent
 from src.core.runtime_provenance import component_provenance_from_environment
 from src.shared.runtime_actor import (
     RUNTIME_ACTOR_BOOTSTRAP_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,
 )
@@ -1206,9 +1208,21 @@ class OrchestratorClient:
                 await self.connect()
             assert self._client is not None
             try:
+                refresh_headers = {
+                    RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential
+                }
+                if force:
+                    # ``force`` is used only by the persistent loop's
+                    # before-turn authorization callback. This hidden phase
+                    # assertion lets the dark verification plan wait for the
+                    # post-persistence/pre-provider boundary; it is not
+                    # identity or authorization input.
+                    refresh_headers[RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER] = (
+                        RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN
+                    )
                 response = await self._client.post(
                     f"{self.orchestrator_url}/api/runtime-actors/refresh",
-                    headers={RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential},
+                    headers=refresh_headers,
                 )
                 if response.status_code != 200:
                     code = f"http-{response.status_code}"

@@ -804,6 +804,90 @@ async def test_precompaction_background_capture_cannot_start_provider_after_fenc
 
 
 @pytest.mark.asyncio
+async def test_failed_officer_maintenance_fences_queued_auxiliary_and_rebuild(
+    monkeypatch, tmp_path
+):
+    """A queued aux call re-checks authorization after the pre-turn failure."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    boot_model = MagicMock()
+    boot_model.ainvoke = AsyncMock(return_value=AIMessage(content="must not run"))
+    boot_aux = AuxiliaryLLM(boot_model)
+    officer_config = SimpleNamespace(officer=SimpleNamespace(enabled=True))
+    session = SimpleNamespace(
+        config=officer_config,
+        auxiliary_llm=boot_aux,
+        memory_service=None,
+    )
+    client = SimpleNamespace(
+        maintain_runtime_actor=AsyncMock(
+            side_effect=[
+                (False, "verification maintenance failed"),
+                (True, "verification maintenance recovered"),
+            ]
+        )
+    )
+    monkeypatch.setattr(persistent_app, "_session", session)
+    monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
+    monkeypatch.setattr(
+        persistent_app, "_TERMINATION_SENTINEL_PATH", tmp_path / "terminating"
+    )
+    monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
+    monkeypatch.setattr(persistent_app, "_runtime_authorization_admission_open", True)
+    persistent_app._wire_session_aux_archiver()
+
+    class _Writer:
+        event_kinds = frozenset({"pre_compaction"})
+
+        async def on_event(self, _event):
+            entered.set()
+            await release.wait()
+            await boot_aux.ainvoke([], task_name="pre_compaction")
+
+    manager = MemoryManager(
+        SimpleNamespace(),
+        writers=[("pre_compaction", _Writer())],
+    )
+    queued = manager.capture_nowait(
+        CaptureEvent(kind="pre_compaction", messages=[], phase=0)
+    )
+    await entered.wait()
+
+    assert await persistent_app._loop_before_turn_authorization() == (
+        False,
+        "verification maintenance failed",
+    )
+    # The primary loop remains able to reach a later maintenance retry, while
+    # background provider work is closed immediately.
+    assert persistent_app._loop_provider_admission_open() is True
+    assert persistent_app._loop_auxiliary_provider_admission_open() is False
+    release.set()
+    await queued
+    boot_model.ainvoke.assert_not_awaited()
+
+    # A live config rebuild gets the same process-owned callback rather than
+    # inheriting an open provider gate from a new AuxiliaryLLM instance.
+    rebuilt_model = MagicMock()
+    rebuilt_model.ainvoke = AsyncMock(return_value=AIMessage(content="recovered"))
+    rebuilt_aux = AuxiliaryLLM(rebuilt_model)
+    session.auxiliary_llm = rebuilt_aux
+    persistent_app._wire_session_aux_archiver()
+    with pytest.raises(AuxiliaryProviderAdmissionClosed):
+        await rebuilt_aux.ainvoke([], task_name="rebuilt_while_failed")
+    rebuilt_model.ainvoke.assert_not_awaited()
+
+    assert await persistent_app._loop_before_turn_authorization() == (
+        True,
+        "verification maintenance recovered",
+    )
+    assert persistent_app._loop_auxiliary_provider_admission_open() is True
+    response = await rebuilt_aux.ainvoke([], task_name="rebuilt_after_recovery")
+    assert response.content == "recovered"
+    rebuilt_model.ainvoke.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_gate_survives_rebuild_and_quiescence_tracks_inflight(
     monkeypatch, tmp_path
 ):
