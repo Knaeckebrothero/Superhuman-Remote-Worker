@@ -65,6 +65,7 @@ import random
 import re
 import socket
 import time
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -126,6 +127,8 @@ TURN_ABORT_GRACE_SECONDS = 15.0  # polite-unwind budget after an interrupt
 COMPLETE_RETRY_ATTEMPTS = 3
 PENDING_ROWS_LIMIT = 50
 WORKER_FINALIZATION_POLL_SECONDS = 1.0
+
+_AUDIT_WRITER_UNSET = object()
 
 _WORKER_PRESERVE_SHELL_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting", "waiting_for_reply"}
@@ -342,6 +345,7 @@ class StatelessTurnExecutor:
         warm_session_idle_ttl_seconds: float = WARM_SESSION_IDLE_TTL_SECONDS,
         worker_enabled: Optional[bool] = None,
         completion_commands_enabled: Optional[bool] = None,
+        audit_writer: Any = _AUDIT_WRITER_UNSET,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -369,6 +373,29 @@ class StatelessTurnExecutor:
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
+        self._claim_audit_unavailable_logged = False
+        if audit_writer is _AUDIT_WRITER_UNSET:
+            try:
+                # Reuse the process-wide archiver's SyncAuditWriter. Creating a
+                # second writer would mean a second private event loop/pool;
+                # resolving it once here also keeps writer construction out of
+                # the per-claim path.
+                from ..core.archiver import get_archiver
+
+                archiver = get_archiver()
+                self._claim_audit_writer = (
+                    getattr(archiver, "_writer", None) if archiver is not None else None
+                )
+            except Exception:
+                logger.warning(
+                    "worker claim timing audit initialization failed; "
+                    "claims will continue without timing rows",
+                    exc_info=True,
+                )
+                self._claim_audit_writer = None
+                self._claim_audit_unavailable_logged = True
+        else:
+            self._claim_audit_writer = audit_writer
 
         # S1 acceptance (zero in-process claim state): everything below is
         # either the soft-affinity hint or plumbing. Correctness never
@@ -510,6 +537,112 @@ class StatelessTurnExecutor:
         )
         await self._detach_cached_session("warm_idle_ttl")
 
+    def _new_worker_claim_timing(
+        self, claim: WorkerClaim
+    ) -> tuple[dict[str, Any], datetime, float]:
+        """Create the one claim-local payload and its monotonic wall clock."""
+
+        claimed_at = datetime.now(timezone.utc)
+        timing: dict[str, Any] = {
+            "bundle": 0.0,
+            "preflight": 0.0,
+            "agent_start": 0.0,
+            "stream": 0.0,
+            "finish": 0.0,
+            "claimed_at": claimed_at.isoformat().replace("+00:00", "Z"),
+            "released_at": None,
+            "outcome": "error",
+            "lease_token": int(claim.lease_token),
+            "pod_name": self._pod_name,
+            "mcp_attached": False,
+        }
+        return timing, claimed_at, time.perf_counter()
+
+    @staticmethod
+    def _add_worker_finish_timing(
+        timing: dict[str, Any] | None, started_at: float
+    ) -> None:
+        if timing is not None:
+            timing["finish"] = float(timing.get("finish") or 0.0) + max(
+                0.0, time.perf_counter() - started_at
+            )
+
+    def _record_worker_claim_timing(
+        self,
+        claim: WorkerClaim,
+        timing: dict[str, Any],
+        *,
+        claimed_at: datetime,
+        started_at: float,
+    ) -> None:
+        """Best-effort append of the claim's sole ``claim_timing`` row."""
+
+        released_at = datetime.now(timezone.utc)
+        timing["released_at"] = released_at.isoformat().replace("+00:00", "Z")
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        logger.info(
+            "worker claim timing: unit=%s token=%d outcome=%s pod=%s "
+            "mcp_attached=%s bundle=%.3fs preflight=%.3fs "
+            "agent_start=%.3fs stream=%.3fs finish=%.3fs total=%.3fs",
+            claim.unit_id,
+            claim.lease_token,
+            timing["outcome"],
+            self._pod_name,
+            timing["mcp_attached"],
+            timing["bundle"],
+            timing["preflight"],
+            timing["agent_start"],
+            timing["stream"],
+            timing["finish"],
+            elapsed,
+        )
+
+        writer = self._claim_audit_writer
+        if writer is None:
+            if not self._claim_audit_unavailable_logged:
+                logger.warning(
+                    "worker claim timing audit unavailable; claims continue "
+                    "without agent_audit timing rows"
+                )
+                self._claim_audit_unavailable_logged = True
+            return
+        try:
+            writer.insert_audit_pre(
+                {
+                    "job_id": str(claim.unit_id),
+                    "agent_type": "worker",
+                    "iteration": claim.unit.attempts_since_completion,
+                    "step_type": "claim_timing",
+                    "node_name": "worker_claim",
+                    # Claim time, not insert time, is the stable ordering key
+                    # when a fenced predecessor finishes after its successor.
+                    "timestamp": claimed_at,
+                    "latency_ms": round(elapsed * 1000),
+                    "payload": dict(timing),
+                    "metadata": None,
+                }
+            )
+        except Exception:
+            # SyncAuditWriter already converts its own readiness/write failures
+            # to a warning + None. This belt protects injected/alternate sinks
+            # without ever changing the queue disposition.
+            logger.warning(
+                "worker claim timing audit write failed; claim disposition "
+                "is unchanged (unit=%s token=%d)",
+                claim.unit_id,
+                claim.lease_token,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _worker_mcp_attached(request: JobStartRequest) -> bool:
+        """Whether resolved claim inputs will construct an MCP manager."""
+
+        return any(
+            isinstance(datasource, dict) and datasource.get("type") == "mcp"
+            for datasource in (request.datasources or ())
+        )
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -566,13 +699,29 @@ class StatelessTurnExecutor:
                 # Claimed on the stop boundary — hand it straight back for
                 # another pod (no backoff, not an error).
                 stop_claim = worker_claim.unit if worker_claim is not None else claim
-                with contextlib.suppress(Exception):
-                    state = await release_unit(
-                        self._db,
-                        unit_id=stop_claim.unit_id,
-                        lease_token=stop_claim.lease_token,
-                        backoff_seconds=0.0,
-                    )
+                stop_timing: dict[str, Any] | None = None
+                stop_claimed_at: datetime | None = None
+                stop_started_at: float | None = None
+                if worker_claim is not None:
+                    (
+                        stop_timing,
+                        stop_claimed_at,
+                        stop_started_at,
+                    ) = self._new_worker_claim_timing(worker_claim)
+                try:
+                    finish_started_at = time.perf_counter()
+                    try:
+                        state = await release_unit(
+                            self._db,
+                            unit_id=stop_claim.unit_id,
+                            lease_token=stop_claim.lease_token,
+                            backoff_seconds=0.0,
+                        )
+                    finally:
+                        self._add_worker_finish_timing(
+                            stop_timing,
+                            finish_started_at,
+                        )
                     logger.info(
                         "run_queue release: unit=%s token=%d reason=shutting_down "
                         "state=%s",
@@ -580,6 +729,22 @@ class StatelessTurnExecutor:
                         stop_claim.lease_token,
                         state,
                     )
+                except Exception:
+                    pass
+                finally:
+                    if (
+                        worker_claim is not None
+                        and stop_timing is not None
+                        and stop_claimed_at is not None
+                        and stop_started_at is not None
+                    ):
+                        stop_timing["outcome"] = "released:shutting_down"
+                        self._record_worker_claim_timing(
+                            worker_claim,
+                            stop_timing,
+                            claimed_at=stop_claimed_at,
+                            started_at=stop_started_at,
+                        )
                 break
             if worker_claim is not None:
                 try:
@@ -633,6 +798,7 @@ class StatelessTurnExecutor:
         unit = claim.unit
         unit_id = str(unit.unit_id)
         token = unit.lease_token
+        timing, claimed_at, claim_started_at = self._new_worker_claim_timing(claim)
         logger.info(
             "run_queue claim: unit=%s kind=%s token=%d attempts=%d "
             "input_seq=%s consumed_seq=%s prior_job_status=%s pod=%s",
@@ -649,11 +815,12 @@ class StatelessTurnExecutor:
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
         self._worker_completion_accepted_generation = None
-        heartbeat_task = asyncio.create_task(
-            self._worker_heartbeat_loop(claim),
-            name=f"worker-lease-heartbeat-{unit_id[:8]}",
-        )
+        heartbeat_task: asyncio.Task | None = None
         try:
+            heartbeat_task = asyncio.create_task(
+                self._worker_heartbeat_loop(claim),
+                name=f"worker-lease-heartbeat-{unit_id[:8]}",
+            )
             pa = _pa()
             # A shared pod can still hold a warm interactive session when the
             # next durable claim is a worker.  Perform the same physical claim
@@ -665,8 +832,9 @@ class StatelessTurnExecutor:
             self._scrub_process_residue()
             self._lease.update(unit_id, token)
 
-            await self._serve_worker_claim_inner(
+            timing["outcome"] = await self._serve_worker_claim_inner(
                 claim,
+                timing=timing,
                 retry_exhausted=(unit.attempts_since_completion > claim.max_attempts),
             )
         except asyncio.CancelledError:
@@ -709,7 +877,9 @@ class StatelessTurnExecutor:
                     claim,
                     reason="terminal_report_failed",
                     park_on_exhaustion=False,
+                    timing=timing,
                 )
+                timing["outcome"] = "released:terminal_report_failed"
                 return
             if str(self._lease.unit_id or "") != unit_id or int(
                 self._lease.lease_token
@@ -735,7 +905,9 @@ class StatelessTurnExecutor:
                     claim,
                     reason="exhausted_checkpoint_probe_failed",
                     park_on_exhaustion=False,
+                    timing=timing,
                 )
+                timing["outcome"] = "released:exhausted_checkpoint_probe_failed"
                 return
             if (
                 unit.attempts_since_completion == claim.max_attempts
@@ -755,7 +927,11 @@ class StatelessTurnExecutor:
                     claim.max_attempts,
                 )
                 try:
-                    await self._report_worker_terminal(claim, final_state)
+                    timing["outcome"] = await self._report_worker_terminal(
+                        claim,
+                        final_state,
+                        timing=timing,
+                    )
                     return
                 except Exception:
                     # The report path itself is retriable forever (correction
@@ -773,29 +949,49 @@ class StatelessTurnExecutor:
                         claim,
                         reason="terminal_report_failed",
                         park_on_exhaustion=False,
+                        timing=timing,
                     )
+                    timing["outcome"] = "released:terminal_report_failed"
                     return
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._cleanup_worker_runtime(preserve_shell=True)
-            await self._release_worker_claim(claim, reason="driver_error")
+            await self._release_worker_claim(
+                claim,
+                reason="driver_error",
+                timing=timing,
+            )
+            timing["outcome"] = "released:driver_error"
         finally:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat_task
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat_task
+            self._record_worker_claim_timing(
+                claim,
+                timing,
+                claimed_at=claimed_at,
+                started_at=claim_started_at,
+            )
 
     async def _serve_worker_claim_inner(
         self,
         claim: WorkerClaim,
         *,
+        timing: dict[str, Any],
         retry_exhausted: bool = False,
-    ) -> None:
+    ) -> str:
         pa = _pa()
         unit = claim.unit
         job_id = str(unit.unit_id)
         token = unit.lease_token
 
-        bundle = await self._fetch_bundle(job_id, token)
+        started_at = time.perf_counter()
+        try:
+            bundle = await self._fetch_bundle(job_id, token)
+        finally:
+            timing["bundle"] = max(0.0, time.perf_counter() - started_at)
         request, batch = self._parse_worker_bundle(bundle, claim)
+        timing["mcp_attached"] = self._worker_mcp_attached(request)
         metadata = self._worker_job_metadata(request)
         context = request.context or {}
         self._seed_worker_inboxes(
@@ -806,11 +1002,15 @@ class StatelessTurnExecutor:
 
         # Close the claim→bundle race and get the authoritative control state
         # before creating a workspace or invoking the graph.
-        renewal = await renew_worker_batch(
-            self._db,
-            unit_id=unit.unit_id,
-            lease_token=token,
-        )
+        started_at = time.perf_counter()
+        try:
+            renewal = await renew_worker_batch(
+                self._db,
+                unit_id=unit.unit_id,
+                lease_token=token,
+            )
+        finally:
+            timing["preflight"] = max(0.0, time.perf_counter() - started_at)
         if renewal is None:
             self._lease.mark_lost()
             logger.warning(
@@ -818,11 +1018,11 @@ class StatelessTurnExecutor:
                 job_id,
                 token,
             )
-            return
+            return "error"
         self._observe_worker_renewal(job_id, renewal)
         if self._worker_preempted.is_set():
-            await self._finish_external_worker_preempt(claim)
-            return
+            await self._finish_external_worker_preempt(claim, timing=timing)
+            return "preempted"
 
         agent = pa._agent
         client = pa._orchestrator_client
@@ -835,6 +1035,8 @@ class StatelessTurnExecutor:
         steering_acker = CheckpointSteeringAcker(job_id, client)
 
         streaming_gen: Optional[AsyncIterator[Dict[str, Any]]] = None
+        agent_start_started_at = time.perf_counter()
+        timing["agent_start"] = None
         try:
             streaming_gen = await agent.process_job(
                 job_id,
@@ -854,8 +1056,20 @@ class StatelessTurnExecutor:
                 defer_cleanup=True,
                 worker_checkpoint_post_commit=steering_acker,
             )
-            outcome, final_state = await self._consume_worker_stream(streaming_gen)
+            outcome, final_state = await self._consume_worker_stream(
+                streaming_gen,
+                timing=timing,
+                agent_start_started_at=agent_start_started_at,
+            )
         finally:
+            # ``agent_start`` ends at the first superstep yielded by the graph,
+            # not at process_job() returning its async iterator. It therefore
+            # intentionally includes workspace SSH, datasource/MCP setup,
+            # checkpoint/Todo hydration, and any work inside that first step.
+            if timing["agent_start"] is None:
+                timing["agent_start"] = max(
+                    0.0, time.perf_counter() - agent_start_started_at
+                )
             if streaming_gen is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await streaming_gen.aclose()
@@ -867,19 +1081,19 @@ class StatelessTurnExecutor:
                 token,
             )
             await self._cleanup_worker_runtime(preserve_shell=True)
-            return
+            return "error"
         if outcome == "preempted":
-            await self._finish_external_worker_preempt(claim)
-            return
+            await self._finish_external_worker_preempt(claim, timing=timing)
+            return "preempted"
         # A renewal can commit between the stream's StopAsyncIteration and the
         # disposition branch.  Recheck both signals so an external control is
         # still guaranteed to make zero HTTP completion reports.
         if self._lease.lost.is_set():
             await self._cleanup_worker_runtime(preserve_shell=True)
-            return
+            return "error"
         if self._worker_preempted.is_set():
-            await self._finish_external_worker_preempt(claim)
-            return
+            await self._finish_external_worker_preempt(claim, timing=timing)
+            return "preempted"
         if outcome != "graph_end" or final_state is None:
             if unit.attempts_since_completion >= claim.max_attempts:
                 exhausted = self._worker_retry_exhausted_state(
@@ -898,23 +1112,35 @@ class StatelessTurnExecutor:
                     unit.attempts_since_completion,
                     claim.max_attempts,
                 )
-                await self._report_worker_terminal(claim, exhausted, client=client)
-                return
+                return await self._report_worker_terminal(
+                    claim,
+                    exhausted,
+                    client=client,
+                    timing=timing,
+                )
             await self._cleanup_worker_runtime(preserve_shell=True)
-            await self._release_worker_claim(claim, reason="graph_stream_ended_empty")
-            return
+            await self._release_worker_claim(
+                claim,
+                reason="graph_stream_ended_empty",
+                timing=timing,
+            )
+            return "released:graph_stream_ended_empty"
 
         freeze = final_state.get("freeze_data") or {}
         freeze_type = freeze.get("freeze_type") if isinstance(freeze, dict) else None
         if freeze_type == FREEZE_TYPE_BATCH_BOUNDARY:
             await self._cleanup_worker_runtime(preserve_shell=True)
-            rotation = await rotate_worker_batch(
-                self._db,
-                unit_id=unit.unit_id,
-                lease_token=token,
-                input_seq=unit.input_seq,
-                fair_key=unit.fair_key,
-            )
+            started_at = time.perf_counter()
+            try:
+                rotation = await rotate_worker_batch(
+                    self._db,
+                    unit_id=unit.unit_id,
+                    lease_token=token,
+                    input_seq=unit.input_seq,
+                    fair_key=unit.fair_key,
+                )
+            finally:
+                self._add_worker_finish_timing(timing, started_at)
             if rotation is None:
                 self._lease.mark_lost()
                 logger.warning(
@@ -922,7 +1148,7 @@ class StatelessTurnExecutor:
                     job_id,
                     token,
                 )
-                return
+                return "error"
             logger.info(
                 "worker_batch rotate: unit=%s token=%d "
                 "queue_verb=complete_and_requeue queue_state=%s "
@@ -934,7 +1160,7 @@ class StatelessTurnExecutor:
                 rotation.prior_input_seq,
                 rotation.next_input_seq,
             )
-            return
+            return "rotated"
 
         if self._worker_stop_is_recoverable(final_state, freeze_type):
             if unit.attempts_since_completion >= claim.max_attempts:
@@ -954,7 +1180,11 @@ class StatelessTurnExecutor:
                 )
             else:
                 await self._cleanup_worker_runtime(preserve_shell=True)
-                await self._release_worker_claim(claim, reason="recoverable_stop")
+                await self._release_worker_claim(
+                    claim,
+                    reason="recoverable_stop",
+                    timing=timing,
+                )
                 logger.info(
                     "worker_batch recoverable release: unit=%s token=%d "
                     "freeze=%s attempts=%d/%d complete_calls=0 "
@@ -965,9 +1195,14 @@ class StatelessTurnExecutor:
                     unit.attempts_since_completion,
                     claim.max_attempts,
                 )
-                return
+                return "released:recoverable_stop"
 
-        await self._report_worker_terminal(claim, final_state, client=client)
+        return await self._report_worker_terminal(
+            claim,
+            final_state,
+            client=client,
+            timing=timing,
+        )
 
     async def _report_worker_terminal(
         self,
@@ -975,7 +1210,8 @@ class StatelessTurnExecutor:
         final_state: Dict[str, Any],
         *,
         client: Any | None = None,
-    ) -> None:
+        timing: dict[str, Any] | None = None,
+    ) -> str:
         """Report one genuine/give-up stop, then fence the queue disposition."""
 
         unit = claim.unit
@@ -999,8 +1235,9 @@ class StatelessTurnExecutor:
             await self._release_worker_claim(
                 claim,
                 reason="nonterminal_completion_report_blocked",
+                timing=timing,
             )
-            return
+            return "released:nonterminal_completion_report_blocked"
         if client is None:
             client = _pa()._orchestrator_client
         if client is None:
@@ -1012,6 +1249,7 @@ class StatelessTurnExecutor:
         # failures preserve tmux and re-report; the exact coded pre-write 422
         # below instead follows ordinary bounded retry/parking semantics.
         self._worker_terminal_report_generation = (job_id, int(token))
+        started_at = time.perf_counter()
         try:
             reported = await client.report_completion(
                 job_id,
@@ -1048,8 +1286,11 @@ class StatelessTurnExecutor:
             await self._release_worker_claim(
                 claim,
                 reason=exc.code,
+                timing=timing,
             )
-            return
+            return f"released:{exc.code}"
+        finally:
+            self._add_worker_finish_timing(timing, started_at)
         if not reported:
             # A pause/cancel may win after the handler's thin entry fence.  The
             # handler's jobs-row disposition CAS then rejects the report. Read
@@ -1083,21 +1324,25 @@ class StatelessTurnExecutor:
                     accepted_completion.command_id,
                     accepted_completion.command_state,
                 )
-                await self._finish_accepted_worker_completion(
+                resolved_status = await self._finish_accepted_worker_completion(
                     claim,
                     accepted_completion,
                     http_result_ambiguous=True,
                 )
-                return
+                return self._worker_terminal_timing_outcome(
+                    final_state,
+                    observed_status=resolved_status or accepted_completion.job_status,
+                )
             if self._lease.lost.is_set():
                 await self._cleanup_worker_runtime(preserve_shell=True)
-                return
+                return "error"
             if self._worker_preempted.is_set():
                 await self._finish_external_worker_preempt(
                     claim,
                     http_complete_calls=1,
+                    timing=timing,
                 )
-                return
+                return "preempted"
             await self._cleanup_worker_runtime(
                 preserve_shell=failed_report_status
                 not in {"completed", "failed", "cancelled"}
@@ -1106,8 +1351,9 @@ class StatelessTurnExecutor:
                 claim,
                 reason="terminal_report_failed",
                 park_on_exhaustion=False,
+                timing=timing,
             )
-            return
+            return "released:terminal_report_failed"
 
         # Do not rely on the heartbeat event observed before/during the HTTP
         # call. Re-read the exact token and authoritative job status after the
@@ -1139,20 +1385,24 @@ class StatelessTurnExecutor:
                 job_id,
                 token,
             )
-            return
+            return self._worker_terminal_timing_outcome(final_state)
         if self._worker_preempted.is_set():
             await self._finish_external_worker_preempt(
                 claim,
                 http_complete_calls=1,
+                timing=timing,
             )
-            return
+            return "preempted"
         if accepted_completion is not None:
-            await self._finish_accepted_worker_completion(
+            resolved_status = await self._finish_accepted_worker_completion(
                 claim,
                 accepted_completion,
                 http_result_ambiguous=False,
             )
-            return
+            return self._worker_terminal_timing_outcome(
+                final_state,
+                observed_status=resolved_status or accepted_completion.job_status,
+            )
         await self._cleanup_worker_runtime(
             preserve_shell=post_report_status in _WORKER_PRESERVE_SHELL_STATUSES
         )
@@ -1169,13 +1419,20 @@ class StatelessTurnExecutor:
                 job_id,
                 token,
             )
-            return
+            return self._worker_terminal_timing_outcome(
+                final_state,
+                observed_status=post_report_status,
+            )
         logger.info(
             "worker_batch terminal: unit=%s token=%d queue_state=%s "
             "complete_calls=1 http_complete_calls=1",
             job_id,
             token,
             state,
+        )
+        return self._worker_terminal_timing_outcome(
+            final_state,
+            observed_status=post_report_status,
         )
 
     @staticmethod
@@ -1190,6 +1447,32 @@ class StatelessTurnExecutor:
         ):
             return checkpointed, "checkpoint_envelope"
         return final_state, "live_state"
+
+    @classmethod
+    def _worker_terminal_timing_outcome(
+        cls,
+        final_state: Dict[str, Any],
+        *,
+        observed_status: str | None = None,
+    ) -> str:
+        """Label telemetry without making an orchestrator status decision."""
+
+        normalized = str(observed_status or "").strip()
+        if normalized and normalized not in {"created", "processing"}:
+            return f"terminal:{normalized}"
+        payload, _ = cls._worker_completion_wire_payload(final_state)
+        freeze = payload.get("freeze_data")
+        if isinstance(freeze, dict):
+            reported_status = str(freeze.get("status") or "").strip()
+            if reported_status:
+                if reported_status == "job_completed":
+                    reported_status = "completed"
+                return f"terminal:{reported_status}"
+        if payload.get("goal_achieved") is True:
+            return "terminal:completed"
+        if payload.get("error"):
+            return "terminal:failed"
+        return "terminal:unknown"
 
     @staticmethod
     def _parse_worker_bundle(
@@ -1298,10 +1581,14 @@ class StatelessTurnExecutor:
     async def _consume_worker_stream(
         self,
         stream: AsyncIterator[Dict[str, Any]],
+        *,
+        timing: dict[str, Any],
+        agent_start_started_at: float,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Race each graph step against exact-lease loss and external stop."""
 
         final_state: Optional[Dict[str, Any]] = None
+        stream_started_at: float | None = None
         lost_waiter = asyncio.create_task(self._lease.lost.wait())
         preempt_waiter = asyncio.create_task(self._worker_preempted.wait())
         try:
@@ -1327,6 +1614,11 @@ class StatelessTurnExecutor:
                         state = next_state.result()
                     except StopAsyncIteration:
                         return "graph_end", final_state
+                    if stream_started_at is None:
+                        stream_started_at = time.perf_counter()
+                        timing["agent_start"] = max(
+                            0.0, stream_started_at - agent_start_started_at
+                        )
                     if isinstance(state, dict):
                         final_state = state
                 finally:
@@ -1335,6 +1627,14 @@ class StatelessTurnExecutor:
                         with contextlib.suppress(asyncio.CancelledError, Exception):
                             await next_state
         finally:
+            finished_at = time.perf_counter()
+            if timing["agent_start"] is None:
+                timing["agent_start"] = max(0.0, finished_at - agent_start_started_at)
+            timing["stream"] = (
+                max(0.0, finished_at - stream_started_at)
+                if stream_started_at is not None
+                else 0.0
+            )
             for waiter in (lost_waiter, preempt_waiter):
                 if not waiter.done():
                     waiter.cancel()
@@ -1459,7 +1759,7 @@ class StatelessTurnExecutor:
         accepted: WorkerCompletionAcceptance,
         *,
         http_result_ambiguous: bool,
-    ) -> None:
+    ) -> str | None:
         """Hold an accepted worker shell until its exact command resolves.
 
         B4 already changed the queue row to ``done``; releasing or completing
@@ -1512,7 +1812,7 @@ class StatelessTurnExecutor:
                     claim.lease_token,
                     current.command_id,
                 )
-                return
+                return None
             current = observed
 
         resolved_status = (
@@ -1535,6 +1835,7 @@ class StatelessTurnExecutor:
             "preserved" if preserve_shell else "retired",
             http_result_ambiguous,
         )
+        return resolved_status or current.job_status
 
     def _observe_worker_renewal(self, job_id: str, renewal: WorkerRenewal) -> None:
         self._seed_worker_inboxes(
@@ -1663,16 +1964,21 @@ class StatelessTurnExecutor:
         claim: WorkerClaim,
         *,
         http_complete_calls: int = 0,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         status = self._worker_preempt_status or "unknown"
         preserve_shell = status in _WORKER_PRESERVE_SHELL_STATUSES
         await self._cleanup_worker_runtime(preserve_shell=preserve_shell)
-        state = await complete_worker_batch(
-            self._db,
-            unit_id=claim.unit_id,
-            lease_token=claim.lease_token,
-            consumed_seq=claim.unit.input_seq,
-        )
+        started_at = time.perf_counter()
+        try:
+            state = await complete_worker_batch(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                consumed_seq=claim.unit.input_seq,
+            )
+        finally:
+            self._add_worker_finish_timing(timing, started_at)
         logger.info(
             "worker_batch external stop: unit=%s token=%d status=%s "
             "queue_state=%s complete_calls=0 http_complete_calls=%d",
@@ -1694,6 +2000,7 @@ class StatelessTurnExecutor:
         *,
         reason: str,
         park_on_exhaustion: bool = True,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         if self._lease.lost.is_set():
             logger.info(
@@ -1704,6 +2011,7 @@ class StatelessTurnExecutor:
                 reason,
             )
             return
+        started_at = time.perf_counter()
         try:
             state = await release_worker_batch(
                 self._db,
@@ -1720,6 +2028,8 @@ class StatelessTurnExecutor:
                 exc_info=True,
             )
             return
+        finally:
+            self._add_worker_finish_timing(timing, started_at)
         logger.info(
             "run_queue release: worker unit=%s token=%d reason=%s state=%s",
             claim.unit_id,

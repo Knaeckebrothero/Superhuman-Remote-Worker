@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,6 +11,8 @@ import pytest
 from services.bench import (
     analyze_job_metrics,
     build_aggregates,
+    compute_bench_report,
+    fetch_claim_timings,
     fetch_main_requests,
     fetch_phase_events,
 )
@@ -29,6 +32,28 @@ def _request(
         "output_tokens": output_tokens,
         "latency_ms": latency_ms,
         "cache_read_tokens": cache_read_tokens,
+    }
+
+
+def _claim_timing(
+    claimed_at: datetime,
+    released_at: datetime,
+    *,
+    bundle: float,
+    preflight: float,
+    agent_start: float,
+    mcp_attached: bool = False,
+) -> dict:
+    return {
+        "timestamp": claimed_at.isoformat(),
+        "payload": {
+            "claimed_at": claimed_at.isoformat(),
+            "released_at": released_at.isoformat(),
+            "bundle": bundle,
+            "preflight": preflight,
+            "agent_start": agent_start,
+            "mcp_attached": mcp_attached,
+        },
     }
 
 
@@ -126,6 +151,48 @@ def test_requests_without_input_tokens_are_not_counted_cold():
     assert row["cache_hit_pct"] is None
 
 
+def test_claim_overhead_sums_setup_handoff_clamps_clock_skew_and_splits_mcp():
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    row = analyze_job_metrics(
+        job_id="stateless-job",
+        status="completed",
+        requests=[_request(start), _request(start + timedelta(seconds=100))],
+        phase_events=[],
+        claim_timings=[
+            _claim_timing(
+                start,
+                start + timedelta(seconds=10),
+                bundle=0.5,
+                preflight=0.25,
+                agent_start=1.25,
+            ),
+            _claim_timing(
+                start + timedelta(seconds=13),
+                start + timedelta(seconds=30),
+                bundle=1.0,
+                preflight=1.0,
+                agent_start=1.0,
+                mcp_attached=True,
+            ),
+            # This pod's clock is one second behind the prior releaser. The
+            # negative apparent gap contributes zero, never negative overhead.
+            _claim_timing(
+                start + timedelta(seconds=29),
+                start + timedelta(seconds=50),
+                bundle=0.25,
+                preflight=0.25,
+                agent_start=0.5,
+            ),
+        ],
+    )
+
+    assert row["claims"] == 3
+    assert row["setup_s"] == 6.0
+    assert row["handoff_dead_s"] == 3.0
+    assert row["overhead_pct"] == 9.0
+    assert row["mcp_attached"] is True
+
+
 def test_exactly_fifteen_percent_tail_is_not_an_anomaly():
     start = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
     requests = [_request(start + timedelta(seconds=i)) for i in range(20)]
@@ -155,6 +222,11 @@ def test_no_first_llm_request_is_classified_as_infra():
         "tail_anomaly": False,
         "tail_requests": 0,
         "tail_req": 0,
+        "claims": None,
+        "setup_s": None,
+        "handoff_dead_s": None,
+        "overhead_pct": None,
+        "mcp_attached": None,
     }
 
 
@@ -176,6 +248,9 @@ def test_aggregates_exclude_infra_and_tail_anomalies():
             "median_prompt_tokens": 200,
             "strategic_share_latency_pct": 40,
             "strategic_share_prompt_tokens_pct": 35,
+            "overhead_pct": 1.5,
+            "setup_s": 4.0,
+            "handoff_dead_s": 1.0,
         },
         {
             "task": "task",
@@ -225,6 +300,9 @@ def test_aggregates_exclude_infra_and_tail_anomalies():
         # reported cache detail into a phantom regression.
         "cache_hit_pct": None,
         "cold_calls": None,
+        "overhead_pct": {"median": 1.5, "min": 1.5, "max": 1.5},
+        "setup_s": {"median": 4, "min": 4.0, "max": 4.0},
+        "handoff_dead_s": {"median": 1, "min": 1.0, "max": 1.0},
     }
 
 
@@ -302,6 +380,107 @@ async def test_audit_reader_pagination_keeps_server_latency():
         audit_reader.list_llm_requests.await_args_list[0].kwargs["call_type"] == "main"
     )
     assert audit_reader.list_llm_requests.await_args_list[1].kwargs["offset"] == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_timing_reader_uses_the_strict_audit_seam():
+    class StrictAuditReader:
+        async def list_claim_timings(self, job_id):
+            assert job_id == "job-id"
+            return [
+                {
+                    "timestamp": "2026-08-04T10:00:00Z",
+                    "payload": {"outcome": "rotated"},
+                }
+            ]
+
+    assert await fetch_claim_timings(StrictAuditReader(), "job-id") == [
+        {
+            "timestamp": "2026-08-04T10:00:00Z",
+            "payload": {"outcome": "rotated"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compute_report_joins_claim_rows_through_strict_reader():
+    job_id = "11111111-1111-4111-8111-111111111111"
+
+    class StrictAuditReader:
+        async def list_llm_requests(self, requested_job_id, **kwargs):
+            assert requested_job_id == job_id
+            assert kwargs["call_type"] == "main"
+            return {
+                "entries": [
+                    {
+                        "timestamp": "2026-08-04T10:00:00Z",
+                        "token_usage": {"prompt_tokens": 100},
+                    },
+                    {
+                        "timestamp": "2026-08-04T10:01:40Z",
+                        "token_usage": {"prompt_tokens": 100},
+                    },
+                ],
+                "hasMore": False,
+            }
+
+        async def list_claim_timings(self, requested_job_id):
+            assert requested_job_id == job_id
+            return [
+                {
+                    "timestamp": "2026-08-04T10:00:00Z",
+                    "payload": {
+                        "claimed_at": "2026-08-04T10:00:00Z",
+                        "released_at": "2026-08-04T10:00:30Z",
+                        "bundle": 1,
+                        "preflight": 1,
+                        "agent_start": 1,
+                        "mcp_attached": False,
+                    },
+                }
+            ]
+
+    db = SimpleNamespace(
+        get_job=AsyncMock(
+            return_value={
+                "status": "completed",
+                "created_at": "2026-08-04T09:59:00Z",
+            }
+        )
+    )
+    report = await compute_bench_report(
+        db,
+        {
+            "id": "run-id",
+            "name": "strict-reader",
+            "status": "done",
+            "created_by": "user-id",
+            "spec": {
+                "replicates": 1,
+                "tasks": [{"id": "task"}],
+                "arms": [{"name": "stateless"}],
+            },
+            "state": [
+                {
+                    "job_id": job_id,
+                    "task": "task",
+                    "arm": "stateless",
+                    "replicate": 1,
+                }
+            ],
+        },
+        audit_reader=StrictAuditReader(),
+        gitea_client=SimpleNamespace(is_initialized=False),
+        resolve_job_repo=AsyncMock(),
+    )
+
+    assert report["jobs"][0]["claims"] == 1
+    assert report["jobs"][0]["setup_s"] == 3.0
+    assert report["aggregates"][0]["metrics"]["overhead_pct"] == {
+        "median": 3,
+        "min": 3.0,
+        "max": 3.0,
+    }
 
 
 @pytest.mark.asyncio

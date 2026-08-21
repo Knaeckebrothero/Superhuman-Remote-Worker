@@ -13,6 +13,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import random
 import statistics
@@ -770,6 +771,13 @@ async def fetch_main_requests(audit_reader: Any, job_id: str) -> list[dict[str, 
     return rows
 
 
+async def fetch_claim_timings(audit_reader: Any, job_id: str) -> list[dict[str, Any]]:
+    """Read stateless worker claim timing rows through the audit seam."""
+
+    rows = await audit_reader.list_claim_timings(job_id)
+    return [dict(row) for row in rows]
+
+
 async def fetch_phase_events(
     gitea_client: Any,
     resolve_job_repo: ResolveJobRepoFn,
@@ -814,12 +822,88 @@ def _median_number(values: Sequence[int | float]) -> int | float:
     return value
 
 
+def _nonnegative_float(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, number) if math.isfinite(number) else 0.0
+
+
+def analyze_claim_metrics(
+    claim_timings: Sequence[Mapping[str, Any]],
+    *,
+    job_wall_seconds: float | None,
+) -> dict[str, Any]:
+    """Compute setup and cross-pod handoff overhead from append-only rows."""
+
+    if not claim_timings:
+        return {
+            "claims": None,
+            "setup_s": None,
+            "handoff_dead_s": None,
+            "overhead_pct": None,
+            "mcp_attached": None,
+        }
+
+    rows = [dict(row) for row in claim_timings]
+
+    def payload(row: Mapping[str, Any]) -> Mapping[str, Any]:
+        value = row.get("payload")
+        return value if isinstance(value, Mapping) else {}
+
+    def timestamp(row: Mapping[str, Any]) -> datetime:
+        raw = row.get("timestamp") or payload(row).get("claimed_at")
+        try:
+            return parse_timestamp(raw)
+        except (TypeError, ValueError):
+            return datetime.max.replace(tzinfo=timezone.utc)
+
+    rows.sort(key=timestamp)
+    setup_seconds = sum(
+        _nonnegative_float(claim_payload.get(segment))
+        for row in rows
+        for claim_payload in (payload(row),)
+        for segment in ("bundle", "preflight", "agent_start")
+    )
+    handoff_seconds = 0.0
+    for previous, successor in zip(rows, rows[1:]):
+        previous_released = payload(previous).get("released_at")
+        successor_claimed = payload(successor).get("claimed_at")
+        if not previous_released or not successor_claimed:
+            continue
+        try:
+            gap = (
+                parse_timestamp(successor_claimed) - parse_timestamp(previous_released)
+            ).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        # Different pods can have slightly skewed clocks. A negative handoff
+        # is measurement noise, never negative overhead.
+        handoff_seconds += max(0.0, gap)
+
+    overhead_pct = None
+    if job_wall_seconds is not None and job_wall_seconds > 0:
+        overhead_pct = round(
+            100.0 * (setup_seconds + handoff_seconds) / job_wall_seconds,
+            3,
+        )
+    return {
+        "claims": len(rows),
+        "setup_s": round(setup_seconds, 3),
+        "handoff_dead_s": round(handoff_seconds, 3),
+        "overhead_pct": overhead_pct,
+        "mcp_attached": any(payload(row).get("mcp_attached") is True for row in rows),
+    }
+
+
 def analyze_job_metrics(
     *,
     job_id: str,
     status: str | None,
     requests: Sequence[Mapping[str, Any]],
     phase_events: Sequence[tuple[str, datetime]],
+    claim_timings: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Port the v0 request/archive segmentation into a pure calculation."""
 
@@ -837,10 +921,12 @@ def analyze_job_metrics(
         "tail_req": 0,
     }
     if not normalized_requests:
+        result.update(analyze_claim_metrics(claim_timings, job_wall_seconds=None))
         return result
 
     t0 = normalized_requests[0]["ts"]
     t1 = normalized_requests[-1]["ts"]
+    job_wall_seconds = max(0.0, (t1 - t0).total_seconds())
     input_tokens = [
         int(request.get("input_tokens") or 0) for request in normalized_requests
     ]
@@ -884,6 +970,12 @@ def analyze_job_metrics(
             "arch_S": sum(1 for typ, _ in phase_events if typ == "S"),
             "arch_T": sum(1 for typ, _ in phase_events if typ == "T"),
         }
+    )
+    result.update(
+        analyze_claim_metrics(
+            claim_timings,
+            job_wall_seconds=job_wall_seconds,
+        )
     )
     if not phase_events:
         result.update(
@@ -1003,6 +1095,13 @@ def build_aggregates(
                     [row.get("cache_hit_pct") for row in clean]
                 ),
                 "cold_calls": metric_summary([row.get("cold_calls") for row in clean]),
+                "overhead_pct": metric_summary(
+                    [row.get("overhead_pct") for row in clean]
+                ),
+                "setup_s": metric_summary([row.get("setup_s") for row in clean]),
+                "handoff_dead_s": metric_summary(
+                    [row.get("handoff_dead_s") for row in clean]
+                ),
             }
             aggregate: dict[str, Any] = {
                 "task": task.get("id"),
@@ -1052,6 +1151,7 @@ async def compute_bench_report(
             else entry.get("final_status") or entry.get("last_status") or "missing"
         )
         requests = await fetch_main_requests(audit_reader, job_id)
+        claim_timings = await fetch_claim_timings(audit_reader, job_id)
         events: list[tuple[str, datetime]] = []
         archive_error: str | None = None
         if requests:
@@ -1077,6 +1177,7 @@ async def compute_bench_report(
             status=str(status),
             requests=requests,
             phase_events=events,
+            claim_timings=claim_timings,
         )
         row.update(
             {
@@ -1109,6 +1210,7 @@ __all__ = [
     "SWEEP_SECONDS",
     "TAIL_ANOMALY_FRACTION",
     "TERMINAL_JOB_STATUSES",
+    "analyze_claim_metrics",
     "analyze_job_metrics",
     "bench_sweeper_loop",
     "build_aggregates",
@@ -1117,6 +1219,7 @@ __all__ = [
     "cancel_bench_run",
     "compute_bench_report",
     "create_bench_run",
+    "fetch_claim_timings",
     "fetch_main_requests",
     "fetch_phase_events",
     "freeze_spec",

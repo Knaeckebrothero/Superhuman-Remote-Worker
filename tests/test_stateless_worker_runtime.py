@@ -281,6 +281,35 @@ class _FakeClient:
         return _bundle(self.claim)
 
 
+class _FakeAuditWriter:
+    def __init__(self, *, ready=True):
+        self.ready = ready
+        self.rows = []
+
+    def insert_audit_pre(self, row):
+        self.rows.append(row)
+        return len(self.rows) if self.ready else None
+
+
+def _claim_timing_payload(writer: _FakeAuditWriter) -> dict:
+    assert len(writer.rows) == 1
+    row = writer.rows[0]
+    assert row["step_type"] == "claim_timing"
+    assert row["node_name"] == "worker_claim"
+    assert row["agent_type"] == "worker"
+    payload = row["payload"]
+    assert payload["claimed_at"] == row["timestamp"].isoformat().replace("+00:00", "Z")
+    assert (
+        datetime.fromisoformat(payload["released_at"].replace("Z", "+00:00"))
+        >= (row["timestamp"])
+    )
+    assert all(
+        isinstance(payload[name], float) and payload[name] >= 0
+        for name in ("bundle", "preflight", "agent_start", "stream", "finish")
+    )
+    return payload
+
+
 @pytest.fixture
 def worker_runtime(monkeypatch):
     saved = {
@@ -305,7 +334,14 @@ def worker_runtime(monkeypatch):
         pa._thread_id = saved["thread_id"]
 
 
-def _install(monkeypatch, claim, final_state, *, report_result=True):
+def _install(
+    monkeypatch,
+    claim,
+    final_state,
+    *,
+    report_result=True,
+    audit_writer=None,
+):
     agent = _FakeAgent(final_state)
     client = _FakeClient(claim, report_result=report_result)
     pa._agent = agent
@@ -328,6 +364,7 @@ def _install(monkeypatch, claim, final_state, *, report_result=True):
     executor = turn_executor.StatelessTurnExecutor(
         pod_name="worker-pod",
         worker_enabled=True,
+        audit_writer=audit_writer,
     )
     return executor, agent, client, renew, rotate, complete, release
 
@@ -409,6 +446,116 @@ async def test_rotation_uses_complete_and_requeue_and_zero_complete_calls(
     assert "queue_verb=complete_and_requeue" in caplog.text
     assert "complete_calls=0" in caplog.text
     assert "http_complete_calls=0" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rotated_worker_claim_emits_one_mcp_split_timing_row(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(input_seq=12, prior="processing")
+    writer = _FakeAuditWriter()
+    executor, _, client, _, _, _, _ = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "freeze_data": {"freeze_type": "batch_boundary"},
+            "error": None,
+        },
+        audit_writer=writer,
+    )
+    bundle = _bundle(claim)
+    bundle["job"]["datasources"] = [{"type": "mcp", "name": "bench-server"}]
+    client.get_claim_bundle = AsyncMock(return_value=bundle)
+
+    await executor._serve_worker_claim(claim)
+
+    payload = _claim_timing_payload(writer)
+    assert payload["outcome"] == "rotated"
+    assert payload["lease_token"] == claim.lease_token
+    assert payload["pod_name"] == "worker-pod"
+    assert payload["mcp_attached"] is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_worker_claim_emits_one_timing_row(worker_runtime, monkeypatch):
+    claim = _claim(input_seq=31, prior="processing")
+    writer = _FakeAuditWriter()
+    executor, _, _, _, _, _, _ = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "goal_achieved": True,
+            "freeze_data": None,
+            "error": None,
+        },
+        audit_writer=writer,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    payload = _claim_timing_payload(writer)
+    assert payload["outcome"] == "terminal:completed"
+    assert payload["mcp_attached"] is False
+
+
+@pytest.mark.asyncio
+async def test_preempted_worker_claim_emits_one_timing_row(worker_runtime, monkeypatch):
+    claim = _claim(input_seq=41, prior="processing")
+    writer = _FakeAuditWriter()
+    executor, agent, _, renew, _, complete, _ = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True},
+        audit_writer=writer,
+    )
+    renew.return_value = _renewal("paused")
+
+    await executor._serve_worker_claim(claim)
+
+    assert _claim_timing_payload(writer)["outcome"] == "preempted"
+    assert agent.process_calls == []
+    complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_claim_audit_absence_and_unready_writer_are_nonfatal(
+    worker_runtime, monkeypatch, caplog
+):
+    claim = _claim(input_seq=12, prior="processing")
+    final = {
+        "should_stop": True,
+        "freeze_data": {"freeze_type": "batch_boundary"},
+        "error": None,
+    }
+    executor, _, _, _, rotate, _, _ = _install(
+        monkeypatch,
+        claim,
+        final,
+        audit_writer=None,
+    )
+
+    with caplog.at_level("WARNING"):
+        await executor._serve_worker_claim(claim)
+
+    rotate.assert_awaited_once()
+    assert caplog.text.count("worker claim timing audit unavailable") == 1
+
+    successor = replace(claim, unit=replace(claim.unit, lease_token=8))
+    unready = _FakeAuditWriter(ready=False)
+    executor, _, client, _, rotate, _, _ = _install(
+        monkeypatch,
+        successor,
+        final,
+        audit_writer=unready,
+    )
+    client.claim = successor
+
+    await executor._serve_worker_claim(successor)
+
+    rotate.assert_awaited_once()
+    assert len(unready.rows) == 1
 
 
 @pytest.mark.asyncio
