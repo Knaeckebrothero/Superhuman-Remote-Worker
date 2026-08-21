@@ -1,0 +1,50 @@
+{{/*
+One ObjectStore per release, shared by every backing-up cluster.
+
+serverName is deliberately UNSET: Barman defaults it to the cluster name, which
+gives each of the five its own folder under destinationPath. Setting it here
+would point all five at one prefix and they would overwrite each other's base
+backups.
+
+Requires the Barman Cloud plugin, which this chart cannot install -- it is a raw
+manifest pinned to the operator's namespace. See
+knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+*/}}
+{{- if (include "srw.anyDbBacksUp" .) }}
+{{- $backup := .Values.databases.backup }}
+{{- if not $backup.destinationPath }}
+{{- fail "databases.backup.method is objectstore but databases.backup.destinationPath is empty. Set it to s3://bucket/prefix -- there is no safe default, and a backup nobody can find is not a backup." }}
+{{- end }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ include "srw.fullname" . }}-backups
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "backups") | nindent 4 }}
+  # Deliberately NOT resource-policy: keep. This resource is configuration
+  # pointing at a bucket; deleting it destroys no backup, because the objects
+  # live in the bucket. Keeping it would only leave litter behind an uninstall.
+spec:
+  retentionPolicy: {{ $backup.retentionPolicy | quote }}
+  configuration:
+    destinationPath: {{ $backup.destinationPath | quote }}
+    {{- with $backup.endpointURL }}
+    endpointURL: {{ . | quote }}
+    {{- end }}
+    {{- with $backup.endpointCA.secretName }}
+    endpointCA:
+      name: {{ . | quote }}
+      key: {{ $backup.endpointCA.key | quote }}
+    {{- end }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ include "srw.backupSecretName" . }}
+        key: {{ $backup.accessKeyIdKey | quote }}
+      secretAccessKey:
+        name: {{ include "srw.backupSecretName" . }}
+        key: {{ $backup.secretAccessKeyKey | quote }}
+    wal:
+      compression: {{ $backup.wal.compression | quote }}
+    data:
+      compression: {{ $backup.data.compression | quote }}
+{{- end }}
