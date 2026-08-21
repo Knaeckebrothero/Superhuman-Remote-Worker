@@ -322,12 +322,14 @@ data:
   POSTGRES_HOST: {{ include "srw.postgresHost" . | quote }}
   POSTGRES_PORT: {{ include "srw.postgresPort" . | quote }}
   POSTGRES_DB: {{ include "srw.postgresDb" . | quote }}
+  POSTGRES_SSLMODE: {{ .Values.databases.postgres.sslMode | default "prefer" | quote }}
 
   # Vector DB — non-secret connection parts. Composed with
   # VECTOR_POSTGRES_USER/VECTOR_POSTGRES_PASSWORD from the Secret.
   VECTOR_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
   VECTOR_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
   VECTOR_POSTGRES_DB: {{ include "srw.vectorPostgresDb" . | quote }}
+  VECTOR_POSTGRES_SSLMODE: {{ .Values.databases.vector.sslMode | default "prefer" | quote }}
 
   # Audit DB (srw-auditdb) — non-secret connection parts. Composed with
   # AUDIT_POSTGRES_USER/AUDIT_POSTGRES_PASSWORD from the Secret. Agent pods
@@ -335,6 +337,7 @@ data:
   AUDIT_POSTGRES_HOST: {{ include "srw.auditPostgresHost" . | quote }}
   AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
   AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
+  AUDIT_POSTGRES_SSLMODE: {{ .Values.databases.audit.sslMode | default "prefer" | quote }}
 
   # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
   # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is

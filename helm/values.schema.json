@@ -731,6 +731,24 @@
     "databases": {
       "type": "object",
       "properties": {
+        "postgres": {
+          "type": "object",
+          "properties": {
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+          }
+        },
+        "vector": {
+          "type": "object",
+          "properties": {
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+          }
+        },
         "neo4j": {
           "type": "object",
           "properties": {
