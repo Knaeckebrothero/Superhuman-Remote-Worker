@@ -1,33 +1,37 @@
+@use '../../../styles/variables' as v;
+
 .job-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-4, 1rem);
+  gap: v.$space-md;
   flex-wrap: wrap;
-  padding: var(--space-3, 0.75rem) var(--space-4, 1rem);
-  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
-  font-size: var(--text-sm, 0.875rem);
-  color: var(--text-secondary, #a6adc8);
+  padding: v.$space-sm v.$space-md;
+  border-top: 1px solid var(--border-color);
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
 }
 
 .job-footer__range {
   margin: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .job-footer__controls {
   display: flex;
   align-items: center;
-  gap: var(--space-3, 0.75rem);
+  gap: v.$space-md;
 }
 
 .job-footer__size {
   display: flex;
   align-items: center;
-  gap: var(--space-2, 0.5rem);
+  gap: v.$space-sm;
 }
 
 .job-footer__size-label {
   white-space: nowrap;
+  color: var(--text-muted);
 }
 
 .job-footer__page {

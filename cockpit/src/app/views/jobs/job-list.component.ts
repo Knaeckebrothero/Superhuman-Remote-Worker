@@ -627,7 +627,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     `
       .filter-row {
         position: relative;
-        padding: 0 var(--space-4, 1rem) var(--space-2, 0.5rem);
+        padding: 0 1rem 0.5rem;
       }
 
       .table-anchor {
@@ -648,30 +648,30 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
 
       .new-jobs-pill {
         position: sticky;
-        top: var(--space-2, 0.5rem);
-        z-index: 20;
+        top: 0.5rem;
+        z-index: 100; /* $z-sticky */
         align-self: center;
-        margin: 0 auto var(--space-2, 0.5rem);
+        margin: 0 auto 0.5rem;
         padding: 0.25rem 0.9rem;
-        border: 1px solid var(--accent, #cba6f7);
-        border-radius: 999px;
-        background: var(--bg-elevated, #1e1e2e);
-        color: var(--accent, #cba6f7);
-        font-size: var(--text-sm, 0.875rem);
+        border: 1px solid var(--accent-color);
+        border-radius: var(--radius-pill);
+        background: var(--surface-2, var(--surface-1));
+        color: var(--accent-color);
+        font-size: 0.875rem;
         cursor: pointer;
       }
 
       .live-note {
-        margin: 0 var(--space-4, 1rem) var(--space-2, 0.5rem);
-        font-size: var(--text-xs, 0.8125rem);
+        margin: 0 1rem 0.5rem;
+        font-size: 0.75rem;
         color: var(--text-muted, #7f849c);
       }
 
       .live-note__jump {
-        margin-left: var(--space-2, 0.5rem);
+        margin-left: 0.5rem;
         border: 0;
         background: none;
-        color: var(--accent, #cba6f7);
+        color: var(--accent-color);
         cursor: pointer;
         text-decoration: underline;
       }
