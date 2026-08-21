@@ -63,33 +63,33 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-1ed62e2
+    tag: sha-16cd3e8
   agent:
-    tag: sha-1ed62e2
+    tag: sha-16cd3e8
   cockpit:
-    tag: sha-1ed62e2
+    tag: sha-cc5bda0
   mcp:
-    tag: sha-1ed62e2
-    digest: sha256:db353515bc00be09d2b9aedbad97e7ab0239dda18a55be929134c858d3128da5
+    tag: sha-16cd3e8
+    digest: sha256:57595fed4cd3b309dcb57a6c3106634f78996bcb44e9967de18e240530eaeb1e
   workspace:
     tag: sha-cee8f27
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-1ed62e242fa0e321a97c174b993ddf463528d7b8"
+  releaseVersion: "0.0.0-dev.sha-16cd3e8c9d6376d53f1a5514b3017009c1310b3d"
   components:
     orchestrator:
-      sourceRevision: 1ed62e242fa0e321a97c174b993ddf463528d7b8
-      releaseVersion: "0.0.0-dev.sha-1ed62e242fa0e321a97c174b993ddf463528d7b8"
+      sourceRevision: 16cd3e8c9d6376d53f1a5514b3017009c1310b3d
+      releaseVersion: "0.0.0-dev.sha-16cd3e8c9d6376d53f1a5514b3017009c1310b3d"
     agent:
-      sourceRevision: 1ed62e242fa0e321a97c174b993ddf463528d7b8
-      releaseVersion: "0.0.0-dev.sha-1ed62e242fa0e321a97c174b993ddf463528d7b8"
+      sourceRevision: 16cd3e8c9d6376d53f1a5514b3017009c1310b3d
+      releaseVersion: "0.0.0-dev.sha-16cd3e8c9d6376d53f1a5514b3017009c1310b3d"
     cockpit:
-      sourceRevision: 1ed62e242fa0e321a97c174b993ddf463528d7b8
-      releaseVersion: "0.0.0-dev.sha-1ed62e242fa0e321a97c174b993ddf463528d7b8"
+      sourceRevision: cc5bda0fad1fdafcb9931217a9f62fceb5f0869d
+      releaseVersion: "0.0.0-dev.sha-cc5bda0fad1fdafcb9931217a9f62fceb5f0869d"
     mcp:
-      sourceRevision: 1ed62e242fa0e321a97c174b993ddf463528d7b8
-      releaseVersion: "0.0.0-dev.sha-1ed62e242fa0e321a97c174b993ddf463528d7b8"
+      sourceRevision: 16cd3e8c9d6376d53f1a5514b3017009c1310b3d
+      releaseVersion: "0.0.0-dev.sha-16cd3e8c9d6376d53f1a5514b3017009c1310b3d"
     workspace:
       sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
       releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
