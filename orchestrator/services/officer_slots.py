@@ -223,6 +223,32 @@ def admit(
     return name, patch
 
 
+def below_floor_pools(
+    officer_meta: dict[str, Any],
+    ready_by_pool: Optional[dict[str, int]],
+) -> list[str]:
+    """Categorized pools whose ready queue sits under its floor.
+
+    The floor IS the pool's slot count (§13.2). This is the single source of
+    truth for that predicate: :func:`capacity_lines` marks the starved pools
+    and the wake's closing call-to-action names them, and the two must never
+    disagree about which pools are short — a sitrep that marks a pool BELOW
+    FLOOR while the closing line says nothing reads as a number to note
+    rather than a thing to do.
+    """
+    if ready_by_pool is None:
+        return []
+    roster = roster_from_meta(officer_meta)
+    if roster is None:
+        return []
+    return [
+        name
+        for name in sorted(roster)
+        if roster[name].get("category")
+        and ready_by_pool.get(name, 0) < roster[name]["count"]
+    ]
+
+
 def capacity_lines(
     officer_meta: dict[str, Any],
     in_flight_by_slot: dict[Optional[str], int],
@@ -256,18 +282,22 @@ def capacity_lines(
         total = sum(in_flight_by_slot.values())
         return f"Capacity: {total}/{cap} worker slots in use."
 
+    # The floor IS the pool's slot count (§13.2): if every agent in the pool
+    # lands at once, each must find a ticket waiting. Shared with the wake's
+    # closing call-to-action through below_floor_pools() so the marker and the
+    # instruction cannot drift apart.
+    starved = set(below_floor_pools(officer_meta, ready_by_pool))
+
     parts = []
     for name in sorted(roster):
         count = roster[name]["count"]
         segment = f"{name} {in_flight_by_slot.get(name, 0)}/{count}"
         if ready_by_pool is not None and roster[name].get("category"):
             ready = ready_by_pool.get(name, 0)
-            # The floor IS the pool's slot count (§13.2): if every agent in the
-            # pool lands at once, each must find a ticket waiting. Parenthesised
-            # so the sentence still parses — an unbracketed "BELOW FLOOR" ran
-            # straight into the trailing "worker slots in use" and read as if it
-            # described the slots rather than the queue.
-            flag = ", BELOW FLOOR" if ready < count else ""
+            # Parenthesised so the sentence still parses — an unbracketed
+            # "BELOW FLOOR" ran straight into the trailing "worker slots in
+            # use" and read as if it described the slots rather than the queue.
+            flag = ", BELOW FLOOR" if name in starved else ""
             segment += f" (ready {ready}{flag})"
         parts.append(segment)
 

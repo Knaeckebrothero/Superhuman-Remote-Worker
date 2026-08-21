@@ -18,7 +18,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.officer_backlog import pool_status_lines, ready_depth_by_pool
-from services.officer_slots import capacity_lines, validate_slots_spec
+from services.officer_slots import (
+    below_floor_pools,
+    capacity_lines,
+    validate_slots_spec,
+)
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -84,6 +88,53 @@ class TestCapacityLine:
             oldest_claim_age_hours=51.4,
         )
         assert "Oldest open claim 51h." in line
+
+
+# =============================================================================
+# The floor predicate — one definition, two readers
+# =============================================================================
+
+
+class TestBelowFloorPools:
+    """The marker and the wake's closing call-to-action share this predicate.
+
+    On 2026-08-20 an officer read "ready 0, BELOW FLOOR" on all three of his
+    pools across ten consecutive wakes and filed sleep on every one, because
+    the marker sat mid-line while the last thing he read was "file a sleep".
+    The names are now also rendered as the wake's final line — so the two
+    renderings must never disagree about which pools are short.
+    """
+
+    def test_it_agrees_with_the_marker(self):
+        ready = {"researchers": 1, "executors": 1}
+        line = capacity_lines(META, {}, ready_by_pool=ready)
+        starved = below_floor_pools(META, ready)
+        assert starved == ["researchers"]
+        assert "researchers 0/2 (ready 1, BELOW FLOOR)" in line
+        assert "executors 0/1 (ready 1)" in line
+
+    def test_a_healthy_queue_names_nobody(self):
+        # The negative control: a full queue must produce no call to action,
+        # or the closing line becomes noise the officer learns to skip.
+        assert below_floor_pools(META, {"researchers": 2, "executors": 4}) == []
+
+    def test_unread_depth_is_not_starvation(self):
+        # ready_by_pool=None means the KB was never read. "unavailable" is
+        # never "empty" — inventing a floor breach here would send the officer
+        # to arm tickets against a number nobody measured.
+        assert below_floor_pools(META, None) == []
+
+    def test_uncategorized_slots_have_no_floor(self):
+        meta = {"slots": {"adhoc": {"count": 3}, "researchers": POOLS["researchers"]}}
+        assert below_floor_pools(meta, {"researchers": 2}) == []
+
+    def test_a_century_without_pools_names_nobody(self):
+        assert below_floor_pools({"max_concurrent_workers": 3}, {"anything": 0}) == []
+
+    def test_a_missing_pool_counts_as_zero_ready(self):
+        # The tick returns no key for a pool it could not count as eligible;
+        # that pool is starved, not absent.
+        assert below_floor_pools(META, {"executors": 5}) == ["researchers"]
 
 
 # =============================================================================

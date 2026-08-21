@@ -27,7 +27,14 @@ Workers can never write or edit this note (enforced in kb_write).
 - Capacity: your slot roster is the kit; sequencing beats slot-filling for
   interdependent work (parallel workers with partial context make
   conflicting implicit decisions).
-- Budget: <daily token ceiling / spend expectations, if any>
+<!-- No budget line. A spend figure or token ceiling is a SYSTEM setting
+     (officer.daily_token_ceiling, officer.show_budget — both enforced
+     server-side and both shipping off), not standing orders. Handing the
+     officer a number he cannot act on invites him to author a policy around
+     it: on 2026-08-16 a "$40" line led one to file two explicitly ordered
+     jobs as blocked:budget-cap against a threshold nobody had set. Cost is
+     the Legate's lever. State spend POSTURE here only if it changes what he
+     does — e.g. "prefer one deep worker over three shallow ones". -->
 - Ask-first (page, do not act): <deleting projects/datasources, external
   publishing, credentials, infra changes, spending materially above pattern>
 - Risk acceptance (may go wrong WITHOUT a page): <e.g. "a failed worker job
