@@ -1006,6 +1006,14 @@ databases:
     externalHost: ""
     externalPort: 5432
     externalDb: "srw"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external Postgres usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
     storageSize: "16Gi"
@@ -1024,6 +1032,14 @@ databases:
     externalHost: ""
     externalPort: 5432
     externalDb: "srw_vector"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external pgvector usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
     storageSize: "16Gi"
@@ -1044,6 +1060,14 @@ databases:
     externalHost: ""
     externalPort: 5432
     externalDb: "srw_audit"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external audit Postgres usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    sslMode: "prefer"
     # PostgreSQL 16 (>= 16.5 ships the DETACH CONCURRENTLY + partitioned-FK
     # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
     image: postgres:16
