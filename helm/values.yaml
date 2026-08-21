@@ -1013,6 +1013,11 @@ databases:
     #    "require", or "verify-full" to defeat MITM.
     #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
     #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
     sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
@@ -1039,6 +1044,11 @@ databases:
     #    "require", or "verify-full" to defeat MITM.
     #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
     #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
     sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
@@ -1067,6 +1077,11 @@ databases:
     #    "require", or "verify-full" to defeat MITM.
     #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
     #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
     sslMode: "prefer"
     # PostgreSQL 16 (>= 16.5 ships the DETACH CONCURRENTLY + partitioned-FK
     # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
