@@ -60,6 +60,36 @@ export const KNOWN_JOB_ORIGINS: readonly string[] = Object.freeze([
   'bench',
 ]);
 
+/**
+ * Origins a person initiated directly. Everything else — automation, loop,
+ * officer, subjob, lifecycle, bench — is work the system started on its own,
+ * and is what the jobs list hides by default.
+ *
+ * The default lives in the cockpit rather than in `/api/jobs`, deliberately:
+ * archiving a project is a user saying "put this away", so the API honours it,
+ * whereas a critic subjob is real work nobody retired and is only noise *in a
+ * table*. Keeping "no filters" meaning "every job you can see" is also what
+ * lets an agent reason about the endpoint without reading this file.
+ */
+export const HUMAN_ORIGINS: readonly string[] = Object.freeze(['user', 'session']);
+
+/**
+ * URL sentinel for "every origin".
+ *
+ * Needed because the default selection is non-empty: without it, an empty
+ * origin list serialises to an absent param, an absent param parses back to
+ * the default, and removing the "system jobs hidden" token silently re-applies
+ * itself. Never sent to the API — the client maps the empty set to no `origin`
+ * param at all, which is what the server already means by "no filter".
+ */
+export const ALL_ORIGINS = 'all';
+
+/** True when the origin selection is exactly the default human pair. */
+export function isSystemHiddenSelection(origin: readonly string[]): boolean {
+  const unique = new Set(origin);
+  return unique.size === HUMAN_ORIGINS.length && HUMAN_ORIGINS.every((o) => unique.has(o));
+}
+
 export const PAGE_SIZE_OPTIONS: readonly number[] = Object.freeze([25, 50, 100]);
 
 export const DEFAULT_PAGE_SIZE = 25;
@@ -83,7 +113,7 @@ const EMPTY: readonly string[] = Object.freeze([]);
  */
 export const DEFAULT_JOB_FILTERS: JobListFilters = Object.freeze({
   status: EMPTY as string[],
-  origin: EMPTY as string[],
+  origin: HUMAN_ORIGINS as string[],
   projectIds: EMPTY as string[],
   hasProject: null,
   includeArchivedProjects: false,
@@ -156,9 +186,18 @@ export function parseJobFilters(params: RawParams): JobListFilters {
   const status = dedupe(readAll(params, 'status')).filter((value) =>
     KNOWN_JOB_STATUSES.includes(value),
   );
-  const origin = dedupe(readAll(params, 'origin')).filter((value) =>
-    KNOWN_JOB_ORIGINS.includes(value),
-  );
+  // Three states, not two. Absent means the default (hide system-created
+  // work); the ALL_ORIGINS sentinel means the user explicitly asked for
+  // everything; anything else is a validated selection. Without the sentinel,
+  // "show me everything" and "first visit" are both an empty set, and
+  // clearing the default filter would immediately re-apply it.
+  const rawOrigin = readAll(params, 'origin');
+  const origin =
+    rawOrigin.length === 0
+      ? [...HUMAN_ORIGINS]
+      : rawOrigin.includes(ALL_ORIGINS)
+        ? []
+        : dedupe(rawOrigin).filter((value) => KNOWN_JOB_ORIGINS.includes(value));
 
   // `project_id` carries two things: real uuids and the `none` bucket alias.
   const rawProjects = dedupe(readAll(params, 'project_id'));
@@ -226,7 +265,11 @@ export function jobFiltersToQueryParams(filters: JobListFilters): Record<string,
 
   return {
     status: filters.status.length > 0 ? dedupe(filters.status) : null,
-    origin: filters.origin.length > 0 ? dedupe(filters.origin) : null,
+    origin: isSystemHiddenSelection(filters.origin)
+      ? null // the default — omitted, so a bare URL is the default view
+      : filters.origin.length === 0
+        ? ALL_ORIGINS // explicitly every origin, which absence cannot express
+        : dedupe(filters.origin),
     project_id: projectParam,
     // The false case rides on `project_id=none` above; only `true` needs the
     // flag, and it must never accompany the bucket alias.
@@ -246,7 +289,7 @@ export function jobFiltersToQueryParams(filters: JobListFilters): Record<string,
 export function isDefaultJobFilters(filters: JobListFilters): boolean {
   return (
     filters.status.length === 0 &&
-    filters.origin.length === 0 &&
+    isSystemHiddenSelection(filters.origin) &&
     filters.projectIds.length === 0 &&
     filters.hasProject === null &&
     filters.includeArchivedProjects === DEFAULT_JOB_FILTERS.includeArchivedProjects &&
@@ -296,7 +339,14 @@ export function jobFiltersToApiQuery(filters: JobListFilters): Record<string, un
   return query;
 }
 
-export type JobFilterTokenKind = 'status' | 'origin' | 'project' | 'noProject' | 'search' | 'archived';
+export type JobFilterTokenKind =
+  | 'status'
+  | 'origin'
+  | 'systemHidden'
+  | 'project'
+  | 'noProject'
+  | 'search'
+  | 'archived';
 
 export interface JobFilterToken {
   id: string;
@@ -341,14 +391,25 @@ export function activeFilterTokens(
     });
   }
 
-  for (const value of dedupe(filters.origin)) {
+  if (isSystemHiddenSelection(filters.origin)) {
+    // One honest token beats two ("Source: user", "Source: session") that
+    // describe a default nobody set. Removing it clears the origin filter,
+    // which is what "show me everything" means.
     tokens.push({
-      id: `origin:${value}`,
-      kind: 'origin',
-      value,
-      labelKey: 'jobs.filter.token.origin',
-      labelParams: {value},
+      id: 'systemHidden',
+      kind: 'systemHidden',
+      labelKey: 'jobs.filter.token.systemHidden',
     });
+  } else {
+    for (const value of dedupe(filters.origin)) {
+      tokens.push({
+        id: `origin:${value}`,
+        kind: 'origin',
+        value,
+        labelKey: 'jobs.filter.token.origin',
+        labelParams: {value},
+      });
+    }
   }
 
   for (const value of dedupe(filters.projectIds)) {
@@ -415,6 +476,11 @@ export function removeFilterToken(filters: JobListFilters, token: JobFilterToken
     case 'origin':
       next.origin = next.origin.filter((value) => value !== token.value);
       return next;
+    case 'systemHidden':
+      // Removing the "system jobs hidden" chip means show every origin, not
+      // "drop one of the two" — the token stood for the whole default.
+      next.origin = [];
+      return next;
     case 'project':
       next.projectIds = next.projectIds.filter((value) => value !== token.value);
       return next;
@@ -457,7 +523,7 @@ export function setPageSize(filters: JobListFilters, pageSize: number): JobListF
 export function clearJobFilters(filters: JobListFilters): JobListFilters {
   return {
     status: [],
-    origin: [],
+    origin: [...HUMAN_ORIGINS],
     projectIds: [],
     hasProject: null,
     includeArchivedProjects: DEFAULT_JOB_FILTERS.includeArchivedProjects,

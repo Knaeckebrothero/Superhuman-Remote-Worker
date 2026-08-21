@@ -55,7 +55,10 @@ function mountLogic(overrides: {
       {provide: Router, useValue: {navigate}},
       {
         provide: ActivatedRoute,
-        useValue: {queryParamMap: overrides.params ?? new BehaviorSubject(paramMap({}))},
+        useValue: {
+          // A bare param map is the steady state and the default view.
+          queryParamMap: overrides.params ?? new BehaviorSubject(paramMap({})),
+        },
       },
     ],
   });
@@ -212,6 +215,55 @@ describe('JobListComponent — filters drive the URL', () => {
     expect(extras.queryParams.status).toEqual(['failed']);
     expect(extras.queryParams.page).toBeNull();
     expect(extras.replaceUrl).toBe(false);
+  });
+
+  it('a bare URL IS the default view — hides system-created work, no redirect', async () => {
+    const params = new BehaviorSubject(paramMap({}));
+    const {fixture, component, api, navigate} = mountLogic({params});
+    fixture.detectChanges();
+    await Promise.resolve();
+
+    // parseJobFilters treats an absent `origin` as the default rather than as
+    // "no filter", so there is nothing to redirect to and the URL stays clean.
+    expect(component.filters().origin).toEqual(['user', 'session']);
+    expect(navigate).not.toHaveBeenCalled();
+    // The default is the cockpit's, not the API's — so it must be SENT.
+    expect(api.getJobsPage).toHaveBeenCalled();
+    const query = (api.getJobsPage as unknown as {mock: {calls: unknown[][]}}).mock.calls[0][0];
+    expect((query as Record<string, unknown>)['origin']).toEqual(['user', 'session']);
+  });
+
+  it('collapses the default pair into one honest token', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+
+    // Two tokens reading "Source: user" and "Source: session" would describe
+    // a default the user never set.
+    const tokens = component.tokens();
+    expect(tokens.filter((t) => t.kind === 'origin')).toHaveLength(0);
+    expect(tokens.map((t) => t.id)).toContain('systemHidden');
+  });
+
+  it('removing that token shows every origin, and says so in the URL', () => {
+    const {fixture, component, navigate} = mountLogic();
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    const token = component.tokens().find((t) => t.id === 'systemHidden')!;
+    component.onRemoveToken(token);
+
+    // NOT an absent param: absence means the default, so clearing the filter
+    // would silently re-apply it. The sentinel is what makes "everything"
+    // expressible and shareable.
+    const [, extras] = navigate.mock.calls[0];
+    expect(extras.queryParams.origin).toBe('all');
+  });
+
+  it('round-trips the all-origins sentinel back to every origin', () => {
+    const params = new BehaviorSubject(paramMap({origin: 'all'}));
+    const {fixture, component} = mountLogic({params});
+    fixture.detectChanges();
+    expect(component.filters().origin).toEqual([]);
   });
 
   it('discards an invalid status from the URL instead of erroring', () => {

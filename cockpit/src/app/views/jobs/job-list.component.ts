@@ -1332,6 +1332,15 @@ export class JobListComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.pageSizePreference.restore();
     this.route.queryParamMap.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((params) => {
+      // A bare /jobs is the default view — human-initiated work only, 61 of
+      // 118 rows on the dev cluster — because parseJobFilters treats an absent
+      // `origin` as the default rather than as "no filter". No redirect is
+      // needed, and the URL stays clean.
+      //
+      // The default lives in the cockpit rather than in /api/jobs on purpose:
+      // the API hides what a user explicitly retired (an archived project),
+      // the UI hides what is merely noisy. That keeps "no filters" meaning
+      // "every job you can see" for MCP, agents and API-key callers.
       const parsed = parseJobFilters(readParamMap(params));
       // The URL is the source of truth; a hand-edited or stale link degrades
       // silently rather than erroring, because parseJobFilters discards what
