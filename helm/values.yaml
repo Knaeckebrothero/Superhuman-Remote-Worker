@@ -1029,6 +1029,53 @@ databases:
     #    across nodes inside one zone buys nothing.
     topologyKey: "kubernetes.io/hostname"
 
+  # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
+  #    CNPG-I plugin. Applies only to databases on the `cnpg` engine.
+  #
+  #    REQUIRES that plugin, which this chart CANNOT install: it ships as a raw
+  #    manifest that hardcodes the operator's namespace (cnpg-system), which a
+  #    release deployed elsewhere does not own. See the runbook:
+  #    knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+  backup:
+    # -- none | objectstore. Default none, deliberately. Pointing this at the
+    #    BUNDLED Garage would be worse than nothing: single node, one PVC, same
+    #    cluster as the databases -- whatever kills the database plausibly kills
+    #    the backup, while looking like a backup. Use storage in a different
+    #    failure domain, and confirm a restore before believing it.
+    method: "none"
+    # -- s3://bucket/prefix. Required when method is objectstore. Each cluster
+    #    gets its own folder underneath, named after the cluster.
+    destinationPath: ""
+    # -- Override S3 endpoint discovery (MinIO, Garage, Ceph, R2). Leave empty
+    #    for AWS S3 proper.
+    endpointURL: ""
+    # -- CA bundle for an S3 endpoint served by a private CA.
+    endpointCA:
+      secretName: ""
+      key: "ca.crt"
+    # -- Secret holding the S3 credentials. Empty = the chart's own Secret, so
+    #    the keys ride the existing Vault bundle rather than a second ESO path.
+    credentialsSecret: ""
+    accessKeyIdKey: "BACKUP_S3_ACCESS_KEY_ID"
+    secretAccessKeyKey: "BACKUP_S3_SECRET_ACCESS_KEY"
+    # -- XXu, u in [dwm]. Applies to base backups AND the WALs between them.
+    retentionPolicy: "30d"
+    wal:
+      # -- bzip2 | gzip | lz4 | snappy | xz | zstd
+      compression: "gzip"
+    data:
+      # -- bzip2 | gzip | lz4 | snappy. NOT xz or zstd -- those are WAL-only
+      #    and the CRD rejects them here.
+      compression: "gzip"
+    # -- SIX-field cron, seconds FIRST (robfig/cron), not the five-field
+    #    Kubernetes CronJob format. "0 0 2 * * *" is 02:00:00 daily; the
+    #    five-field "0 2 * * *" is silently misparsed into the wrong time.
+    schedule: "0 0 2 * * *"
+    # -- Take one immediately when the ScheduledBackup is created, so a fresh
+    #    install has a base backup before the first scheduled window. Without a
+    #    base backup the WAL archive restores nothing.
+    immediate: true
+
   postgres:
     enabled: true
     # -- Which implementation backs this database.
@@ -1046,6 +1093,8 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
@@ -1111,6 +1160,8 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
@@ -1180,6 +1231,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Audit is append-heavy, so it dominates WAL volume, and it is non-fatal
+    #    by contract and already retention-bounded. Off by default; turn it on
+    #    if the audit trail is a compliance artefact for you.
+    backupEnabled: false
     # -- CloudNativePG operand image, used ONLY when `engine` is not
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
@@ -1240,6 +1295,8 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
@@ -1288,6 +1345,8 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects

@@ -766,6 +766,15 @@
           }
         },
         "profile": { "type": "string", "enum": ["single", "ha"] },
+        "backup": {
+          "type": "object",
+          "properties": {
+            "method": { "type": "string", "enum": ["none", "objectstore"] },
+            "retentionPolicy": { "type": "string", "pattern": "^[0-9]+[dwm]$" },
+            "wal": { "type": "object", "properties": { "compression": { "type": "string", "enum": ["bzip2", "gzip", "lz4", "snappy", "xz", "zstd"] } } },
+            "data": { "type": "object", "properties": { "compression": { "type": "string", "enum": ["bzip2", "gzip", "lz4", "snappy"] } } }
+          }
+        },
         "neo4j": {
           "type": "object",
           "properties": {

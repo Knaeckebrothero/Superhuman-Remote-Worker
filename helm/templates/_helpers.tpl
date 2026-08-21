@@ -868,3 +868,55 @@ Usage: {{ if (include "srw.dbRendersStatefulset" (dict "context" . "key" "postgr
 {{- if has $engine (list "statefulset" "migrating") -}}true{{- end -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Whether a database's backups are on. Three things must hold: the release backs
+up at all, the database renders a CNPG Cluster (a StatefulSet has no plugin to
+hook), and the database has not opted out.
+Usage: {{ if (include "srw.dbBacksUp" (dict "context" . "key" "postgres")) }}
+*/}}
+{{- define "srw.dbBacksUp" -}}
+{{- if eq .context.Values.databases.backup.method "objectstore" -}}
+{{- if include "srw.dbRendersCnpg" . -}}
+{{- $db := index .context.Values.databases .key -}}
+{{- if ne $db.backupEnabled false -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Secret holding the S3 credentials for backups. Defaults to the chart's own, so
+the keys ride the existing Vault bundle instead of a second ExternalSecret.
+*/}}
+{{- define "srw.backupSecretName" -}}
+{{- .Values.databases.backup.credentialsSecret | default (include "srw.secretName" .) -}}
+{{- end }}
+
+{{/*
+Whether ANY database backs up -- i.e. whether the ObjectStore is referenced by
+something. One that nothing references is litter, and would misreport the
+release as backed up.
+*/}}
+{{- define "srw.anyDbBacksUp" -}}
+{{- $any := "" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- if include "srw.dbBacksUp" (dict "context" $ "key" $key) -}}
+{{- $any = "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $any -}}
+{{- end }}
+
+{{/*
+Whether ANY database renders a CNPG Cluster, for warnings that only apply once
+the data tier has actually moved.
+*/}}
+{{- define "srw.anyDbRendersCnpg" -}}
+{{- $any := "" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- if include "srw.dbRendersCnpg" (dict "context" $ "key" $key) -}}
+{{- $any = "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $any -}}
+{{- end }}
