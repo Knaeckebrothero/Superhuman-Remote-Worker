@@ -15,8 +15,12 @@ SSL_MODES = ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"
 
 def _template_command(*settings: str, show_only: str | None = None) -> list[str]:
     command = [
-        "helm", "template", "external-db-tls-test", str(CHART),
-        "-f", str(CHART / "ci/test-values.yaml"),
+        "helm",
+        "template",
+        "external-db-tls-test",
+        str(CHART),
+        "-f",
+        str(CHART / "ci/test-values.yaml"),
     ]
     if show_only:
         command.extend(["--show-only", show_only])
@@ -28,7 +32,9 @@ def _template_command(*settings: str, show_only: str | None = None) -> list[str]
 def _render(*settings: str, show_only: str | None = None) -> list[dict]:
     rendered = subprocess.run(
         _template_command(*settings, show_only=show_only),
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     return [document for document in yaml.safe_load_all(rendered) if document]
 
@@ -40,10 +46,14 @@ def _only_kind(documents: list[dict], kind: str) -> dict:
 
 
 def _config_map(*settings: str) -> dict:
-    return _only_kind(_render(*settings, show_only="templates/configmap.yaml"), "ConfigMap")
+    return _only_kind(
+        _render(*settings, show_only="templates/configmap.yaml"), "ConfigMap"
+    )
 
 
-pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+pytestmark = pytest.mark.skipif(
+    shutil.which("helm") is None, reason="Helm is not installed"
+)
 
 
 def test_default_ssl_mode_is_prefer_for_all_three_app_databases():
@@ -84,7 +94,8 @@ def test_ssl_mode_is_emitted_in_external_mode_too():
 def test_schema_rejects_an_invalid_ssl_mode():
     result = subprocess.run(
         _template_command("databases.postgres.sslMode=bogus"),
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode != 0
     assert "sslMode" in result.stderr or "bogus" in result.stderr
@@ -124,7 +135,9 @@ SSL_ENV_KEYS = ["POSTGRES_SSLMODE", "VECTOR_POSTGRES_SSLMODE", "AUDIT_POSTGRES_S
 def _container(documents: list[dict], kind: str, name: str) -> dict:
     workload = _only_kind(documents, kind)
     matches = [
-        c for c in workload["spec"]["template"]["spec"]["containers"] if c["name"] == name
+        c
+        for c in workload["spec"]["template"]["spec"]["containers"]
+        if c["name"] == name
     ]
     assert len(matches) == 1, f"expected exactly one {name} container"
     return matches[0]
@@ -133,7 +146,8 @@ def _container(documents: list[dict], kind: str, name: str) -> dict:
 def test_orchestrator_container_receives_every_ssl_mode_env():
     container = _container(
         _render(show_only="templates/orchestrator/deployment.yaml"),
-        "Deployment", "orchestrator",
+        "Deployment",
+        "orchestrator",
     )
     by_name = {entry["name"]: entry for entry in container["env"]}
     for key in SSL_ENV_KEYS:
@@ -147,21 +161,31 @@ def test_orchestrator_container_receives_every_ssl_mode_env():
 
 def test_llm_seed_job_receives_the_app_ssl_mode_env():
     container = _container(
-        _render("llm.seed.enabled=true", show_only="templates/orchestrator/llm-seed-job.yaml"),
-        "Job", "seed",
+        _render(
+            "llm.seed.enabled=true",
+            show_only="templates/orchestrator/llm-seed-job.yaml",
+        ),
+        "Job",
+        "seed",
     )
     by_name = {entry["name"]: entry for entry in container["env"]}
     assert "POSTGRES_SSLMODE" in by_name
-    assert by_name["POSTGRES_SSLMODE"]["valueFrom"]["configMapKeyRef"]["key"] == "POSTGRES_SSLMODE"
+    assert (
+        by_name["POSTGRES_SSLMODE"]["valueFrom"]["configMapKeyRef"]["key"]
+        == "POSTGRES_SSLMODE"
+    )
 
 
 def test_agent_pods_inherit_ssl_mode_via_env_from():
     """Agents need no explicit wiring -- verified live on k3d, where an agent
     pod already reported POSTGRES_SSLMODE=prefer purely through envFrom."""
     container = _container(
-        _render("agent.stateless.enabled=true",
-                show_only="templates/agent/stateless-deployment.yaml"),
-        "Deployment", "agent",
+        _render(
+            "agent.stateless.enabled=true",
+            show_only="templates/agent/stateless-deployment.yaml",
+        ),
+        "Deployment",
+        "agent",
     )
     sources = [
         source["configMapRef"]["name"]
