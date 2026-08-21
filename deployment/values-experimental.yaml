@@ -63,33 +63,33 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-7c2fcf6
+    tag: sha-81a9c8e
   agent:
-    tag: sha-7c2fcf6
+    tag: sha-81a9c8e
   cockpit:
     tag: sha-cc5bda0
   mcp:
-    tag: sha-16cd3e8
-    digest: sha256:57595fed4cd3b309dcb57a6c3106634f78996bcb44e9967de18e240530eaeb1e
+    tag: sha-81a9c8e
+    digest: sha256:7c92166fb77ccf01ba76538a53b9c8dca5b4a5dc108c4826941f1ce88f5bc8a2
   workspace:
     tag: sha-cee8f27
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-7c2fcf6703c0006fc710e20561335207c40b4447"
+  releaseVersion: "0.0.0-dev.sha-81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5"
   components:
     orchestrator:
-      sourceRevision: 7c2fcf6703c0006fc710e20561335207c40b4447
-      releaseVersion: "0.0.0-dev.sha-7c2fcf6703c0006fc710e20561335207c40b4447"
+      sourceRevision: 81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5
+      releaseVersion: "0.0.0-dev.sha-81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5"
     agent:
-      sourceRevision: 7c2fcf6703c0006fc710e20561335207c40b4447
-      releaseVersion: "0.0.0-dev.sha-7c2fcf6703c0006fc710e20561335207c40b4447"
+      sourceRevision: 81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5
+      releaseVersion: "0.0.0-dev.sha-81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5"
     cockpit:
       sourceRevision: cc5bda0fad1fdafcb9931217a9f62fceb5f0869d
       releaseVersion: "0.0.0-dev.sha-cc5bda0fad1fdafcb9931217a9f62fceb5f0869d"
     mcp:
-      sourceRevision: 16cd3e8c9d6376d53f1a5514b3017009c1310b3d
-      releaseVersion: "0.0.0-dev.sha-16cd3e8c9d6376d53f1a5514b3017009c1310b3d"
+      sourceRevision: 81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5
+      releaseVersion: "0.0.0-dev.sha-81a9c8e055cf2da5388ec8196f74ce07e4ef7ef5"
     workspace:
       sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
       releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
