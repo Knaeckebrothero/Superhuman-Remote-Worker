@@ -1,4 +1,4 @@
-{{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) (list "statefulset" "migrating")) }}
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "postgres")) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

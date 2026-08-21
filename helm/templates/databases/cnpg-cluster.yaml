@@ -67,28 +67,26 @@ spec:
     {{- toYaml $db.resources | nindent 4 }}
 {{- end }}
 
-{{- $renderCnpg := list "migrating" "cnpg" -}}
-
-{{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) $renderCnpg) }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw") }}
 ---
 {{- end }}
 
-{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.vector)) $renderCnpg) }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw") }}
 ---
 {{- end }}
 
-{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.audit)) $renderCnpg) }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw") }}
 ---
 {{- end }}
 
-{{- if and .Values.gitea.enabled .Values.gitea.internal (include "srw.giteaUsesPostgres" .) .Values.databases.gitea.enabled .Values.databases.gitea.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.gitea)) $renderCnpg) }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "gitea")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea") }}
 ---
 {{- end }}
 
-{{- if and .Values.keycloak.enabled .Values.keycloak.internal .Values.databases.keycloak.enabled .Values.databases.keycloak.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) $renderCnpg) }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak") }}
 {{- end }}
