@@ -1,4 +1,4 @@
-{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.vector)) (list "statefulset" "migrating")) }}
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "vector")) }}
 # Vector Database (pgvector) — Citations, Embeddings, Memories, Knowledge Index
 #
 # Separate PostgreSQL instance with pgvector extension for all vector operations.

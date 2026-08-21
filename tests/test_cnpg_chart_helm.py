@@ -232,3 +232,122 @@ def test_operand_image_is_used_when_pinned():
         "databases.postgres.cnpgImage=ghcr.io/cloudnative-pg/postgresql:16.10",
     )[0]
     assert cluster["spec"]["imageName"] == "ghcr.io/cloudnative-pg/postgresql:16.10"
+
+
+# --- credential projection -------------------------------------------------
+#
+# The chart has three secret modes and the projection needs a different
+# mechanism in each. `helm/ci/test-values.yaml` runs the External Secrets mode,
+# which is also how dev is configured.
+
+CREDENTIALS = "templates/databases/cnpg-credentials.yaml"
+CREATE_MODE = ("externalSecrets.enabled=false", "secrets.create=true")
+
+
+def _credentials(*settings: str) -> dict[str, dict]:
+    return {d["metadata"]["name"]: d for d in _render(*settings, show_only=CREDENTIALS)}
+
+
+def _render_fails(*settings: str) -> str:
+    result = subprocess.run(
+        _template_command(*settings), capture_output=True, text=True
+    )
+    assert result.returncode != 0, "expected the render to fail"
+    return result.stderr
+
+
+def test_no_credential_object_when_inert():
+    result = subprocess.run(
+        _template_command(show_only=CREDENTIALS), capture_output=True, text=True
+    )
+    # Helm errors when --show-only matches nothing rendered; either way, nothing.
+    assert result.returncode != 0 or "kind:" not in result.stdout
+
+
+@pytest.mark.parametrize("key", sorted(DATABASES))
+def test_external_secrets_mode_projects_into_a_basic_auth_shape(key):
+    component, _, owner = DATABASES[key]
+    external = _credentials(f"databases.{key}.engine=cnpg")[
+        f"{FULLNAME}-{component}-app"
+    ]
+    assert external["kind"] == "ExternalSecret"
+    template = external["spec"]["target"]["template"]
+    assert template["type"] == "kubernetes.io/basic-auth"
+    assert template["data"]["username"] == owner
+    # Left for the ESO controller to substitute, not rendered away by Helm.
+    assert template["data"]["password"] == "{{ .password }}"
+
+
+@pytest.mark.parametrize(
+    "key,password_key",
+    [
+        ("postgres", "POSTGRES_PASSWORD"),
+        ("vector", "VECTOR_POSTGRES_PASSWORD"),
+        ("audit", "AUDIT_POSTGRES_PASSWORD"),
+        ("gitea", "GITEA_DB_PASSWORD"),
+        ("keycloak", "KC_DB_PASSWORD"),
+    ],
+)
+def test_external_secrets_mode_reads_the_same_vault_property_consumers_do(
+    key, password_key
+):
+    component, _, _ = DATABASES[key]
+    external = _credentials(f"databases.{key}.engine=cnpg")[
+        f"{FULLNAME}-{component}-app"
+    ]
+    entry = external["spec"]["data"][0]
+    assert entry["secretKey"] == "password"
+    assert entry["remoteRef"]["property"] == password_key
+
+
+def test_create_mode_projects_the_operators_own_value():
+    secret = _credentials(
+        *CREATE_MODE,
+        "secrets.values.POSTGRES_PASSWORD=s3cret",
+        "databases.postgres.engine=cnpg",
+    )[f"{FULLNAME}-postgres-app"]
+    assert secret["kind"] == "Secret"
+    assert secret["type"] == "kubernetes.io/basic-auth"
+    assert secret["stringData"] == {"username": "srw", "password": "s3cret"}
+
+
+def test_create_mode_refuses_to_invent_a_password():
+    """An empty password bootstraps a database nothing can log into, while
+    looking configured. Fail at render instead."""
+    stderr = _render_fails(*CREATE_MODE, "databases.postgres.engine=cnpg")
+    assert "secrets.values.POSTGRES_PASSWORD is unset" in stderr
+
+
+def test_create_mode_rejects_a_username_that_disagrees_with_the_owner():
+    """CNPG creates the owner role. A consumer authenticating as a different
+    role would own nothing -- and would find out at the first write."""
+    stderr = _render_fails(
+        *CREATE_MODE,
+        "secrets.values.POSTGRES_PASSWORD=s3cret",
+        "secrets.values.POSTGRES_USER=someoneelse",
+        "databases.postgres.engine=cnpg",
+    )
+    assert "would own nothing" in stderr
+
+
+def test_existing_secret_mode_names_the_secret_the_operator_must_create():
+    stderr = _render_fails(
+        "externalSecrets.enabled=false",
+        "secrets.create=false",
+        "secrets.existingSecret=my-secret",
+        "databases.postgres.engine=cnpg",
+    )
+    assert f"{FULLNAME}-postgres-app" in stderr
+    assert "kubernetes.io/basic-auth" in stderr
+
+
+def test_credential_name_matches_what_the_cluster_references():
+    cluster = _cluster("databases.postgres.engine=cnpg")[0]
+    referenced = cluster["spec"]["bootstrap"]["initdb"]["secret"]["name"]
+    assert referenced in _credentials("databases.postgres.engine=cnpg")
+
+
+def test_every_rendered_cluster_gets_a_credential_object():
+    clusters = {c["metadata"]["name"] for c in _cluster(*_all_cnpg())}
+    credentials = set(_credentials(*_all_cnpg()))
+    assert {f"{name}-app" for name in clusters} == credentials

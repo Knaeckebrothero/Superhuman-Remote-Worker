@@ -824,3 +824,47 @@ Usage: {{ include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgr
 {{- end -}}
 {{- $engine -}}
 {{- end }}
+
+{{/*
+Whether a bundled database is deployed by this chart at all, independent of
+which engine backs it. Gitea's and Keycloak's databases carry extra
+prerequisites (their own service must be bundled too), and those conditions
+are needed by four templates -- the StatefulSet, the Cluster, the credential
+Secret and the PDB. Duplicating them is how they drift.
+Usage: {{ include "srw.dbPrereqs" (dict "context" . "key" "postgres") }}
+*/}}
+{{- define "srw.dbPrereqs" -}}
+{{- $ctx := .context -}}
+{{- $db := index $ctx.Values.databases .key -}}
+{{- $ok := and $db.enabled $db.internal -}}
+{{- if eq .key "gitea" -}}
+{{- $ok = and $ok $ctx.Values.gitea.enabled $ctx.Values.gitea.internal (include "srw.giteaUsesPostgres" $ctx) -}}
+{{- else if eq .key "keycloak" -}}
+{{- $ok = and $ok $ctx.Values.keycloak.enabled $ctx.Values.keycloak.internal -}}
+{{- end -}}
+{{- if $ok -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Whether a database renders its CloudNativePG Cluster (engine cnpg or, during
+the transition, migrating). Empty string is falsey, so use it in an `if`.
+Usage: {{ if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+*/}}
+{{- define "srw.dbRendersCnpg" -}}
+{{- if include "srw.dbPrereqs" . -}}
+{{- $engine := include "srw.dbEngine" (dict "context" .context "db" (index .context.Values.databases .key)) -}}
+{{- if has $engine (list "migrating" "cnpg") -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether a database renders its bundled StatefulSet. `migrating` renders BOTH,
+so Phase 4 can import from the live Service before the StatefulSet goes away.
+Usage: {{ if (include "srw.dbRendersStatefulset" (dict "context" . "key" "postgres")) }}
+*/}}
+{{- define "srw.dbRendersStatefulset" -}}
+{{- if include "srw.dbPrereqs" . -}}
+{{- $engine := include "srw.dbEngine" (dict "context" .context "db" (index .context.Values.databases .key)) -}}
+{{- if has $engine (list "statefulset" "migrating") -}}true{{- end -}}
+{{- end -}}
+{{- end }}

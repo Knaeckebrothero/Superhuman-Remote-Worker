@@ -1,4 +1,4 @@
-{{- if and .Values.keycloak.enabled .Values.keycloak.internal .Values.databases.keycloak.enabled .Values.databases.keycloak.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) (list "statefulset" "migrating")) }}
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "keycloak")) }}
 # Dedicated PostgreSQL for the bundled Keycloak.
 #
 # Keeps the IdP's data plane isolated from the orchestrator's `srw-postgres`.
