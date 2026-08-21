@@ -139,6 +139,17 @@ class TestRunCommand:
         assert backend.shell_run.call_args[0][0] == "echo hello-world"
         assert backend.shell_run.call_args[1]["working_dir"] == "."
 
+    def test_handoff_lost_tab_uses_tool_level_missing_tab_error(self, manager, backend):
+        backend.shell_ensure_tab.side_effect = KeyError(
+            "Tab 'default' no longer exists. Available: build"
+        )
+        tool = self._get_run_command(manager)
+
+        result = tool.invoke({"command": "echo must-not-run"})
+
+        assert result == ("Error: \"Tab 'default' no longer exists. Available: build\"")
+        backend.shell_run.assert_not_called()
+
     def test_working_dir_forwarded(self, manager, backend):
         tool = self._get_run_command(manager)
         tool.invoke({"command": "pwd", "working_dir": "repo"})
