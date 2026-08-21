@@ -364,6 +364,7 @@ POST   /api/projects/{project_id}/officer/commission                            
 POST   /api/projects/{project_id}/officer/decommission                                  gated:require_project_owner
 POST   /api/projects/{project_id}/officer/hold                                          gated:require_project_owner
 POST   /api/projects/{project_id}/officer/note                                          gated:require_project_owner
+POST   /api/projects/{project_id}/officer/recycle                                       gated:require_project_owner
 POST   /api/projects/{project_id}/officer/release                                       gated:require_project_owner
 GET    /api/projects/{project_id}/repositories                                          gated:require_project_member
 POST   /api/projects/{project_id}/repositories                                          gated:require_project_owner
