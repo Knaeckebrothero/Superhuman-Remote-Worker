@@ -142,6 +142,17 @@ export interface JobSummary {
   pending_approval?: boolean;
   /** Newest open request id, for the inbox deep-link (`/inbox?sudo=<id>`). */
   pending_approval_request_id?: string | null;
+  /** Where the job came from: user|session|automation|loop|officer|subjob|lifecycle|bench. */
+  origin?: string;
+  /**
+   * The display root this row belongs to. The server pages over display
+   * roots — a matching job whose parent does not match — and sends each
+   * root's matching children along with it, so a tree is never split across
+   * pages and the page size always counts whole trees.
+   */
+  display_root_id?: string;
+  /** True when this row IS its display root, false when it is a child of one. */
+  is_display_root?: boolean;
 }
 
 /**
