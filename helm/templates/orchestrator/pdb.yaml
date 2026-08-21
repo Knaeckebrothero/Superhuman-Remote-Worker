@@ -6,7 +6,10 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
 spec:
-  minAvailable: {{ .Values.orchestrator.pdb.minAvailable }}
+  # Derived, not configured: at replicas:1 a minAvailable of 1 blocks every
+  # voluntary eviction and `kubectl drain` hangs forever. That is the
+  # 2026-05-16 node-pull incident, and a values comment did not prevent it.
+  minAvailable: {{ if gt (int .Values.orchestrator.replicas) 1 }}1{{ else }}0{{ end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
