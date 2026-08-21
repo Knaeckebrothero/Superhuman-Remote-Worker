@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import asyncpg
@@ -401,6 +401,45 @@ async def test_list_llm_requests_token_usage_and_status(seeded):
         assert errs["entries"][0]["error"]["type"] == "TimeoutError"
     finally:
         await s.disconnect()
+
+
+async def test_list_claim_timings_returns_payloads_in_claim_time_order(seeded):
+    job_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    writer = SyncAuditWriter(seeded["dsn"])
+    try:
+        for timestamp, outcome in (
+            (now, "terminal:completed"),
+            (now - timedelta(seconds=30), "rotated"),
+        ):
+            writer.insert_audit_pre(
+                {
+                    "job_id": job_id,
+                    "agent_type": "worker",
+                    "iteration": 1,
+                    "step_type": "claim_timing",
+                    "node_name": "worker_claim",
+                    "timestamp": timestamp,
+                    "payload": {
+                        "claimed_at": timestamp.isoformat(),
+                        "outcome": outcome,
+                    },
+                }
+            )
+    finally:
+        writer.close()
+
+    store = await _store(seeded["dsn"])
+    try:
+        rows = await store.list_claim_timings(job_id)
+    finally:
+        await store.disconnect()
+
+    assert [row["payload"]["outcome"] for row in rows] == [
+        "rotated",
+        "terminal:completed",
+    ]
+    assert all(row["timestamp"].endswith("Z") for row in rows)
 
 
 async def test_get_request_and_non_uuid(seeded):

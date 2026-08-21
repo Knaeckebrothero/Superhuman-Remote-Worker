@@ -797,6 +797,32 @@ class AuditStore:
             logger.warning(f"list_llm_requests failed: {e}")
             return empty
 
+    async def list_claim_timings(self, job_id: str) -> List[Dict[str, Any]]:
+        """Return worker ``claim_timing`` payloads in claim timestamp order."""
+
+        if not self._available or self._pool is None:
+            return []
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT timestamp, payload FROM agent_audit "
+                    "WHERE job_id=$1::uuid AND event_phase='pre' "
+                    "AND step_type='claim_timing' ORDER BY timestamp, id",
+                    job_id,
+                )
+            return [
+                {
+                    "timestamp": _to_iso_utc(row["timestamp"]),
+                    "payload": (
+                        row["payload"] if isinstance(row["payload"], dict) else {}
+                    ),
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.warning(f"list_claim_timings failed: {e}")
+            return []
+
     # -- cache-invalidation version ----------------------------------------
 
     async def get_job_version(self, job_id: str) -> Optional[Dict[str, Any]]:
