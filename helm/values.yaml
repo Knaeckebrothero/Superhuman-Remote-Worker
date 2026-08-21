@@ -991,8 +991,50 @@ llmOutage:
   ceilingSeconds: 43200
 
 databases:
+  # -- CloudNativePG operator. The chart can install it as a subchart for a
+  #    batteries-included self-host, or defer to one the cluster already runs
+  #    (one operator serving many namespaces is the normal deployment, and is
+  #    how the dev cluster is set up — cnpg-system, cluster-wide).
+  operator:
+    install: true
+
+  # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
+  #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
+  #    Anti-affinity, PDBs and topology all derive from the RESOLVED count, so
+  #    an explicit `instances: 3` behaves correctly without naming a profile.
+  profile: single
+
+  ha:
+    # -- kubernetes.io/hostname on bare metal. On a hyperscaler set
+    #    topology.kubernetes.io/zone: block volumes are zonal, so spreading
+    #    across nodes inside one zone buys nothing.
+    topologyKey: "kubernetes.io/hostname"
+
   postgres:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
+    #    picks its own default operand image, so the PostgreSQL major is the
+    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
+    cnpgImage: ""
     # -- Deploy StatefulSet within chart (false = external database — set
     # externalHost/externalPort/externalDb below)
     internal: true
@@ -1035,6 +1077,41 @@ databases:
         cpu: "500m"
   vector:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
+    #    picks its own default operand image, so the PostgreSQL major is the
+    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
+    cnpgImage: ""
+    # -- PostgreSQL extensions mounted as image volumes (CloudNativePG >= 1.29).
+    #    REQUIRES Kubernetes >= 1.35, or 1.33/1.34 with the ImageVolume feature
+    #    gate enabled on the API server and every kubelet, plus containerd
+    #    >= 2.1.0. The image tag encodes the PostgreSQL major ("-18-"), so it
+    #    must match `image` below. Declaring an extension only makes it
+    #    AVAILABLE; the migrations still run CREATE EXTENSION.
+    #    Alternative for older clusters: leave this empty and point `image` at
+    #    an operand image with pgvector already built in.
+    extensions:
+      - name: pgvector
+        image:
+          reference: ghcr.io/cloudnative-pg/pgvector:0.8.6-18-trixie
     internal: true
     # -- External mode connection parts. See ``databases.postgres`` above for
     # the rationale (credentials live in the Secret, not a bundled URL).
@@ -1069,6 +1146,29 @@ databases:
   # isolation). Append-only, monthly-partitioned, retention-bounded.
   audit:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
+    #    picks its own default operand image, so the PostgreSQL major is the
+    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
+    cnpgImage: ""
     internal: true
     # -- External mode connection parts (credentials live in the Secret).
     externalHost: ""
@@ -1106,6 +1206,29 @@ databases:
   # `gitea.database.type: postgres`, and this DB are all internal.
   gitea:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
+    #    picks its own default operand image, so the PostgreSQL major is the
+    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
+    cnpgImage: ""
     # -- When false, the bundled Gitea points at externalHost/Port/Db below
     #    (managed Postgres — RDS, Cloud SQL, CloudNativePG). Credentials still
     #    come from the Secret (GITEA_DB_USER / GITEA_DB_PASSWORD).
@@ -1131,6 +1254,29 @@ databases:
   # Keycloak and this DB are internal.
   keycloak:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
+    #    picks its own default operand image, so the PostgreSQL major is the
+    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
+    cnpgImage: ""
     # -- When false, KC_DB_URL on the Keycloak pod uses externalUrl below.
     #    Lets the bundled Keycloak point at a managed Postgres (RDS, Cloud SQL).
     internal: true

@@ -1,4 +1,4 @@
-{{- if and .Values.gitea.enabled .Values.gitea.internal (include "srw.giteaUsesPostgres" .) .Values.databases.gitea.enabled .Values.databases.gitea.internal }}
+{{- if and .Values.gitea.enabled .Values.gitea.internal (include "srw.giteaUsesPostgres" .) .Values.databases.gitea.enabled .Values.databases.gitea.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.gitea)) (list "statefulset" "migrating")) }}
 # Dedicated PostgreSQL for the bundled Gitea's metadata (users, orgs, repo
 # rows, issues, PRs, OIDC login source). Git objects stay on the Gitea PVC.
 #
