@@ -1,0 +1,94 @@
+{{/*
+CloudNativePG Cluster for one bundled database.
+
+The cluster NAME equals the current Service name, so CNPG's "<name>-rw"
+service is the only thing Phase 4's host helpers have to change.
+
+Credentials come from a derived basic-auth Secret rather than CNPG's own
+generated one, so every consumer's env stays untouched (see cnpg-credentials.yaml).
+
+Rendered only when `databases.<name>.engine` is `migrating` or `cnpg`; the
+chart default is `statefulset`, so a default release is unaffected.
+*/}}
+{{- define "srw.cnpgCluster" -}}
+{{- $ctx := .context -}}
+{{- $db := .db -}}
+{{- $instances := int (include "srw.dbInstances" (dict "context" $ctx "db" $db)) -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "srw.fullname" $ctx }}-{{ .component }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ctx "component" .component) | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  instances: {{ $instances }}
+  {{- with $db.cnpgImage }}
+  # Omitted when empty: CNPG then uses its own default operand image. The
+  # StatefulSet's `image` is NOT interchangeable -- its tag grammar
+  # ("pg15") fails CNPG's version parse.
+  imageName: {{ . }}
+  {{- end }}
+  # Carries the chart's component labels onto every pod CNPG creates, so the
+  # existing NetworkPolicy and Service selectors keep matching unmodified.
+  inheritedMetadata:
+    labels:
+      {{- include "srw.componentSelectorLabels" (dict "context" $ctx "component" .component) | nindent 6 }}
+  storage:
+    size: {{ $db.storageSize }}
+    {{- if $db.storageClass }}
+    storageClass: {{ $db.storageClass }}
+    {{- end }}
+  affinity:
+    enablePodAntiAffinity: true
+    # Hard once there is more than one instance: replicas stacked on a single
+    # node look like insurance and are not. Pending is the honest failure.
+    podAntiAffinityType: {{ if gt $instances 1 }}required{{ else }}preferred{{ end }}
+    topologyKey: {{ $ctx.Values.databases.ha.topologyKey | quote }}
+  postgresql:
+    # Always render parameters, never an empty mapping: `postgresql:` with no
+    # children YAML-parses to null, which breaks every consumer that expects a
+    # dict. The connection budget lives here now, where the StatefulSet used to
+    # inherit the image default of 100.
+    parameters:
+      max_connections: {{ $db.maxConnections | default 100 | quote }}
+    {{- with $db.extensions }}
+    extensions:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  bootstrap:
+    initdb:
+      database: {{ .database | quote }}
+      owner: {{ .owner | quote }}
+      secret:
+        name: {{ include "srw.fullname" $ctx }}-{{ .component }}-app
+  resources:
+    {{- toYaml $db.resources | nindent 4 }}
+{{- end }}
+
+{{- $renderCnpg := list "migrating" "cnpg" -}}
+
+{{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) $renderCnpg) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw") }}
+---
+{{- end }}
+
+{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.vector)) $renderCnpg) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw") }}
+---
+{{- end }}
+
+{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.audit)) $renderCnpg) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw") }}
+---
+{{- end }}
+
+{{- if and .Values.gitea.enabled .Values.gitea.internal (include "srw.giteaUsesPostgres" .) .Values.databases.gitea.enabled .Values.databases.gitea.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.gitea)) $renderCnpg) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea") }}
+---
+{{- end }}
+
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal .Values.databases.keycloak.enabled .Values.databases.keycloak.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) $renderCnpg) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak") }}
+{{- end }}

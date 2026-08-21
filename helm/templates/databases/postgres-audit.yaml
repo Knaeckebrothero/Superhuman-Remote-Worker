@@ -1,4 +1,4 @@
-{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
+{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal (has (include "srw.dbEngine" (dict "context" . "db" .Values.databases.audit)) (list "statefulset" "migrating")) }}
 # Audit Database (srw-auditdb) — the observability tier.
 #
 # Dedicated PostgreSQL instance for the append-only audit/llm/chat trace (and,

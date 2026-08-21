@@ -794,3 +794,33 @@ Two deliberate boundaries:
 {{- $canonical := trim (toString .Values.email.smtp.port) -}}
 {{- if regexMatch "^[0-9]+$" $canonical -}}{{ $canonical }}{{- else -}}1025{{- end -}}
 {{- end -}}
+
+{{/*
+Resolved instance count for one database. Explicit `instances` wins; otherwise
+the profile decides. Everything downstream (anti-affinity, PDBs) reads THIS,
+never the profile name — a generated values file may set instances directly.
+Usage: {{ include "srw.dbInstances" (dict "context" . "db" .Values.databases.postgres) }}
+*/}}
+{{- define "srw.dbInstances" -}}
+{{- if .db.instances -}}
+{{- .db.instances -}}
+{{- else if eq .context.Values.databases.profile "ha" -}}
+2
+{{- else -}}
+1
+{{- end -}}
+{{- end }}
+
+{{/*
+Which implementation backs a database. Rejects typos loudly rather than
+silently falling back to the StatefulSet, which would strand a migrated
+Cluster's data behind an empty one.
+Usage: {{ include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres) }}
+*/}}
+{{- define "srw.dbEngine" -}}
+{{- $engine := .db.engine | default "statefulset" -}}
+{{- if not (has $engine (list "statefulset" "migrating" "cnpg")) -}}
+{{- fail (printf "databases.<name>.engine must be statefulset, migrating or cnpg, got %q" $engine) -}}
+{{- end -}}
+{{- $engine -}}
+{{- end }}

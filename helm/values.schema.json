@@ -734,21 +734,38 @@
         "postgres": {
           "type": "object",
           "properties": {
-            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] },
+            "engine": { "type": "string", "enum": ["statefulset", "migrating", "cnpg"] }
           }
         },
         "vector": {
           "type": "object",
           "properties": {
-            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] },
+            "engine": { "type": "string", "enum": ["statefulset", "migrating", "cnpg"] }
           }
         },
         "audit": {
           "type": "object",
           "properties": {
-            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] }
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] },
+            "engine": { "type": "string", "enum": ["statefulset", "migrating", "cnpg"] }
           }
         },
+        "gitea": {
+          "type": "object",
+          "properties": {
+            "sslMode": { "type": "string", "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] },
+            "engine": { "type": "string", "enum": ["statefulset", "migrating", "cnpg"] }
+          }
+        },
+        "keycloak": {
+          "type": "object",
+          "properties": {
+            "engine": { "type": "string", "enum": ["statefulset", "migrating", "cnpg"] }
+          }
+        },
+        "profile": { "type": "string", "enum": ["single", "ha"] },
         "neo4j": {
           "type": "object",
           "properties": {
