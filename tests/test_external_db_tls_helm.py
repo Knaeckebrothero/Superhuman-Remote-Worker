@@ -108,3 +108,66 @@ def test_gitea_keeps_its_own_ssl_mode_knob_and_default():
     ssl_mode = [e for e in container["env"] if e["name"] == "GITEA__database__SSL_MODE"]
     assert len(ssl_mode) == 1
     assert ssl_mode[0]["value"] == "disable"
+
+
+# ---------------------------------------------------------------------------
+# A ConfigMap key is not enough. The orchestrator and the llm-seed Job build
+# their env EXPLICITLY and do NOT envFrom the shared ConfigMap -- the trap is
+# documented at helm/templates/orchestrator/deployment.yaml:108-110. Agent pods
+# DO envFrom it, so they inherit new keys for free. These tests pin that split;
+# asserting only on ConfigMap contents let a dead knob ship.
+# ---------------------------------------------------------------------------
+
+SSL_ENV_KEYS = ["POSTGRES_SSLMODE", "VECTOR_POSTGRES_SSLMODE", "AUDIT_POSTGRES_SSLMODE"]
+
+
+def _container(documents: list[dict], kind: str, name: str) -> dict:
+    workload = _only_kind(documents, kind)
+    matches = [
+        c for c in workload["spec"]["template"]["spec"]["containers"] if c["name"] == name
+    ]
+    assert len(matches) == 1, f"expected exactly one {name} container"
+    return matches[0]
+
+
+def test_orchestrator_container_receives_every_ssl_mode_env():
+    container = _container(
+        _render(show_only="templates/orchestrator/deployment.yaml"),
+        "Deployment", "orchestrator",
+    )
+    by_name = {entry["name"]: entry for entry in container["env"]}
+    for key in SSL_ENV_KEYS:
+        assert key in by_name, (
+            f"{key} is missing from the orchestrator container env. The "
+            "orchestrator does not envFrom the shared ConfigMap, so adding the "
+            "key to configmap.yaml alone leaves the knob dead."
+        )
+        assert by_name[key]["valueFrom"]["configMapKeyRef"]["key"] == key
+
+
+def test_llm_seed_job_receives_the_app_ssl_mode_env():
+    container = _container(
+        _render("llm.seed.enabled=true", show_only="templates/orchestrator/llm-seed-job.yaml"),
+        "Job", "seed",
+    )
+    by_name = {entry["name"]: entry for entry in container["env"]}
+    assert "POSTGRES_SSLMODE" in by_name
+    assert by_name["POSTGRES_SSLMODE"]["valueFrom"]["configMapKeyRef"]["key"] == "POSTGRES_SSLMODE"
+
+
+def test_agent_pods_inherit_ssl_mode_via_env_from():
+    """Agents need no explicit wiring -- verified live on k3d, where an agent
+    pod already reported POSTGRES_SSLMODE=prefer purely through envFrom."""
+    container = _container(
+        _render("agent.stateless.enabled=true",
+                show_only="templates/agent/stateless-deployment.yaml"),
+        "Deployment", "agent",
+    )
+    sources = [
+        source["configMapRef"]["name"]
+        for source in container.get("envFrom", [])
+        if "configMapRef" in source
+    ]
+    assert any("config" in name for name in sources), (
+        "agent pods must envFrom the shared ConfigMap, or they stop inheriting new keys"
+    )
