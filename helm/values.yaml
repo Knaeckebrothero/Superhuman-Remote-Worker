@@ -152,6 +152,10 @@ orchestrator:
   # replica serves the parked-boundary acknowledgement contract; the
   # owner/admin manual recycle endpoint remains available while false.
   persistentAgentReconciliationEnabled: false
+  # -- Admin-only, exact-binding runtime-grant verification plans. This is a
+  # deployed-test seam, never an Officer/model capability; every profile ships
+  # disabled and a bounded gate enables it only for the test interval.
+  officerRuntimeVerificationEnabled: false
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:

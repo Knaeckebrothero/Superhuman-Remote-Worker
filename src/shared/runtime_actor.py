@@ -17,6 +17,11 @@ from typing import Any, Final, Mapping
 RUNTIME_ACTOR_HEADER: Final = "X-SRW-Runtime-Actor"
 RUNTIME_ACTOR_REFRESH_HEADER: Final = "X-SRW-Runtime-Actor-Refresh"
 RUNTIME_ACTOR_BOOTSTRAP_HEADER: Final = "X-SRW-Runtime-Actor-Bootstrap"
+# Hidden transport assertion used by the persistent loop's pre-provider
+# maintenance callback. It selects no identity or authority: the opaque
+# refresh bearer plus server-side Post/thread/agent/grant locks still do that.
+RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER: Final = "X-SRW-Runtime-Actor-Maintenance-Phase"
+RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN: Final = "pre-turn"
 
 # BP-09 Legate decision point.  This is the complete default human matrix for
 # dispatch-authorizing machine tags AND charter writes.  Conference runtimes

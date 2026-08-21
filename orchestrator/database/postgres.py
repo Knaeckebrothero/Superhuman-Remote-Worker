@@ -103,6 +103,32 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
     }
 )
 
+# These Post-state keys are lifecycle/authorization authority, not runtime
+# authored Officer state.  They must never be harvested from a thread,
+# restored into a successor thread, or replaced through the generic shallow
+# state-merge helper.  Their owning services update them under the durable
+# Post lock.
+_SERVER_OWNED_PROJECT_OFFICER_STATE_KEYS = frozenset(
+    {"runtime_actor_incident", "runtime_actor_verification"}
+)
+_PROJECT_OFFICER_NON_HARVEST_STATE_KEYS = (
+    _SERVER_OWNED_PROJECT_OFFICER_STATE_KEYS
+    | frozenset({"while_vacant", "while_vacant_dropped"})
+)
+
+
+def project_officer_harvested_state(value: Any) -> Dict[str, Any]:
+    """Return only Post state that truthfully represents harvested memory."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in _PROJECT_OFFICER_NON_HARVEST_STATE_KEYS
+    }
+
+
 _LEASE_RECOVERY_CONTEXT_KEY = "_lease_recovery"
 LEASE_RECOVERY_UNCHANGED_LIMIT = 3
 LEASE_RECOVERY_AUDIT_TIMEOUT_SECONDS = 5.0
@@ -11966,14 +11992,8 @@ class PostgresDB:
                     state_restore = {
                         key: value
                         for key, value in state.items()
-                        if key
-                        not in (
-                            "while_vacant",
-                            "while_vacant_dropped",
-                            # Server-owned authorization incident state never
-                            # enters model/runtime-authored thread metadata.
-                            "runtime_actor_incident",
-                        )
+                        if key not in {"while_vacant", "while_vacant_dropped"}
+                        and key not in _SERVER_OWNED_PROJECT_OFFICER_STATE_KEYS
                     }
                     restored = await conn.fetchrow(
                         """
@@ -12715,14 +12735,11 @@ class PostgresDB:
                 if not isinstance(officer_state, dict):
                     officer_state = {}
                 else:
-                    # The runtime actor incident is Post-only server authority.
-                    # A thread projection must not create, replace, or settle it
-                    # during decommission harvesting.
-                    officer_state = {
-                        key: value
-                        for key, value in officer_state.items()
-                        if key != "runtime_actor_incident"
-                    }
+                    # Runtime-actor incident and verification state are
+                    # Post-only server authority. A thread projection must not
+                    # create, replace, settle, or carry either one across an
+                    # incarnation during decommission harvesting.
+                    officer_state = project_officer_harvested_state(officer_state)
                 if officer_state:
                     await conn.execute(
                         """
@@ -13066,7 +13083,7 @@ class PostgresDB:
         patch = {
             key: value
             for key, value in patch.items()
-            if key != "runtime_actor_incident"
+            if key not in _SERVER_OWNED_PROJECT_OFFICER_STATE_KEYS
         }
         async with self.acquire() as conn:
             row = await conn.fetchrow(

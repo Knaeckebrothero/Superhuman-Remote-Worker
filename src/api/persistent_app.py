@@ -131,6 +131,15 @@ _termination_admission_fenced: bool = False
 _termination_fence_reason: Optional[str] = None
 _TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
 
+# Process-local authorization latch for auxiliary provider work. The primary
+# loop must remain able to reach its pre-turn maintenance callback after a
+# failure, so this is deliberately separate from the termination/provider
+# fence used by ``run_persistent_loop``. Commissioned Officers start closed,
+# open only after successful server maintenance, and close again immediately
+# on any failed maintenance result. AuxiliaryLLM re-checks the latch at the
+# actual provider boundary, including work queued before the failure.
+_runtime_authorization_admission_open: bool = False
+
 # One process incarnation inside one pod. Kubernetes may restart a container
 # without changing the pod UID; a new value lets that successor reclaim input
 # that existed only in the predecessor's RAM queue. Reset on every attach.
@@ -2190,6 +2199,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
     global _input_runtime_generation
+    global _runtime_authorization_admission_open
 
     await _stop_thread_interrupt_watcher()
     await _stop_thread_control_watcher()
@@ -2248,6 +2258,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
     _input_runtime_generation = None
+    _runtime_authorization_admission_open = False
     _queued_input_claims.clear()
     _clear_all_canvas_awareness()
     _subscribers.clear()
@@ -2340,8 +2351,13 @@ async def _attach_session(
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
     global _turn_event_open, _session_generation, _draft_title_value
     global _event_writer, _cloud_sync_retry_pending
+    global _runtime_authorization_admission_open
 
     _cloud_sync_retry_pending = False
+    # A pooled process must never carry a prior Officer's successful
+    # maintenance result into the next attachment. Ordinary sessions bypass
+    # this latch through ``_officer_cfg() is None`` below.
+    _runtime_authorization_admission_open = False
     _clear_all_canvas_awareness()
 
     if _session is not None:
@@ -3226,6 +3242,7 @@ async def _terminate_session_inner(
     global _event_writer, _cloud_sync_retry_pending, _draft_title_value
     global _active_permission_request_id
     global _input_runtime_generation
+    global _runtime_authorization_admission_open
 
     if not _session:
         return
@@ -3460,6 +3477,7 @@ async def _terminate_session_inner(
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
     _input_runtime_generation = None
+    _runtime_authorization_admission_open = False
     _queued_input_claims.clear()
     _draft_title_value = None
     _clear_all_canvas_awareness()
@@ -7864,14 +7882,21 @@ async def _run_subscriber_pump(
 async def _loop_before_turn_authorization() -> tuple[bool, str]:
     """Maintain a commissioned Officer before any provider spend."""
 
+    global _runtime_authorization_admission_open
+
     if _officer_cfg() is None:
+        _runtime_authorization_admission_open = True
         return True, "not an Officer session"
     client = _orchestrator_client
     if client is None:
+        _runtime_authorization_admission_open = False
         return False, "orchestrator maintenance channel is unavailable"
     try:
-        return await client.maintain_runtime_actor(force=True)
+        maintained, reason = await client.maintain_runtime_actor(force=True)
+        _runtime_authorization_admission_open = bool(maintained)
+        return maintained, reason
     except Exception as exc:
+        _runtime_authorization_admission_open = False
         # The durable server watchdog owns incident creation independently.
         # This local fence owns only the immediate no-spend guarantee and may
         # never expose a credential or response body in its error.
@@ -7885,6 +7910,19 @@ def _loop_provider_admission_open() -> bool:
     """Synchronous fence read immediately before every provider invocation."""
 
     return not _termination_admission_closed()
+
+
+def _loop_auxiliary_provider_admission_open() -> bool:
+    """Fence auxiliary spend on termination and Officer authorization.
+
+    This must not replace ``_loop_provider_admission_open`` on the primary
+    loop: a failed Officer still needs to consume a later durable input far
+    enough to retry server maintenance, without reaching retrieval or a model.
+    """
+
+    if _termination_admission_closed():
+        return False
+    return _officer_cfg() is None or _runtime_authorization_admission_open
 
 
 async def _loop_admit_input_delivery(
@@ -9673,7 +9711,7 @@ def _wire_session_aux_archiver() -> None:
         # This belongs beside archiver wiring because every aux rebuild already
         # converges through this function. A hot swap must not detach either
         # observability or the termination no-spend fence.
-        gate_setter(_loop_provider_admission_open)
+        gate_setter(_loop_auxiliary_provider_admission_open)
     if not _thread_id:
         return
     try:

@@ -1284,6 +1284,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: PERSISTENT_AGENT_RECONCILIATION_ENABLED
+            - name: OFFICER_RUNTIME_VERIFICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OFFICER_RUNTIME_VERIFICATION_ENABLED
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED
               valueFrom:
