@@ -1,0 +1,49 @@
+.job-panel {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 40;
+  width: min(22rem, 90vw);
+  max-height: 70vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 1rem);
+  padding: var(--space-4, 1rem);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-elevated, #1e1e2e);
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+}
+
+.job-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 0.5rem);
+}
+
+.job-panel__title {
+  margin: 0;
+  font-size: var(--text-base, 1rem);
+  color: var(--text-primary, #cdd6f4);
+}
+
+.job-panel__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 0.5rem);
+}
+
+.job-panel__label {
+  margin: 0;
+  font-size: var(--text-sm, 0.875rem);
+  font-weight: 600;
+  color: var(--text-primary, #cdd6f4);
+}
+
+.job-panel__hint {
+  margin: 0;
+  font-size: var(--text-xs, 0.8125rem);
+  color: var(--text-muted, #7f849c);
+}

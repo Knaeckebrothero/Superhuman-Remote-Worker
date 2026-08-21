@@ -192,18 +192,17 @@ export interface JobListFilters {
   user_id?: string | null;
 }
 
-export interface JobListQuery {
-  status?: string | string[];
-  projectIds?: string[];
-  hasProject?: boolean;
-  includeArchivedProjects?: boolean;
-  search?: string;
-  asOf?: string;
-  userId?: string;
-  limit?: number;
-  offset?: number;
-  includeTotal?: boolean;
-}
+/**
+ * REST query params for `/api/jobs` and `/api/stats/jobs`, in wire shape.
+ *
+ * Snake_case and array-valued because that is what the API takes — repeated
+ * keys for multi-values. `job-filters.ts` is the single place that maps
+ * filter state onto this; nothing else should re-derive it.
+ */
+export type JobListParams = Record<
+  string,
+  string | number | boolean | readonly string[] | null | undefined
+>;
 
 /** What `getJobsPage()` yields when the request fails. */
 export const EMPTY_JOB_LIST_PAGE: JobListPage = {

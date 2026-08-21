@@ -1,0 +1,195 @@
+@use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
+
+:host {
+  display: inline-block;
+  position: relative;
+}
+
+// --- Disclosure button -------------------------------------------------------
+
+.app-multi-select__trigger {
+  @include shape.control;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: v.$space-sm;
+  width: 100%;
+  min-width: 160px;
+  height: 36px;
+  padding: 0 v.$space-md;
+  font-family: inherit;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-normal;
+  line-height: v.$line-height-tight;
+  color: var(--text-primary);
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+
+  &:hover:not(:disabled) {
+    background: var(--hover, var(--surface-1));
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 1px;
+    border-color: var(--accent-color);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  &[data-open] {
+    border-color: var(--accent-color);
+  }
+}
+
+.app-multi-select__summary {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-multi-select__chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+}
+
+// --- Panel (portalled to <body>) ---------------------------------------------
+
+.app-multi-select__panel {
+  display: none;
+
+  &[data-open] {
+    display: flex;
+    flex-direction: column;
+    gap: v.$space-xs;
+    position: fixed;
+    z-index: v.$z-overlay;
+    min-width: 200px;
+    max-width: 360px;
+    padding: v.$space-xs;
+    background: var(--surface-2, var(--surface-1));
+    border: 1px solid var(--border-color);
+
+    @include shape.surface;
+
+    box-shadow: var(--shadow-md, 0 8px 24px rgb(0, 0, 0, 0.3));
+    animation: app-multi-select-fade 0.12s ease-out;
+  }
+}
+
+.app-multi-select__filter {
+  display: block;
+}
+
+.app-multi-select__options {
+  display: flex;
+  flex-direction: column;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.app-multi-select__option {
+  display: flex;
+  align-items: center;
+  padding: v.$space-xs v.$space-sm;
+
+  @include shape.control;
+
+  &:hover {
+    background: var(--hover, var(--surface-1));
+  }
+
+  // The row's focus ring rides on the checkbox tile (roving tabindex focuses
+  // the native input inside app-checkbox), so nothing is needed here.
+  app-checkbox {
+    width: 100%;
+  }
+}
+
+.app-multi-select__empty {
+  margin: 0;
+  padding: v.$space-sm;
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+  text-align: center;
+}
+
+.app-multi-select__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: v.$space-sm;
+  padding-top: v.$space-xs;
+  border-top: 1px solid var(--border-color);
+}
+
+.app-multi-select__count {
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+}
+
+.app-multi-select__clear {
+  @include shape.control;
+
+  padding: v.$space-xs v.$space-sm;
+  font-family: inherit;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    background: var(--hover, var(--surface-1));
+    color: var(--text-primary);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 1px;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+}
+
+@keyframes app-multi-select-fade {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-multi-select__panel[data-open] {
+    animation: none;
+  }
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-multi-select__trigger {
+    min-height: v.$touch-target-min;
+  }
+
+  .app-multi-select__option {
+    min-height: v.$touch-target-min;
+  }
+}

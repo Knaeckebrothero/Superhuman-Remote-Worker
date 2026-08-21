@@ -103,7 +103,7 @@ import {
   AuditResponse,
   EMPTY_JOB_LIST_PAGE,
   JobListPage,
-  JobListQuery,
+  JobListParams,
   JobSummary,
 } from '../models/audit.model';
 import {LLMRequest} from '../../workbench/request.model';
@@ -276,6 +276,26 @@ export function encodeUploadPath(name: string): string {
 /**
  * HTTP client service for the cockpit API.
  */
+/**
+ * Build HttpParams from a wire-shaped query record.
+ *
+ * Array values become repeated keys (`?status=a&status=b`), matching both the
+ * REST API and the URL codec; null/undefined are dropped so a caller can pass
+ * a sparse record without pruning it first.
+ */
+function toHttpParams(query: JobListParams): HttpParams {
+  let params = new HttpParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === null || value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) params = params.append(key, String(item));
+    } else {
+      params = params.set(key, String(value));
+    }
+  }
+  return params;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
@@ -350,48 +370,28 @@ export class ApiService {
    * controls need `total`/`has_more`, so they call `getJobsPage()` instead.
    */
   getJobs(status?: string, limit: number = 100, userId?: string): Observable<JobSummary[]> {
-    return this.getJobsPage({ status, limit, userId }).pipe(map((page) => page.jobs));
+    const query: JobListParams = {limit};
+    if (status) query['status'] = status;
+    if (userId) query['user_id'] = userId;
+    return this.getJobsPage(query).pipe(map((page) => page.jobs));
   }
 
   /**
    * Get one page of jobs together with the counts a paging UI needs.
+   *
+   * Takes REST-shaped params rather than a camelCase options object on
+   * purpose: `job-filters.ts` already owns the filter-state → wire mapping,
+   * and a second mapping here would be a second thing to keep in step.
    */
-  getJobsPage(options: JobListQuery = {}): Observable<JobListPage> {
-    let params = new HttpParams().set('limit', (options.limit ?? 100).toString());
-    for (const status of options.status ? [options.status].flat() : []) {
-      params = params.append('status', status);
-    }
-    for (const projectId of options.projectIds ?? []) {
-      params = params.append('project_id', projectId);
-    }
-    if (options.userId) {
-      params = params.set('user_id', options.userId);
-    }
-    if (options.hasProject !== undefined) {
-      params = params.set('has_project', String(options.hasProject));
-    }
-    if (options.includeArchivedProjects) {
-      params = params.set('include_archived_projects', 'true');
-    }
-    if (options.search) {
-      params = params.set('search', options.search);
-    }
-    if (options.asOf) {
-      params = params.set('as_of', options.asOf);
-    }
-    if (options.offset) {
-      params = params.set('offset', options.offset.toString());
-    }
-    if (options.includeTotal === false) {
-      params = params.set('include_total', 'false');
-    }
-
-    return this.http.get<JobListPage>(`${this.baseUrl}/jobs`, { params }).pipe(
-      catchError((error) => {
-        console.error('Failed to fetch jobs:', error);
-        return of(EMPTY_JOB_LIST_PAGE);
-      }),
-    );
+  getJobsPage(query: JobListParams = {}): Observable<JobListPage> {
+    return this.http
+      .get<JobListPage>(`${this.baseUrl}/jobs`, {params: toHttpParams(query)})
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to fetch jobs:', error);
+          return of(EMPTY_JOB_LIST_PAGE);
+        }),
+      );
   }
 
   /**
@@ -2194,6 +2194,20 @@ export class ApiService {
   /**
    * Get overall job statistics.
    */
+  /**
+   * Status-chip counts under the list's filters.
+   *
+   * Deliberately drops `status`: these are disjunctive facet counts, so a
+   * facet's own filter must not narrow it, or selecting one status drops
+   * every other chip to zero.
+   */
+  getJobStatisticsFiltered(query: JobListParams = {}): Observable<JobStatistics | null> {
+    const {status: _status, limit: _limit, offset: _offset, include_total: _t, ...rest} = query;
+    return this.http
+      .get<JobStatistics>(`${this.baseUrl}/stats/jobs`, {params: toHttpParams(rest)})
+      .pipe(catchError(() => of(null)));
+  }
+
   getJobStatistics(): Observable<JobStatistics | null> {
     return this.http.get<JobStatistics>(`${this.baseUrl}/stats/jobs`).pipe(
       catchError((error) => {

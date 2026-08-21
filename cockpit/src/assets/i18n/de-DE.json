@@ -330,6 +330,7 @@
     }
   },
   "common": {
+    "close": "Schließen",
     "save": "Speichern",
     "saving": "Wird gespeichert...",
     "saved": "Gespeichert",
@@ -608,6 +609,34 @@
     }
   },
   "jobs": {
+    "pagination": {
+      "label": "Seitennavigation",
+      "current": "Seite {{page}}",
+      "goToPage": "Zu Seite {{page}}",
+      "previous": "Vorherige Seite",
+      "next": "Nächste Seite",
+      "pageSize": "Pro Seite",
+      "rangeUnknown": "{{start}}–{{end}}"
+    },
+    "live": {
+      "on": "Live",
+      "paused": "Pausiert",
+      "pause": "Live-Aktualisierung pausieren",
+      "resume": "Live-Aktualisierung fortsetzen",
+      "pausedOnPage": "Live-Aktualisierung pausiert — Seite {{page}}",
+      "backToLive": "Zurück zu Live",
+      "newJobs": "{{count}} neu — anzeigen"
+    },
+    "origin": {
+      "user": "Von einer Person erstellt",
+      "session": "Aus einer Sitzung gestartet",
+      "automation": "Automatisierung",
+      "loop": "Schleife",
+      "officer": "Officer",
+      "subjob": "Teilauftrag",
+      "lifecycle": "System-Lebenszyklus",
+      "bench": "Benchmark"
+    },
     "title": "Aufträge",
     "confirmDelete": "Diesen Job endgültig löschen? Ein vorhandener Backlog-Ticket-Anspruch bleibt bestehen und wird nicht erneut freigegeben.",
     "confirmCancel": "Diesen Job abbrechen?",
@@ -622,7 +651,7 @@
     "noJobsHintFilter": "Versuchen Sie einen anderen Filter",
     "noJobsHintEmpty": "Erstellen Sie einen neuen Auftrag, um zu beginnen",
     "snapshotsSummary": "{{count}} Snapshots · {{size}}",
-    "count": "Zeige {{filtered}} von {{total}} Aufträgen",
+    "count": "{{start}}–{{end}} von {{total}} Aufträgen",
     "colJob": "Auftrag",
     "colProject": "Projekt",
     "colStatus": "Status",
@@ -632,6 +661,34 @@
     "projectUnknown": "Unbekanntes Projekt",
     "failureReason": "Grund",
     "filter": {
+      "token": {
+        "status": "Status: {{value}}",
+        "origin": "Herkunft: {{value}}",
+        "project": "Projekt: {{name}}",
+        "noProject": "Ohne Projekt",
+        "search": "Suche: {{term}}",
+        "archived": "Archivierte Projekte ausgeblendet"
+      },
+      "statusGroup": "Nach Status filtern",
+      "appliedGroup": "Aktive Filter",
+      "searchPlaceholder": "Titel oder ID suchen",
+      "searchLabel": "Jobs durchsuchen",
+      "more": "Filter",
+      "clearAll": "Alle zurücksetzen",
+      "removeToken": "Filter entfernen: {{filter}}",
+      "resultAnnouncement": "{{count}} Jobs gefunden",
+      "panelTitle": "Filter",
+      "panelLabel": "Job-Filter",
+      "originLabel": "Herkunft",
+      "originHint": "Woher der Job stammt. Leer lassen, um alle anzuzeigen.",
+      "projectLabel": "Projekt",
+      "projectAll": "Alle Projekte",
+      "projectSearch": "Projekte filtern",
+      "noProject": "Nur Jobs ohne Projekt",
+      "noProjectHint": "Nicht mit einzelnen Projekten kombinierbar.",
+      "archivedLabel": "Archivierte Projekte",
+      "includeArchived": "Jobs aus archivierten Projekten einbeziehen",
+      "includeArchivedHint": "Standardmäßig aus — deren Jobs sind hier ausgeblendet.",
       "all": "Alle",
       "pending_review": "Prüfung",
       "reviewing": "In Prüfung",
@@ -644,6 +701,7 @@
       "cancelled": "Abgebrochen"
     },
     "status": {
+      "pending": "Ausstehend",
       "pending_review": "Prüfung ausstehend",
       "reviewing": "In Prüfung",
       "waiting": "Wartend",
@@ -3528,5 +3586,15 @@
     "checkpoint": "Meilenstein · prüfen und fortfahren",
     "syncComplete": "Berichte eingereicht.",
     "errorGeneric": "Das Signal kam nicht durch. Erneut versuchen."
+  },
+  "ui": {
+    "multiSelect": {
+      "placeholder": "Optionen auswählen",
+      "filterPlaceholder": "Optionen filtern",
+      "filterLabel": "Optionen filtern",
+      "empty": "Keine passenden Optionen",
+      "selectedCount": "{{count}} ausgewählt",
+      "clear": "Zurücksetzen"
+    }
   }
 }

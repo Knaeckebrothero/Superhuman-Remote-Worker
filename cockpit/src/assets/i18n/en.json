@@ -330,6 +330,7 @@
     }
   },
   "common": {
+    "close": "Close",
     "save": "Save",
     "saving": "Saving...",
     "saved": "Saved",
@@ -608,6 +609,34 @@
     }
   },
   "jobs": {
+    "pagination": {
+      "label": "Pagination",
+      "current": "Page {{page}}",
+      "goToPage": "Go to page {{page}}",
+      "previous": "Previous page",
+      "next": "Next page",
+      "pageSize": "Per page",
+      "rangeUnknown": "{{start}}–{{end}}"
+    },
+    "live": {
+      "on": "Live",
+      "paused": "Paused",
+      "pause": "Pause live updates",
+      "resume": "Resume live updates",
+      "pausedOnPage": "Live updates paused — viewing page {{page}}",
+      "backToLive": "Back to live",
+      "newJobs": "{{count}} new — show"
+    },
+    "origin": {
+      "user": "Submitted by a person",
+      "session": "Started from a session",
+      "automation": "Automation",
+      "loop": "Loop",
+      "officer": "Officer",
+      "subjob": "Sub-job",
+      "lifecycle": "System lifecycle",
+      "bench": "Benchmark"
+    },
     "title": "Jobs",
     "confirmDelete": "Delete this job permanently? Any backlog-ticket claim remains and is not re-armed.",
     "confirmCancel": "Cancel this job?",
@@ -622,7 +651,7 @@
     "noJobsHintFilter": "Try selecting a different filter",
     "noJobsHintEmpty": "Create a new job to get started",
     "snapshotsSummary": "{{count}} snapshots · {{size}}",
-    "count": "Showing {{filtered}} of {{total}} jobs",
+    "count": "{{start}}–{{end}} of {{total}} jobs",
     "colJob": "Job",
     "colProject": "Project",
     "colStatus": "Status",
@@ -632,6 +661,34 @@
     "projectUnknown": "Unknown project",
     "failureReason": "Reason",
     "filter": {
+      "token": {
+        "status": "Status: {{value}}",
+        "origin": "Source: {{value}}",
+        "project": "Project: {{name}}",
+        "noProject": "No project",
+        "search": "Search: {{term}}",
+        "archived": "Archived projects hidden"
+      },
+      "statusGroup": "Filter by status",
+      "appliedGroup": "Applied filters",
+      "searchPlaceholder": "Search title or ID",
+      "searchLabel": "Search jobs",
+      "more": "Filters",
+      "clearAll": "Clear all",
+      "removeToken": "Remove filter: {{filter}}",
+      "resultAnnouncement": "{{count}} jobs match",
+      "panelTitle": "Filters",
+      "panelLabel": "Job filters",
+      "originLabel": "Source",
+      "originHint": "Where the job came from. Leave empty to show everything.",
+      "projectLabel": "Project",
+      "projectAll": "All projects",
+      "projectSearch": "Filter projects",
+      "noProject": "Only jobs with no project",
+      "noProjectHint": "Cannot be combined with specific projects.",
+      "archivedLabel": "Archived projects",
+      "includeArchived": "Include jobs from archived projects",
+      "includeArchivedHint": "Off by default — their jobs are hidden from this list.",
       "all": "All",
       "pending_review": "Review",
       "reviewing": "Reviewing",
@@ -644,6 +701,7 @@
       "cancelled": "Cancelled"
     },
     "status": {
+      "pending": "Pending",
       "pending_review": "Pending Review",
       "reviewing": "Reviewing",
       "waiting": "Waiting",
@@ -3528,5 +3586,15 @@
     "checkpoint": "Mile marker · review and proceed",
     "syncComplete": "Reports filed.",
     "errorGeneric": "The signal didn't reach. Try again."
+  },
+  "ui": {
+    "multiSelect": {
+      "placeholder": "Select options",
+      "filterPlaceholder": "Filter options",
+      "filterLabel": "Filter options",
+      "empty": "No matching options",
+      "selectedCount": "{{count}} selected",
+      "clear": "Clear"
+    }
   }
 }

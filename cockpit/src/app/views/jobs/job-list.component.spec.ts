@@ -1,238 +1,321 @@
-import { describe, it, expect } from 'vitest';
-import { Job, JobStatus } from '../../core/models/api.model';
-import { JobSummary } from '../../core/models/audit.model';
-import { jobCloudAction } from './job-list.component';
+import {signal, ɵresolveComponentResources} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
+import {ActivatedRoute, Router} from '@angular/router';
+import {TranslocoTestingModule} from '@jsverse/transloco';
+import {BehaviorSubject, of} from 'rxjs';
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
+import {ApiService} from '../../core/services/api.service';
+import {DataService} from '../../core/services/data.service';
+import {UserService} from '../../core/services/user.service';
+import {ViewportService} from '../../core/services/viewport.service';
+import {JobSummary} from '../../core/models/audit.model';
+import {JobListComponent, jobCloudAction} from './job-list.component';
+
+// The real catalogue, so these specs double as proof the jobs.* keys the
+// template asks for actually exist — a key missing from BOTH locales passes
+// the i18n parity gate and ships as the raw key string.
+import en from '../../../assets/i18n/en.json';
 
 /**
- * Unit tests for JobListComponent utility functions.
+ * The template is replaced with an empty one for every spec here.
  *
- * Note: These tests focus on pure utility functions extracted from the component.
- * Full component testing with Angular TestBed is not set up in this project.
- * Integration testing should be done via e2e tests.
+ * Not laziness — the JIT compiler vitest runs cannot see initializer-based
+ * inputs (`input()`/`model()`), so property-binding any signal input in a
+ * TestBed template is NG0303, and this component binds a dozen of them across
+ * `ui/` and its own children. Stubbing them all would test the stubs. The
+ * template is covered by the AOT build and by driving the real page; what is
+ * worth asserting here is the class logic, which the template only displays.
  */
+function mountLogic(overrides: {
+  api?: Partial<ApiService>;
+  params?: BehaviorSubject<ReturnType<typeof paramMap>>;
+} = {}) {
+  const navigate = vi.fn().mockResolvedValue(true);
+  const api = {
+    getJobsPage: vi.fn().mockReturnValue(of(page([]))),
+    getJobStatisticsFiltered: vi.fn().mockReturnValue(of({total_jobs: 0, by_status: {}})),
+    getSnapshotStats: vi.fn().mockReturnValue(of(null)),
+    getProjects: vi.fn().mockReturnValue(of([])),
+    ...overrides.api,
+  } as unknown as ApiService;
 
-// Extract utility functions from component for testing
-function truncatePrompt(prompt: string | undefined, maxLength: number = 80): string {
-  if (!prompt) {
-    return '';
-  }
-  if (prompt.length <= maxLength) {
-    return prompt;
-  }
-  return prompt.slice(0, maxLength) + '...';
-}
-
-function formatDate(dateString: string): string {
-  const date = new Date(dateString);
-  return date.toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
+  TestBed.configureTestingModule({
+    imports: [
+      JobListComponent,
+      TranslocoTestingModule.forRoot({
+        langs: {en},
+        translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      }),
+    ],
+    providers: [
+      {provide: ApiService, useValue: api},
+      {provide: DataService, useValue: {}},
+      {provide: UserService, useValue: {currentUser: signal({id: 'user-1'})}},
+      {provide: ViewportService, useValue: {isMobile: signal(false)}},
+      {provide: Router, useValue: {navigate}},
+      {
+        provide: ActivatedRoute,
+        useValue: {queryParamMap: overrides.params ?? new BehaviorSubject(paramMap({}))},
+      },
+    ],
   });
+  TestBed.overrideComponent(JobListComponent, {set: {template: '', imports: []}});
+  const fixture = TestBed.createComponent(JobListComponent);
+  return {fixture, component: fixture.componentInstance, api, navigate};
 }
 
-function filterJobsByStatus(jobs: Job[], filter: 'all' | JobStatus): Job[] {
-  if (filter === 'all') {
-    return jobs;
-  }
-  return jobs.filter((job) => job.status === filter);
-}
-
-function getStatusCount(jobs: Job[], status: JobStatus): number {
-  return jobs.filter((job) => job.status === status).length;
-}
-
-// Mock job factory
-function createMockJob(overrides: Partial<Job> = {}): Job {
+function paramMap(values: Record<string, string | string[]>) {
+  const normalised = new Map<string, string[]>(
+    Object.entries(values).map(([key, value]) => [key, Array.isArray(value) ? value : [value]]),
+  );
   return {
-    id: `job_${Math.random().toString(36).slice(2)}`,
-    description: 'Test job description',
-    config_name: 'default',
-    status: 'created' as JobStatus,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    ...overrides,
+    keys: [...normalised.keys()],
+    has: (key: string) => normalised.has(key),
+    get: (key: string) => normalised.get(key)?.[0] ?? null,
+    getAll: (key: string) => normalised.get(key) ?? [],
   };
 }
 
-describe('JobListComponent utilities', () => {
-  describe('truncatePrompt', () => {
-    it('should not truncate short prompts', () => {
-      const shortPrompt = 'A short prompt';
+function page(jobs: Partial<JobSummary>[], extra: Record<string, unknown> = {}) {
+  return {
+    jobs: jobs as JobSummary[],
+    total: jobs.length,
+    total_is_capped: false,
+    has_more: false,
+    limit: 25,
+    offset: 0,
+    as_of: '2026-08-21T00:00:00Z',
+    ...extra,
+  };
+}
 
-      const result = truncatePrompt(shortPrompt);
+function job(id: string, over: Partial<JobSummary> = {}): Partial<JobSummary> {
+  return {
+    id,
+    description: id,
+    status: 'completed',
+    created_at: '2026-08-20T00:00:00Z',
+    is_display_root: true,
+    display_root_id: id,
+    ...over,
+  };
+}
 
-      expect(result).toBe(shortPrompt);
-    });
-
-    it('should truncate long prompts with ellipsis', () => {
-      const longPrompt = 'A'.repeat(100);
-
-      const result = truncatePrompt(longPrompt, 80);
-
-      expect(result.length).toBe(83); // 80 chars + '...'
-      expect(result.endsWith('...')).toBe(true);
-    });
-
-    it('should not truncate prompts exactly at max length', () => {
-      const exactPrompt = 'A'.repeat(80);
-
-      const result = truncatePrompt(exactPrompt, 80);
-
-      expect(result).toBe(exactPrompt);
-    });
-
-    it('should use default max length of 80', () => {
-      const prompt = 'A'.repeat(100);
-
-      const result = truncatePrompt(prompt);
-
-      expect(result.length).toBe(83); // 80 + '...'
-    });
+describe('JobListComponent — server-resolved tree', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
   });
+  afterEach(() => TestBed.resetTestingModule());
 
-  describe('formatDate', () => {
-    it('should format date with day, month, hour and minute', () => {
-      const dateString = '2024-03-15T10:30:00Z';
-
-      const result = formatDate(dateString);
-
-      // Should contain day and month
-      expect(result).toMatch(/\d{2}/);
-      expect(result).toMatch(/Mar/);
-    });
-
-    it('should format ISO date strings', () => {
-      const dateString = new Date().toISOString();
-
-      const result = formatDate(dateString);
-
-      expect(result).toBeTruthy();
-      expect(result.length).toBeGreaterThan(0);
-    });
-  });
-
-  describe('filterJobsByStatus', () => {
-    const mockJobs = [
-      createMockJob({ id: 'job-1', status: 'created' }),
-      createMockJob({ id: 'job-2', status: 'processing' }),
-      createMockJob({ id: 'job-3', status: 'completed' }),
-      createMockJob({ id: 'job-4', status: 'completed' }),
-      createMockJob({ id: 'job-5', status: 'failed' }),
+  it('renders each display root once, with children only when expanded', () => {
+    const rows = [
+      job('root-1'),
+      job('kid-a', {is_display_root: false, display_root_id: 'root-1', parent_job_id: 'root-1'}),
+      job('kid-b', {is_display_root: false, display_root_id: 'root-1', parent_job_id: 'root-1'}),
+      job('root-2'),
     ];
-
-    it('should return all jobs when filter is "all"', () => {
-      const result = filterJobsByStatus(mockJobs, 'all');
-
-      expect(result).toHaveLength(5);
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(rows)))} as Partial<ApiService>,
     });
+    fixture.detectChanges();
 
-    it('should filter jobs by created status', () => {
-      const result = filterJobsByStatus(mockJobs, 'created');
+    expect(component.displayRows().map((row) => row.job.id)).toEqual(['root-1', 'root-2']);
+    expect(component.displayRows()[0].hasChildren).toBe(true);
 
-      expect(result).toHaveLength(1);
-      expect(result[0].id).toBe('job-1');
-    });
-
-    it('should filter jobs by completed status', () => {
-      const result = filterJobsByStatus(mockJobs, 'completed');
-
-      expect(result).toHaveLength(2);
-      expect(result.every((j) => j.status === 'completed')).toBe(true);
-    });
-
-    it('should return empty array when no jobs match', () => {
-      const result = filterJobsByStatus(mockJobs, 'cancelled');
-
-      expect(result).toHaveLength(0);
-    });
+    component.toggleExpand('root-1');
+    expect(component.displayRows().map((row) => row.job.id)).toEqual([
+      'root-1',
+      'kid-a',
+      'kid-b',
+      'root-2',
+    ]);
   });
 
-  describe('getStatusCount', () => {
-    const mockJobs = [
-      createMockJob({ status: 'created' }),
-      createMockJob({ status: 'processing' }),
-      createMockJob({ status: 'completed' }),
-      createMockJob({ status: 'completed' }),
-      createMockJob({ status: 'failed' }),
+  it('counts display roots, not rows — the page size is expressed in roots', () => {
+    const rows = [
+      job('root-1'),
+      job('kid-a', {is_display_root: false, display_root_id: 'root-1'}),
+      job('root-2'),
     ];
-
-    it('should count jobs by status correctly', () => {
-      expect(getStatusCount(mockJobs, 'created')).toBe(1);
-      expect(getStatusCount(mockJobs, 'processing')).toBe(1);
-      expect(getStatusCount(mockJobs, 'completed')).toBe(2);
-      expect(getStatusCount(mockJobs, 'failed')).toBe(1);
-      expect(getStatusCount(mockJobs, 'cancelled')).toBe(0);
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(rows)))} as Partial<ApiService>,
     });
+    fixture.detectChanges();
 
-    it('should return 0 for empty job list', () => {
-      expect(getStatusCount([], 'created')).toBe(0);
-    });
+    expect(component.rootCount()).toBe(2);
+    expect(component.getChildCount('root-1')).toBe(1);
   });
 
-  describe('status filters configuration', () => {
-    const statusFilters = [
-      { label: 'All', value: 'all' },
-      { label: 'Created', value: 'created' },
-      { label: 'Processing', value: 'processing' },
-      { label: 'Completed', value: 'completed' },
-      { label: 'Failed', value: 'failed' },
-      { label: 'Cancelled', value: 'cancelled' },
+  it('reports the FILTERED child count, so the expander cannot overpromise', () => {
+    // The server sent one child because the filter excluded the sibling.
+    const rows = [
+      job('root-1'),
+      job('kid-a', {is_display_root: false, display_root_id: 'root-1'}),
     ];
-
-    it('should have 6 status filters', () => {
-      expect(statusFilters).toHaveLength(6);
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(rows)))} as Partial<ApiService>,
     });
-
-    it('should have correct filter values', () => {
-      expect(statusFilters.map((f) => f.value)).toEqual([
-        'all',
-        'created',
-        'processing',
-        'completed',
-        'failed',
-        'cancelled',
-      ]);
-    });
+    fixture.detectChanges();
+    expect(component.getChildCount('root-1')).toBe(1);
   });
-  describe('jobCloudAction', () => {
-    // Export and open are two clicks on purpose: the export outlives the ~5s
-    // of transient user activation, so auto-opening from its callback is
-    // popup-blocked. See knowledge-base/knowledge/issues/job_cloud_export_open_blocked.md.
-    function job(overrides: Partial<JobSummary> = {}): JobSummary {
-      return {
-        id: 'j1',
-        status: 'completed',
-        created_at: new Date(0).toISOString(),
-        cloud_review_mode: 'open_folder',
-        ...overrides,
-      } as JobSummary;
-    }
 
-    it('offers export before anything has been exported', () => {
-      expect(jobCloudAction(job())).toBe('export');
+  it('treats a row with no tree fields as a root, so an older server still renders', () => {
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([{id: 'a'} as Partial<JobSummary>]))),
+      } as Partial<ApiService>,
     });
+    fixture.detectChanges();
+    expect(component.displayRows().map((row) => row.job.id)).toEqual(['a']);
+  });
+});
 
-    it('offers open once exported and a URL is available', () => {
-      expect(
-        jobCloudAction(
-          job({ exported_at: '2026-08-04T08:19:36Z', exported_folder_url: 'https://c/f' }),
-        ),
-      ).toBe('open');
-    });
+describe('JobListComponent — filters drive the URL', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
 
-    it('falls back to a plain badge when the URL is missing', () => {
-      // Cloud backend down at read time: exported, but nothing to link to.
-      expect(jobCloudAction(job({ exported_at: '2026-08-04T08:19:36Z' }))).toBe('exported');
-    });
+  it('debounces search into a single replaceUrl navigation', async () => {
+    const {fixture, component, navigate} = mountLogic();
+    fixture.detectChanges();
+    navigate.mockClear();
 
-    it('offers nothing for Mode A (diff-review) jobs', () => {
-      expect(jobCloudAction(job({ cloud_review_mode: 'diff' }))).toBe('none');
-    });
+    component.onSearchInput('d3');
+    component.onSearchInput('d30');
+    component.onSearchInput('d30d6e8a');
+    expect(navigate).not.toHaveBeenCalled();
 
-    it('offers nothing until the job completes', () => {
-      expect(jobCloudAction(job({ status: 'processing' }))).toBe('none');
-    });
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(navigate).toHaveBeenCalledTimes(1);
+    const [, extras] = navigate.mock.calls[0];
+    expect(extras.queryParams.search).toBe('d30d6e8a');
+    // replaceUrl while typing, or the back button steps through every keystroke.
+    expect(extras.replaceUrl).toBe(true);
+  });
+
+  it('resets to page 1 on any filter change', () => {
+    const params = new BehaviorSubject(paramMap({page: '3'}));
+    const {fixture, component, navigate} = mountLogic({params});
+    fixture.detectChanges();
+    expect(component.filters().page).toBe(3);
+    navigate.mockClear();
+
+    component.toggleStatus('failed');
+
+    const [, extras] = navigate.mock.calls[0];
+    expect(extras.queryParams.status).toEqual(['failed']);
+    expect(extras.queryParams.page).toBeNull();
+    expect(extras.replaceUrl).toBe(false);
+  });
+
+  it('discards an invalid status from the URL instead of erroring', () => {
+    const params = new BehaviorSubject(paramMap({status: ['failed', 'nonsense']}));
+    const {fixture, component} = mountLogic({params});
+    fixture.detectChanges();
+    expect(component.filters().status).toEqual(['failed']);
+  });
+
+  it('freezes the window when leaving page 1 and thaws on return', () => {
+    const {fixture, component, navigate} = mountLogic();
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    component.goToPage(2);
+    expect(navigate.mock.calls[0][1].queryParams.as_of).toBe('2026-08-21T00:00:00Z');
+
+    navigate.mockClear();
+    component.goToPage(1);
+    expect(navigate.mock.calls[0][1].queryParams.as_of).toBeNull();
+  });
+});
+
+describe('JobListComponent — live refresh', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  it('polls on page 1 but not past it', async () => {
+    const getJobsPage = vi.fn().mockReturnValue(of(page([job('a')])));
+    const {fixture, component, api} = mountLogic({api: {getJobsPage} as Partial<ApiService>});
+    fixture.detectChanges();
+    const afterLoad = getJobsPage.mock.calls.length;
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobsPage.mock.calls.length).toBeGreaterThan(afterLoad);
+
+    // Auto-refresh plus offset paging skips and duplicates rows, so the poller
+    // is hard-gated to the first page.
+    component.filters.set({...component.filters(), page: 3});
+    const beforeIdle = getJobsPage.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobsPage.mock.calls.length).toBe(beforeIdle);
+    expect(api).toBeDefined();
+  });
+
+  it('does not poll while paused', async () => {
+    const getJobsPage = vi.fn().mockReturnValue(of(page([job('a')])));
+    const {fixture, component} = mountLogic({api: {getJobsPage} as Partial<ApiService>});
+    fixture.detectChanges();
+
+    component.toggleLive();
+    expect(component.livePaused()).toBe(true);
+    const before = getJobsPage.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobsPage.mock.calls.length).toBe(before);
+  });
+
+  it('announces new jobs instead of splicing them above the cursor', async () => {
+    const first = page([job('a')]);
+    const grown = page([job('new'), job('a')]);
+    const getJobsPage = vi.fn().mockReturnValueOnce(of(first)).mockReturnValue(of(grown));
+    const {fixture, component} = mountLogic({api: {getJobsPage} as Partial<ApiService>});
+    fixture.detectChanges();
+    expect(component.jobs().map((j) => j.id)).toEqual(['a']);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // Every row here carries Cancel and Delete; inserting above the pointer
+    // moves the target under the user's cursor.
+    expect(component.pendingNewCount()).toBe(1);
+    expect(component.jobs().map((j) => j.id)).toEqual(['a']);
+  });
+});
+
+describe('jobCloudAction', () => {
+  const base = {status: 'completed', cloud_review_mode: 'open_folder'} as Partial<JobSummary>;
+
+  it('offers nothing until the job is completed and in folder mode', () => {
+    expect(jobCloudAction({...base, status: 'processing'} as JobSummary)).toBe('none');
+    expect(jobCloudAction({...base, cloud_review_mode: 'diff'} as JobSummary)).toBe('none');
+  });
+
+  it('offers export first, then the folder once a URL exists', () => {
+    expect(jobCloudAction(base as JobSummary)).toBe('export');
+    expect(
+      jobCloudAction({
+        ...base,
+        exported_at: '2026-08-20T00:00:00Z',
+        exported_folder_url: 'https://cloud.example/f/1',
+      } as JobSummary),
+    ).toBe('open');
+  });
+
+  it('degrades to "exported" when the backend cannot hand back a URL', () => {
+    // Export happened, but there is nothing to link to — two separate actions
+    // exist precisely so this state is representable.
+    expect(
+      jobCloudAction({...base, exported_at: '2026-08-20T00:00:00Z'} as JobSummary),
+    ).toBe('exported');
   });
 });
