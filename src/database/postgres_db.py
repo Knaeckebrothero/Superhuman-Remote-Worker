@@ -487,11 +487,20 @@ class PostgresDB:
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
         query = """
-            SELECT role, content, tool_calls, tool_call_id, turn_number
-            FROM thread_messages
-            WHERE thread_id = $1
-              AND role NOT IN ('summary', 'error')
-              AND rewound_at IS NULL
+            SELECT message.id, message.role, message.content,
+                   message.tool_calls, message.tool_call_id,
+                   message.turn_number
+            FROM thread_messages AS message
+            WHERE message.thread_id = $1
+              AND message.role NOT IN ('summary', 'error')
+              AND message.rewound_at IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM thread_input_deliveries AS delivery
+                     WHERE delivery.message_id = message.id
+                       AND delivery.state IN (
+                           'persisted', 'owned', 'queued', 'deferred'
+                       )
+                  )
         """
         params: List[Any] = [thread_id]
         if seq_gt is not None:
@@ -1331,6 +1340,138 @@ class PostgresDB:
                     await _require_run_queue_fence(conn, lease)
                     row = await _write(conn)
         return {"id": str(row["id"]), "seq": row["seq"]}
+
+    async def persist_pinned_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        role: str,
+        content: str,
+        source: str,
+        turn_number: Optional[int],
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+    ) -> Dict[str, Any]:
+        """Persist and claim one pinned input in a parent-first transaction."""
+
+        from src.shared.persistent_input_delivery import persist_input_delivery
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await persist_input_delivery(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    role=role,
+                    content=content,
+                    source=source,
+                    turn_number=turn_number,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                )
+
+    async def claim_pending_pinned_input_deliveries(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+    ) -> List[Dict[str, Any]]:
+        """Reclaim persisted but unadmitted input after attach/restart."""
+
+        from src.shared.persistent_input_delivery import claim_pending_input_deliveries
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await claim_pending_input_deliveries(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                )
+
+    async def mark_pinned_input_delivery_queued(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        claim_generation: int,
+    ) -> bool:
+        from src.shared.persistent_input_delivery import (
+            lock_runtime_authority,
+            mark_input_delivery_queued,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await lock_runtime_authority(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                )
+                return await mark_input_delivery_queued(
+                    conn,
+                    delivery_id=delivery_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    claim_generation=claim_generation,
+                )
+
+    async def transition_pinned_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        claim_generation: int,
+        transition: str,
+        turn_number: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        from src.shared.persistent_input_delivery import (
+            lock_runtime_authority,
+            transition_input_delivery,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await lock_runtime_authority(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                )
+                return await transition_input_delivery(
+                    conn,
+                    delivery_id=delivery_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    claim_generation=claim_generation,
+                    transition=transition,
+                    turn_number=turn_number,
+                    reason=reason,
+                )
+
+    async def get_pinned_input_delivery(
+        self, delivery_id: str
+    ) -> Optional[Dict[str, Any]]:
+        from src.shared.persistent_input_delivery import get_input_delivery
+
+        async with self.acquire() as conn:
+            return await get_input_delivery(conn, delivery_id)
 
     async def save_thread_messages(
         self,

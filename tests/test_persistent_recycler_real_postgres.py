@@ -23,6 +23,14 @@ from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
 )
+from src.shared.persistent_input_delivery import (
+    InputDeliveryAuthorityLost,
+    claim_pending_input_deliveries,
+    lock_runtime_authority,
+    mark_input_delivery_queued,
+    persist_input_delivery,
+    transition_input_delivery,
+)
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -393,6 +401,566 @@ async def test_concurrent_missing_pod_recovery_uses_one_generation_and_create(db
     assert len({r.generation for r in results if r.generation}) == 1
     assert state["phase"] == "awaiting_replacement"
     assert provisioner.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_delete_wake_rejection_survives_hold_and_replacement(db):
+    """The observed ordering: wake claim precedes the 60s lifecycle tick.
+
+    The terminating runtime refuses that first delivery, so the outbox row is
+    released rather than stamped sent.  Missing-pod reconciliation then owns a
+    maintenance hold; after exact replacement authority is healthy, the same
+    durable delivery id is claimed and can be settled once.
+    """
+
+    ids = await _seed(db)
+    assert await db.enqueue_session_wake_event(
+        ids["thread"],
+        source="timer",
+        dedup_key="timer",
+        payload={"minutes": 30, "reason": "raw deletion race"},
+        project_id=ids["project"],
+    )
+
+    claimed = await db.claim_pending_session_wake_events(
+        debounce_seconds_by_source={"timer": 0}
+    )
+    assert len(claimed) == 1
+    first = await db.assign_session_wake_delivery_groups([int(claimed[0]["id"])])
+    assert len(first) == 1
+    delivery_id = first[0]["delivery_id"]
+    await db.release_session_wake_events([int(first[0]["id"])])
+
+    provisioner = FakeProvisioner()
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    missing = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert missing.phase == "awaiting_replacement"
+    state, metadata = await _recycle_state(db, ids["thread"])
+    hold = metadata["config_override"]["officer"]["hold"]
+    assert hold["kind"] == "maintenance"
+    assert "thread_id" not in hold
+    assert (
+        await db.claim_pending_session_wake_events(
+            debounce_seconds_by_source={"timer": 0}
+        )
+        == []
+    )
+
+    new_uid = provisioner.current["pod_uid"]
+    successor, actor = await _bind_replacement_agent(
+        db, thread_id=ids["thread"], pod_uid=new_uid
+    )
+    provisioner.current = _pod_status(
+        ids["thread"],
+        uid=new_uid,
+        build="new-build",
+        generation=state["generation"],
+        ready=True,
+    )
+    completed = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert completed.phase == "complete"
+    assert str((await db.get_thread(ids["thread"]))["agent_id"]) == successor
+    recovered_actor = await runtime_actor._actor_for_access(db, actor.access_credential)
+    assert recovered_actor.thread_id == ids["thread"]
+    assert recovered_actor.caller_kind == "officer"
+
+    retried = await db.claim_pending_session_wake_events(
+        debounce_seconds_by_source={"timer": 0}
+    )
+    assert len(retried) == 1
+    second = await db.assign_session_wake_delivery_groups([int(retried[0]["id"])])
+    assert [row["delivery_id"] for row in second] == [delivery_id]
+    runtime_generation = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="event",
+                content="replacement executes the retained wake",
+                source="officer_wake",
+                turn_number=1,
+                agent_id=successor,
+                pod_uid=new_uid,
+                runtime_generation=runtime_generation,
+            )
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=successor,
+                pod_uid=new_uid,
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=successor,
+                pod_uid=new_uid,
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+                transition="admitted",
+                turn_number=1,
+            )
+    await db.finish_session_wake_events([int(second[0]["id"])])
+    assert (
+        await db.claim_pending_session_wake_events(
+            debounce_seconds_by_source={"timer": 0}
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_delivery_identity_and_transcript_accept_are_once(db):
+    ids = await _seed(db)
+    for key in ("first", "second"):
+        assert await db.enqueue_session_wake_event(
+            ids["thread"],
+            source="test",
+            dedup_key=key,
+            payload={"summary": key},
+            project_id=ids["project"],
+        )
+
+    left, right = await asyncio.gather(
+        db.claim_pending_session_wake_events(),
+        db.claim_pending_session_wake_events(),
+    )
+    claimed = [*left, *right]
+    assert len(claimed) == 2
+    claimed_ids = [int(row["id"]) for row in claimed]
+
+    assigned_a, assigned_b = await asyncio.gather(
+        db.assign_session_wake_delivery_groups(claimed_ids),
+        db.assign_session_wake_delivery_groups(claimed_ids),
+    )
+    delivery_ids_a = {row["delivery_id"] for row in assigned_a}
+    delivery_ids_b = {row["delivery_id"] for row in assigned_b}
+    assert len(delivery_ids_a) == 1
+    assert delivery_ids_a == delivery_ids_b
+    delivery_id = next(iter(delivery_ids_a))
+    assert (
+        len(await db.get_session_wake_delivery_group(ids["thread"], delivery_id)) == 2
+    )
+
+    runtime_generation = uuid4()
+
+    async def persist_once():
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                return await persist_input_delivery(
+                    conn,
+                    thread_id=ids["thread"],
+                    delivery_id=delivery_id,
+                    role="event",
+                    content="same accepted wake",
+                    source="officer_wake",
+                    turn_number=1,
+                    agent_id=ids["agent"],
+                    pod_uid="old-pod",
+                    runtime_generation=runtime_generation,
+                )
+
+    first, retry = await asyncio.gather(persist_once(), persist_once())
+    assert sorted((first["transcript_inserted"], retry["transcript_inserted"])) == [
+        False,
+        True,
+    ]
+    assert first["claim_generation"] == retry["claim_generation"] == 1
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            rerendered = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="event",
+                content="newer sitrep text must not replace accepted input",
+                source="officer_wake",
+                turn_number=2,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=runtime_generation,
+            )
+    assert rerendered["content"] == "same accepted wake"
+    async with db.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM thread_messages "
+            "WHERE thread_id=$1 AND role='event' "
+            "AND content='same accepted wake'",
+            UUID(ids["thread"]),
+        )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_input_persist_crash_successor_reclaim_and_stale_owner_fence(db):
+    """INSERT-without-queue is reclaimable; the predecessor cannot settle it."""
+
+    ids = await _seed(db)
+    delivery_id = uuid4()
+    old_runtime = uuid4()
+    new_runtime = uuid4()
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            first = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="event",
+                content="durable before process death",
+                source="officer_wake",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=old_runtime,
+            )
+    assert first["state"] == "owned"
+    assert first["transcript_inserted"] is True
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            reclaimed = await claim_pending_input_deliveries(
+                conn,
+                thread_id=ids["thread"],
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=new_runtime,
+            )
+    assert len(reclaimed) == 1
+    assert int(reclaimed[0]["claim_generation"]) == 2
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            assert not await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=old_runtime,
+                claim_generation=1,
+                transition="settled",
+            )
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=new_runtime,
+                claim_generation=2,
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=new_runtime,
+                claim_generation=2,
+                transition="admitted",
+                turn_number=1,
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=new_runtime,
+                claim_generation=2,
+                transition="settled",
+            )
+
+    async with db.acquire() as conn:
+        counts = await conn.fetchrow(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE state='settled') "
+            "AS settled FROM thread_input_deliveries WHERE delivery_id=$1",
+            delivery_id,
+        )
+        transcript = await conn.fetchval(
+            "SELECT count(*) FROM thread_messages message JOIN "
+            "thread_input_deliveries delivery ON delivery.message_id=message.id "
+            "WHERE delivery.delivery_id=$1",
+            delivery_id,
+        )
+    assert dict(counts) == {"total": 1, "settled": 1}
+    assert transcript == 1
+
+
+@pytest.mark.asyncio
+async def test_wake_outbox_refuses_transcript_only_then_accepts_admission(db):
+    ids = await _seed(db)
+    assert await db.enqueue_session_wake_event(
+        ids["thread"],
+        source="timer",
+        dedup_key="execution-boundary",
+        payload={"minutes": 30},
+        project_id=ids["project"],
+    )
+    claimed = await db.claim_pending_session_wake_events(
+        debounce_seconds_by_source={"timer": 0}
+    )
+    assigned = await db.assign_session_wake_delivery_groups([int(claimed[0]["id"])])
+    delivery_id = assigned[0]["delivery_id"]
+    runtime_generation = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="event",
+                content="timer wake",
+                source="officer_wake",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=runtime_generation,
+            )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.finish_session_wake_events([int(assigned[0]["id"])])
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+                transition="admitted",
+                turn_number=1,
+            )
+    await db.finish_session_wake_events([int(assigned[0]["id"])])
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM session_wake_events WHERE id=$1",
+                int(assigned[0]["id"]),
+            )
+            == "sent"
+        )
+
+
+@pytest.mark.asyncio
+async def test_job_wake_outbox_requires_durable_provider_admission(db):
+    ids = await _seed(db)
+    thread_id, agent_id, job_id = uuid4(), uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO threads "
+            "(id,user_id,project_id,status,execution_lane,config_name,metadata) "
+            "VALUES ($1,$2,$3,'active','pinned','base','{}'::jsonb)",
+            thread_id,
+            UUID(ids["user"]),
+            UUID(ids["project"]),
+        )
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,thread_id) "
+            "VALUES ($1,'base',$2,'127.0.0.3','plain-pod','session',"
+            "'persistent',$3)",
+            agent_id,
+            f"persistent-{str(thread_id)[:12]}",
+            thread_id,
+        )
+        await conn.execute(
+            "UPDATE threads SET agent_id=$2 WHERE id=$1", thread_id, agent_id
+        )
+        await conn.execute(
+            "INSERT INTO jobs "
+            "(id,description,status,user_id,project_id,created_by_thread_id,"
+            "wake_on_complete,wake_state) "
+            "VALUES ($1,'execution boundary','completed',$2,$3,$4,true,'pending')",
+            job_id,
+            UUID(ids["user"]),
+            UUID(ids["project"]),
+            thread_id,
+        )
+
+    claimed = [row for row in await db.claim_pending_job_wakes() if row["id"] == job_id]
+    assert len(claimed) == 1
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.finish_job_wake(str(job_id), "completed")
+
+    async with db.acquire() as conn:
+        delivery_id = await conn.fetchval(
+            "SELECT wake_delivery_id FROM jobs WHERE id=$1", job_id
+        )
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=thread_id,
+                delivery_id=delivery_id,
+                role="event",
+                content="execute this wake once",
+                source="officer_wake",
+                turn_number=1,
+                agent_id=agent_id,
+                pod_uid="plain-pod",
+                runtime_generation=uuid4(),
+            )
+            runtime_generation = delivery["owner_runtime_generation"]
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=agent_id,
+                pod_uid="plain-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=agent_id,
+                pod_uid="plain-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+                transition="admitted",
+                turn_number=1,
+            )
+    assert await db.finish_job_wake(str(job_id), "completed") is True
+
+
+@pytest.mark.asyncio
+async def test_pre_0174_claimers_fail_before_session_or_job_network_delivery(db):
+    """The mixed-version fence is tied to each claim attempt, not old state."""
+
+    ids = await _seed(db)
+    assert await db.enqueue_session_wake_event(
+        ids["thread"],
+        source="timer",
+        dedup_key="rolling-fence",
+        payload={"minutes": 30},
+        project_id=ids["project"],
+    )
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE session_wake_events SET state='sending', "
+                "claimed_at=now(), attempts=attempts+1 "
+                "WHERE thread_id=$1 AND dedup_key='rolling-fence'",
+                UUID(ids["thread"]),
+            )
+        event_state = await conn.fetchrow(
+            "SELECT state, attempts FROM session_wake_events "
+            "WHERE thread_id=$1 AND dedup_key='rolling-fence'",
+            UUID(ids["thread"]),
+        )
+    assert dict(event_state) == {"state": "pending", "attempts": 0}
+
+    claimed_events = await db.claim_pending_session_wake_events(
+        debounce_seconds_by_source={"timer": 0}
+    )
+    assert len(claimed_events) == 1
+    claimed_payload = claimed_events[0]["payload"]
+    if isinstance(claimed_payload, str):
+        claimed_payload = json.loads(claimed_payload)
+    assert claimed_payload["_delivery_claim_attempt"] == 1
+    UUID(claimed_payload["_delivery_id"])
+
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs "
+            "(id,description,status,user_id,project_id,created_by_thread_id,"
+            "wake_on_complete,wake_state) "
+            "VALUES ($1,'rolling claim','completed',$2,$3,$4,true,'pending')",
+            job_id,
+            UUID(ids["user"]),
+            UUID(ids["project"]),
+            UUID(ids["thread"]),
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE jobs SET wake_state='sending', wake_claimed_at=now(), "
+                "wake_attempts=wake_attempts+1 WHERE id=$1",
+                job_id,
+            )
+        job_state = await conn.fetchrow(
+            "SELECT wake_state, wake_attempts FROM jobs WHERE id=$1", job_id
+        )
+    assert dict(job_state) == {"wake_state": "pending", "wake_attempts": 0}
+
+    claimed_jobs = [
+        row for row in await db.claim_pending_job_wakes() if row["id"] == job_id
+    ]
+    assert len(claimed_jobs) == 1
+    async with db.acquire() as conn:
+        job_claim = await conn.fetchrow(
+            "SELECT wake_delivery_id, wake_delivery_claim_attempt, wake_attempts "
+            "FROM jobs WHERE id=$1",
+            job_id,
+        )
+    assert job_claim["wake_delivery_id"] is not None
+    assert job_claim["wake_delivery_claim_attempt"] == job_claim["wake_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_binding_steals_once_and_old_agent_cannot_mutate(db):
+    ids = await _seed(db)
+    delivery_id = uuid4()
+    old_runtime = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="human",
+                content="retain direct input",
+                source="direct_human",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=old_runtime,
+            )
+
+    successor, _actor = await _bind_replacement_agent(
+        db, thread_id=ids["thread"], pod_uid="new-pod"
+    )
+    successor_runtime = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            rows = await claim_pending_input_deliveries(
+                conn,
+                thread_id=ids["thread"],
+                agent_id=successor,
+                pod_uid="new-pod",
+                runtime_generation=successor_runtime,
+            )
+    assert len(rows) == 1
+    assert int(rows[0]["claim_generation"]) == 2
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            with pytest.raises(InputDeliveryAuthorityLost):
+                await lock_runtime_authority(
+                    conn,
+                    thread_id=ids["thread"],
+                    agent_id=ids["agent"],
+                    pod_uid="old-pod",
+                )
 
 
 @pytest.mark.asyncio

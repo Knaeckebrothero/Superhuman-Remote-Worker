@@ -21,7 +21,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -1024,12 +1024,21 @@ class AuxInputTooLarge(Exception):
 #   * rate_limit (via `retryable`) — a throttled aux model should escalate too.
 #     Sitting out a provider's 90 s Retry-After is strictly worse than asking the
 #     main model, which is exactly the choice the fallback exists to make.
+class AuxiliaryProviderAdmissionClosed(RuntimeError):
+    """A lifecycle fence refused a not-yet-started auxiliary provider call."""
+
+
 _AUX_RETRY = RetryPolicy(
     max_attempts=2,
     base_delay=1.0,
     max_delay=5.0,
     retryable=frozenset({"transient", "auth_unavailable"}),
-    never_retry=(asyncio.TimeoutError, ContextOverflowError, AuxInputTooLarge),
+    never_retry=(
+        asyncio.TimeoutError,
+        ContextOverflowError,
+        AuxInputTooLarge,
+        AuxiliaryProviderAdmissionClosed,
+    ),
     respect_retry_after=False,
 )
 
@@ -1091,8 +1100,31 @@ class AuxiliaryLLM:
         self._archiver = archiver
         self._job_id = job_id
         self._agent_type = agent_type or "unknown"
+        self._provider_admission_gate: Optional[Callable[[], bool]] = None
+        self._provider_calls_inflight = 0
         #: Observability for silent non-fatal failures (see AuxHealth).
         self.health = AuxHealth(model=_get_model_name(llm))
+
+    def set_provider_admission_gate(self, gate: Optional[Callable[[], bool]]) -> None:
+        """Install the process-local lifecycle gate on every aux call shape."""
+
+        self._provider_admission_gate = gate
+
+    @property
+    def provider_calls_inflight(self) -> int:
+        return self._provider_calls_inflight
+
+    async def _invoke_provider(self, runnable: Any, invoke_arg: Any, timeout: float):
+        gate = self._provider_admission_gate
+        if gate is not None and not gate():
+            raise AuxiliaryProviderAdmissionClosed(
+                "auxiliary provider admission is closed"
+            )
+        self._provider_calls_inflight += 1
+        try:
+            return await asyncio.wait_for(runnable.ainvoke(invoke_arg), timeout=timeout)
+        finally:
+            self._provider_calls_inflight -= 1
 
     def set_job_context(
         self,
@@ -1158,9 +1190,8 @@ class AuxiliaryLLM:
             # The per-attempt wait_for lives INSIDE the retried callable so each
             # attempt gets its own timeout budget rather than sharing a spent one.
             result = await invoke_with_retry(
-                lambda: asyncio.wait_for(
-                    build_runnable(self.llm, method).ainvoke(invoke_arg),
-                    timeout=_timeout,
+                lambda: self._invoke_provider(
+                    build_runnable(self.llm, method), invoke_arg, _timeout
                 ),
                 policy=_policy,
                 description=f"aux '{task_name}' on model '{self.health.model}'",
@@ -1188,6 +1219,8 @@ class AuxiliaryLLM:
                 f"Structured-output validation failed for {task_name} "
                 "after raw fallback recovery"
             )
+        except AuxiliaryProviderAdmissionClosed:
+            raise
         except ValidationError as primary_exc:
             parsed = await self._recover_via_raw_invoke(
                 self.llm,
@@ -1231,11 +1264,10 @@ class AuxiliaryLLM:
             # SummarizationFailed('aux_unavailable') — failing the turn on a
             # blip, at the exact moment we had already given up on aux.
             fallback_raw = await invoke_with_retry(
-                lambda: asyncio.wait_for(
-                    build_runnable(self.fallback_llm, fallback_method).ainvoke(
-                        invoke_arg
-                    ),
-                    timeout=_timeout,
+                lambda: self._invoke_provider(
+                    build_runnable(self.fallback_llm, fallback_method),
+                    invoke_arg,
+                    _timeout,
                 ),
                 policy=_policy,
                 description=(
@@ -1329,9 +1361,9 @@ class AuxiliaryLLM:
         if schema is None:
             return None
         try:
-            raw_result = await asyncio.wait_for(
-                llm.ainvoke(invoke_arg), timeout=timeout
-            )
+            raw_result = await self._invoke_provider(llm, invoke_arg, timeout)
+        except AuxiliaryProviderAdmissionClosed:
+            raise
         except Exception as recovery_exc:
             logger.debug("Raw fallback parse recovery failed: %s", recovery_exc)
             return None

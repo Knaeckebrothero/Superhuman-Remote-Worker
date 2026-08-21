@@ -38,6 +38,11 @@ from services.officer_admission import (
     count_in_flight_by_slot,
     prepare_officer_admission,
 )
+from src.shared.persistent_input_delivery import (
+    mark_input_delivery_queued,
+    persist_input_delivery,
+    transition_input_delivery,
+)
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -596,6 +601,57 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
     )
     claimed = await db.claim_pending_session_wake_events(limit=10)
     assert [row["id"] for row in claimed] == [queued["wake_event_id"]]
+    assigned = await db.assign_session_wake_delivery_groups([queued["wake_event_id"]])
+    assert len(assigned) == 1
+
+    agent_id = uuid4()
+    runtime_generation = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,thread_id) "
+            "VALUES ($1,'centurion',$2,'127.0.0.1','bp10-pod','session',"
+            "'persistent',$3)",
+            agent_id,
+            f"persistent-{seed['thread_id'][:12]}",
+            UUID(seed["thread_id"]),
+        )
+        await conn.execute(
+            "UPDATE threads SET agent_id=$2 WHERE id=$1",
+            UUID(seed["thread_id"]),
+            agent_id,
+        )
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=seed["thread_id"],
+                delivery_id=assigned[0]["delivery_id"],
+                role="event",
+                content="deliver this floor-wake episode",
+                source="officer_wake",
+                turn_number=1,
+                agent_id=agent_id,
+                pod_uid="bp10-pod",
+                runtime_generation=runtime_generation,
+            )
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=assigned[0]["delivery_id"],
+                agent_id=agent_id,
+                pod_uid="bp10-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=assigned[0]["delivery_id"],
+                agent_id=agent_id,
+                pod_uid="bp10-pod",
+                runtime_generation=runtime_generation,
+                claim_generation=int(delivery["claim_generation"]),
+                transition="admitted",
+                turn_number=1,
+            )
     await db.finish_session_wake_events([queued["wake_event_id"]])
 
     outcomes = await db.list_officer_floor_wake_outcomes(seed["project_id"])

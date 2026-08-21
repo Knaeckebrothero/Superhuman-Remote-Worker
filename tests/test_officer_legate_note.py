@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
@@ -37,6 +38,11 @@ class _FakeResponse:
         self.status_code = status_code
         self.text = text
 
+    def json(self):
+        if self.status_code in {200, 202}:
+            return {"delivery_state": "admitted"}
+        return {}
+
 
 class _FakeAsyncClient:
     posts: list = []
@@ -51,7 +57,7 @@ class _FakeAsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         _FakeAsyncClient.posts.append((url, json))
         return _FakeResponse(_FakeAsyncClient.next_status)
 
@@ -101,7 +107,9 @@ async def test_a_live_officer_receives_the_note_on_his_input_queue():
 
     url, body = _FakeAsyncClient.posts[0]
     assert url == "http://10.1.2.3:8001/api/input"
-    assert body == {"content": NOTE, "role": "event"}
+    assert body["content"] == NOTE
+    assert body["role"] == "event"
+    UUID(body["delivery_id"])
     db.enqueue_session_wake_event.assert_not_awaited()
 
 
@@ -114,7 +122,23 @@ async def test_a_note_with_no_live_pod_is_queued_verbatim_for_the_next_wake():
     kwargs = db.enqueue_session_wake_event.await_args.kwargs
     assert kwargs["source"] == "legate"
     assert kwargs["payload"]["message"] == NOTE
+    UUID(kwargs["payload"]["_delivery_id"])
     assert kwargs["project_id"] == PROJECT_ID
+
+
+@pytest.mark.asyncio
+async def test_refused_live_note_queues_the_same_delivery_identity():
+    db = _db(agent=_agent())
+    _FakeAsyncClient.next_status = 503
+
+    assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
+
+    posted_id = _FakeAsyncClient.posts[0][1]["delivery_id"]
+    queued_id = db.enqueue_session_wake_event.await_args.kwargs["payload"][
+        "_delivery_id"
+    ]
+    assert queued_id == posted_id
+    UUID(queued_id)
 
 
 @pytest.mark.asyncio

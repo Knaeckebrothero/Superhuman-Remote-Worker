@@ -160,6 +160,10 @@ class ReadyResponse(BaseModel):
     connections: Dict[str, bool] = Field(
         ..., description="Connection status for dependencies"
     )
+    capabilities: Dict[str, bool] = Field(
+        default_factory=dict,
+        description="Server-owned runtime protocol capabilities",
+    )
 
 
 class AgentStatusResponse(BaseModel):

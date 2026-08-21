@@ -9,6 +9,7 @@ Connect with: websocat ws://localhost:8001/ws/chat
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import (
     Any,
     Awaitable,
@@ -29,6 +31,7 @@ from typing import (
     Set,
     Tuple,
 )
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -76,6 +79,7 @@ from ..shared.runtime_actor import RuntimeActorContext
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
+    INTERRUPT_SENTINEL,
     PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY,
     IdleTimeoutError,
     PermissionOutcome,
@@ -113,6 +117,25 @@ _pending_exit_task: Optional[asyncio.Task] = None
 # intent is deferred (flag stays False) and re-checked on each 5s tick.
 _drain_intent_handled: bool = False
 _drain_deferred_logged: bool = False
+
+# Kubernetes termination-admission fence for dedicated persistent pods.
+#
+# The pod's preStop hook creates this sentinel before it makes an HTTP request
+# back into the event loop.  Reading the file at every admission boundary means
+# a busy loop does not have to process the callback before new provider work is
+# refused.  The boolean is the fast in-process half, set by the loopback route.
+# Neither is durable authority: Kubernetes owns pod termination; Post/thread
+# state and the Officer recycler own durable replacement.
+_TERMINATION_SENTINEL_PATH = Path("/tmp/srw-persistent-terminating")
+_termination_admission_fenced: bool = False
+_termination_fence_reason: Optional[str] = None
+_TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
+
+# One process incarnation inside one pod. Kubernetes may restart a container
+# without changing the pod UID; a new value lets that successor reclaim input
+# that existed only in the predecessor's RAM queue. Reset on every attach.
+_input_runtime_generation: Optional[str] = None
+_queued_input_claims: set[tuple[str, int]] = set()
 
 # True exactly while the persistent loop is parked in _loop_get_user_input's
 # queue wait — the only state where an out-of-band teardown (drain-suspend)
@@ -439,10 +462,10 @@ _NOTIFICATION_METHODS = frozenset(
 # system-injected notice (currently: a worker job this session created reached a
 # terminal state — knowledge-base/knowledge/features/session_wake_on_job_completion.md).
 #
-# An allow-list rather than a passthrough because /api/input has NO
-# authentication of any kind (no session token, no internal key; the agent
-# NetworkPolicy is egress-only). An arbitrary role would let anything that can
-# reach the pod forge 'ai' or 'system' rows in the transcript.
+# An allow-list rather than a passthrough because ordinary /api/input has no
+# session token. A supplied durable event identity is the narrower exception:
+# it requires the existing internal transport key below. An arbitrary role
+# would let anything that can reach the pod forge 'ai' or 'system' rows.
 _ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
 
 
@@ -684,6 +707,98 @@ def _app_guide_health() -> dict[str, str]:
     return app_guide_health_snapshot(reader_available=reader_available)
 
 
+def _termination_admission_closed() -> bool:
+    """Return the earliest process-visible Kubernetes termination signal.
+
+    ``deletionTimestamp`` itself lives outside the container, so this function
+    deliberately does not claim to observe the API-server mutation atomically.
+    The preStop shell creates the sentinel before Python/HTTP work; the route
+    then latches the in-process boolean.  Either one closes admission.
+    """
+
+    if _termination_admission_fenced:
+        return True
+    try:
+        return _TERMINATION_SENTINEL_PATH.exists()
+    except OSError:
+        # A broken pod-local fence path is not a reason to spend through a
+        # termination signal.  The normal /tmp path is always stat-able.
+        return True
+
+
+def activate_termination_admission_fence(source: str) -> bool:
+    """Latch the no-new-turn fence and wake an idle queue waiter.
+
+    Returns True only for the first process-local transition.  Repeated preStop
+    callbacks/signals are idempotent and never consume a queued user/event row.
+    """
+
+    global _termination_admission_fenced, _termination_fence_reason
+    first = not _termination_admission_fenced
+    _termination_admission_fenced = True
+    if _termination_fence_reason is None:
+        _termination_fence_reason = str(source or "termination")[:80]
+    if first:
+        logger.warning(
+            "Persistent runtime admission fenced for termination (source=%s, "
+            "turn_open=%s, tool_inflight=%s)",
+            _termination_fence_reason,
+            _turn_event_open,
+            _tool_inflight,
+        )
+    # queue.get() otherwise has no reason to wake and notice the file/flag.
+    # The sentinel is filtered by the loop and is never persisted.
+    if _awaiting_input and _loop_user_queue is not None:
+        try:
+            _loop_user_queue.put_nowait(_TERMINATION_QUEUE_SENTINEL)
+        except asyncio.QueueFull:  # pragma: no cover - production queue unbounded
+            pass
+    return first
+
+
+def _termination_quiescent() -> bool:
+    """True after the current turn's complete settlement boundary."""
+
+    if _tool_inflight or _turn_event_open:
+        return False
+    session = _session
+    if session is not None:
+        auxiliary = getattr(session, "auxiliary_llm", None)
+        if int(getattr(auxiliary, "provider_calls_inflight", 0) or 0) > 0:
+            return False
+        memory = getattr(session, "memory_service", None)
+        if int(getattr(memory, "background_tasks_inflight", 0) or 0) > 0:
+            return False
+    task = _loop_task
+    return task is None or task.done() or _awaiting_input
+
+
+async def _wait_for_termination_quiescence(timeout_seconds: float) -> bool:
+    """Wait within preStop's grace budget; never cancel an active tool."""
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    while not _termination_quiescent():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+    return True
+
+
+def _termination_rejection() -> JSONResponse:
+    """Stable, base64/secret-free retry contract for direct injectors."""
+
+    return JSONResponse(
+        {
+            "error": "runtime_terminating",
+            "retryable": True,
+            "message": "Persistent runtime is terminating; retry on its replacement.",
+        },
+        status_code=503,
+        headers={"Retry-After": "5"},
+    )
+
+
 def _session_ready() -> bool:
     """True when the persistent session is fully attached and the loop
     primitives are ready to accept a WS subscriber.
@@ -698,7 +813,8 @@ def _session_ready() -> bool:
     get-user-input callback would crash on a ``None`` queue.
     """
     return (
-        _session is not None
+        not _termination_admission_closed()
+        and _session is not None
         and _session.llm_with_tools is not None
         and _loop_user_queue is not None
     )
@@ -748,6 +864,10 @@ def _ensure_persistent_loop_started(
             hard_interrupt_event=_hard_interrupt_event,
             on_thinking_reset=_loop_on_thinking_reset,
             before_turn_authorization=_loop_before_turn_authorization,
+            before_provider_admission=_loop_provider_admission_open,
+            admit_input_delivery=_loop_admit_input_delivery,
+            defer_input_delivery=_loop_defer_input_delivery,
+            settle_input_delivery=_loop_settle_input_delivery,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -891,6 +1011,10 @@ def _session_parked() -> bool:
     """
     if not _awaiting_input or _tool_inflight:
         return False
+    if _termination_admission_closed():
+        # Queue contents remain durable/deferred for the replacement.  They do
+        # not make the predecessor active once termination admission is closed.
+        return True
     queue = _loop_user_queue
     return queue is None or queue.empty()
 
@@ -2065,6 +2189,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
+    global _input_runtime_generation
 
     await _stop_thread_interrupt_watcher()
     await _stop_thread_control_watcher()
@@ -2122,6 +2247,8 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _input_runtime_generation = None
+    _queued_input_claims.clear()
     _clear_all_canvas_awareness()
     _subscribers.clear()
 
@@ -2668,6 +2795,10 @@ async def _attach_session(
         cloud_mount_cfg=cloud_mount_cfg,
     )
     logger.info("attach step: session.setup %.2fs", time.perf_counter() - _t_step)
+    # Install the lifecycle provider fence before restore/attach can invoke
+    # compaction or any other auxiliary model. Turn-complete and hot-swap paths
+    # call the same idempotent wiring helper again for rebuilt instances.
+    _wire_session_aux_archiver()
 
     # Live citation-verdict push: let the engine's background verifier broadcast
     # pending→verified/failed so the cockpit citations panel updates in place
@@ -2947,11 +3078,18 @@ async def _attach_session(
     # the loop can keep reading input / responding to interrupts across
     # transport churn. Cleared in _terminate_session.
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
-    global _hard_interrupt_event
+    global _hard_interrupt_event, _input_runtime_generation
     _loop_user_queue = asyncio.Queue()
     _loop_interrupt_flag = None
     _hard_interrupt_event = asyncio.Event()
     _loop_last_user_content = [""]
+    _input_runtime_generation = str(uuid4())
+    _queued_input_claims.clear()
+
+    # Restore deliberately excludes persisted-but-unadmitted delivery rows:
+    # they are executable inbox work, not passive conversation context. Claim
+    # and queue them after the exact reciprocal binding is active.
+    await _reclaim_pending_pinned_inputs()
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
@@ -3087,6 +3225,7 @@ async def _terminate_session_inner(
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _event_writer, _cloud_sync_retry_pending, _draft_title_value
     global _active_permission_request_id
+    global _input_runtime_generation
 
     if not _session:
         return
@@ -3215,6 +3354,7 @@ async def _terminate_session_inner(
         and not _session.final_memory_extracted
         and _session.messages
         and not (_session.shell_owner_token is not None and not mark_thread)
+        and not _termination_admission_closed()
     ):
         try:
             from ..services.memory import CaptureEvent
@@ -3319,6 +3459,8 @@ async def _terminate_session_inner(
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _input_runtime_generation = None
+    _queued_input_claims.clear()
     _draft_title_value = None
     _clear_all_canvas_awareness()
     _subscribers.clear()
@@ -3436,6 +3578,38 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             }
         )
 
+    @app.post("/api/lifecycle/termination-fence")
+    async def termination_fence(request: Request):
+        """Close admission and hold preStop at the exact parked boundary.
+
+        This is transport-authenticated by loopback placement, not by a bearer:
+        the preStop helper runs in the same container and no credential is
+        available or necessary.  A caller-provided identity is never accepted.
+        """
+
+        host = request.client.host if request.client is not None else ""
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            return JSONResponse({"error": "loopback only"}, status_code=403)
+        activate_termination_admission_fence("kubernetes_prestop")
+        timeout_seconds = max(
+            0.0,
+            float(os.environ.get("PERSISTENT_TERMINATION_DRAIN_SECONDS", "165")),
+        )
+        parked = await _wait_for_termination_quiescence(timeout_seconds)
+        if not parked:
+            logger.error(
+                "Persistent termination grace expired before the current turn "
+                "settled; Kubernetes may force-stop it and LF-5 restore repair "
+                "will own recovery"
+            )
+        return JSONResponse(
+            {
+                "fenced": True,
+                "parked": parked,
+                "retryable_deferred_input": True,
+            }
+        )
+
     @app.get("/ready")
     async def ready():
         if _stateless_mode():
@@ -3445,12 +3619,22 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
             is_ready = executor_running()
             return JSONResponse(
-                {"ready": is_ready, "mode": "stateless", "thread_id": _thread_id},
+                {
+                    "ready": is_ready,
+                    "mode": "stateless",
+                    "thread_id": _thread_id,
+                    "capabilities": {"durable_input_delivery": False},
+                },
                 status_code=200 if is_ready else 503,
             )
         is_ready = _session_ready()
         return JSONResponse(
-            {"ready": is_ready, "mode": "persistent", "thread_id": _thread_id},
+            {
+                "ready": is_ready,
+                "mode": "persistent",
+                "thread_id": _thread_id,
+                "capabilities": {"durable_input_delivery": True},
+            },
             status_code=200 if is_ready else 503,
         )
 
@@ -3668,10 +3852,174 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
 
 
-async def _accept_user_input(content: str, *, role: str = "human") -> str:
+class TerminationAdmissionClosed(RuntimeError):
+    """Input reached the runtime after its termination fence closed."""
+
+
+class DurableInputUnavailable(RuntimeError):
+    """A retry-stable event could not establish its durable inbox row."""
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedInput:
+    message_id: str
+    delivery_id: str
+    delivery_state: str
+    claim_generation: int
+    enqueued: bool
+    duplicate: bool = False
+    deferred: bool = False
+
+
+def _accepted_input_payload(admission: AcceptedInput) -> dict[str, Any]:
+    """Serialize one durable input acknowledgement across REST and WS.
+
+    Once the transcript+delivery transaction commits, the input belongs to
+    the durable inbox.  In particular, ``deferred`` means the successor will
+    reclaim it; telling an uncorrelated WebSocket client to retry would mint a
+    second delivery identity and could buy a second turn.
+    """
+
+    return {
+        "accepted": True,
+        "message_id": admission.message_id,
+        "duplicate": admission.duplicate,
+        "deferred": admission.deferred,
+        "retryable": False,
+        "delivery_id": admission.delivery_id,
+        "delivery_state": admission.delivery_state,
+    }
+
+
+def _pinned_input_runtime_identity() -> tuple[str, str, str]:
+    agent_id = _registered_pinned_agent_id()
+    pod_uid = str(os.environ.get("POD_UID") or "").strip()
+    generation = str(_input_runtime_generation or "").strip()
+    if agent_id is None or not pod_uid or not generation:
+        raise DurableInputUnavailable
+    return agent_id, pod_uid, generation
+
+
+async def _transition_claimed_input(
+    delivery_id: str,
+    claim_generation: int,
+    transition: str,
+    *,
+    turn_number: int | None = None,
+    reason: str | None = None,
+) -> bool:
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return False
+    try:
+        agent_id, pod_uid, runtime_generation = _pinned_input_runtime_identity()
+        return await _session.postgres_conn.transition_pinned_input_delivery(
+            thread_id=_thread_id,
+            delivery_id=delivery_id,
+            agent_id=agent_id,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            claim_generation=claim_generation,
+            transition=transition,
+            turn_number=turn_number,
+            reason=reason,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Pinned input %s transition failed (%s)",
+            transition,
+            type(exc).__name__,
+        )
+        return False
+
+
+async def _queue_claimed_input(row: dict[str, Any]) -> bool:
+    """Queue one exact durable claim once in this process generation."""
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return False
+    queue = _loop_user_queue
+    if queue is None:
+        return False
+    delivery_id = str(row["delivery_id"])
+    claim_generation = int(row["claim_generation"])
+    key = (delivery_id, claim_generation)
+    if key in _queued_input_claims:
+        return False
+    agent_id, pod_uid, runtime_generation = _pinned_input_runtime_identity()
+    queued = await _session.postgres_conn.mark_pinned_input_delivery_queued(
+        thread_id=_thread_id,
+        delivery_id=delivery_id,
+        agent_id=agent_id,
+        pod_uid=pod_uid,
+        runtime_generation=runtime_generation,
+        claim_generation=claim_generation,
+    )
+    if not queued:
+        return False
+    # Another same-process request may have completed the identical DB CAS
+    # while this coroutine awaited it. Re-check at the no-await publication
+    # boundary so concurrent HTTP retries still produce one queue item.
+    if key in _queued_input_claims:
+        return False
+    if _termination_admission_closed():
+        await _transition_claimed_input(
+            delivery_id,
+            claim_generation,
+            "deferred",
+            reason="runtime_terminating_before_queue",
+        )
+        return False
+
+    # No await between local dedup publication and the unbounded put. A retry
+    # in this process observes the set; a process death loses the set and its
+    # new runtime generation reclaims the durable queued row.
+    _queued_input_claims.add(key)
+    queue.put_nowait(
+        {
+            "content": str(row["content"]),
+            "id": str(row["message_id"]),
+            "role": str(row["role"]),
+            "delivery_id": delivery_id,
+            "claim_generation": claim_generation,
+        }
+    )
+    return True
+
+
+async def _reclaim_pending_pinned_inputs() -> set[tuple[str, int]]:
+    """Attach-time successor replay for persisted but unadmitted input."""
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return set()
+    agent_id, pod_uid, runtime_generation = _pinned_input_runtime_identity()
+    rows = await _session.postgres_conn.claim_pending_pinned_input_deliveries(
+        thread_id=_thread_id,
+        agent_id=agent_id,
+        pod_uid=pod_uid,
+        runtime_generation=runtime_generation,
+    )
+    queued: set[tuple[str, int]] = set()
+    for row in rows:
+        if await _queue_claimed_input(row):
+            queued.add((str(row["delivery_id"]), int(row["claim_generation"])))
+    if queued:
+        logger.info(
+            "Reclaimed %d durable persistent input(s) for thread %s",
+            len(queued),
+            _thread_id,
+        )
+    return queued
+
+
+async def _accept_user_input(
+    content: str,
+    *,
+    role: str = "human",
+    delivery_id: str | None = None,
+) -> AcceptedInput:
     """Persist an accepted user message, then enqueue it for the loop.
 
-    Returns the message id. Persisting BEFORE the 200 goes out closes the
+    Returns the durable/local admission outcome. Persisting BEFORE the 200 closes the
     swallowed-input gap (session_silent_failure_audit.md #1): the queue is
     process memory, so without the row a mid-turn input vanished from the UI
     on reload and died with the pod. The loop reuses the id when it consumes
@@ -3692,45 +4040,77 @@ async def _accept_user_input(content: str, *, role: str = "human") -> str:
       AIMessage+ToolMessage pair (the *transient* injection family) would be the
       wrong shape: this is a one-time fact that must survive compaction.
     """
-    import uuid as _uuid
+    if _termination_admission_closed():
+        raise TerminationAdmissionClosed
 
-    from langchain_core.messages import HumanMessage
-
-    msg = HumanMessage(content=content)
-    msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
+    parsed_delivery_id = UUID(str(delivery_id)) if delivery_id else uuid4()
     injected = role != "human"
-    if injected:
-        # Carried on the message so BOTH writes agree: this accept-time persist
-        # and the loop's turn-start reconcile, which re-serializes the same row
-        # by id and would otherwise flip the role back to 'human'.
-        msg.additional_kwargs[_PERSIST_ROLE_KEY] = role
-    else:
+    if not injected:
         _loop_last_user_content[0] = content
-    if (
-        _session is not None
-        and _session.postgres_conn is not None
-        and _thread_id is not None
-    ):
-        try:
-            await asyncio.wait_for(
-                _persist_one_message(
-                    _session.postgres_conn,
-                    _thread_id,
-                    msg,
-                    _session.turn_count + 1,
-                ),
-                timeout=5.0,
-            )
-        except Exception as e:
-            # Same non-fatal contract as _loop_persist_message: a failed
-            # write must not reject the input; the loop's upsert recovers
-            # it for any turn that starts.
-            logger.warning(f"Accept-time user message persist failed: {e}")
-    item = {"content": content, "id": msg.id}
-    if injected:
-        item["role"] = role
-    await _loop_user_queue.put(item)
-    if injected:
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise DurableInputUnavailable
+    try:
+        agent_id, pod_uid, runtime_generation = _pinned_input_runtime_identity()
+        row = await asyncio.wait_for(
+            _session.postgres_conn.persist_pinned_input_delivery(
+                thread_id=_thread_id,
+                delivery_id=str(parsed_delivery_id),
+                role=role,
+                content=content,
+                source="officer_wake" if injected else "direct_human",
+                turn_number=_session.turn_count + 1,
+                agent_id=agent_id,
+                pod_uid=pod_uid,
+                runtime_generation=runtime_generation,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.warning("Durable input persist/claim failed (%s)", type(exc).__name__)
+        raise DurableInputUnavailable from exc
+
+    state = str(row["state"])
+    claim_generation = int(row["claim_generation"])
+    duplicate = not bool(row.get("transcript_inserted"))
+    if state in {"admitted", "settled"}:
+        return AcceptedInput(
+            message_id=str(row["message_id"]),
+            delivery_id=str(parsed_delivery_id),
+            delivery_state=state,
+            claim_generation=claim_generation,
+            enqueued=False,
+            duplicate=True,
+        )
+
+    if _termination_admission_closed():
+        await _transition_claimed_input(
+            str(parsed_delivery_id),
+            claim_generation,
+            "deferred",
+            reason="runtime_terminating_after_persist",
+        )
+        return AcceptedInput(
+            message_id=str(row["message_id"]),
+            delivery_id=str(parsed_delivery_id),
+            delivery_state="deferred",
+            claim_generation=claim_generation,
+            enqueued=False,
+            duplicate=duplicate,
+            deferred=True,
+        )
+
+    key = (str(parsed_delivery_id), claim_generation)
+    already_queued = key in _queued_input_claims
+    # Claim the whole durable inbox in transcript order, including this row.
+    # That both preserves ordering and gives a same-process runtime a bounded
+    # way to recover inputs deferred by a transient authorization failure. A
+    # retry of this row observes the local claim set and cannot publish twice.
+    newly_queued = await _reclaim_pending_pinned_inputs()
+    queued_here = key in _queued_input_claims
+    enqueued = key in newly_queued and not already_queued
+    deferred = not queued_here and _termination_admission_closed()
+    if injected and enqueued:
         # Make the injection visible in a live cockpit. Nothing else would:
         # /api/input broadcasts nothing and no frame carries user-message
         # content (the cockpit builds a user turn from its own optimistic
@@ -3739,7 +4119,14 @@ async def _accept_user_input(content: str, *, role: str = "human") -> str:
         # agent apparently talking to itself. Rides the normal _broadcast path,
         # so it reaches WS subscribers and the thread_events log (hence SSE)
         # alike.
-        _broadcast("session.event", {"content": content, "id": msg.id, "role": role})
+        _broadcast(
+            "session.event",
+            {
+                "content": str(row["content"]),
+                "id": str(row["message_id"]),
+                "role": role,
+            },
+        )
     # Title the thread from the opening prompt(s) so the cockpit header fills in
     # on submit rather than only after the (possibly long) first turn ends.
     # Fire-and-forget — must not block input acceptance. _early_title_from_prompt
@@ -3763,7 +4150,15 @@ async def _accept_user_input(content: str, *, role: str = "human") -> str:
                 name=f"early-title-{title_thread_id[:12]}",
             )
         )
-    return msg.id
+    return AcceptedInput(
+        message_id=str(row["message_id"]),
+        delivery_id=str(parsed_delivery_id),
+        delivery_state="deferred" if deferred else "queued" if queued_here else state,
+        claim_generation=claim_generation,
+        enqueued=enqueued,
+        duplicate=duplicate,
+        deferred=deferred,
+    )
 
 
 async def handle_api_input(request: Request) -> JSONResponse:
@@ -3773,12 +4168,16 @@ async def handle_api_input(request: Request) -> JSONResponse:
     injecting a system notice (a worker job the session created finished) so the
     persisted row does not render as a user bubble.
 
-    A 503 here is not an error for that caller — it means the loop is not
-    running, and the orchestrator falls back to writing the notice durably for
-    the next resume.
+    Before persistence, a 503 tells either caller to retry. After the durable
+    transaction commits, both human and event inputs receive an accepted 202
+    with their exact delivery state. The orchestrator interprets that as
+    persisted-not-executed and retains its stable-identity outbox claim; an
+    uncorrelated human client must not submit a second input.
     """
     if _stateless_mode():
         return _stateless_reject()
+    if _termination_admission_closed():
+        return _termination_rejection()
     if _session is None or _loop_user_queue is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -3797,16 +4196,61 @@ async def handle_api_input(request: Request) -> JSONResponse:
             {"error": f"role must be one of {sorted(_ACCEPTED_INPUT_ROLES)}"},
             status_code=400,
         )
+    delivery_id = body.get("delivery_id")
+    if delivery_id is not None:
+        import uuid as _uuid
+
+        if role != "event":
+            return JSONResponse(
+                {"error": "delivery_id is reserved for durable event input"},
+                status_code=400,
+            )
+        expected_key = os.environ.get("MCP_INTERNAL_KEY", "")
+        presented_key = request.headers.get("X-Internal-Key", "")
+        if not expected_key or not hmac.compare_digest(expected_key, presented_key):
+            # The identity links an outbox row to its one paid turn. It is
+            # server-owned authority, not an unauthenticated dedup hint.
+            return JSONResponse(
+                {"error": "durable event delivery requires internal authority"},
+                status_code=403,
+            )
+        try:
+            delivery_id = str(_uuid.UUID(str(delivery_id)))
+        except (ValueError, TypeError, AttributeError):
+            return JSONResponse(
+                {"error": "delivery_id must be a UUID"}, status_code=400
+            )
     if not _ensure_persistent_loop_started("rest_input"):
+        if _termination_admission_closed():
+            return _termination_rejection()
         return JSONResponse({"error": "Session not ready"}, status_code=503)
-    message_id = await _accept_user_input(content, role=role)
+    try:
+        admission = await _accept_user_input(
+            content,
+            role=role,
+            delivery_id=delivery_id,
+        )
+    except TerminationAdmissionClosed:
+        return _termination_rejection()
+    except DurableInputUnavailable:
+        return JSONResponse(
+            {
+                "error": "durable_input_unavailable",
+                "retryable": True,
+                "message": "Durable input admission is temporarily unavailable.",
+            },
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
     return JSONResponse(
         {
-            "accepted": True,
+            **_accepted_input_payload(admission),
             "turn_id": _session.turn_count,
             "queue_depth": _loop_user_queue.qsize(),
-            "message_id": message_id,
-        }
+        },
+        status_code=(
+            200 if admission.delivery_state in {"admitted", "settled"} else 202
+        ),
     )
 
 
@@ -4047,6 +4491,22 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
         await ws.close(code=4409, reason="stateless executor")
         return
 
+    if _termination_admission_closed():
+        try:
+            await ws.send_json(
+                {
+                    "method": "input.rejected",
+                    "params": {
+                        "error": "runtime_terminating",
+                        "retryable": True,
+                        "message": "Retry input on the replacement runtime.",
+                    },
+                }
+            )
+        finally:
+            await ws.close(code=4512, reason="runtime terminating")
+        return
+
     # Signal the boot-WS watchdog that a connection arrived. Done before
     # the readiness check so even a failed-to-be-ready connection counts:
     # the user clearly came back, and a different error path applies.
@@ -4146,7 +4606,34 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             if method == "message":
                 content = data.get("content", "")
                 if content and _loop_user_queue is not None:
-                    await _accept_user_input(content)
+                    try:
+                        admission = await _accept_user_input(content)
+                        rejection_error = "runtime_terminating"
+                        rejection_message = "Retry input on the replacement runtime."
+                    except TerminationAdmissionClosed:
+                        admission = None
+                        rejection_error = "runtime_terminating"
+                        rejection_message = "Retry input on the replacement runtime."
+                    except DurableInputUnavailable:
+                        admission = None
+                        rejection_error = "durable_input_unavailable"
+                        rejection_message = "Retry input when durable storage recovers."
+                    if admission is None:
+                        await _ws_send(
+                            ws,
+                            "input.rejected",
+                            {
+                                "error": rejection_error,
+                                "retryable": True,
+                                "message": rejection_message,
+                            },
+                        )
+                    elif admission.deferred:
+                        await _ws_send(
+                            ws,
+                            "input.accepted",
+                            _accepted_input_payload(admission),
+                        )
 
             elif method in {
                 "canvas.presentation_updated",
@@ -7394,6 +7881,65 @@ async def _loop_before_turn_authorization() -> tuple[bool, str]:
         return False, "authorization maintenance failed before the turn"
 
 
+def _loop_provider_admission_open() -> bool:
+    """Synchronous fence read immediately before every provider invocation."""
+
+    return not _termination_admission_closed()
+
+
+async def _loop_admit_input_delivery(
+    delivery_id: str, claim_generation: int, turn_number: int
+) -> bool:
+    """Cross the durable execution boundary immediately before model spend."""
+
+    if _termination_admission_closed():
+        return False
+    admitted = await _transition_claimed_input(
+        delivery_id,
+        claim_generation,
+        "admitted",
+        turn_number=turn_number,
+    )
+    # Close the in-process race as tightly as possible. If the sentinel became
+    # visible while the CAS awaited Postgres, roll the not-yet-used admission
+    # back to retryable before returning to the loop. No provider call exists
+    # between these two statements.
+    if admitted and _termination_admission_closed():
+        await _transition_claimed_input(
+            delivery_id,
+            claim_generation,
+            "unadmit",
+            reason="runtime_terminating_before_provider",
+        )
+        return False
+    return admitted
+
+
+async def _loop_defer_input_delivery(
+    delivery_id: str, claim_generation: int, reason: str
+) -> bool:
+    deferred = await _transition_claimed_input(
+        delivery_id,
+        claim_generation,
+        "deferred",
+        reason=reason,
+    )
+    if deferred:
+        _queued_input_claims.discard((delivery_id, claim_generation))
+    return deferred
+
+
+async def _loop_settle_input_delivery(delivery_id: str, claim_generation: int) -> bool:
+    settled = await _transition_claimed_input(
+        delivery_id,
+        claim_generation,
+        "settled",
+    )
+    if settled:
+        _queued_input_claims.discard((delivery_id, claim_generation))
+    return settled
+
+
 async def _loop_get_user_input() -> str:
     """Wait for the next user input. Honors session idle timeout.
 
@@ -7401,11 +7947,25 @@ async def _loop_get_user_input() -> str:
     raises IdleTimeoutError — the loop unwinds, _loop_completion_handler
     routes it to _handle_idle_archive() + _terminate_session("idle_timeout").
     """
+    global _awaiting_input
+
     queue = _loop_user_queue
     if queue is None:
         # _attach_session always initializes this. If we hit None here the
         # session is being torn down — fail loudly so the loop unwinds.
         raise RuntimeError("_loop_user_queue not initialized — session torn down?")
+
+    if _termination_admission_closed():
+        # Do not consume already-durable queued work. The exact successor
+        # reclaims it from thread_input_deliveries; transcript restore excludes
+        # unadmitted rows because conversation context is not an inbox. This
+        # wait is cancelled by normal process shutdown after preStop observes
+        # the exact parked boundary.
+        _awaiting_input = True
+        try:
+            await asyncio.Future()
+        finally:
+            _awaiting_input = False
 
     _broadcast("ready", {})
 
@@ -7453,7 +8013,6 @@ async def _loop_get_user_input() -> str:
     # Parked window for the drain-suspend gate (_session_parked): exactly the
     # span where this coroutine is blocked on the queue. The finally also
     # covers loop-task cancellation and the idle-timeout raise.
-    global _awaiting_input
     _awaiting_input = True
     try:
         if _session is None:
@@ -9109,6 +9668,12 @@ def _wire_session_aux_archiver() -> None:
     """
     if _session is None or getattr(_session, "auxiliary_llm", None) is None:
         return
+    gate_setter = getattr(_session.auxiliary_llm, "set_provider_admission_gate", None)
+    if callable(gate_setter):
+        # This belongs beside archiver wiring because every aux rebuild already
+        # converges through this function. A hot swap must not detach either
+        # observability or the termination no-spend fence.
+        gate_setter(_loop_provider_admission_open)
     if not _thread_id:
         return
     try:
@@ -9282,7 +9847,7 @@ async def _loop_on_turn_complete_body(
     # turn-start hook (e.g. workspace_sync.error) can tear down the WS before
     # the title frame is flushed, leaving the cockpit header stuck on
     # "Untitled Session" until a manual refetch.
-    if turn_id <= 3 and _session.postgres_conn:
+    if turn_id <= 3 and _session.postgres_conn and not _termination_admission_closed():
         await _auto_title_after_first_turn()
 
     # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits to
@@ -9685,7 +10250,7 @@ def _sanitize_restored_history(restored: list) -> list:
 
 
 def _db_rows_to_lc_messages(db_messages: list) -> list:
-    """Convert ``thread_messages`` rows to LangChain messages with fresh UUIDs.
+    """Convert ``thread_messages`` rows to LangChain messages with stable ids.
 
     Shared by the restore paths (Path A checkpoint+tail, Path B full load).
     Falls back to positional pairing of tool results for legacy rows whose
@@ -9705,11 +10270,11 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
         content = db_msg["content"] or ""
         tool_calls = db_msg.get("tool_calls")
 
-        # Fresh UUID per restored message. Without an `id`,
-        # `RemoveMessage(id=...)` in compaction is a no-op — a resumed
-        # session that needs compaction could never shrink. The ID is a
-        # LangGraph state key, not user-facing or persisted.
-        msg_id = str(_uuid.uuid4())
+        # Preserve the durable row id when available. It still gives
+        # RemoveMessage a real state key, and lets a reclaimed input append the
+        # exact row once rather than duplicating a restored conversation item.
+        # Legacy/unit rows without an id retain the fresh-id fallback.
+        msg_id = str(db_msg.get("id") or _uuid.uuid4())
 
         if role in ("human", "user"):
             restored.append(HumanMessage(content=content, id=msg_id))
@@ -10632,6 +11197,13 @@ async def _handle_compact(
     rewind hits the same hazard, not just the rewind sheet's "Summarize up
     to here".
     """
+    if _termination_admission_closed():
+        await _ws_send(
+            ws,
+            "error",
+            {"message": "Persistent runtime is terminating; retry on its replacement"},
+        )
+        return
     if _rewind_lock.locked():
         await _ws_send(
             ws,
@@ -10691,6 +11263,16 @@ async def _handle_compact(
 
             before_count = len(_session.messages)
             runs_before = getattr(ctx_mgr, "compaction_runs", 0)
+            if _termination_admission_closed():
+                await _ws_send(
+                    ws,
+                    "error",
+                    {
+                        "message": "Persistent runtime is terminating; retry on "
+                        "its replacement"
+                    },
+                )
+                return
             result = await ctx_mgr.summarize_and_compact(
                 messages=_session.messages,
                 auxiliary=_session.auxiliary_llm,
@@ -11385,7 +11967,11 @@ async def _handle_archive(ws: WebSocket) -> None:
             if _session.tool_context
             else None
         )
-        if not _stateless_mode() and _session.memory_service is not None:
+        if (
+            not _stateless_mode()
+            and _session.memory_service is not None
+            and not _termination_admission_closed()
+        ):
             from ..services.memory import CaptureEvent
 
             await _session.memory_service.capture(
@@ -11397,6 +11983,7 @@ async def _handle_archive(ws: WebSocket) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
+            and not _termination_admission_closed()
         ):
             try:
                 from ..services.auxiliary import extract_and_store_memories
@@ -11571,7 +12158,11 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             if _session.tool_context
             else None
         )
-        if not _stateless_mode() and _session.memory_service is not None:
+        if (
+            not _stateless_mode()
+            and _session.memory_service is not None
+            and not _termination_admission_closed()
+        ):
             from ..services.memory import CaptureEvent
 
             await _session.memory_service.capture(
@@ -11583,6 +12174,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
+            and not _termination_admission_closed()
         ):
             try:
                 from ..services.auxiliary import extract_and_store_memories
@@ -12305,6 +12897,9 @@ def _title_looks_conversational(title: str) -> bool:
 
 async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[str]:
     """Generate a short title from conversation using AuxiliaryLLM."""
+    if _termination_admission_closed():
+        logger.debug("Title generation skipped: termination admission is closed")
+        return None
     if not auxiliary_llm or not messages:
         logger.debug(
             "Title generation skipped: auxiliary_llm=%s, messages=%d",
@@ -12345,6 +12940,9 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         # main-model fallback rather than a silent "Untitled Session".
         from src.services.auxiliary import GenerateTitleTask
 
+        if _termination_admission_closed():
+            logger.debug("Title generation skipped: termination admission closed")
+            return None
         result = await auxiliary_llm.chain(GenerateTitleTask("\n".join(sample)))
         auxiliary_llm.health.record_success("title_generation")
         raw_title = (getattr(result, "title", None) or "").strip()

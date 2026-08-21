@@ -197,6 +197,10 @@ class TestDrainBrake:
         ]
         db = SimpleNamespace()
         db.claim_pending_session_wake_events = AsyncMock(return_value=rows)
+        delivery_id = str(uuid.uuid4())
+        assigned = [{**row, "delivery_id": delivery_id} for row in rows]
+        db.assign_session_wake_delivery_groups = AsyncMock(return_value=assigned)
+        db.get_session_wake_delivery_group = AsyncMock(return_value=assigned)
         db.get_thread = AsyncMock(return_value={**_thread(), "project_id": project_id})
         db.defer_session_wake_events = AsyncMock()
         db.finish_session_wake_events = AsyncMock()
@@ -224,6 +228,10 @@ class TestDrainBrake:
         ]
         db = SimpleNamespace()
         db.claim_pending_session_wake_events = AsyncMock(return_value=rows)
+        delivery_id = str(uuid.uuid4())
+        assigned = [{**row, "delivery_id": delivery_id} for row in rows]
+        db.assign_session_wake_delivery_groups = AsyncMock(return_value=assigned)
+        db.get_session_wake_delivery_group = AsyncMock(return_value=assigned)
         db.get_thread = AsyncMock(return_value=_thread(ceiling=1))
         db.defer_session_wake_events = AsyncMock()
         db.finish_session_wake_events = AsyncMock()

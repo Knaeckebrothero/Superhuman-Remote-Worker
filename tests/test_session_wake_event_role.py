@@ -118,9 +118,12 @@ def test_the_override_is_read_at_the_single_serialization_point():
 
 
 def test_only_human_and_event_are_accepted_over_api_input():
-    """/api/input has NO authentication of any kind — no session token, no
-    internal key. An arbitrary passthrough role would let anything that can
-    reach the pod forge 'ai' or 'system' rows in the transcript."""
+    """Ordinary input has no session token, so role remains allow-listed.
+
+    The narrower retry-stable event identity is independently internal-key
+    protected by ``handle_api_input``; an arbitrary role must still never
+    reach transcript persistence.
+    """
     assert _ACCEPTED_INPUT_ROLES == frozenset({"human", "event"})
     for forged in ("ai", "system", "tool", "summary", "error"):
         assert forged not in _ACCEPTED_INPUT_ROLES
