@@ -188,8 +188,9 @@ async def build_wake_message(
         lines += await _pending_section(db, thread_id, project_id, now)
         lines += await _worker_messages_section(db, project_id, now)
         lines += await _knowledge_section(db, vector_db, project_id)
+        signals: dict[str, Any] = {}
         lines += await _capacity_section(
-            db, thread, thread_id, vector_db, project_id, now
+            db, thread, thread_id, vector_db, project_id, now, signals=signals
         )
         lines += await _fleet_section(db)
         lines += await _budget_section(thread, usage_ledger, project_id, now)
@@ -198,6 +199,22 @@ async def build_wake_message(
             "Assess, act within your authority, then file a sleep. Use "
             "notify_user if something needs the Legate."
         )
+        # Deliberately AFTER the closing instruction, and only when a pool is
+        # actually starved. The last line of the wake is the one that gets
+        # acted on, and for a long stretch the last thing this officer read
+        # every wake was "file a sleep" — so an empty queue rendered as a
+        # marker in the middle of the capacity line while the instruction to
+        # sleep held the position that carries. Doctrine (persona
+        # <backlog_doctrine> 1-2) already says an empty ready queue is waste
+        # and that a starved pool is solicited or reported as dry; this puts
+        # that duty where it is read, on exactly the wakes it applies to.
+        starved = signals.get("below_floor") or []
+        if starved:
+            lines.append(
+                f"{', '.join(starved)} {'is' if len(starved) == 1 else 'are'} "
+                "BELOW FLOOR. Replenishing the queue is acting: arm a ticket, "
+                "or tell the Legate the well is dry."
+            )
         patch = {
             "sitrep": {
                 "watermark": now.isoformat(),
@@ -596,7 +613,18 @@ async def _capacity_section(
     vector_db: Any = None,
     project_id: Optional[str] = None,
     now: Optional[datetime] = None,
+    *,
+    signals: Optional[dict[str, Any]] = None,
 ) -> list[str]:
+    """Capacity/runtime lines, plus optional out-signals for the caller.
+
+    ``signals`` is an out-parameter rather than a second return value so the
+    section keeps its list-of-lines contract with every existing caller. The
+    only key today is ``below_floor``: the starved pool names, which
+    :func:`build` renders as the wake's final line. It is computed here
+    because this is where ``ready_by_pool`` is queried — recomputing it in the
+    caller would cost a second round-trip to say the same thing.
+    """
     try:
         from services.officer_admission import count_in_flight_by_slot
         from services.officer_backlog import (
@@ -631,6 +659,10 @@ async def _capacity_section(
             ready_by_pool = await ready_depth_by_pool(
                 db, vector_db, str(project_id), pools, now=now
             )
+        if signals is not None:
+            from services.officer_slots import below_floor_pools
+
+            signals["below_floor"] = below_floor_pools(officer_meta, ready_by_pool)
 
         oldest_hours: Optional[float] = None
         try:
