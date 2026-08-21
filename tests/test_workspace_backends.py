@@ -2568,6 +2568,151 @@ class TestRemoteBackendTmuxFences:
         assert "capture-pane -J " in command
         assert f"-S -{backend._scrollback_limit}" in command
 
+    def test_capture_prunes_only_proven_gone_pane_and_keeps_shell_live(
+        self, remote_backend, caplog
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(17)
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["verify-spec-lock"] = _RemoteTab("verify-spec-lock", pane_id="%2")
+        commands = []
+
+        def execute(command, **_kwargs):
+            commands.append(command)
+            if command.startswith("tmux capture-pane"):
+                if "%2" in command:
+                    return "", 1
+                return "surviving pane\n", 0
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "", 1
+            return "", 0
+
+        with (
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+            caplog.at_level(logging.WARNING),
+        ):
+            with pytest.raises(KeyError, match="no longer exists"):
+                backend._tmux_capture("verify-spec-lock")
+            assert backend._tmux_capture("default") == ["surviving pane"]
+
+        assert backend._shell_initialized is True
+        assert list(backend._tabs) == ["default"]
+        assert "pane_lost_at_handoff" in caplog.text
+        assert "tab=verify-spec-lock" in caplog.text
+        assert "shell_owner_token=17" in caplog.text
+        cleanup = next(command for command in commands if command.startswith("umask"))
+        assert '"$_srw_tmux_token" = 17 ] || exit 75' in cleanup
+        assert "tmux kill-window" in cleanup
+        assert cleanup.count("set-option -w -u") == 6
+        for option in (
+            "@srw_tab_type",
+            "@srw_pending_sentinel",
+            "@srw_pending_since",
+            "@srw_pane_id",
+            "@srw_window_prompt_token",
+            "@srw_window_setup_state",
+        ):
+            assert option in cleanup
+
+    @pytest.mark.parametrize("probe_failure", ("tmux", "transport"))
+    def test_capture_probe_server_failure_keeps_workspace_error_semantics(
+        self, remote_backend, probe_failure
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["verify-spec-lock"] = _RemoteTab("verify-spec-lock", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if command.startswith("tmux capture-pane"):
+                return "", 1
+            if command.startswith("tmux has-session"):
+                if probe_failure == "transport":
+                    raise WorkspaceUnavailableError("SSH command failed")
+                return "", 1
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            with pytest.raises(
+                WorkspaceUnavailableError,
+                match="capture pane verify-spec-lock failed with exit code 1",
+            ):
+                backend._tmux_capture("verify-spec-lock")
+
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    def test_capture_probe_does_not_prune_pane_that_is_still_listed(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["verify-spec-lock"] = _RemoteTab("verify-spec-lock", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if command.startswith("tmux capture-pane"):
+                return "", 1
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "%2\n", 0
+            raise AssertionError(f"Unexpected command: {command}")
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 1"):
+                backend._tmux_capture("verify-spec-lock")
+
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    def test_reattach_prune_reports_loss_once_before_tab_can_recreate(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(18)
+        backend._shell_protocol_current = True
+        metadata = "\n".join(
+            (
+                _tmux_window_row("default", "shell", pane_id="%1"),
+                _tmux_window_row(
+                    "verify-spec-lock",
+                    "shell",
+                    pane_id="%2",
+                    stored_pane_id="%2",
+                ),
+            )
+        )
+
+        def execute(command, **_kwargs):
+            if command.startswith("tmux list-windows"):
+                return metadata, 0
+            if command.startswith("tmux capture-pane"):
+                if "%2" in command:
+                    return "", 1
+                return "$\n", 0
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "", 1
+            return "", 0
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            backend._rehydrate_tabs()
+
+        assert list(backend._tabs) == ["default"]
+        assert backend._lost_tab_notices == {"verify-spec-lock"}
+        backend._shell_initialized = True
+        with pytest.raises(KeyError, match="verify-spec-lock.*no longer exists"):
+            backend.shell_run("echo must-not-run", tab_name="verify-spec-lock")
+
+        with patch.object(backend, "shell_open_tab") as open_tab:
+            backend.shell_ensure_tab("verify-spec-lock")
+        open_tab.assert_called_once_with("verify-spec-lock")
+
     def test_full_owner_id_mismatch_refuses_truncated_name_collision(
         self, remote_backend
     ):
@@ -3711,10 +3856,11 @@ class TestRemoteBackendShellRun:
         long_cwd = "/workspace/" + "nested-directory/" * 30
         captures = 0
 
-        def capture(command, *, operation):
+        def capture(command, *, operation, pane_context):
             nonlocal captures
             assert "capture-pane -J " in command
             assert operation == "capture pane default"
+            assert pane_context == ("default", "%1")
             captures += 1
             if captures == 1:
                 return "$\n"
@@ -4039,9 +4185,10 @@ class TestRemoteBackendShellCancel:
             assert expected == "__DONE_aaaaaaaaaaaa__"
             tab.pending_sentinel = sentinel
 
-        def capture(command, *, operation):
+        def capture(command, *, operation, pane_context):
             assert "capture-pane -J " in command
             assert operation == "capture pane default"
+            assert pane_context == ("default", "%1")
             return f"__DONE_bbbbbbbbbbbb__ 130 {long_cwd}\n"
 
         def clear(_name, _expected):

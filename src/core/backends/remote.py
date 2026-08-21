@@ -245,6 +245,14 @@ _TMUX_SETUP_COMPLETE = "complete"
 _TMUX_PROMPT_TOKEN_OPTION = "@srw_prompt_token"
 _TMUX_WINDOW_PROMPT_OPTION = "@srw_window_prompt_token"
 _TMUX_WINDOW_SETUP_OPTION = "@srw_window_setup_state"
+_TMUX_WINDOW_STATE_OPTIONS = (
+    _TMUX_TAB_TYPE_OPTION,
+    _TMUX_PENDING_SENTINEL_OPTION,
+    _TMUX_PENDING_SINCE_OPTION,
+    _TMUX_PANE_ID_OPTION,
+    _TMUX_WINDOW_PROMPT_OPTION,
+    _TMUX_WINDOW_SETUP_OPTION,
+)
 _TMUX_FIELD_SEPARATOR = "|"
 _TMUX_TAB_TYPES = frozenset({"shell", "ssh", "repl", "process"})
 _INHERITED_BUSY_SENTINEL = "__SRW_INHERITED_BUSY__"
@@ -543,6 +551,9 @@ class RemoteBackend(WorkspaceBackend):
         self._tmux_durable_lock_filename = f"{lock_key}.lock"
         self._tmux_owner_digest = state_key
         self._tabs: OrderedDict[str, _RemoteTab] = OrderedDict()
+        # A pane pruned while reattaching must be reported to the agent once,
+        # before the usual ensure-tab path is allowed to recreate it.
+        self._lost_tab_notices: set[str] = set()
         self._sync_lock = threading.Lock()
         self._shell_init_lock = threading.Lock()
         # Serializes the final local admission check with each remote tmux I/O.
@@ -2338,6 +2349,7 @@ __SRW_PROCESS_ZERO_PY__
         operation: str,
         allow_shell_retired: bool = False,
         close_sftp: bool = False,
+        pane_context: Optional[tuple[str, str]] = None,
     ) -> str:
         """Run a generated tmux command and prove its remote exit status.
 
@@ -2346,6 +2358,9 @@ __SRW_PROCESS_ZERO_PY__
         missing session/window must never be mistaken for a successful durable
         guard or key send. Use Paramiko's already-drained remote exit status
         directly, without adding temp-file I/O to the 300 ms capture loop.
+        Pane-scoped capture callers may supply their exact tab and pane identity;
+        only a follow-up liveness proof can then downgrade the failure to an
+        ordinary missing-tab error.
         """
         with self._shell_io_lock:
             if self._shell_retired and not allow_shell_retired:
@@ -2371,12 +2386,88 @@ __SRW_PROCESS_ZERO_PY__
             # generic 5 MiB SSH cap cannot make a finished command look busy.
             output, exit_code = self._exec_with_status(command, retain_tail=True)
             if exit_code != 0:
+                if pane_context is not None:
+                    tab_name, pane_id = pane_context
+                    try:
+                        pane_gone = self._tmux_pane_gone(tab_name, pane_id)
+                    except Exception as probe_error:
+                        self._shell_initialized = False
+                        self._tabs.clear()
+                        raise WorkspaceUnavailableError(
+                            f"Remote tmux {operation} failed with exit code {exit_code}"
+                        ) from probe_error
+                    if pane_gone:
+                        self._prune_lost_tmux_tab(tab_name)
+                        raise KeyError(self._lost_tab_message(tab_name))
                 self._shell_initialized = False
                 self._tabs.clear()
                 raise WorkspaceUnavailableError(
                     f"Remote tmux {operation} failed with exit code {exit_code}"
                 )
             return output
+
+    def _lost_tab_message(self, tab_name: str) -> str:
+        return (
+            f"Tab '{tab_name}' no longer exists. "
+            f"Available: {', '.join(self._tabs.keys())}"
+        )
+
+    def _tmux_pane_gone(self, tab_name: str, pane_id: str) -> bool:
+        """Prove that one pane vanished while its exact session stayed live.
+
+        Tmux stderr is intentionally not part of the decision. A successful
+        session probe proves that the server and exact SRW session answered;
+        the exact window's pane inventory is then authoritative. Re-check the
+        session after a failed window lookup so a concurrent session loss
+        remains a workspace-level failure.
+        """
+        session_probe = f"tmux has-session -t {self._tmux_target()} >/dev/null 2>&1"
+        _output, session_exit = self._exec_with_status(session_probe)
+        if session_exit != 0:
+            return False
+
+        panes, panes_exit = self._exec_with_status(
+            f"tmux list-panes -t {self._tmux_target(tab_name)} "
+            "-F '#{pane_id}' 2>/dev/null"
+        )
+        if panes_exit == 0:
+            pane_ids = {line.strip() for line in panes.splitlines() if line.strip()}
+            return pane_id not in pane_ids
+
+        _output, session_exit = self._exec_with_status(session_probe)
+        return session_exit == 0
+
+    def _prune_lost_tmux_tab(self, tab_name: str) -> None:
+        """Remove one proven-lost pane without weakening tmux owner fences."""
+        session = self._tmux_target()
+        window = self._tmux_target(tab_name)
+        clear_options = "".join(
+            f"  tmux set-option -w -u -t {window} {option} 2>/dev/null || true\n"
+            for option in _TMUX_WINDOW_STATE_OPTIONS
+        )
+        cleanup = (
+            f"tmux has-session -t {session} 2>/dev/null || exit 79\n"
+            f"if tmux list-panes -t {window} >/dev/null 2>&1; then\n"
+            f"{clear_options}"
+            f"  if ! tmux kill-window -t {window} 2>/dev/null; then\n"
+            f"    tmux has-session -t {session} 2>/dev/null || exit 79\n"
+            "  fi\n"
+            "else\n"
+            f"  tmux has-session -t {session} 2>/dev/null || exit 79\n"
+            "fi"
+        )
+        self._tmux_mutate_checked(
+            cleanup,
+            operation=f"prune lost pane {tab_name}",
+        )
+        self._tabs.pop(tab_name, None)
+        logger.warning(
+            "pane_lost_at_handoff: pruned dead remote tmux pane: "
+            "session=%s tab=%s shell_owner_token=%s",
+            self._session_name,
+            tab_name,
+            self._shell_owner_token,
+        )
 
     def _tmux_mutate_checked(
         self,
@@ -3180,11 +3271,21 @@ __SRW_PROCESS_ZERO_PY__
             )
         for name, option, value in option_migrations:
             self._set_tmux_window_option(name, option, value)
-        for name, tab in self._tabs.items():
+        for name, tab in list(self._tabs.items()):
             if tab.tab_type != "shell":
                 continue
             try:
                 lines = self._tmux_capture(name)
+            except KeyError:
+                if name not in self._tabs:
+                    # Reattachment consumed the pane-loss error internally so
+                    # the claim can continue. Preserve one agent-visible notice
+                    # before ensure-tab is allowed to recreate this name.
+                    self._lost_tab_notices.add(name)
+                    continue
+                raise
+            except WorkspaceUnavailableError:
+                raise
             except Exception:
                 # Failure to inspect must never be interpreted as an idle pane.
                 lines = []
@@ -3279,6 +3380,7 @@ __SRW_PROCESS_ZERO_PY__
         with self._shell_init_lock:
             if self._shell_initialized:
                 return
+            self._lost_tab_notices.clear()
             started = time.perf_counter()
             self._ensure_connected()
             disposition = self._create_or_observe_tmux_session()
@@ -3434,10 +3536,13 @@ __SRW_PROCESS_ZERO_PY__
         width; without join-lines, strict parsing would leave the durable
         pending guard stuck even though the shell had completed.
         """
+        pane = self._tmux_pane_target(tab_name)
+        tab = self._tabs[tab_name]
+        assert tab.pane_id is not None
         output = self._tmux_exec_checked(
-            f"tmux capture-pane -J -t {self._tmux_pane_target(tab_name)} -p "
-            f"-S -{self._scrollback_limit}",
+            f"tmux capture-pane -J -t {pane} -p -S -{self._scrollback_limit}",
             operation=f"capture pane {tab_name}",
+            pane_context=(tab_name, tab.pane_id),
         )
         lines = output.splitlines()
         # Strip trailing empty lines
@@ -3777,6 +3882,8 @@ __SRW_PROCESS_ZERO_PY__
             while clean_lines and not clean_lines[-1].strip():
                 clean_lines.pop()
             return "\n".join(clean_lines)
+        except KeyError:
+            raise
         except Exception as e:
             logger.debug(f"Failed to capture terminal state: {e}")
             return "(failed to capture terminal state)"
@@ -3999,6 +4106,9 @@ __SRW_PROCESS_ZERO_PY__
         self._ensure_shell()
         if name in self._tabs:
             return
+        if name in self._lost_tab_notices:
+            self._lost_tab_notices.remove(name)
+            raise KeyError(self._lost_tab_message(name))
         self.shell_open_tab(name)
 
     def shell_open_tab(
@@ -4050,6 +4160,7 @@ __SRW_PROCESS_ZERO_PY__
             pane_id = self._discover_single_pane(name)
             tab = _RemoteTab(name=name, tab_type=tab_type, pane_id=pane_id)
             self._tabs[name] = tab
+            self._lost_tab_notices.discard(name)
             self._set_tmux_window_option(name, _TMUX_TAB_TYPE_OPTION, tab_type)
             self._set_tmux_window_option(name, _TMUX_PANE_ID_OPTION, pane_id)
 
