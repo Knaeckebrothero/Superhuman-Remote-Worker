@@ -264,3 +264,75 @@ def test_unmigrated_databases_are_untouched():
     clusters = _clusters(*BACKUP_ON, "databases.postgres.engine=cnpg")
     assert set(clusters) == {f"{FULLNAME}-postgres"}
     assert _plugins(clusters[f"{FULLNAME}-postgres"]) != []
+
+
+# --- scheduled base backups ------------------------------------------------
+
+
+def _scheduled(*settings: str) -> dict[str, dict]:
+    return {
+        d["metadata"]["name"]: d
+        for d in _kinds(_render(*settings, show_only=SCHEDULED), "ScheduledBackup")
+    }
+
+
+def test_no_scheduled_backup_when_off():
+    assert _renders_nothing(*_all_cnpg(), show_only=SCHEDULED)
+
+
+def test_one_per_backing_up_cluster():
+    """auditdb opts out by default; every other cluster gets one."""
+    assert set(_scheduled(*BACKUP_ON, *_all_cnpg())) == {
+        f"{FULLNAME}-{component}-backup"
+        for component in ("postgres", "pgvector", "giteadb", "keycloakdb")
+    }
+
+
+def test_scheduled_backup_uses_the_plugin_method():
+    backup = _scheduled(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres-backup"]
+    assert backup["spec"]["method"] == "plugin"
+    assert (
+        backup["spec"]["pluginConfiguration"]["name"]
+        == "barman-cloud.cloudnative-pg.io"
+    )
+    assert backup["spec"]["cluster"]["name"] == f"{FULLNAME}-postgres"
+
+
+def test_every_scheduled_backup_names_a_cluster_that_renders():
+    settings = (*BACKUP_ON, *_all_cnpg())
+    targets = {b["spec"]["cluster"]["name"] for b in _scheduled(*settings).values()}
+    assert targets <= set(_clusters(*settings))
+
+
+def test_schedule_is_six_field_cron():
+    """CNPG uses robfig/cron, which puts SECONDS first. A five-field crontab
+    expression is silently misparsed into the wrong time."""
+    backup = _scheduled(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres-backup"]
+    assert len(backup["spec"]["schedule"].split()) == 6
+
+
+def test_five_field_schedule_is_rejected():
+    result = subprocess.run(
+        _template_command(
+            *BACKUP_ON, *_all_cnpg(), "databases.backup.schedule=0 2 * * *"
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "six" in result.stderr.lower()
+
+
+def test_backups_prefer_a_standby_when_one_exists():
+    """A base backup is heavy sequential IO. Running it on the primary steals
+    that from live traffic; prefer-standby falls back to the primary at one
+    instance, so it is correct at every replica count."""
+    backup = _scheduled(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres-backup"]
+    assert backup["spec"]["target"] == "prefer-standby"
+
+
+def test_first_backup_is_immediate_by_default():
+    """Until a base backup exists the WAL archive restores nothing, so a fresh
+    install must not wait for the first scheduled window."""
+    backup = _scheduled(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres-backup"]
+    assert backup["spec"]["immediate"] is True
