@@ -28543,6 +28543,236 @@ async def read_job_evidence_route(
         ) from None
 
 
+# Lead-in slack for a per-job usage window: absorbs clock skew between the
+# orchestrator (which stamps jobs.created_at) and the audit writers that stamp
+# usage_events.ts. Applied at both ends; the tail also runs to now (never to
+# completed_at) because late rows are the normal case, not the exception.
+_JOB_USAGE_WINDOW_SLACK = timedelta(minutes=5)
+
+# The materializer's poll interval (120s, llm_usage_poll_loop) plus its aging
+# window (60s). A running job's figure is at worst this far behind the truth.
+_JOB_USAGE_LAG_SECONDS = 180
+
+_JOB_USAGE_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+# usage_events.unit -> the token bucket it belongs to. Reasoning tokens are a
+# subset of the completion total and ride in `details`, so they are deliberately
+# absent here — counting them would double-count (see audit_usage.py).
+_JOB_USAGE_TOKEN_UNITS = {
+    "prompt-token": "prompt_tokens",
+    "cached-prompt-token": "cached_prompt_tokens",
+    "completion-token": "completion_tokens",
+}
+
+
+def _job_usage_window(
+    created_at: Any, now: datetime, floor: Optional[datetime]
+) -> tuple[datetime, datetime]:
+    """The [from, to) range to read a job's usage over.
+
+    ``usage_events`` is partitioned on ``ts``, so a per-job read must carry a
+    range — and a wrong range is indistinguishable from "this job was free".
+    The tail is *now*, never ``completed_at``: workspace-pod intervals close at
+    teardown and async auxiliary LLM calls land after the job seals, so a window
+    ending at completion drops real spend. Slack at both ends absorbs clock skew
+    between the orchestrator that stamps ``jobs.created_at`` and the audit
+    writers that stamp ``ts``.
+    """
+    to_ts = now + _JOB_USAGE_WINDOW_SLACK
+    if isinstance(created_at, datetime):
+        return created_at - _JOB_USAGE_WINDOW_SLACK, to_ts
+    # jobs.created_at defaults to CURRENT_TIMESTAMP so this is unreachable in
+    # practice — widen to the whole ledger rather than invent a window and risk
+    # the confident zero this endpoint exists to avoid.
+    return floor or (now - timedelta(days=365)), to_ts
+
+
+def _job_usage_window_payload(from_ts: datetime, to_ts: datetime) -> dict[str, str]:
+    """Serialize a window as Zulu.
+
+    ``+00:00`` survives JSON but not a round trip through a query string, where
+    the ``+`` decodes as a space and comes back a 422 — the jobs list shipped
+    exactly that bug in its ``as_of`` watermark.
+    """
+    return {
+        "from": from_ts.isoformat().replace("+00:00", "Z"),
+        "to": to_ts.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _job_usage_state(
+    rows: list[dict[str, Any]], created_at: Any, floor: Optional[datetime]
+) -> str:
+    """Which kind of "nothing" an empty result is.
+
+    A job created before the materializer's forward-only anchor has no rows and
+    never will, which is not the same claim as "this job spent nothing" — and
+    rendering both as $0.00 is how a cost feature loses its credibility. With no
+    floor (an empty ledger) there is nothing to compare against, so the honest
+    answer stays ``no_usage``.
+    """
+    if rows:
+        return "measured"
+    if floor is not None and isinstance(created_at, datetime) and created_at < floor:
+        return "predates_ledger"
+    return "no_usage"
+
+
+def _fold_job_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold ledger rows into totals that admit what they do not know.
+
+    ``cost_usd`` stays None until some row carries a price, so a job whose models
+    have no rate card reports "unknown", not "$0.00". ``complete`` is the flag a
+    UI needs to decide between rendering the number plainly and qualifying it as
+    a floor: a partially priced job has a real cost strictly above what is shown.
+    """
+    tokens = {v: 0 for v in _JOB_USAGE_TOKEN_UNITS.values()}
+    by_category: dict[str, dict[str, Any]] = {}
+    cost: float | None = None
+    priced_events = 0
+    events = 0
+    for row in rows:
+        events += row["events"]
+        priced_events += row["priced_events"]
+        if row["cost_usd"] is not None:
+            cost = (cost or 0.0) + row["cost_usd"]
+        if row["category"] == "llm":
+            bucket = _JOB_USAGE_TOKEN_UNITS.get(row["unit"])
+            if bucket:
+                tokens[bucket] += int(row["quantity"])
+        agg = by_category.setdefault(
+            row["category"],
+            {
+                "category": row["category"],
+                "cost_usd": None,
+                "events": 0,
+                "priced_events": 0,
+            },
+        )
+        agg["events"] += row["events"]
+        agg["priced_events"] += row["priced_events"]
+        if row["cost_usd"] is not None:
+            agg["cost_usd"] = (agg["cost_usd"] or 0.0) + row["cost_usd"]
+    return {
+        "llm": {
+            **tokens,
+            "total_tokens": sum(tokens.values()),
+            "cache_hit_ratio": cache_hit_ratio_from_rows(rows),
+        },
+        "by_category": sorted(by_category.values(), key=lambda r: r["category"]),
+        "cost": {
+            "usd": cost,
+            "complete": priced_events == events,
+            "priced_events": priced_events,
+            "events": events,
+        },
+    }
+
+
+@app.get("/api/jobs/{job_id}/usage")
+async def get_job_usage(
+    request: Request,
+    job_id: str,
+    include_subjobs: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Metered tokens, machine time and price for one job.
+
+    Reads the ``usage_events`` ledger rather than re-aggregating ``llm_requests``:
+    the materializer already normalizes tokens out of three different homes, and
+    a fresh aggregator reproduces the bug where Responses-API rows (``token_usage
+    = {}`` plus a NULL ``metadata``) meter as nothing — one job lost ~17.3M tokens
+    that way before the fallbacks landed (``services/audit_usage.py``).
+
+    Three things this endpoint owns that ``GET /api/usage?ref_id=`` does not:
+
+    * **The window.** ``usage_events`` is partitioned on ``ts``, so every read
+      needs a range and a caller who picks the wrong one gets a confident zero:
+      ``/api/usage?ref_id=<job>&days=1`` reports ``total_cost_usd: 0`` with
+      ``available: true`` for a job that cost $0.94 a week earlier. Here the
+      window comes from the job itself, and its tail is *now* rather than
+      ``completed_at`` — workspace-pod intervals close at teardown and async
+      auxiliary calls (memory extraction, summarization) land after the job
+      seals, so a window that ends at completion loses real spend.
+    * **Unpriced is not free.** ``cost.usd`` is null until something is priced,
+      and ``cost.complete`` says whether every metered event carried a rate. The
+      shared ``query_usage`` COALESCEs the sum to 0.0, which is why unpriced
+      workspace compute currently renders as costing nothing.
+    * **Three empty states, not one.** ``no_usage`` (really spent nothing),
+      ``predates_ledger`` (created before the materializer's forward-only anchor,
+      so it has no rows and never will), ``unavailable`` (audit tier off). Only
+      the first is a zero.
+
+    ``include_subjobs=true`` sums the job and every descendant, terminal ones
+    included — the honest total for a parent row in a list that pages over
+    display roots, where children ride along with their parent. Default is the
+    job's own spend.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    now = datetime.now(timezone.utc)
+    scope = "subtree" if include_subjobs else "job"
+    status = str(job.get("status") or "")
+    freshness = {
+        "as_of": now.isoformat().replace("+00:00", "Z"),
+        "live": status not in _JOB_USAGE_TERMINAL_STATUSES,
+        "lag_seconds": _JOB_USAGE_LAG_SECONDS,
+    }
+
+    created_at = job.get("created_at")
+
+    if usage_ledger is None or not usage_ledger.is_available:
+        # The window is derived from the job, not from the ledger, so it is still
+        # answerable with metering off — and returning it keeps every response the
+        # same shape. A null here reads as "no window" and invites the caller to
+        # index into it anyway; this endpoint's own live check did exactly that.
+        from_ts, to_ts = _job_usage_window(created_at, now, None)
+        return {
+            "job_id": job_id,
+            "scope": scope,
+            "job_count": 1,
+            "state": "unavailable",
+            "window": _job_usage_window_payload(from_ts, to_ts),
+            "freshness": freshness,
+            "rows": [],
+            **_fold_job_usage([]),
+        }
+
+    ref_ids = [job_id]
+    if include_subjobs:
+        ref_ids.extend(await postgres_db.get_job_descendant_ids(job_id))
+
+    floor = await usage_ledger.earliest_event_ts()
+    from_ts, to_ts = _job_usage_window(created_at, now, floor)
+
+    try:
+        rows = await usage_ledger.query_ref_usage(
+            ref_kind="job", ref_ids=ref_ids, from_ts=from_ts, to_ts=to_ts
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {
+        "job_id": job_id,
+        "scope": scope,
+        "job_count": len(ref_ids),
+        "state": _job_usage_state(rows, created_at, floor),
+        "window": _job_usage_window_payload(from_ts, to_ts),
+        "freshness": freshness,
+        "rows": [
+            {
+                "category": r["category"],
+                "resource": r["resource"],
+                "unit": r["unit"],
+                "quantity": r["quantity"],
+                "cost_usd": r["cost_usd"],
+                "events": r["events"],
+                "priced_events": r["priced_events"],
+            }
+            for r in rows
+        ],
+        **_fold_job_usage(rows),
+    }
+
+
 @app.get("/api/jobs/{job_id}/audit")
 async def get_job_audit(
     request: Request,
