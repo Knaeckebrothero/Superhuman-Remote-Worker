@@ -56,7 +56,10 @@ def build(request):
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for key in list(os.environ):
-        if key.startswith(("POSTGRES_", "VECTOR_POSTGRES_", "AUDIT_POSTGRES_")) or key == "DATABASE_URL":
+        if (
+            key.startswith(("POSTGRES_", "VECTOR_POSTGRES_", "AUDIT_POSTGRES_"))
+            or key == "DATABASE_URL"
+        ):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("POSTGRES_USER", "srw")
     monkeypatch.setenv("POSTGRES_PASSWORD", "pw")
@@ -72,7 +75,10 @@ def test_no_ssl_env_leaves_the_dsn_unchanged(build):
 
 def test_sslmode_is_appended_as_a_query_parameter(build, clean_env):
     clean_env.setenv("POSTGRES_SSLMODE", "require")
-    assert build("POSTGRES") == "postgresql://srw:pw@pg.example.com:5432/srw?sslmode=require"
+    assert (
+        build("POSTGRES")
+        == "postgresql://srw:pw@pg.example.com:5432/srw?sslmode=require"
+    )
 
 
 def test_sslrootcert_is_appended_after_sslmode(build, clean_env):
@@ -86,7 +92,10 @@ def test_sslrootcert_is_appended_after_sslmode(build, clean_env):
 
 def test_sslrootcert_alone_is_appended(build, clean_env):
     clean_env.setenv("POSTGRES_SSLROOTCERT", "/ca.crt")
-    assert build("POSTGRES") == "postgresql://srw:pw@pg.example.com:5432/srw?sslrootcert=%2Fca.crt"
+    assert (
+        build("POSTGRES")
+        == "postgresql://srw:pw@pg.example.com:5432/srw?sslrootcert=%2Fca.crt"
+    )
 
 
 def test_ssl_env_is_not_appended_to_a_fallback_dsn(build, clean_env):
@@ -130,9 +139,9 @@ def test_asyncpg_accepts_every_sslmode_we_expose(build, clean_env, mode):
 
 
 def test_both_trees_define_an_identical_build_postgres_url():
-    assert _function_source(ORCHESTRATOR_COPY, "build_postgres_url") == _function_source(
-        AGENT_COPY, "build_postgres_url"
-    ), (
+    assert _function_source(
+        ORCHESTRATOR_COPY, "build_postgres_url"
+    ) == _function_source(AGENT_COPY, "build_postgres_url"), (
         "build_postgres_url has drifted between orchestrator/utils/db_url.py and "
         "src/utils/db_url.py. The duplication is deliberate; keep both in sync."
     )
