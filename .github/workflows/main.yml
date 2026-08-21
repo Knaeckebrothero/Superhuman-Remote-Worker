@@ -104,6 +104,7 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
 
       - name: Install kubeconform
@@ -149,6 +150,7 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
 
       - name: Assert invalid values are rejected by the schema
@@ -379,6 +381,7 @@ jobs:
       - name: Build Helm dependencies
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
@@ -1261,6 +1264,7 @@ jobs:
       - name: Package both charts
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
           helm dependency build helm/
           mkdir -p dist
           for chart_dir in helm helm-vm-cluster; do

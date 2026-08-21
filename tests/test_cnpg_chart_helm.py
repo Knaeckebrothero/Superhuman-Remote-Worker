@@ -497,3 +497,41 @@ def test_statefulset_engine_never_gets_a_database_pdb():
         text=True,
     )
     assert result.returncode != 0 or "kind: PodDisruptionBudget" not in result.stdout
+
+
+# --- operator subchart -----------------------------------------------------
+
+
+def test_chart_declares_the_operator_dependency_conditionally():
+    chart = yaml.safe_load((CHART / "Chart.yaml").read_text())
+    dependency = [d for d in chart["dependencies"] if d["name"] == "cloudnative-pg"]
+    assert len(dependency) == 1
+    assert dependency[0]["condition"] == "databases.operator.install"
+    assert dependency[0]["repository"] == "https://cloudnative-pg.github.io/charts"
+
+
+def test_chart_lock_pins_the_operator():
+    """CI runs `helm dependency build`, which resolves from the lock, not the
+    range. An unpinned lock means a silently different operator per build."""
+    lock = yaml.safe_load((CHART / "Chart.lock").read_text())
+    pinned = {d["name"]: d["version"] for d in lock["dependencies"]}
+    chart = yaml.safe_load((CHART / "Chart.yaml").read_text())
+    declared = {d["name"]: d["version"] for d in chart["dependencies"]}
+    assert pinned["cloudnative-pg"] == declared["cloudnative-pg"]
+
+
+def test_operator_is_not_installed_by_default():
+    """Phase 2 is inert: nothing renders a Cluster, so an operator would
+    manage nothing -- and on a cluster that already runs one (dev runs 1.29.1
+    cluster-wide) a second install fights it over cluster-scoped CRDs. Helm
+    neither upgrades nor removes subchart CRDs, so that is a one-way door."""
+    documents = _render()
+    assert not [
+        d for d in documents if "cloudnative-pg" in d["metadata"].get("name", "")
+    ]
+
+
+def test_operator_renders_when_asked_for():
+    documents = _render("databases.operator.install=true")
+    names = [d["metadata"].get("name", "") for d in documents]
+    assert any("cloudnative-pg" in name for name in names)

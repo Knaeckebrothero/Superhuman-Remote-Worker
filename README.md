@@ -312,6 +312,7 @@ $EDITOR deployment/values-local.yaml
 # the chart depends on the Collabora subchart (Canvas Office rendering), so its
 # repo must be registered before `helm dependency build` will resolve Chart.lock
 helm repo add collabora https://collaboraonline.github.io/online --force-update
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
 helm dependency build ./helm
 helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
