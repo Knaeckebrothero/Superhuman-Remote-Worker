@@ -430,3 +430,70 @@ def test_statefulset_policy_is_unchanged_when_inert(key, component):
     ]
     assert component not in components
     assert _sources(policy, "namespaceSelector") == []
+
+
+# --- disruption budgets ----------------------------------------------------
+
+CNPG_PDB = "templates/databases/cnpg-pdb.yaml"
+
+
+def _orchestrator_pdb(*settings: str) -> dict:
+    documents = _render(*settings, show_only="templates/orchestrator/pdb.yaml")
+    return _kinds(documents, "PodDisruptionBudget")[0]
+
+
+def test_orchestrator_pdb_does_not_block_drain_at_one_replica():
+    """minAvailable:1 at replicas:1 blocks EVERY voluntary eviction -- the
+    2026-05-16 incident that started the HA work."""
+    assert _orchestrator_pdb("orchestrator.replicas=1")["spec"]["minAvailable"] == 0
+
+
+def test_orchestrator_pdb_protects_a_leader_above_one_replica():
+    assert _orchestrator_pdb("orchestrator.replicas=2")["spec"]["minAvailable"] == 1
+
+
+def test_orchestrator_pdb_default_is_unchanged():
+    """The chart default is replicas:2, so deriving must not move it."""
+    assert _orchestrator_pdb()["spec"]["minAvailable"] == 1
+
+
+def test_no_database_pdb_at_a_single_instance():
+    result = subprocess.run(
+        _template_command("databases.postgres.engine=cnpg", show_only=CNPG_PDB),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0 or "kind: PodDisruptionBudget" not in result.stdout
+
+
+def test_database_pdb_appears_once_replicated():
+    documents = _render(
+        "databases.postgres.engine=cnpg",
+        "databases.postgres.instances=2",
+        show_only=CNPG_PDB,
+    )
+    pdb = _kinds(documents, "PodDisruptionBudget")[0]
+    assert pdb["spec"]["minAvailable"] == 1
+    assert (
+        pdb["spec"]["selector"]["matchLabels"]["app.kubernetes.io/component"]
+        == "postgres"
+    )
+
+
+def test_every_replicated_database_gets_a_pdb():
+    documents = _render("databases.profile=ha", *_all_cnpg(), show_only=CNPG_PDB)
+    names = {d["metadata"]["name"] for d in _kinds(documents, "PodDisruptionBudget")}
+    assert names == {
+        f"{FULLNAME}-{component}-pdb" for component, _, _ in DATABASES.values()
+    }
+
+
+def test_statefulset_engine_never_gets_a_database_pdb():
+    """A CNPG PDB selects by component label, which the StatefulSet pod also
+    carries -- so rendering one for an unmigrated database would freeze it."""
+    result = subprocess.run(
+        _template_command("databases.profile=ha", show_only=CNPG_PDB),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0 or "kind: PodDisruptionBudget" not in result.stdout
