@@ -86,6 +86,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: POSTGRES_DB
+            # Explicit env -- this Job does not envFrom the shared ConfigMap.
+            - name: POSTGRES_SSLMODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_SSLMODE
             - name: APP_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
