@@ -59,6 +59,16 @@ spec:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
         {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+        # The operator polls instance health; without this, failover never fires.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP
@@ -97,6 +107,16 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
+        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 14 }}
+        # The operator polls instance health; without this, failover never fires.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
@@ -137,6 +157,16 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
+        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 14 }}
+        # The operator polls instance health; without this, failover never fires.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
@@ -230,6 +260,16 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 14 }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
+        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloakdb") | nindent 14 }}
+        # The operator polls instance health; without this, failover never fires.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP

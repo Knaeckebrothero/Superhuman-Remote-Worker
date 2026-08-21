@@ -997,6 +997,11 @@ databases:
   #    how the dev cluster is set up — cnpg-system, cluster-wide).
   operator:
     install: true
+    # -- Namespace the CloudNativePG operator runs in. The database
+    #    NetworkPolicies allow it in so it can poll instance health and
+    #    orchestrate failover; without this the operator is silently locked
+    #    out and a failover simply never happens. Dev: cnpg-system.
+    namespace: "cnpg-system"
 
   # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
   #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
