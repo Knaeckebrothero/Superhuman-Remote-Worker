@@ -1,15 +1,24 @@
-import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
-import {Router} from '@angular/router';
+import {
+  Component,
+  DestroyRef,
+  ElementRef,
+  computed,
+  inject,
+  OnDestroy,
+  OnInit,
+  signal,
+  viewChild,
+} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
-import {JobStatus} from '../../core/models/api.model';
 import {JobSummary} from '../../core/models/audit.model';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
-import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppIconComponent} from '../../ui/icon';
@@ -18,7 +27,40 @@ import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
-type StatusFilter = 'all' | JobStatus;
+import {JobListParams} from '../../core/models/audit.model';
+import {MultiSelectOption} from '../../ui/multi-select';
+import {JobFilterBarComponent} from './job-filter-bar.component';
+import {JobFilterPanelComponent} from './job-filter-panel.component';
+import {JobListFooterComponent} from './job-list-footer.component';
+import {JobPageSizePreference} from './job-list-preferences';
+import {
+  DEFAULT_JOB_FILTERS,
+  DEFAULT_PAGE_SIZE,
+  JobFilterToken,
+  JobListFilters,
+  PAGE_SIZE_OPTIONS,
+  activeFilterTokens,
+  clearJobFilters,
+  jobFiltersToApiQuery,
+  jobFiltersToQueryParams,
+  parseJobFilters,
+  removeFilterToken,
+  setPageSize,
+} from './job-filters';
+
+/**
+ * Angular's ParamMap keeps repeated keys, which is how multi-value filters
+ * travel (`?status=failed&status=paused`). Flatten to the shape the codec
+ * takes: a single string when there is one, an array when there are several.
+ */
+function readParamMap(params: ParamMap): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const key of params.keys) {
+    const all = params.getAll(key);
+    out[key] = all.length > 1 ? all : all[0];
+  }
+  return out;
+}
 
 /** A row in the hierarchical job list. */
 interface JobRow {
@@ -61,7 +103,6 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     TranslocoPipe,
     AppButtonComponent,
     AppBadgeComponent,
-    AppChipComponent,
     AppInputComponent,
     AppSpinnerComponent,
     AppIconComponent,
@@ -70,26 +111,15 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     AppMenuComponent,
     AppMenuItemComponent,
     AppMenuTriggerDirective,
+    JobFilterBarComponent,
+    JobFilterPanelComponent,
+    JobListFooterComponent,
   ],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
         <span class="title">{{ 'jobs.title' | transloco }}</span>
-        <div class="filter-chips">
-          @for (filter of statusFilters; track filter.value) {
-            <app-chip
-              size="sm"
-              [selected]="activeFilter() === filter.value"
-              (clicked)="setFilter(filter.value)"
-            >
-              {{ filter.labelKey | transloco }}
-              @if (filter.value !== 'all') {
-                <span class="count">({{ getStatusCount(filter.value) }})</span>
-              }
-            </app-chip>
-          }
-        </div>
         <div class="header-actions">
           @if (snapshotStats()?.available) {
             <span class="snapshot-stats" [title]="'jobs.tooltip.snapshotStats' | transloco">
@@ -111,6 +141,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                dropped to keep the header to the two actions that matter. -->
           @if (!viewport.isMobile()) {
             <app-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="
+                (livePaused() ? 'jobs.live.resume' : 'jobs.live.pause') | transloco
+              "
+              (clicked)="toggleLive()"
+            >
+              {{ (livePaused() ? 'jobs.live.paused' : 'jobs.live.on') | transloco }}
+            </app-button>
+            <app-button
               variant="secondary"
               size="sm"
               [disabled]="isLoading()"
@@ -129,6 +169,49 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         </div>
       </div>
 
+      <div class="filter-row">
+        <app-job-filter-bar
+          [filters]="filters()"
+          [tokens]="tokens()"
+          [statusCounts]="statusCounts()"
+          [totalCount]="facetTotal()"
+          [search]="searchDraft()"
+          [panelOpen]="panelOpen()"
+          (statusToggle)="toggleStatus($event)"
+          (clearStatuses)="patchFilters({status: []})"
+          (searchInput)="onSearchInput($event)"
+          (togglePanel)="panelOpen.set(!panelOpen())"
+          (removeToken)="onRemoveToken($event)"
+          (clearAll)="onClearAll()"
+        />
+        <app-job-filter-panel
+          [open]="panelOpen()"
+          [filters]="filters()"
+          [projects]="projectOptions()"
+          (closed)="panelOpen.set(false)"
+          (patch)="patchFilters($event)"
+        />
+      </div>
+
+      @if (filters().page > 1) {
+        <p class="live-note">
+          {{ 'jobs.live.pausedOnPage' | transloco:{ page: filters().page } }}
+          <button type="button" class="live-note__jump" (click)="goToPage(1)">
+            {{ 'jobs.live.backToLive' | transloco }}
+          </button>
+        </p>
+      }
+
+      @if (pendingNewCount() > 0) {
+        <button type="button" class="new-jobs-pill" (click)="showNewJobs()">
+          {{ 'jobs.live.newJobs' | transloco:{ count: pendingNewCount() } }}
+        </button>
+      }
+
+      <p class="sr-only" role="status">
+        {{ 'jobs.filter.resultAnnouncement' | transloco:{ count: rootCount() } }}
+      </p>
+
       <!-- Loading State -->
       @if (isLoading() && jobs().length === 0) {
         <div class="loading-state">
@@ -142,7 +225,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4CB;</span>
           <span>{{ 'jobs.noJobsFound' | transloco }}</span>
-          @if (activeFilter() !== 'all') {
+          @if (tokens().length > 0) {
             <span class="empty-hint">{{ 'jobs.noJobsHintFilter' | transloco }}</span>
           } @else {
             <span class="empty-hint">{{ 'jobs.noJobsHintEmpty' | transloco }}</span>
@@ -151,6 +234,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       }
 
       <!-- Job Table -->
+      <div #tableTop tabindex="-1" class="table-anchor"></div>
       @if (displayRows().length > 0) {
         <div class="table-container">
           <table class="job-table">
@@ -489,11 +573,18 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       }
 
       <!-- Footer -->
-      <div class="footer-bar">
-        <span class="job-count">
-          {{ 'jobs.count' | transloco:{ filtered: filteredJobs().length, total: jobs().length } }}
-        </span>
-      </div>
+      <app-job-list-footer
+        [page]="filters().page"
+        [pageSize]="filters().pageSize"
+        [count]="rootCount()"
+        [total]="total()"
+        [totalIsCapped]="totalIsCapped()"
+        [hasMore]="hasMore()"
+        [loading]="isLoading()"
+        [pageSizeOptions]="pageSizeOptions"
+        (pageChange)="goToPage($event)"
+        (pageSizeChange)="onPageSizeChange($event)"
+      />
 
       <!-- Confirm delete — themed dialog (replaces the old inline two-tap; mirrors Sessions). -->
       <app-dialog
@@ -534,6 +625,56 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   `,
   styles: [
     `
+      .filter-row {
+        position: relative;
+        padding: 0 var(--space-4, 1rem) var(--space-2, 0.5rem);
+      }
+
+      .table-anchor {
+        outline: none;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .new-jobs-pill {
+        position: sticky;
+        top: var(--space-2, 0.5rem);
+        z-index: 20;
+        align-self: center;
+        margin: 0 auto var(--space-2, 0.5rem);
+        padding: 0.25rem 0.9rem;
+        border: 1px solid var(--accent, #cba6f7);
+        border-radius: 999px;
+        background: var(--bg-elevated, #1e1e2e);
+        color: var(--accent, #cba6f7);
+        font-size: var(--text-sm, 0.875rem);
+        cursor: pointer;
+      }
+
+      .live-note {
+        margin: 0 var(--space-4, 1rem) var(--space-2, 0.5rem);
+        font-size: var(--text-xs, 0.8125rem);
+        color: var(--text-muted, #7f849c);
+      }
+
+      .live-note__jump {
+        margin-left: var(--space-2, 0.5rem);
+        border: 0;
+        background: none;
+        color: var(--accent, #cba6f7);
+        cursor: pointer;
+        text-decoration: underline;
+      }
       :host {
         display: block;
         height: 100%;
@@ -1064,10 +1205,40 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
   protected readonly viewport = inject(ViewportService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly pageSizePreference = inject(JobPageSizePreference);
+
+  /** Guards against a slow earlier response overwriting a newer one. */
+  private requestSerial = 0;
+  private searchDebounce: ReturnType<typeof setTimeout> | null = null;
+  private readonly tableTop = viewChild<ElementRef<HTMLElement>>('tableTop');
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
-  readonly activeFilter = signal<StatusFilter>('all');
+  readonly filters = signal<JobListFilters>(clearJobFilters(DEFAULT_JOB_FILTERS));
+  /** Draft of the search box, debounced into `filters` (§7.6). */
+  readonly searchDraft = signal('');
+  readonly panelOpen = signal(false);
+
+  /** Server-authoritative paging state. */
+  readonly total = signal<number | null>(null);
+  readonly totalIsCapped = signal(false);
+  readonly hasMore = signal(false);
+  readonly asOf = signal<string | null>(null);
+
+  /** Disjunctive facet counts — never narrowed by the status selection. */
+  readonly statusCounts = signal<Record<string, number>>({});
+  readonly facetTotal = signal<number | null>(null);
+
+  readonly projectOptions = signal<MultiSelectOption[]>([]);
+
+  /** Live-refresh state (§7.5). */
+  readonly livePaused = signal(false);
+  readonly pendingNewCount = signal(0);
+  readonly lastUpdatedAt = signal<number | null>(null);
+
+  protected readonly pageSizeOptions = PAGE_SIZE_OPTIONS;
   readonly snapshotStats = signal<{ available: boolean; total_snapshots: number; total_size_bytes: number } | null>(null);
   readonly selectedJobId = signal<string | null>(null);
 
@@ -1094,105 +1265,99 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
-  readonly statusFilters: { labelKey: string; value: StatusFilter }[] = [
-    { labelKey: 'jobs.filter.all', value: 'all' },
-    { labelKey: 'jobs.filter.pending_review', value: 'pending_review' },
-    { labelKey: 'jobs.filter.reviewing', value: 'reviewing' },
-    { labelKey: 'jobs.filter.waiting', value: 'waiting' },
-    { labelKey: 'jobs.filter.created', value: 'created' },
-    { labelKey: 'jobs.filter.processing', value: 'processing' },
-    { labelKey: 'jobs.filter.completed', value: 'completed' },
-    { labelKey: 'jobs.filter.paused', value: 'paused' },
-    { labelKey: 'jobs.filter.failed', value: 'failed' },
-    { labelKey: 'jobs.filter.cancelled', value: 'cancelled' },
-  ];
+  private readonly projectNames = computed(
+    () => new Map(this.projectOptions().map((option) => [option.value, option.label])),
+  );
 
-  readonly filteredJobs = computed(() => {
-    const filter = this.activeFilter();
-    const allJobs = this.jobs();
+  readonly tokens = computed(() => activeFilterTokens(this.filters(), this.projectNames()));
 
-    if (filter === 'all') {
-      return allJobs;
-    }
-    return allJobs.filter((job) => job.status === filter);
-  });
+  /**
+   * Display roots on this page. The footer counts roots, not rows, because
+   * that is the unit the server pages in — a parent's children ride along
+   * with it and are never counted against the page size.
+   */
+  readonly rootCount = computed(
+    () => this.jobs().filter((job) => job.is_display_root !== false).length,
+  );
 
   /** Count of jobs awaiting human review — drives the header Review button. */
   readonly pendingReviewCount = computed(
-    () => this.jobs().filter((job) => job.status === 'pending_review').length,
+    () =>
+      this.statusCounts()['pending_review'] ??
+      this.jobs().filter((job) => job.status === 'pending_review').length,
   );
 
   /**
-   * Build a flat list of JobRows with hierarchy info.
-   * Root jobs (no parent_job_id) appear first, followed by their children
-   * when expanded. Children whose parent is not in the filtered list
-   * appear as root-level items.
+   * Flatten the server's tree into renderable rows.
+   *
+   * The hierarchy arrives already resolved: every row carries the
+   * `display_root_id` of the tree it belongs to, and `is_display_root` says
+   * which one is the head. There is nothing to re-derive — and nothing can be
+   * missing, because the server never splits a tree across pages.
    */
   readonly displayRows = computed<JobRow[]>(() => {
-    const jobs = this.filteredJobs();
+    const jobs = this.jobs();
     const expanded = this.expandedJobIds();
 
-    // Build parent → children map from the full filtered list
-    const childrenMap = new Map<string, JobSummary[]>();
-    const childIds = new Set<string>();
-
+    const childrenByRoot = new Map<string, JobSummary[]>();
+    const roots: JobSummary[] = [];
     for (const job of jobs) {
-      if (job.parent_job_id) {
-        const siblings = childrenMap.get(job.parent_job_id) || [];
+      if (job.is_display_root === false && job.display_root_id) {
+        const siblings = childrenByRoot.get(job.display_root_id) ?? [];
         siblings.push(job);
-        childrenMap.set(job.parent_job_id, siblings);
-        childIds.add(job.id);
+        childrenByRoot.set(job.display_root_id, siblings);
+      } else {
+        roots.push(job);
       }
     }
 
     const rows: JobRow[] = [];
-
-    for (const job of jobs) {
-      // Skip children — they'll be inserted after their parent
-      if (childIds.has(job.id)) {
-        // Unless their parent is not in the filtered list
-        const parentInList = jobs.some((j) => j.id === job.parent_job_id);
-        if (parentInList) continue;
-        // Parent not visible — show as standalone child indicator
-        rows.push({
-          job,
-          depth: 0,
-          hasChildren: childrenMap.has(job.id),
-          isChild: true,
-        });
-        continue;
-      }
-
-      const children = childrenMap.get(job.id);
-      const hasChildren = !!children && children.length > 0;
-
-      rows.push({ job, depth: 0, hasChildren, isChild: false });
-
-      // Insert children if expanded
-      if (hasChildren && expanded.has(job.id)) {
+    for (const root of roots) {
+      const children = childrenByRoot.get(root.id) ?? [];
+      rows.push({
+        job: root,
+        depth: 0,
+        hasChildren: children.length > 0,
+        isChild: false,
+      });
+      if (children.length > 0 && expanded.has(root.id)) {
         for (const child of children) {
-          rows.push({
-            job: child,
-            depth: 1,
-            hasChildren: childrenMap.has(child.id),
-            isChild: true,
-          });
+          rows.push({job: child, depth: 1, hasChildren: false, isChild: true});
         }
       }
     }
-
     return rows;
   });
 
   ngOnInit(): void {
-    this.refresh();
+    this.pageSizePreference.restore();
+    this.route.queryParamMap.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((params) => {
+      const parsed = parseJobFilters(readParamMap(params));
+      // The URL is the source of truth; a hand-edited or stale link degrades
+      // silently rather than erroring, because parseJobFilters discards what
+      // it cannot validate.
+      const next =
+        parsed.pageSize === DEFAULT_PAGE_SIZE && !params.has('page_size')
+          ? {...parsed, pageSize: this.pageSizePreference.value()}
+          : parsed;
+      this.filters.set(next);
+      this.searchDraft.set(next.search);
+      this.load();
+      this.loadFacets();
+    });
+
     this.api.getSnapshotStats().subscribe((stats) => {
       if (stats) this.snapshotStats.set(stats);
     });
-    // Auto-refresh every 30 seconds
+    this.loadProjects();
+
+    // Poll for changes, but only on page 1. Auto-refresh plus offset paging
+    // skips and duplicates rows, so past page 1 the poller is off and the UI
+    // says so rather than lying quietly. WCAG 2.2.2 (Level A) also requires a
+    // way to pause auto-updating content; livePaused is it.
     this.refreshInterval = setInterval(() => {
-      if (!this.isLoading()) {
-        this.refresh();
+      if (this.canPoll()) {
+        this.pollForChanges();
       }
     }, 30000);
   }
@@ -1201,27 +1366,192 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
     }
-    // Clean up IDE polling intervals
+    if (this.searchDebounce) {
+      clearTimeout(this.searchDebounce);
+    }
     for (const interval of this.idePollingIntervals.values()) {
       clearInterval(interval);
     }
     this.idePollingIntervals.clear();
   }
 
+  /** Page 1, not paused, not already loading, and the tab is visible. */
+  private canPoll(): boolean {
+    return (
+      this.filters().page === 1 &&
+      !this.livePaused() &&
+      !this.isLoading() &&
+      !this.panelOpen() &&
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'visible'
+    );
+  }
+
   refresh(): void {
+    this.pendingNewCount.set(0);
+    this.load();
+    this.loadFacets();
+  }
+
+  /**
+   * Fetch one page.
+   *
+   * A monotonic serial guards against a slow earlier response overwriting a
+   * newer one — the specific race a debounced search creates, where the
+   * request for "d3" can land after the request for "d30".
+   */
+  private load(): void {
+    const serial = ++this.requestSerial;
     this.isLoading.set(true);
-    this.api.getJobs().subscribe((jobs) => {
-      this.jobs.set(jobs);
-      this.isLoading.set(false);
+    const query = jobFiltersToApiQuery(this.filters()) as JobListParams;
+    // The codec drops the count past page 1 because the client normally
+    // carries it from page 1. A cold load of a shared deep link has no page 1
+    // to have carried it from, so ask — otherwise the recipient of a "page 3"
+    // link sees "76–100" with nothing to anchor it against.
+    if (this.total() === null) {
+      delete query['include_total'];
+    }
+    this.api.getJobsPage(query).subscribe({
+      next: (page) => {
+        if (serial !== this.requestSerial) return;
+        this.jobs.set(page.jobs);
+        this.hasMore.set(page.has_more);
+        if (page.total !== null && page.total !== undefined) {
+          this.total.set(page.total);
+          this.totalIsCapped.set(page.total_is_capped);
+        }
+        if (page.as_of) this.asOf.set(page.as_of);
+        this.pendingNewCount.set(0);
+        this.lastUpdatedAt.set(Date.now());
+        this.isLoading.set(false);
+      },
+      error: () => {
+        if (serial === this.requestSerial) this.isLoading.set(false);
+      },
     });
   }
 
-  setFilter(filter: StatusFilter): void {
-    this.activeFilter.set(filter);
+  /**
+   * Chip counts come from a second request on purpose: a facet's own filter
+   * must be removed from its counts, or selecting `failed` drops every other
+   * chip to (0) and the counts become worse than useless.
+   */
+  private loadFacets(): void {
+    const {status: _status, page: _page, ...rest} = this.filters();
+    this.api
+      .getJobStatisticsFiltered(jobFiltersToApiQuery({...rest, status: [], page: 1}) as JobListParams)
+      .subscribe((stats) => {
+        if (!stats) return;
+        this.statusCounts.set(stats.by_status ?? {});
+        this.facetTotal.set(stats.total_jobs ?? null);
+      });
   }
 
-  getStatusCount(status: string): number {
-    return this.jobs().filter((job) => job.status === status).length;
+  private loadProjects(): void {
+    this.api.getProjects().subscribe((projects) => {
+      this.projectOptions.set(
+        (projects ?? []).map((project) => ({value: project.id, label: project.name})),
+      );
+    });
+  }
+
+  /**
+   * Ask the server whether page 1 has grown, without touching the rendered
+   * rows. Splicing rows in would move the row under the user's cursor, and
+   * every row here carries Cancel and Delete.
+   */
+  private pollForChanges(): void {
+    const probe = {...this.filters(), page: 1, asOf: null};
+    this.api.getJobsPage(jobFiltersToApiQuery(probe) as JobListParams).subscribe((page) => {
+      const known = new Set(this.jobs().map((job) => job.id));
+      const fresh = page.jobs.filter((job) => !known.has(job.id)).length;
+      this.pendingNewCount.set(fresh);
+      this.lastUpdatedAt.set(Date.now());
+      if (fresh === 0) {
+        // Nothing new above the fold: refresh cell state in place. Changing a
+        // rendered row's contents is free; inserting above it is not.
+        this.jobs.update((current) => {
+          const byId = new Map(page.jobs.map((job) => [job.id, job]));
+          return current.map((job) => byId.get(job.id) ?? job);
+        });
+      }
+    });
+  }
+
+  showNewJobs(): void {
+    this.pendingNewCount.set(0);
+    this.patchFilters({asOf: null, page: 1});
+  }
+
+  toggleLive(): void {
+    this.livePaused.update((paused) => !paused);
+  }
+
+  // ---------------------------------------------------------------- filters
+
+  /** Every filter change resets to page 1 — offset arithmetic under changed
+   *  filters lands somewhere arbitrary. */
+  patchFilters(patch: Partial<JobListFilters>): void {
+    const next: JobListFilters = {...this.filters(), ...patch};
+    if (!('page' in patch)) next.page = 1;
+    this.writeUrl(next, {replaceUrl: false});
+  }
+
+  toggleStatus(status: string): void {
+    const current = this.filters().status;
+    this.patchFilters({
+      status: current.includes(status)
+        ? current.filter((value) => value !== status)
+        : [...current, status],
+    });
+  }
+
+  onSearchInput(value: string): void {
+    this.searchDraft.set(value);
+    if (this.searchDebounce) clearTimeout(this.searchDebounce);
+    // House idiom: a cleared setTimeout, not rxjs. replaceUrl while typing so
+    // the back button does not step through every keystroke.
+    this.searchDebounce = setTimeout(() => {
+      this.searchDebounce = null;
+      this.writeUrl({...this.filters(), search: value, page: 1}, {replaceUrl: true});
+    }, 250);
+  }
+
+  onRemoveToken(token: JobFilterToken): void {
+    this.writeUrl(removeFilterToken(this.filters(), token), {replaceUrl: false});
+  }
+
+  onClearAll(): void {
+    this.searchDraft.set('');
+    this.writeUrl(clearJobFilters(this.filters()), {replaceUrl: false});
+  }
+
+  goToPage(page: number): void {
+    if (page < 1) return;
+    // Freeze the window as soon as the user leaves page 1, so rows inserted
+    // while they page cannot shift the offset underneath them.
+    const asOf = page > 1 ? (this.filters().asOf ?? this.asOf()) : null;
+    this.writeUrl({...this.filters(), page, asOf}, {replaceUrl: false});
+    this.tableTop()?.nativeElement.focus?.();
+  }
+
+  onPageSizeChange(pageSize: number): void {
+    this.pageSizePreference.set(pageSize);
+    this.writeUrl(setPageSize(this.filters(), pageSize), {replaceUrl: false});
+  }
+
+  /**
+   * The URL is the source of truth: write it and let the queryParamMap
+   * subscription drive state, so a reload, a shared link and an in-app
+   * interaction all take exactly the same path.
+   */
+  private writeUrl(next: JobListFilters, opts: {replaceUrl: boolean}): void {
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: jobFiltersToQueryParams(next),
+      queryParamsHandling: 'merge',
+      replaceUrl: opts.replaceUrl,
+    });
   }
 
   /** Delegates to the shared helper — this was copy-pasted in two
@@ -1567,9 +1897,17 @@ export class JobListComponent implements OnInit, OnDestroy {
     return prompt.slice(0, maxLength) + '...';
   }
 
+  /**
+   * Children of a display root, as the server resolved them.
+   *
+   * This is the FILTERED count: siblings the filter excluded are not here,
+   * and are not counted. A bare unfiltered count would make the expander lie
+   * about what it is going to reveal.
+   */
   getChildCount(parentId: string): number {
-    const jobs = this.filteredJobs();
-    return jobs.filter((j) => j.parent_job_id === parentId).length;
+    return this.jobs().filter(
+      (job) => job.is_display_root === false && job.display_root_id === parentId,
+    ).length;
   }
 
   formatDate(dateString: string): string {

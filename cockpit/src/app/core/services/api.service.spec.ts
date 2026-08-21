@@ -1138,8 +1138,11 @@ describe('ApiService job list envelope', () => {
   });
 
   it('repeats status and project_id rather than joining them', async () => {
+    // Wire shape, not a camelCase options object: job-filters.ts owns the
+    // filter-state → params mapping, and a second mapping here would be a
+    // second thing to keep in step.
     const pending = firstValueFrom(
-      api.getJobsPage({status: ['failed', 'paused'], projectIds: ['p1', 'p2']}),
+      api.getJobsPage({status: ['failed', 'paused'], project_id: ['p1', 'p2']}),
     );
     const request = httpMock.expectOne((item) => item.url.endsWith('/jobs'));
     expect(request.request.params.getAll('status')).toEqual(['failed', 'paused']);

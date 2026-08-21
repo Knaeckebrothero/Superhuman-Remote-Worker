@@ -7585,6 +7585,9 @@ class PostgresDB:
             project_ids / has_project / include_archived_projects / search /
             as_of / user_id: same meaning as on :meth:`query_jobs`.
 
+        Counts are expressed in **display roots**, matching what the list
+        pages in, so a chip reading (19) yields 19 rows when clicked.
+
         Returns:
             ``total_jobs`` (the "All" chip — every status, filters otherwise
             applied), one key per entry in :data:`KNOWN_JOB_STATUSES`
@@ -7605,14 +7608,42 @@ class PostgresDB:
             user_id=user_id,
         )
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        # Counts are in DISPLAY ROOTS, the same unit the list pages in, so a
+        # chip reading (19) yields 19 rows when clicked. Counting raw rows here
+        # would put two different totals for the same set side by side in the
+        # UI — "All 147" above "1–25 of 118".
+        matched_cte = f"""
+            matched AS (
+                SELECT j.id, j.parent_job_id, j.status
+                  FROM jobs j
+                  LEFT JOIN projects p ON p.id = j.project_id
+                {where_clause}
+            )
+        """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT j.status AS status, count(*) AS n
-                FROM jobs j
-                LEFT JOIN projects p ON p.id = j.project_id
-                {where_clause}
-                GROUP BY j.status
+                WITH {matched_cte}
+                SELECT m.status AS status, count(*) AS n
+                  FROM matched m
+                 WHERE m.parent_job_id IS NULL
+                    OR NOT EXISTS (
+                         SELECT 1 FROM matched parent
+                          WHERE parent.id = m.parent_job_id
+                            AND parent.status = m.status
+                       )
+                 GROUP BY m.status
+                """,
+                *values,
+            )
+            # The "All" chip is the root count of the unfiltered-by-status
+            # view, which is what the list's own total reports.
+            all_roots = await conn.fetchval(
+                f"""
+                WITH {matched_cte}
+                SELECT count(*) FROM matched m
+                 WHERE m.parent_job_id IS NULL
+                    OR m.parent_job_id NOT IN (SELECT id FROM matched)
                 """,
                 *values,
             )
@@ -7623,7 +7654,12 @@ class PostgresDB:
         # silently dropped out of the total.
         by_status = {str(row["status"]): int(row["n"]) for row in rows}
         stats: Dict[str, Any] = {
-            "total_jobs": sum(by_status.values()),
+            # NOT sum(by_status): a completed parent with a failed child is one
+            # root in the All view and contributes a root to the Failed view
+            # too, so the per-status counts legitimately over-sum. Each is the
+            # count you get by clicking that chip, which is the property that
+            # matters.
+            "total_jobs": int(all_roots or 0),
             "by_status": by_status,
         }
         for status in KNOWN_JOB_STATUSES:
