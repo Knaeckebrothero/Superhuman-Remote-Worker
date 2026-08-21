@@ -996,7 +996,17 @@ databases:
   #    (one operator serving many namespaces is the normal deployment, and is
   #    how the dev cluster is set up — cnpg-system, cluster-wide).
   operator:
-    install: true
+    # -- Install the CloudNativePG operator as a subchart. OFF while every
+    #    database still runs on `engine: statefulset` — an operator with no
+    #    Cluster to reconcile is pure risk, and one operator serving many
+    #    namespaces is the normal deployment (the dev cluster is set up that
+    #    way: cnpg-system, cluster-wide, installed out of band).
+    #    Turn it on for a self-host whose cluster has no operator yet.
+    #    NOTE: Helm does not upgrade CRDs installed by a subchart, and
+    #    `helm uninstall` does not remove them, so this is close to a one-way
+    #    door. A cluster that already runs CloudNativePG must leave it off, or
+    #    the two installs fight over the same cluster-scoped CRDs.
+    install: false
     # -- Namespace the CloudNativePG operator runs in. The database
     #    NetworkPolicies allow it in so it can poll instance health and
     #    orchestrate failover; without this the operator is silently locked

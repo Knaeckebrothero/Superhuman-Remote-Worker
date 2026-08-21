@@ -166,6 +166,7 @@ CHART_DEPS=$(helm dependency list "$REPO_ROOT/helm" 2>/dev/null || true)
 if [[ "$CHART_DEPS" == *missing* ]]; then
   log "vendoring Helm chart dependencies into helm/charts/"
   helm repo add collabora https://collaboraonline.github.io/online --force-update >/dev/null
+  helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update >/dev/null
   helm dependency build "$REPO_ROOT/helm" >/dev/null
   ok "chart dependencies vendored"
 else
