@@ -1,49 +1,73 @@
+@use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
+
+// Anchored flyout, not a modal: a modal covers the result set and kills the
+// select-observe loop that filtering is. Modelled on ui/menu's panel so it
+// reads as the same class of surface as every other popover in the app.
 .job-panel {
+  @include shape.surface;
+
   position: absolute;
-  right: 0;
-  top: 100%;
-  z-index: 40;
-  width: min(22rem, 90vw);
-  max-height: 70vh;
-  overflow-y: auto;
+
+  // An explicit gutter, not the container's padding: absolute positioning
+  // resolves against the padding box, so a padded ancestor does not inset an
+  // absolutely positioned child and the panel would sit flush to the window.
+  right: v.$space-md;
+  top: calc(100% + #{v.$space-xs});
+  z-index: v.$z-overlay;
   display: flex;
   flex-direction: column;
-  gap: var(--space-4, 1rem);
-  padding: var(--space-4, 1rem);
-  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
-  border-radius: var(--radius-md, 8px);
-  background: var(--bg-elevated, #1e1e2e);
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  gap: v.$space-md;
+  width: min(22rem, calc(100vw - #{v.$space-xl}));
+
+  // A fraction of the viewport rather than a fixed reserve. CSS cannot see
+  // where this panel's own top lands, and that moves: a narrow viewport wraps
+  // the filter bar and pushes the panel down by more than any constant guess.
+  // 60dvh always clears the fold for a top under ~40dvh, and the panel scrolls
+  // internally, so a tall filter set stays reachable either way. dvh rather
+  // than vh so a mobile browser's collapsing toolbar is counted.
+  max-height: min(32rem, 60dvh);
+  overflow-y: auto;
+  padding: v.$space-md;
+  background: var(--surface-2, var(--surface-1));
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-md);
 }
 
 .job-panel__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-2, 0.5rem);
+  gap: v.$space-sm;
+  position: sticky;
+  top: 0;
+  padding-bottom: v.$space-xs;
+  background: inherit;
 }
 
 .job-panel__title {
   margin: 0;
-  font-size: var(--text-base, 1rem);
-  color: var(--text-primary, #cdd6f4);
+  font-size: v.$font-size-base;
+  font-weight: v.$font-weight-medium;
+  color: var(--text-primary);
 }
 
 .job-panel__section {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2, 0.5rem);
+  gap: v.$space-xs;
 }
 
 .job-panel__label {
   margin: 0;
-  font-size: var(--text-sm, 0.875rem);
-  font-weight: 600;
-  color: var(--text-primary, #cdd6f4);
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+  color: var(--text-primary);
 }
 
 .job-panel__hint {
   margin: 0;
-  font-size: var(--text-xs, 0.8125rem);
-  color: var(--text-muted, #7f849c);
+  font-size: v.$font-size-xs;
+  line-height: v.$line-height-base;
+  color: var(--text-muted);
 }

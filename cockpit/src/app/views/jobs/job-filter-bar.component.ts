@@ -44,7 +44,6 @@ import {JobFilterToken, JobListFilters, KNOWN_JOB_STATUSES} from './job-filters'
           <button
             type="button"
             class="job-chip"
-            [class.job-chip--on]="filters().status.length === 0"
             [attr.aria-pressed]="filters().status.length === 0"
             (click)="clearStatuses.emit()"
           >
@@ -57,8 +56,8 @@ import {JobFilterToken, JobListFilters, KNOWN_JOB_STATUSES} from './job-filters'
             <button
               type="button"
               class="job-chip"
-              [class.job-chip--on]="isStatusOn(status)"
               [attr.aria-pressed]="isStatusOn(status)"
+              [disabled]="isDeadEnd(status)"
               (click)="statusToggle.emit(status)"
             >
               {{ t('jobs.status.' + status) }}
@@ -69,6 +68,7 @@ import {JobFilterToken, JobListFilters, KNOWN_JOB_STATUSES} from './job-filters'
 
         <div class="job-filters__tools">
           <app-input
+            class="job-filters__search"
             size="sm"
             type="search"
             [fullWidth]="false"
@@ -186,6 +186,15 @@ export class JobFilterBarComponent implements AfterViewInit {
   /** Absent means zero: a chip that should read (0) must still be there. */
   protected countFor(status: string): number {
     return this.statusCounts()[status] ?? 0;
+  }
+
+  /**
+   * A status with no jobs is a dead end — clicking it empties the table for
+   * no reason. Disabled unless it is the one currently selected, which must
+   * stay clickable so the user can get back out of it.
+   */
+  protected isDeadEnd(status: string): boolean {
+    return this.countFor(status) === 0 && !this.isStatusOn(status);
   }
 
   protected isStatusOn(status: string): boolean {
