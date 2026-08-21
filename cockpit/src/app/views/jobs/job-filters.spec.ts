@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
   DEFAULT_JOB_FILTERS,
+  HUMAN_ORIGINS,
   DEFAULT_PAGE_SIZE,
   JobFilterToken,
   JobListFilters,
@@ -25,16 +26,14 @@ const PROJECT_B = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const NO_NAMES: ReadonlyMap<string, string> = new Map();
 
 function filters(overrides: Partial<JobListFilters> = {}): JobListFilters {
+  // Derived from DEFAULT_JOB_FILTERS rather than restated: a hardcoded copy
+  // silently stops being "the defaults" the moment one of them changes, which
+  // is what happened when `origin` gained a non-empty default.
   return {
-    status: [],
-    origin: [],
-    projectIds: [],
-    hasProject: null,
-    includeArchivedProjects: false,
-    search: '',
-    page: 1,
-    pageSize: DEFAULT_PAGE_SIZE,
-    asOf: null,
+    ...DEFAULT_JOB_FILTERS,
+    status: [...DEFAULT_JOB_FILTERS.status],
+    origin: [...DEFAULT_JOB_FILTERS.origin],
+    projectIds: [...DEFAULT_JOB_FILTERS.projectIds],
     ...overrides,
   };
 }
@@ -313,7 +312,13 @@ describe('jobFiltersToApiQuery (rule 9)', () => {
 
   it('omits everything at its default but always sends limit', () => {
     // limit is NOT omittable: the server default is 100, ours is 25.
-    expect(jobFiltersToApiQuery(DEFAULT_JOB_FILTERS)).toEqual({limit: DEFAULT_PAGE_SIZE});
+    // origin is not omittable either, and for the same kind of reason — the
+    // "hide system-created work" default is the cockpit's, not the API's, so
+    // it has to be sent explicitly on every request.
+    expect(jobFiltersToApiQuery(DEFAULT_JOB_FILTERS)).toEqual({
+      limit: DEFAULT_PAGE_SIZE,
+      origin: [...HUMAN_ORIGINS],
+    });
   });
 
   it('sends the `none` literal for the no-project bucket', () => {
@@ -346,8 +351,24 @@ describe('activeFilterTokens', () => {
     expect(tokens.some((token) => token.kind === 'archived')).toBe(false);
   });
 
-  it('is never empty for default filters, because the default hides rows', () => {
-    expect(activeFilterTokens(DEFAULT_JOB_FILTERS, NO_NAMES)).toHaveLength(1);
+  it('is never empty for default filters, because the defaults hide rows', () => {
+    // Two things are hidden out of the box — archived projects and
+    // system-created work — and each owes the user a visible, removable token.
+    const tokens = activeFilterTokens(DEFAULT_JOB_FILTERS, NO_NAMES);
+    expect(tokens.map((token) => token.id).sort()).toEqual(['archived', 'systemHidden']);
+  });
+
+  it('collapses the default origin pair into one token, not two', () => {
+    const tokens = activeFilterTokens(DEFAULT_JOB_FILTERS, NO_NAMES);
+    expect(tokens.filter((token) => token.kind === 'origin')).toHaveLength(0);
+  });
+
+  it('falls back to per-origin tokens once the selection is not the default', () => {
+    const tokens = activeFilterTokens(filters({origin: ['loop', 'bench']}), NO_NAMES);
+    expect(tokens.filter((token) => token.kind === 'origin').map((t) => t.value)).toEqual([
+      'loop',
+      'bench',
+    ]);
   });
 
   it('emits one removable token per active value with stable unique ids', () => {
@@ -406,9 +427,14 @@ describe('activeFilterTokens', () => {
   });
 
   it('does not emit a token for a whitespace-only search', () => {
-    expect(
-      activeFilterTokens(filters({search: '  ', includeArchivedProjects: true}), NO_NAMES),
-    ).toHaveLength(0);
+    // Asserts the absence of a *search* token rather than a total count: the
+    // count moves whenever a filter gains a hiding default, and that has
+    // nothing to do with what this test is about.
+    const tokens = activeFilterTokens(
+      filters({search: '  ', includeArchivedProjects: true}),
+      NO_NAMES,
+    );
+    expect(tokens.filter((token) => token.kind === 'search')).toHaveLength(0);
   });
 });
 

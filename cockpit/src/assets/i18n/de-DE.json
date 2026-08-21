@@ -667,6 +667,7 @@
         "project": "Projekt: {{name}}",
         "noProject": "Ohne Projekt",
         "search": "Suche: {{term}}",
+"systemHidden": "Systemjobs ausgeblendet",
         "archived": "Archivierte Projekte ausgeblendet"
       },
       "statusGroup": "Nach Status filtern",
