@@ -108,6 +108,9 @@ mcp:
 # a single replica, 0 at one), so one orchestrator keeps serving through a
 # voluntary disruption while a single-pod node drain is still allowed. Setting
 # it here is no longer possible, and no longer necessary.
+#
+# The chart default is 1 (single-node self-host). Dev is a four-node cluster
+# and deliberately overrides it — this is where the HA posture gets exercised.
 # -----------------------------------------------------------------------------
 orchestrator:
   persistentAgentReconciliationEnabled: true
