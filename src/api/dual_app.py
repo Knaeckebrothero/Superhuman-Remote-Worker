@@ -1016,6 +1016,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
                 connections=status["connections"],
+                capabilities={"durable_input_delivery": True},
             )
 
         return ReadyResponse(

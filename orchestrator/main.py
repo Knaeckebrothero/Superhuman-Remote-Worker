@@ -36240,6 +36240,7 @@ async def _hold_officer_for_conference(
                     "actions; your timers and events queue durably and arrive "
                     "with the session brief. If your backstop fires before "
                     "the brief: sleep.]",
+                    delivery_id=str(uuid4()),
                 )
     except Exception:
         logger.exception("conference hold: stamping failed (non-fatal)")
@@ -37026,7 +37027,8 @@ async def _inject_officer_notice(officer_thread: dict[str, Any], text: str) -> b
         agent = await _sw._resolve_live_agent(postgres_db, officer_thread)
         if agent is None:
             return False
-        return await _sw._inject_live(agent, text)
+        outcome = await _sw._inject_live(agent, text, delivery_id=str(uuid4()))
+        return outcome == _sw.WakeDeliveryResult.EXECUTED
     except Exception:
         logger.debug("officer notice: inject failed (non-fatal)", exc_info=True)
         return False
@@ -44375,6 +44377,21 @@ async def _forward_to_agent(
     except Exception as e:
         logger.warning("Agent forward failed: %s %s -> %s", path, agent.get("id"), e)
         raise HTTPException(status_code=503, detail=f"Agent unreachable: {e}") from e
+    if response.status_code == 503:
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and body.get("error") == "runtime_terminating":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "runtime_terminating",
+                    "retryable": True,
+                    "message": "The runtime is terminating; retry on its replacement.",
+                },
+                headers={"Retry-After": response.headers.get("Retry-After", "5")},
+            )
     if response.status_code >= 500:
         raise HTTPException(
             status_code=502,

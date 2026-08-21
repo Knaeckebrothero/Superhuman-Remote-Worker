@@ -292,6 +292,14 @@ class TestPodManifest:
         m = self._build()
         assert m["spec"]["terminationGracePeriodSeconds"] == 180
 
+    def test_prestop_installs_fence_before_waiting_for_parked_boundary(self):
+        container = self._build()["spec"]["containers"][0]
+        command = container["lifecycle"]["preStop"]["exec"]["command"]
+
+        assert command[:2] == ["sh", "-c"]
+        assert command[2].startswith(": > /tmp/srw-persistent-terminating;")
+        assert command[2].endswith("exec python -m src.api.persistent_termination")
+
     def test_init_container_waits_for_orchestrator(self):
         m = self._build()
         init_containers = m["spec"]["initContainers"]

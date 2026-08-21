@@ -47,12 +47,18 @@ class _FakeResponse:
         self.status_code = status_code
         self.text = text
 
+    def json(self):
+        if self.status_code in {200, 202}:
+            return {"delivery_state": _FakeAsyncClient.next_delivery_state}
+        return {}
+
 
 class _FakeAsyncClient:
     """Records POSTs; returns a scripted status (or raises a scripted error)."""
 
     posts: list = []
     next_status = 200
+    next_delivery_state = "admitted"
     raises: Exception | None = None
 
     def __init__(self, *a, **kw):
@@ -64,7 +70,7 @@ class _FakeAsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         _FakeAsyncClient.posts.append((url, json))
         if _FakeAsyncClient.raises is not None:
             raise _FakeAsyncClient.raises
@@ -108,17 +114,21 @@ def _agent(**over) -> dict:
 
 
 def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
+    save_thread_message = AsyncMock(return_value={"transcript_inserted": True})
     return SimpleNamespace(
         claim_pending_job_wakes=AsyncMock(
             return_value=list(claimed) if claimed is not None else []
         ),
         finish_job_wake=AsyncMock(return_value=True),
         release_job_wake=AsyncMock(return_value="pending"),
+        defer_job_wake_for_input=AsyncMock(return_value=True),
+        assign_job_wake_delivery=AsyncMock(return_value=True),
         mark_job_wake_pending=AsyncMock(return_value=True),
         get_thread=AsyncMock(return_value=thread),
         get_agent=AsyncMock(return_value=agent),
         get_expert_by_id=AsyncMock(return_value=None),
-        save_thread_message=AsyncMock(),
+        save_thread_message=save_thread_message,
+        persist_thread_input_delivery=save_thread_message,
         get_thread_job_counts=AsyncMock(
             return_value={"total": 0, "finished": 0, "running": 0}
         ),
@@ -130,6 +140,7 @@ def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
 def _reset_http(monkeypatch):
     _FakeAsyncClient.posts = []
     _FakeAsyncClient.next_status = 200
+    _FakeAsyncClient.next_delivery_state = "admitted"
     _FakeAsyncClient.raises = None
     monkeypatch.setattr(session_wake.httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(session_wake, "probe_ready", AsyncMock(return_value=True))
@@ -231,6 +242,28 @@ async def test_live_inject_uses_a_split_timeout_not_a_flat_one():
 
 
 @pytest.mark.asyncio
+async def test_queued_receipt_stays_retryable_until_provider_admission():
+    row = _claim_row()
+    db = _db(claimed=[row], thread=_thread(), agent=_agent())
+    _FakeAsyncClient.next_status = 202
+    _FakeAsyncClient.next_delivery_state = "queued"
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+    db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
+    db.finish_job_wake.assert_not_awaited()
+
+    _FakeAsyncClient.next_status = 200
+    _FakeAsyncClient.next_delivery_state = "admitted"
+    assert await session_wake.drain_pending_wakes(db) == 1
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    assert len(_FakeAsyncClient.posts) == 2
+    assert (
+        _FakeAsyncClient.posts[0][1]["delivery_id"]
+        == _FakeAsyncClient.posts[1][1]["delivery_id"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_pod_port_defaults_when_the_column_is_null():
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent(pod_port=None))
     await session_wake.drain_pending_wakes(db)
@@ -246,15 +279,22 @@ async def test_pod_port_defaults_when_the_column_is_null():
 async def test_probe_failure_falls_back_to_durable(monkeypatch):
     """agent.status is heartbeat-driven and lags reality by up to ~4 minutes, and
     zombies heartbeat normally — so the probe, not the column, decides."""
-    monkeypatch.setattr(session_wake, "probe_ready", AsyncMock(return_value=False))
+    probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(session_wake, "probe_ready", probe)
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())
 
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
 
     assert _FakeAsyncClient.posts == []
     db.save_thread_message.assert_awaited_once()
     assert db.save_thread_message.await_args.kwargs["role"] == "event"
-    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.finish_job_wake.assert_not_awaited()
+    db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
+    probe.assert_awaited_once_with(
+        "10.1.2.3",
+        8001,
+        required_capability="durable_input_delivery",
+    )
 
 
 @pytest.mark.asyncio
@@ -268,7 +308,7 @@ async def test_probe_failure_falls_back_to_durable(monkeypatch):
 )
 async def test_unusable_agent_states_take_the_durable_branch(agent_over):
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent(**agent_over))
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
     assert _FakeAsyncClient.posts == []
     db.save_thread_message.assert_awaited_once()
 
@@ -297,7 +337,7 @@ async def test_non_live_threads_get_a_durable_row_and_no_restore(status):
     db = _db(claimed=[_claim_row()], thread=_thread(status=status, agent_id=None))
     db.restore_thread_workspace = AsyncMock()
 
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
 
     db.save_thread_message.assert_awaited_once()
     kwargs = db.save_thread_message.await_args.kwargs
@@ -343,7 +383,7 @@ async def test_owner_notification_resolves_the_recipient_address(monkeypatch):
     )
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
 
     assert sent.get("recipient_email") == "owner@example.test"
     assert sent.get("recipient_name") == "Owner"
@@ -367,7 +407,7 @@ async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
     db.get_user = AsyncMock(return_value={"id": "u", "email": None})
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
     assert calls == [], "dispatching with no address just logs a refusal"
 
 
@@ -387,8 +427,9 @@ async def test_failed_notification_does_not_undeliver_the_notice(monkeypatch):
         session_wake, "_notify_owner", AsyncMock(side_effect=RuntimeError("smtp down"))
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
-    assert await session_wake.drain_pending_wakes(db) == 1
-    db.finish_job_wake.assert_awaited_once()
+    assert await session_wake.drain_pending_wakes(db) == 0
+    db.finish_job_wake.assert_not_awaited()
+    db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
 
 
 # --------------------------------------------------------------------------
@@ -410,7 +451,9 @@ async def test_no_thread_backref_consumes_the_claim_without_delivering():
 @pytest.mark.asyncio
 async def test_durable_write_failure_releases_for_retry():
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
-    db.save_thread_message = AsyncMock(side_effect=RuntimeError("write failed"))
+    db.persist_thread_input_delivery = AsyncMock(
+        side_effect=RuntimeError("write failed")
+    )
 
     assert await session_wake.drain_pending_wakes(db) == 0
 
@@ -456,7 +499,9 @@ async def test_one_bad_row_does_not_abort_the_rest_of_the_batch():
         _claim_row(id="j2"),
     ]
     db = _db(claimed=rows, thread=_thread(agent_id=None))
-    db.save_thread_message = AsyncMock(side_effect=[RuntimeError("boom"), None])
+    db.persist_thread_input_delivery = AsyncMock(
+        side_effect=[RuntimeError("boom"), {"transcript_inserted": True}]
+    )
     # j1 short-circuits (no backref), j2's durable write raises then releases.
     await session_wake.drain_pending_wakes(db)
     assert db.finish_job_wake.await_count == 1  # j1 only
@@ -618,7 +663,7 @@ async def test_error_message_surfaces_only_for_failures():
 async def test_payload_survives_a_counts_lookup_failure():
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
     db.get_thread_job_counts = AsyncMock(side_effect=RuntimeError("nope"))
-    assert await session_wake.drain_pending_wakes(db) == 1
+    assert await session_wake.drain_pending_wakes(db) == 0
 
 
 # --------------------------------------------------------------------------

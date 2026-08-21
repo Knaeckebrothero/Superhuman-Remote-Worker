@@ -787,6 +787,26 @@ class PersistentProvisioner:
                             f" --port 8001"
                             f" --host 0.0.0.0",
                         ],
+                        # Kubernetes exposes deletionTimestamp outside the
+                        # container before the process can observe it.  preStop
+                        # creates a pod-local sentinel first, closing input and
+                        # provider admission synchronously inside the runtime,
+                        # then holds the grace window while the current tool
+                        # batch settles.  Abrupt node loss may skip hooks and is
+                        # handled by the persistent transcript/LF-5 recovery
+                        # path instead.
+                        "lifecycle": {
+                            "preStop": {
+                                "exec": {
+                                    "command": [
+                                        "sh",
+                                        "-c",
+                                        ": > /tmp/srw-persistent-terminating; "
+                                        "exec python -m src.api.persistent_termination",
+                                    ]
+                                }
+                            }
+                        },
                         "ports": [{"containerPort": 8001}],
                         # Inject all env from shared ConfigMap + Secret
                         "envFrom": [

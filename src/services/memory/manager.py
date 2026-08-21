@@ -331,6 +331,12 @@ class MemoryManager:
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
+    @property
+    def background_tasks_inflight(self) -> int:
+        """Number of detached captures not yet at their settlement boundary."""
+
+        return sum(1 for task in self._bg_tasks if not task.done())
+
     async def drain_background(self, timeout: Optional[float] = None) -> int:
         """Await in-flight ``capture_nowait`` tasks; returns how many were pending.
 

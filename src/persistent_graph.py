@@ -13,6 +13,7 @@ Reuses the same shared infrastructure as the worker graph:
 """
 
 import asyncio
+import inspect
 import logging
 import time
 import uuid as _uuid
@@ -410,6 +411,10 @@ class TurnResult:
     interrupted: bool = False
     error: Optional[str] = None
     metrics: Optional[dict] = None
+    # A lifecycle fence closed after this turn was durably admitted.  Already
+    # running provider/tool work may have settled, but no subsequent provider
+    # invocation was started and turn-end auxiliary spend must be skipped.
+    admission_closed: bool = False
     # NOTE: there is deliberately no `awaiting_permission` flag. A turn that
     # parks on an unanswered gate just ends — the durable pending row is the
     # only record, and cleaning it up belongs to whoever announced it
@@ -611,6 +616,21 @@ class PersistentLoopCallbacks:
     before_turn_authorization: Optional[Callable[[], Awaitable[tuple[bool, str]]]] = (
         None
     )
+
+    # Synchronous lifecycle predicate checked immediately before retrieval,
+    # compaction and every concrete provider invocation/retry.  This is the
+    # runtime's last process-local admission decision; it deliberately does not
+    # claim atomicity with an external Kubernetes DELETE. Dedicated persistent
+    # pods wire the preStop sentinel into it; other runtimes leave it unset.
+    before_provider_admission: Optional[Callable[[], bool]] = None
+
+    # Durable pinned-input execution lifecycle. The transport supplies an
+    # exact delivery/claim identity on dict-shaped input. Admission is invoked
+    # once at the first provider boundary; defer/settle are generation-fenced
+    # database transitions. Legacy/plain-string callers leave these unset.
+    admit_input_delivery: Optional[Callable[[str, int, int], Awaitable[bool]]] = None
+    defer_input_delivery: Optional[Callable[[str, int, str], Awaitable[bool]]] = None
+    settle_input_delivery: Optional[Callable[[str, int], Awaitable[bool]]] = None
 
     # Deterministic LF-5 fault seam. Invoked only after an assistant response
     # containing tool calls has been appended and incrementally persisted, but
@@ -955,8 +975,17 @@ async def run_persistent_loop(
         # every later write an upsert onto that row instead of a duplicate.
         input_msg_id: Optional[str] = None
         input_persist_role: Optional[str] = None
+        input_delivery_id: Optional[str] = None
+        input_claim_generation: Optional[int] = None
         if isinstance(user_input, dict):
             input_msg_id = user_input.get("id")
+            input_delivery_id = user_input.get("delivery_id")
+            raw_claim_generation = user_input.get("claim_generation")
+            if raw_claim_generation is not None:
+                try:
+                    input_claim_generation = int(raw_claim_generation)
+                except (TypeError, ValueError):
+                    input_claim_generation = None
             # System-injected input (e.g. a worker job this session created
             # finished) persists under its own transcript role. Carried through
             # so the turn-start reconcile below re-writes the SAME role the
@@ -1043,9 +1072,37 @@ async def run_persistent_loop(
         # by message id either way.
         if callbacks.persist_message is not None:
             await callbacks.persist_message(user_msg)
+
+        async def _defer_current_delivery(reason: str) -> None:
+            if (
+                input_delivery_id is not None
+                and input_claim_generation is not None
+                and callbacks.defer_input_delivery is not None
+            ):
+                await callbacks.defer_input_delivery(
+                    input_delivery_id,
+                    input_claim_generation,
+                    reason,
+                )
+
+        if (
+            callbacks.before_provider_admission is not None
+            and not callbacks.before_provider_admission()
+        ):
+            await _defer_current_delivery("runtime_terminating_before_turn")
+            await callbacks.on_error(
+                "Persistent runtime termination admission is closed; this "
+                "input remains durable for the replacement and no provider "
+                "request was made.",
+                turn_id=turn_id,
+            )
+            if callbacks.on_turn_settled is not None:
+                await callbacks.on_turn_settled(turn_id)
+            continue
         if callbacks.before_turn_authorization is not None:
             authorized, reason = await callbacks.before_turn_authorization()
             if not authorized:
+                await _defer_current_delivery("runtime_authorization_unavailable")
                 await callbacks.on_error(
                     "Officer runtime authorization is unavailable; this turn "
                     "was durably recorded but no model request was made. "
@@ -1073,6 +1130,32 @@ async def run_persistent_loop(
 
         result = None
         halt_after_turn = False
+        input_delivery_admitted = False
+
+        async def _admit_current_delivery() -> bool:
+            nonlocal input_delivery_admitted
+            if input_delivery_id is None or input_claim_generation is None:
+                return True
+            if input_delivery_admitted:
+                return True
+            if (
+                callbacks.before_provider_admission is not None
+                and not callbacks.before_provider_admission()
+            ):
+                await _defer_current_delivery("runtime_terminating_before_provider")
+                return False
+            if callbacks.admit_input_delivery is None:
+                # A delivery-bearing item without its durable transition is a
+                # mixed-version unsafe shape. Fail closed before model spend.
+                await _defer_current_delivery("delivery_admission_unavailable")
+                return False
+            input_delivery_admitted = await callbacks.admit_input_delivery(
+                input_delivery_id,
+                input_claim_generation,
+                turn_id,
+            )
+            return input_delivery_admitted
+
         try:
             result = await _execute_turn(
                 llm_with_tools=llm_with_tools,
@@ -1090,15 +1173,22 @@ async def run_persistent_loop(
                 tool_context=tool_context,
                 memory_service=memory_service,
                 defer_memory_capture_to_outbox=defer_memory_extraction_to_outbox,
+                before_first_provider_admission=_admit_current_delivery,
             )
             tool_calls_this_turn = result.tool_calls_made
+            if result.admission_closed and not input_delivery_admitted:
+                await _defer_current_delivery("runtime_terminating_before_provider")
             pairing_error_signature = None
             pairing_error_count = 0
         except asyncio.CancelledError:
             logger.info(f"Turn {turn_id} cancelled")
+            if not input_delivery_admitted:
+                await _defer_current_delivery("turn_cancelled_before_provider")
             return
         except Exception as e:
             logger.exception(f"Error in turn {turn_id}")
+            if not input_delivery_admitted:
+                await _defer_current_delivery("turn_failed_before_provider")
             signature = _strict_pairing_error_signature(e)
             if signature is not None:
                 # Repair the mutable source of the next provider request, not
@@ -1149,7 +1239,15 @@ async def run_persistent_loop(
         # mints one durable per-turn effect, and an independent drain owns the
         # auxiliary extraction. Running either path here as well would make the
         # outbox non-authoritative and duplicate memory mutation.
-        if not defer_memory_extraction_to_outbox:
+        provider_admission_open = (
+            callbacks.before_provider_admission is None
+            or callbacks.before_provider_admission()
+        )
+        if (
+            not defer_memory_extraction_to_outbox
+            and provider_admission_open
+            and not (result is not None and result.admission_closed)
+        ):
             # Memory extraction every N turns. It is part of a pinned claim's
             # durable footprint: snapshot the mutable history and await the
             # writer before publishing the full turn-settled edge.
@@ -1275,6 +1373,21 @@ async def run_persistent_loop(
         finally:
             if callbacks.on_turn_settled is not None:
                 await callbacks.on_turn_settled(turn_id)
+            if (
+                input_delivery_admitted
+                and input_delivery_id is not None
+                and input_claim_generation is not None
+                and callbacks.settle_input_delivery is not None
+            ):
+                settled = await callbacks.settle_input_delivery(
+                    input_delivery_id,
+                    input_claim_generation,
+                )
+                if not settled:
+                    logger.error(
+                        "Pinned input settlement lost delivery authority (delivery=%s)",
+                        input_delivery_id[:8],
+                    )
 
         if halt_after_turn:
             return
@@ -1371,6 +1484,7 @@ async def _execute_turn(
     tool_context: Optional[Any] = None,
     memory_service: Optional[Any] = None,
     defer_memory_capture_to_outbox: bool = False,
+    before_first_provider_admission: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> TurnResult:
     """Execute a single turn: LLM call -> tool calls -> repeat until done.
 
@@ -1379,6 +1493,32 @@ async def _execute_turn(
     """
     tool_calls_made = 0
     messages_added = 0
+    first_provider_admitted = False
+
+    def _provider_admission_closed() -> bool:
+        gate = callbacks.before_provider_admission
+        return gate is not None and not gate()
+
+    def _closed_result() -> TurnResult:
+        return TurnResult(
+            turn_id=0,
+            messages_added=messages_added,
+            tool_calls_made=tool_calls_made,
+            interrupted=True,
+            admission_closed=True,
+        )
+
+    async def _admit_first_provider() -> bool:
+        nonlocal first_provider_admitted
+        if first_provider_admitted:
+            return True
+        if _provider_admission_closed():
+            return False
+        if before_first_provider_admission is not None:
+            first_provider_admitted = bool(await before_first_provider_admission())
+        else:
+            first_provider_admitted = True
+        return first_provider_admitted and not _provider_admission_closed()
 
     async def _persist(msg: Any) -> None:
         """Persist a message the instant it's appended to history.
@@ -1441,6 +1581,9 @@ async def _execute_turn(
     # Memory/knowledge retrieval with timeout — must never block the LLM call
     _RETRIEVAL_TIMEOUT = 5  # seconds
 
+    if _provider_admission_closed():
+        return _closed_result()
+
     # MemoryManager seam read path (memory overhaul Phase 1 cutover): one
     # assemble() replaces the two direct-store blocks below, which stay
     # byte-identical for the flag-off path (pinned by
@@ -1448,6 +1591,8 @@ async def _execute_turn(
     # lives in the manager's runtime (retrieval_timeout).
     manager_injection: List[BaseMessage] = []
     if memory_service is not None:
+        if _provider_admission_closed():
+            return _closed_result()
         from .services.memory import AssembleRequest
         from .services.memory.plugins.legacy import build_persistent_query_text
         from .services.memory.query import build_digest_query_text
@@ -1500,6 +1645,8 @@ async def _execute_turn(
             logger.warning(f"TTL decrement failed (non-fatal): {e}")
 
         try:
+            if _provider_admission_closed():
+                return _closed_result()
             context_text = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
@@ -1536,6 +1683,8 @@ async def _execute_turn(
     effective_pids = project_ids or ([project_id] if project_id else [])
     if knowledge_store and kb_bindings:
         try:
+            if _provider_admission_closed():
+                return _closed_result()
             kb_context = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
@@ -1575,6 +1724,8 @@ async def _execute_turn(
             )
     elif memory_service is None and knowledge_store and effective_pids:
         try:
+            if _provider_admission_closed():
+                return _closed_result()
             kb_context = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
@@ -1621,6 +1772,8 @@ async def _execute_turn(
         and _charter_injection_enabled(config)
     ):
         try:
+            if _provider_admission_closed():
+                return _closed_result()
             for _pid in effective_pids:
                 _charter = await asyncio.wait_for(
                     knowledge_store.get_charter_note(_uuid.UUID(_pid)),
@@ -1658,6 +1811,8 @@ async def _execute_turn(
     )
     if _cit_engine is not None:
         try:
+            if _provider_admission_closed():
+                return _closed_result()
             _failed_cites = await asyncio.wait_for(
                 _cit_engine.list_citations(verification_status="failed"),
                 timeout=_RETRIEVAL_TIMEOUT,
@@ -1699,6 +1854,8 @@ async def _execute_turn(
     guard_force_end_reason = None
 
     while True:
+        if _provider_admission_closed():
+            return _closed_result()
         # Check for interrupt before LLM call
         if callbacks.check_interrupt():
             return TurnResult(
@@ -1734,10 +1891,23 @@ async def _execute_turn(
         # (knowledge-history/done/memory_extraction_before_compaction.md). Fire-and-forget
         # so compaction latency is unchanged; no phase concept in a session →
         # phase=0 (matches the turn_end capture).
+        summary_probe = context_manager.should_summarize(messages)
+        if inspect.isawaitable(summary_probe):
+            # should_summarize is a synchronous predicate in production. Some
+            # narrow test doubles expose an AsyncMock; never leak its coroutine
+            # or treat the object itself as a truthy compaction decision.
+            close = getattr(summary_probe, "close", None)
+            if callable(close):
+                close()
+            needs_compaction = False
+        else:
+            needs_compaction = bool(summary_probe)
+        if needs_compaction and not await _admit_first_provider():
+            return _closed_result()
         if (
             memory_service is not None
             and not defer_memory_capture_to_outbox
-            and context_manager.should_summarize(messages)
+            and needs_compaction
         ):
             from .services.memory import CaptureEvent
 
@@ -1752,6 +1922,8 @@ async def _execute_turn(
 
         pre_compact_len = len(messages)
         compaction_runs_before = getattr(context_manager, "compaction_runs", 0)
+        if _provider_admission_closed():
+            return _closed_result()
         bounded, compact_interrupted = await _await_or_hard_interrupt(
             context_manager.ensure_within_limits(
                 messages,
@@ -1947,6 +2119,10 @@ async def _execute_turn(
                 # Manual iteration (vs. `async for`) so a hard interrupt can
                 # cancel a hung chunk read mid-stream instead of waiting for
                 # the next chunk to arrive before the cooperative check below.
+                if _provider_admission_closed():
+                    return _closed_result()
+                if not await _admit_first_provider():
+                    return _closed_result()
                 _stream = llm_with_tools.astream(_provider_input())
                 _aiter = _stream.__aiter__()
                 _llm_attempt = 0
@@ -1993,6 +2169,8 @@ async def _execute_turn(
                             stream_finish_reason = None
                             response = None
                             _reasoning_buf.clear()
+                            if _provider_admission_closed():
+                                return _closed_result()
                             _stream = llm_with_tools.astream(_provider_input())
                             _aiter = _stream.__aiter__()
                             continue
@@ -2083,6 +2261,8 @@ async def _execute_turn(
                         "retrying with ainvoke"
                     )
                     response_content = ""
+                    if _provider_admission_closed():
+                        return _closed_result()
                     response = await asyncio.wait_for(
                         llm_with_tools.ainvoke(_provider_input()),
                         timeout=llm_timeout,
@@ -2206,6 +2386,8 @@ async def _execute_turn(
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
                     )
+                    if _provider_admission_closed():
+                        return _closed_result()
                     response = await llm_with_tools.ainvoke(_provider_input())
                     # Reasoning first: the non-streaming capture path parks it
                     # in additional_kwargs, so emit it before the answer text.
@@ -2455,6 +2637,8 @@ async def _execute_turn(
                 )
                 retry: Optional[AIMessage] = None
                 try:
+                    if _provider_admission_closed():
+                        return _closed_result()
                     retry = await asyncio.wait_for(
                         llm_with_tools.ainvoke(_provider_input()), timeout=llm_timeout
                     )

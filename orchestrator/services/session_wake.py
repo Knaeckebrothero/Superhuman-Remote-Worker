@@ -39,9 +39,10 @@ same atomic claim, losing it costs latency, not correctness.
 Two rules this module exists to enforce
 ---------------------------------------
 1. **Claim, commit, then send.** Never hold a transaction open across the HTTP
-   call. The send is not idempotent — the agent's ``/api/input`` mints a fresh
-   message id per call and unconditionally enqueues, so a duplicate is a visible
-   message in the user's transcript *plus* a second paid LLM turn.
+   call. Every send carries a durable server-owned delivery id; the agent
+   inserts its transcript row once. A retry is acknowledged only after the
+   durable input ledger proves provider/turn admission, never from transcript
+   persistence alone.
 2. **Do NOT leader-gate any of this.** ``_trigger_dispatch``'s leader gate sits
    right next to where the completion hook goes and invites a copy-paste, but it
    exists because *dispatch is a singleton*, not for dedup. The agent's
@@ -54,10 +55,12 @@ Two rules this module exists to enforce
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
@@ -71,6 +74,14 @@ logger = logging.getLogger(__name__)
 
 class DurableWakeOutboxError(RuntimeError):
     """The established wake route could not durably insert its outbox row."""
+
+
+class WakeDeliveryResult(str, Enum):
+    """Truthful boundary reached by one persistent-runtime delivery attempt."""
+
+    EXECUTED = "executed"
+    PERSISTED = "persisted"
+    FAILED = "failed"
 
 
 # Statuses that owe the creating session a wake. 'pending_review' is included on
@@ -118,6 +129,19 @@ _DELIVER_CONCURRENCY = int(os.getenv("SESSION_WAKE_DELIVER_CONCURRENCY", "5"))
 _SUMMARY_CHARS = 500
 
 _TERMINAL_FOR_COUNTS = ("completed", "failed", "cancelled")
+_WAKE_DELIVERY_NAMESPACE = "ada612a0-95c7-5e7e-83c3-8c37613455de"
+
+
+def _job_wake_delivery_id(row: dict[str, Any]) -> str:
+    """Stable identity for one job/status wake across response loss."""
+
+    # PostgreSQL must derive the same identity inside the atomic claim without
+    # depending on an extension-specific uuid_generate_v5 installation. MD5 is
+    # used only as a deterministic identifier transform, never for security.
+    material = (
+        f"{_WAKE_DELIVERY_NAMESPACE}:job:{row.get('id')}:{row.get('status') or ''}"
+    )
+    return str(UUID(hashlib.md5(material.encode(), usedforsecurity=False).hexdigest()))
 
 
 # --------------------------------------------------------------------------
@@ -279,13 +303,17 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
     job_id = str(row["id"])
     status = str(row.get("status") or "")
     try:
-        ok = await _deliver(db, row)
+        outcome = await _deliver(db, row)
     except Exception:
         logger.exception("session wake: delivery raised for job %s", job_id[:8])
-        ok = False
+        outcome = WakeDeliveryResult.FAILED
 
     try:
-        if ok:
+        # Boolean True remains accepted for narrow test doubles and for the
+        # no-recipient retirement branch. Production injectors return the
+        # explicit enum so transcript persistence can never masquerade as
+        # execution.
+        if outcome is True or outcome == WakeDeliveryResult.EXECUTED:
             settled = await db.finish_job_wake(job_id, status)
             if settled is False:
                 logger.info(
@@ -294,6 +322,9 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
                 )
                 return False
             return True
+        if outcome == WakeDeliveryResult.PERSISTED:
+            await db.defer_job_wake_for_input(job_id)
+            return False
         state = await db.release_job_wake(job_id, max_attempts=MAX_ATTEMPTS)
         if state == "undeliverable":
             logger.info(
@@ -314,8 +345,8 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
     return False
 
 
-async def _deliver(db: Any, row: dict[str, Any]) -> bool:
-    """Deliver one claimed wake. True = delivered (or nothing left to deliver)."""
+async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
+    """Deliver one claim, distinguishing persistence from execution."""
     thread_id = row.get("created_by_thread_id")
     if not thread_id:
         # Forward hard deletes atomically retire the row before the FK is
@@ -373,14 +404,23 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool:
 
     text = await _format_wake_message(db, row, thread_id)
 
+    delivery_id = _job_wake_delivery_id(row)
+    if not await db.assign_job_wake_delivery(str(row["id"]), delivery_id):
+        return WakeDeliveryResult.FAILED
     agent = await _resolve_live_agent(db, thread)
-    if agent is not None and await _inject_live(agent, text):
+    if agent is not None:
+        outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+    else:
+        outcome = WakeDeliveryResult.FAILED
+    if outcome == WakeDeliveryResult.EXECUTED:
         logger.info(
             "session wake: injected into live thread %s (job %s)",
             thread_id[:8],
             str(row["id"])[:8],
         )
-        return True
+        return WakeDeliveryResult.EXECUTED
+    if outcome == WakeDeliveryResult.PERSISTED:
+        return outcome
 
     # Suspended / detached / ended, or the live inject bounced. Write the notice
     # durably so it lands on the next resume, and tell the user out-of-band.
@@ -389,7 +429,14 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool:
     # dies is marked 'ended', not 'suspended', and ended threads are
     # user-resumable — treating 'ended' as terminal would silently drop
     # completions for a supported case.
-    return await _deliver_durable(db, thread, thread_id, row, text)
+    return await _deliver_durable(
+        db,
+        thread,
+        thread_id,
+        row,
+        text,
+        delivery_id=delivery_id,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -433,21 +480,28 @@ async def _resolve_live_agent(db: Any, thread: dict[str, Any]) -> Optional[dict]
     if agent.get("status") not in ("ready", "working", "session"):
         return None
     # Defensive pod_port: a NULL column would make int(None) raise.
-    if not await probe_ready(str(agent["pod_ip"]), int(agent.get("pod_port") or 8001)):
+    if not await probe_ready(
+        str(agent["pod_ip"]),
+        int(agent.get("pod_port") or 8001),
+        required_capability="durable_input_delivery",
+    ):
         return None
     return agent
 
 
-async def _inject_live(agent: dict[str, Any], text: str) -> bool:
-    """POST the notice onto the agent's input queue. True iff it was accepted.
+async def _inject_live(
+    agent: dict[str, Any], text: str, *, delivery_id: str
+) -> WakeDeliveryResult:
+    """POST input and report the durable execution boundary it reached.
 
-    ``/api/input`` persists the message before acknowledging and only then
-    enqueues it (session_silent_failure_audit.md #1) — exactly the durability an
-    injected completion wants. ``role='event'`` keeps the persisted row out of
-    the human-bubble family so the transcript does not claim the user said this.
+    ``/api/input`` persists the message and execution-ledger row before queueing
+    it (session_silent_failure_audit.md #1). Its 202 response means only
+    persisted/queued; 200 is reserved for an already admitted/settled retry.
+    ``role='event'`` keeps the row out of the human-bubble family so the
+    transcript does not claim the user said this.
 
-    A 503 means the loop is not running (the pod is up but the session is not
-    attached); that is a fall-back-to-durable case, not an error.
+    A 503 means the loop is unavailable or termination-fenced. The caller must
+    leave its durable claim retryable; it may not report that wake delivered.
 
     Split timeout on purpose: a flat 30s against a black-holed pod IP would burn
     30s inside the drain for every dead session.
@@ -456,21 +510,41 @@ async def _inject_live(agent: dict[str, Any], text: str) -> bool:
     pod_port = int(agent.get("pod_port") or 8001)
     url = f"http://{pod_ip}:{pod_port}/api/input"
     try:
+        headers: dict[str, str] = {}
+        internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+        if internal_key:
+            headers["X-Internal-Key"] = internal_key
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=3.0)
         ) as client:
-            resp = await client.post(url, json={"content": text, "role": "event"})
+            resp = await client.post(
+                url,
+                json={
+                    "content": text,
+                    "role": "event",
+                    "delivery_id": str(UUID(str(delivery_id))),
+                },
+                headers=headers,
+            )
     except Exception as exc:
         logger.info("session wake: live inject to %s failed: %s", pod_ip, exc)
-        return False
-    if resp.status_code == 200:
-        return True
+        return WakeDeliveryResult.FAILED
+    if resp.status_code in {200, 202}:
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        state = body.get("delivery_state") if isinstance(body, dict) else None
+        if state in {"admitted", "settled"}:
+            return WakeDeliveryResult.EXECUTED
+        if state in {"persisted", "owned", "queued", "deferred"}:
+            return WakeDeliveryResult.PERSISTED
     logger.info(
         "session wake: live inject returned %s (%s)",
         resp.status_code,
         resp.text[:200],
     )
-    return False
+    return WakeDeliveryResult.FAILED
 
 
 # --------------------------------------------------------------------------
@@ -484,34 +558,40 @@ async def _deliver_durable(
     thread_id: str,
     row: dict[str, Any],
     text: str,
-) -> bool:
+    *,
+    delivery_id: str,
+) -> WakeDeliveryResult:
     """Persist the notice and notify the user out-of-band.
 
-    The durable branch is ``thread_messages``, NOT ``thread_events``. The event
-    log looks like the natural home and is unusable: its ``seq`` is allocated by
-    the *agent*, in process memory, and appending into a live epoch from the
-    orchestrator would silently destroy a batch of the agent's frames — while
-    appending into a suspended epoch is unreachable anyway, because replay is
-    hard-scoped to ``threads.events_epoch``, which is bumped unconditionally on
-    every attach. ``thread_messages`` has a database-allocated BIGSERIAL, no
-    retention prune, and the orchestrator already writes it.
+    The durable branch atomically writes ``thread_messages`` plus
+    ``thread_input_deliveries``, NOT ``thread_events``. The transcript is the
+    truthful conversation record but is not an executable inbox by itself; the
+    ledger is what a current runtime generation claims and admits. The event log
+    is unusable here because its ``seq`` is allocated by the *agent*, in process
+    memory, and appending into a live epoch from the orchestrator would silently
+    destroy a batch of the agent's frames.
 
-    No pod restore happens here. Waking a suspended session is the restore path,
-    which reads a whole snapshot tar into RAM and has OOM-killed the
-    orchestrator before; N jobs finishing at once would be N concurrent
-    restores. That is Phase 2, and it needs rate-limiting first.
+    No pod restore happens here. On attach, the exact reciprocal runtime claims
+    unadmitted ledger rows in transcript order; ordinary restore deliberately
+    excludes them so persistence cannot become passive context.
     """
     try:
-        await db.save_thread_message(
+        result = await db.persist_thread_input_delivery(
             thread_id=thread_id,
+            delivery_id=delivery_id,
             role="event",
             content=text,
+            # Every server-injected persistent input uses one source contract.
+            # Its job/event provenance remains in the authoritative outbox;
+            # using another ledger source would make a later live retry of the
+            # same delivery identity look like a conflict.
+            source="officer_wake",
         )
     except Exception:
         logger.exception(
             "session wake: durable write failed for thread %s", thread_id[:8]
         )
-        return False
+        return WakeDeliveryResult.FAILED
 
     logger.info(
         "session wake: wrote durable notice to thread %s (status=%s, job %s)",
@@ -523,13 +603,14 @@ async def _deliver_durable(
     # Best-effort user-facing ping. Only on the durable branch — a live session
     # already showed the user the wake, and emailing them about it would be
     # noise. Failure here must not un-deliver the notice above.
-    try:
-        await _notify_owner(db, thread, thread_id, row)
-    except Exception:
-        logger.warning(
-            "session wake: owner notification failed for thread %s", thread_id[:8]
-        )
-    return True
+    if result.get("transcript_inserted"):
+        try:
+            await _notify_owner(db, thread, thread_id, row)
+        except Exception:
+            logger.warning(
+                "session wake: owner notification failed for thread %s", thread_id[:8]
+            )
+    return WakeDeliveryResult.PERSISTED
 
 
 async def _notify_owner(
@@ -1143,11 +1224,14 @@ async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> st
     carries a fresh ``dedup_key`` so notes never coalesce with each other.
     """
     hold = _officer_hold(thread)
+    delivery_id = str(uuid4())
     if not hold.get("thread_id"):
         try:
             agent = await _resolve_live_agent(db, thread)
-            if agent is not None and await _inject_live(agent, text):
-                return "live"
+            if agent is not None:
+                outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+                if outcome == WakeDeliveryResult.EXECUTED:
+                    return "live"
         except Exception:
             # Resolving or reaching the pod may fail; the durable row below is
             # the whole point of having a second path.
@@ -1161,7 +1245,7 @@ async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> st
         str(thread["id"]),
         source=LEGATE_NOTE_SOURCE,
         dedup_key=uuid4().hex,
-        payload={"message": text},
+        payload={"message": text, "_delivery_id": delivery_id},
         project_id=str(project_id) if project_id else None,
     )
     return "held" if hold else "queued"
@@ -1231,9 +1315,8 @@ async def drain_pending_event_wakes(
     * agent live but inject refused/failed → RELEASE for retry — a running
       officer never re-reads thread_messages, so a durable write would be
       invisible to him until the next restart.
-    * no live agent → durable transcript write + finish; the watchdog's
-      respawn boot-wake makes the restored notice readable
-      (centurion_implementation_notes.md, risk 5).
+    * no live agent → RELEASE for retry. A pod lifecycle gap is not delivery;
+      the replacement consumes the same durable delivery identity.
     """
     try:
         claimed = await db.claim_pending_session_wake_events(
@@ -1247,14 +1330,33 @@ async def drain_pending_event_wakes(
     if not claimed:
         return 0
 
-    by_thread: dict[str, list[dict[str, Any]]] = {}
-    for row in claimed:
-        by_thread.setdefault(str(row["thread_id"]), []).append(row)
+    try:
+        assigned = await db.assign_session_wake_delivery_groups(
+            [int(row["id"]) for row in claimed]
+        )
+    except Exception:
+        logger.exception("officer wake: durable delivery identity assignment failed")
+        try:
+            await db.release_session_wake_events(
+                [int(row["id"]) for row in claimed],
+                max_attempts=_OFFICER_MAX_ATTEMPTS,
+            )
+        except Exception:
+            logger.exception("officer wake: release after identity failure failed")
+        return 0
+
+    by_delivery: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in assigned:
+        key = (str(row["thread_id"]), str(row["delivery_id"]))
+        by_delivery.setdefault(key, []).append(row)
 
     delivered = 0
-    for thread_id, rows in by_thread.items():
-        ids = [int(r["id"]) for r in rows]
+    for (thread_id, delivery_id), claimed_rows in by_delivery.items():
+        ids = [int(r["id"]) for r in claimed_rows]
         try:
+            rows = await db.get_session_wake_delivery_group(thread_id, delivery_id)
+            if not rows:
+                raise RuntimeError("durable wake delivery group disappeared")
             thread = await db.get_thread(thread_id)
             if thread is None:
                 await db.finish_session_wake_events(ids)
@@ -1309,7 +1411,8 @@ async def drain_pending_event_wakes(
                 state_patch = None
             agent = await _resolve_live_agent(db, thread)
             if agent is not None:
-                if await _inject_live(agent, text):
+                outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+                if outcome is True or outcome == WakeDeliveryResult.EXECUTED:
                     await db.finish_session_wake_events(ids)
                     delivered += 1
                     if state_patch:
@@ -1324,19 +1427,33 @@ async def drain_pending_event_wakes(
                                 "officer wake: sitrep state merge failed "
                                 "(non-fatal; next sitrep re-diffs)"
                             )
+                elif outcome == WakeDeliveryResult.PERSISTED:
+                    await db.defer_session_wake_events_for_input(
+                        ids,
+                        fire_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                    )
                 else:
                     await db.release_session_wake_events(
                         ids, max_attempts=_OFFICER_MAX_ATTEMPTS
                     )
                 continue
-            # No live agent: durable notice + finish. The officer watchdog
-            # owns getting the pod back; its boot self-wake surfaces this.
-            try:
-                await db.save_thread_message(
-                    thread_id=thread_id, role="event", content=text
+            # A missing, draining, or not-ready Officer is not delivery. Keep
+            # the outbox authoritative so the replacement receives this exact
+            # delivery identity; never stamp a wake sent merely because no pod
+            # was reachable during a lifecycle transition.
+            persisted = await db.persist_thread_input_delivery(
+                thread_id=thread_id,
+                delivery_id=delivery_id,
+                role="event",
+                content=text,
+                source="officer_wake",
+            )
+            if persisted:
+                await db.defer_session_wake_events_for_input(
+                    ids,
+                    fire_at=datetime.now(timezone.utc) + timedelta(seconds=5),
                 )
-                await db.finish_session_wake_events(ids)
-            except Exception:
+            else:  # pragma: no cover - production method returns a row or raises
                 await db.release_session_wake_events(
                     ids, max_attempts=_OFFICER_MAX_ATTEMPTS
                 )

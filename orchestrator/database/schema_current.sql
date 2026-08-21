@@ -3854,6 +3854,116 @@ $$;
 
 
 --
+-- Name: require_executed_persistent_wake(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_executed_persistent_wake() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    delivery UUID;
+    expected_delivery UUID;
+    claim_attempt INTEGER;
+    is_officer BOOLEAN := FALSE;
+BEGIN
+    IF TG_TABLE_NAME = 'session_wake_events' THEN
+        -- An old replica increments attempts and begins HTTP delivery without
+        -- establishing the execution ledger identity. Reject that claim before
+        -- network I/O. The marker is tied to this exact attempt, so a later old
+        -- replica cannot reuse a marker left by a prior new claim.
+        IF NEW.state = 'sending' AND NEW.attempts > OLD.attempts THEN
+            BEGIN
+                delivery := NULLIF(NEW.payload->>'_delivery_id', '')::uuid;
+                claim_attempt := NULLIF(
+                    NEW.payload->>'_delivery_claim_attempt', ''
+                )::integer;
+            EXCEPTION
+                WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+                    delivery := NULL;
+                    claim_attempt := NULL;
+            END;
+            IF delivery IS NULL OR claim_attempt IS DISTINCT FROM NEW.attempts THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'persistent_wake_requires_delivery_claim',
+                    MESSAGE = 'Persistent wake claim lacks execution-ledger authority',
+                    HINT = 'Retry the claim from an input-ledger-aware replica.';
+            END IF;
+        END IF;
+
+        IF NEW.state <> 'sent' OR OLD.state = 'sent' THEN
+            RETURN NEW;
+        END IF;
+        BEGIN
+            delivery := NULLIF(NEW.payload->>'_delivery_id', '')::uuid;
+        EXCEPTION WHEN invalid_text_representation THEN
+            delivery := NULL;
+        END;
+    ELSE
+        IF NEW.wake_state = 'sending'
+           AND NEW.wake_attempts > OLD.wake_attempts THEN
+            expected_delivery := md5(
+                'ada612a0-95c7-5e7e-83c3-8c37613455de:job:'
+                || NEW.id::text || ':' || COALESCE(NEW.status, '')
+            )::uuid;
+            IF NEW.wake_delivery_id IS DISTINCT FROM expected_delivery
+               OR NEW.wake_delivery_claim_attempt
+                    IS DISTINCT FROM NEW.wake_attempts THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'persistent_wake_requires_delivery_claim',
+                    MESSAGE = 'Persistent wake claim lacks execution-ledger authority',
+                    HINT = 'Retry the claim from an input-ledger-aware replica.';
+            END IF;
+        END IF;
+
+        IF NEW.wake_state <> 'sent' OR OLD.wake_state = 'sent' THEN
+            RETURN NEW;
+        END IF;
+
+        -- Officer-created job wakes are converted into session_wake_events;
+        -- this jobs-row transition retires only the conversion trigger, not
+        -- the actual wake. Preserve that established two-outbox contract.
+        IF NEW.created_by_thread_id IS NOT NULL THEN
+            SELECT COALESCE(
+                (thread.metadata #>> '{config_override,officer,enabled}')::boolean,
+                FALSE
+            )
+              INTO is_officer
+              FROM public.threads AS thread
+             WHERE thread.id = NEW.created_by_thread_id;
+        END IF;
+        IF is_officer THEN
+            RETURN NEW;
+        END IF;
+        delivery := NEW.wake_delivery_id;
+    END IF;
+
+    IF delivery IS NULL OR NOT EXISTS (
+        SELECT 1
+          FROM public.thread_input_deliveries input
+         WHERE input.delivery_id = delivery
+           AND input.state IN ('admitted', 'settled')
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'persistent_wake_requires_execution_admission',
+            MESSAGE = 'Persistent wake delivery has not reached provider admission',
+            HINT = 'Keep the wake retryable until its durable input delivery is admitted.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_executed_persistent_wake(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_executed_persistent_wake() IS 'Rolling-upgrade and settlement fence: pre-0174 replicas cannot claim a persistent wake for HTTP delivery, and no replica can stamp it sent before the durable input reaches provider admission.';
+
+
+--
 -- Name: resource_inventory_snapshot_item_size_bytes(text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -6076,8 +6186,11 @@ CREATE TABLE public.jobs (
     completion_seq_hwm bigint DEFAULT 0 NOT NULL,
     completion_sweep_attempt_hwm bigint DEFAULT 0 NOT NULL,
     origin text DEFAULT 'user'::text NOT NULL,
+    wake_delivery_id uuid,
+    wake_delivery_claim_attempt integer,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
+    CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
     CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text, 'undeliverable'::text]))),
     CONSTRAINT valid_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'processing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'pending_review'::character varying, 'paused'::character varying, 'reviewing'::character varying, 'waiting'::character varying, 'waiting_for_reply'::character varying])::text[])))
 );
@@ -6172,6 +6285,20 @@ COMMENT ON COLUMN public.jobs.completion_sweep_attempt_hwm IS 'Highest job_compl
 --
 
 COMMENT ON COLUMN public.jobs.origin IS 'Where this job came from: user|session|automation|loop|officer|subjob|lifecycle|bench. Records the IMMEDIATE creator, not the root of the chain — a critic subjob of a loop iteration is ''subjob'', and the chain stays reconstructable through parent_job_id. Stamped explicitly by each caller of create_job() and validated there against KNOWN_JOB_ORIGINS; there is deliberately no CHECK constraint (see 0118 precedent). Distinct from runner_kind, which is the dispatch grant class.';
+
+
+--
+-- Name: COLUMN jobs.wake_delivery_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.wake_delivery_id IS 'Server-owned identity linking a non-Officer completion wake to its persistent input execution ledger. Not caller- or model-authored.';
+
+
+--
+-- Name: COLUMN jobs.wake_delivery_claim_attempt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.wake_delivery_claim_attempt IS '0174 rolling-upgrade fence. Must equal wake_attempts on each sending claim so an old replica fails before performing a non-idempotent HTTP send.';
 
 
 --
@@ -8551,6 +8678,59 @@ ALTER TABLE public.thread_events ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDE
 
 
 --
+-- Name: thread_input_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_input_deliveries (
+    delivery_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    message_id uuid NOT NULL,
+    source text NOT NULL,
+    state text DEFAULT 'persisted'::text NOT NULL,
+    claim_generation bigint DEFAULT 0 NOT NULL,
+    owner_agent_id uuid,
+    owner_pod_uid text,
+    owner_runtime_generation uuid,
+    admitted_turn_number bigint,
+    deferred_reason text,
+    persisted_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    owned_at timestamp with time zone,
+    queued_at timestamp with time zone,
+    admitted_at timestamp with time zone,
+    settled_at timestamp with time zone,
+    deferred_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
+    CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
+    CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))),
+    CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))),
+    CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
+    CONSTRAINT thread_input_deliveries_state_check CHECK ((state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'admitted'::text, 'settled'::text, 'deferred'::text])))
+);
+
+
+--
+-- Name: TABLE thread_input_deliveries; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_input_deliveries IS 'Server-owned persistent input execution ledger. A transcript row proves persistence only; admitted/settled are the wake-delivery boundary.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.claim_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.claim_generation IS 'Monotonic CAS fence. A predecessor cannot defer or settle a successor claim.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_runtime_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_runtime_generation IS 'Process generation inside one pod. A container restart may reclaim RAM-queued work even when the Kubernetes pod UID and agent row are unchanged.';
+
+
+--
 -- Name: thread_interrupt_requests; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -10778,6 +10958,22 @@ ALTER TABLE ONLY public.thread_events
 
 
 --
+-- Name: thread_input_deliveries thread_input_deliveries_message_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_message_id_key UNIQUE (message_id);
+
+
+--
+-- Name: thread_input_deliveries thread_input_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_pkey PRIMARY KEY (delivery_id);
+
+
+--
 -- Name: thread_interrupt_requests thread_interrupt_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12066,6 +12262,13 @@ CREATE UNIQUE INDEX idx_thread_events_thread_epoch_seq ON public.thread_events U
 
 
 --
+-- Name: idx_thread_input_deliveries_reclaim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_input_deliveries_reclaim ON public.thread_input_deliveries USING btree (thread_id, persisted_at, delivery_id) WHERE (state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'deferred'::text]));
+
+
+--
 -- Name: idx_thread_interrupt_pending_exact; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13347,10 +13550,24 @@ CREATE TRIGGER trg_canvas_revoke_user_admission AFTER UPDATE OF is_approved ON p
 
 
 --
+-- Name: jobs trg_job_wake_requires_execution_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_job_wake_requires_execution_admission BEFORE UPDATE OF wake_state ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.require_executed_persistent_wake();
+
+
+--
 -- Name: runtime_actor_grants trg_runtime_actor_grants_officer_agent_binding; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_runtime_actor_grants_officer_agent_binding BEFORE INSERT OR UPDATE ON public.runtime_actor_grants FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_runtime_agent_binding();
+
+
+--
+-- Name: session_wake_events trg_session_wake_requires_execution_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_session_wake_requires_execution_admission BEFORE UPDATE OF state ON public.session_wake_events FOR EACH ROW EXECUTE FUNCTION public.require_executed_persistent_wake();
 
 
 --
@@ -14735,6 +14952,22 @@ ALTER TABLE ONLY public.thread_events
 
 ALTER TABLE ONLY public.thread_events
     ADD CONSTRAINT thread_events_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_input_deliveries thread_input_deliveries_message_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_message_id_fkey FOREIGN KEY (message_id) REFERENCES public.thread_messages(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_input_deliveries thread_input_deliveries_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_input_deliveries
+    ADD CONSTRAINT thread_input_deliveries_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

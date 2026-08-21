@@ -127,6 +127,8 @@ async def db(pg_dsn):
                 wake_claimed_at timestamptz,
                 wake_attempts integer NOT NULL DEFAULT 0,
                 wake_notified_status text,
+                wake_delivery_id uuid,
+                wake_delivery_claim_attempt integer,
                 updated_at timestamptz NOT NULL DEFAULT now(),
                 CONSTRAINT jobs_wake_state_known CHECK (
                     wake_state IN (

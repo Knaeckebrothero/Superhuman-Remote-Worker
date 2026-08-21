@@ -900,6 +900,7 @@ class TestAgentRestInputEndpointsNoSession:
         """
         import json
         from types import SimpleNamespace
+        from uuid import uuid4
 
         from starlette.requests import Request
 
@@ -926,11 +927,34 @@ class TestAgentRestInputEndpointsNoSession:
         async def fake_run_persistent_loop(**kwargs):
             seen_inputs.append(await kwargs["callbacks"].get_user_input())
 
+        class _DeliveryDB:
+            def __init__(self):
+                self.row = None
+
+            async def persist_pinned_input_delivery(self, **kwargs):
+                self.row = {
+                    **kwargs,
+                    "state": "owned",
+                    "claim_generation": 1,
+                    "message_id": str(uuid4()),
+                    "transcript_inserted": True,
+                }
+                return dict(self.row)
+
+            async def claim_pending_pinned_input_deliveries(self, **_kwargs):
+                return [dict(self.row)] if self.row is not None else []
+
+            async def mark_pinned_input_delivery_queued(self, **_kwargs):
+                self.row["state"] = "queued"
+                return True
+
         mod._thread_id = "thread-rest"
         mod._loop_task = None
         mod._loop_user_queue = asyncio.Queue()
         mod._loop_last_user_content = [""]
         mod._hard_interrupt_event = asyncio.Event()
+        mod._input_runtime_generation = str(uuid4())
+        mod._queued_input_claims.clear()
         mod._session = SimpleNamespace(
             llm_with_tools=object(),
             tools=[],
@@ -951,7 +975,7 @@ class TestAgentRestInputEndpointsNoSession:
             project_ids=[],
             tool_context=None,
             turn_count=0,
-            postgres_conn=None,
+            postgres_conn=_DeliveryDB(),
             memory_extraction_prompt="",
             memory_service=None,  # legacy path (manager flag off)
         )
@@ -964,22 +988,33 @@ class TestAgentRestInputEndpointsNoSession:
                     new=fake_run_persistent_loop,
                 ),
                 patch.object(mod, "_loop_completion_handler", new=AsyncMock()),
+                patch.object(mod, "_early_title_from_prompt", new=AsyncMock()),
+                patch.object(
+                    mod,
+                    "_orchestrator_client",
+                    new=SimpleNamespace(agent_id=str(uuid4())),
+                ),
+                patch.dict("os.environ", {"POD_UID": "rest-input-pod"}),
             ):
                 response = await mod.handle_api_input(request)
-                assert response.status_code == 200
+                # Persistence/queue ownership is not execution admission.
+                assert response.status_code == 202
                 await asyncio.wait_for(mod._loop_task, timeout=1)
 
             # Accept-time persistence wraps queue items as {content, id} so
             # the loop reuses the already-persisted row id
             # (session_silent_failure_audit.md #1).
             assert [i["content"] for i in seen_inputs] == ["hello from REST"]
-            assert all(i["id"].startswith("msg_") for i in seen_inputs)
+            assert all(i["delivery_id"] for i in seen_inputs)
+            assert all(i["claim_generation"] == 1 for i in seen_inputs)
         finally:
             mod._session = None
             mod._thread_id = None
             mod._loop_task = None
             mod._loop_user_queue = None
             mod._hard_interrupt_event = None
+            mod._input_runtime_generation = None
+            mod._queued_input_claims.clear()
 
 
 # ---------------------------------------------------------------------------

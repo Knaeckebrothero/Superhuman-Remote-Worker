@@ -9656,10 +9656,10 @@ class PostgresDB:
     # and inspectable in a way an in-memory claim is not. Design + rationale:
     # knowledge-base/knowledge/features/session_wake_on_job_completion.md.
     #
-    # The claim exists because the send is NOT idempotent — the agent's
-    # /api/input mints a fresh message id per call and unconditionally enqueues,
-    # so a duplicate is a visible message in the user's transcript plus a second
-    # paid LLM turn. Claim first, commit, then send.
+    # The claim still establishes one sender at a time. Delivery additionally
+    # carries a stable server-owned identity, so a commit followed by a lost
+    # HTTP response is acknowledged on retry without another transcript row or
+    # paid turn. Claim first, commit, then send remains the ordering contract.
     #
     # Deliberately NOT modelled on claim_delegation_resume: its dedup is a CAS
     # on the waiter's own status transition (waiting → paused), where the legal
@@ -9696,7 +9696,9 @@ class PostgresDB:
                 """
                 UPDATE jobs
                    SET wake_state = 'pending',
-                       wake_claimed_at = NULL
+                       wake_claimed_at = NULL,
+                       wake_delivery_id = NULL,
+                       wake_delivery_claim_attempt = NULL
                  WHERE id = $1
                    AND wake_on_complete
                    AND created_by_thread_id IS NOT NULL
@@ -9758,7 +9760,12 @@ class PostgresDB:
                 UPDATE jobs j
                    SET wake_state = 'sending',
                        wake_claimed_at = NOW(),
-                       wake_attempts = j.wake_attempts + 1
+                       wake_attempts = j.wake_attempts + 1,
+                       wake_delivery_id = md5(
+                           'ada612a0-95c7-5e7e-83c3-8c37613455de:job:'
+                           || j.id::text || ':' || COALESCE(j.status, '')
+                       )::uuid,
+                       wake_delivery_claim_attempt = j.wake_attempts + 1
                   FROM (
                         SELECT id FROM jobs
                          WHERE wake_on_complete
@@ -9787,6 +9794,30 @@ class PostgresDB:
                 limit,
             )
         return [dict(row) for row in rows]
+
+    async def assign_job_wake_delivery(self, job_id: str, delivery_id: str) -> bool:
+        """Bind one claimed non-Officer job wake to its stable input identity."""
+
+        try:
+            job_uuid = UUID(job_id)
+            delivery_uuid = UUID(delivery_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET wake_delivery_id = $2
+                 WHERE id = $1
+                   AND wake_state = 'sending'
+                   AND wake_delivery_id = $2
+                   AND wake_delivery_claim_attempt = wake_attempts
+                RETURNING id
+                """,
+                job_uuid,
+                delivery_uuid,
+            )
+        return row is not None
 
     async def finish_job_wake(self, job_id: str, delivered_status: str) -> bool:
         """Mark a claimed wake delivered, recording WHICH terminal status went
@@ -9856,6 +9887,31 @@ class PostgresDB:
         # is not retry exhaustion. Preserve the legacy fail-closed `dead`
         # return for every other missing/stale claim.
         return "undeliverable" if state == "undeliverable" else "dead"
+
+    async def defer_job_wake_for_input(self, job_id: str) -> bool:
+        """Keep a durably persisted but unadmitted input retryable.
+
+        The network attempt did not fail: execution is waiting for a current
+        runtime claim. Undo the claim-side attempt increment so an arbitrarily
+        long pod lifecycle gap cannot exhaust the delivery budget.
+        """
+
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET wake_state = 'pending', wake_claimed_at = NULL,
+                       wake_attempts = GREATEST(0, wake_attempts - 1)
+                 WHERE id = $1 AND wake_state = 'sending'
+                RETURNING id
+                """,
+                job_uuid,
+            )
+        return row is not None
 
     async def get_job_wake_stats(self) -> Dict[str, int]:
         """Fleet-wide wake-outbox depth by state.
@@ -10601,42 +10657,69 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
+                WITH candidates AS MATERIALIZED (
+                    SELECT se.id, se.thread_id,
+                           CASE
+                               WHEN (se.payload->>'_delivery_id') ~*
+                                    '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                               THEN se.payload->>'_delivery_id'
+                               ELSE NULL
+                           END AS existing_delivery_id
+                      FROM session_wake_events se
+                      JOIN threads t ON t.id = se.thread_id
+                     WHERE t.status != 'ended'
+                       AND COALESCE(t.metadata->'config_override'
+                                    ->'officer'->>'enabled','false') = 'true'
+                       AND (t.metadata
+                            #>> '{config_override,officer,hold}') IS NULL
+                       AND (
+                            (se.state = 'pending'
+                             AND (se.fire_at IS NULL OR se.fire_at <= NOW()))
+                            OR (se.state = 'sending'
+                                AND se.claimed_at
+                                    < NOW() - make_interval(
+                                        secs => $1::double precision))
+                           )
+                       AND NOT EXISTS (
+                            SELECT 1 FROM session_wake_events prev
+                             WHERE prev.thread_id = se.thread_id
+                               AND prev.source = se.source
+                               AND prev.state = 'sent'
+                               AND prev.sent_at > NOW() - make_interval(
+                                    secs => COALESCE(
+                                        ($3::jsonb ->> se.source)
+                                            ::double precision,
+                                        $4::double precision))
+                           )
+                     ORDER BY se.created_at
+                     FOR UPDATE OF se SKIP LOCKED
+                     LIMIT $2
+                ), new_groups AS MATERIALIZED (
+                    SELECT thread_id, public.uuid_generate_v4() AS delivery_id
+                      FROM (SELECT DISTINCT thread_id FROM candidates) grouped
+                )
                 UPDATE session_wake_events e
                    SET state = 'sending',
                        claimed_at = NOW(),
-                       attempts = e.attempts + 1
-                  FROM (
-                        SELECT se.id FROM session_wake_events se
-                          JOIN threads t ON t.id = se.thread_id
-                         WHERE t.status != 'ended'
-                           AND COALESCE(t.metadata->'config_override'
-                                        ->'officer'->>'enabled','false') = 'true'
-                           AND (t.metadata
-                                #>> '{config_override,officer,hold}') IS NULL
-                           AND (
-                                (se.state = 'pending'
-                                 AND (se.fire_at IS NULL OR se.fire_at <= NOW()))
-                                OR (se.state = 'sending'
-                                    AND se.claimed_at
-                                        < NOW() - make_interval(
-                                            secs => $1::double precision))
-                               )
-                           AND NOT EXISTS (
-                                SELECT 1 FROM session_wake_events prev
-                                 WHERE prev.thread_id = se.thread_id
-                                   AND prev.source = se.source
-                                   AND prev.state = 'sent'
-                                   AND prev.sent_at > NOW() - make_interval(
-                                        secs => COALESCE(
-                                            ($3::jsonb ->> se.source)
-                                                ::double precision,
-                                            $4::double precision))
-                               )
-                         ORDER BY se.created_at
-                         FOR UPDATE OF se SKIP LOCKED
-                         LIMIT $2
-                       ) s
-                 WHERE e.id = s.id
+                       attempts = e.attempts + 1,
+                       payload = jsonb_set(
+                           jsonb_set(
+                               COALESCE(e.payload, '{}'::jsonb),
+                               '{_delivery_id}',
+                               to_jsonb(COALESCE(
+                                   candidates.existing_delivery_id,
+                                   new_groups.delivery_id::text
+                               )),
+                               TRUE
+                           ),
+                           '{_delivery_claim_attempt}',
+                           to_jsonb(e.attempts + 1),
+                           TRUE
+                       )
+                  FROM candidates
+                  JOIN new_groups
+                    ON new_groups.thread_id = candidates.thread_id
+                 WHERE e.id = candidates.id
                 RETURNING e.id, e.thread_id, e.project_id, e.source,
                           e.dedup_key, e.payload, e.attempts, e.fire_at,
                           e.created_at
@@ -10645,6 +10728,105 @@ class PostgresDB:
                 limit,
                 debounce_json,
                 float(default_debounce_seconds),
+            )
+        return [dict(row) for row in rows]
+
+    async def assign_session_wake_delivery_groups(
+        self, event_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """Return claimed wake rows with a durable delivery identity.
+
+        Delivery is intentionally outside the claim transaction.  A pod can
+        accept an event and the HTTP response can still be lost, so the retry
+        needs a stable identity that survives orchestrator restart and claim
+        expiry.  Store that identity in the existing server-owned JSONB
+        payload while row-locking the claimed events.  Rows already carrying a
+        valid identity retain it; newly claimed rows are coalesced per thread.
+
+        No caller-supplied identity is trusted here.  Invalid historical
+        values are replaced while the row is locked.
+        """
+        if not event_ids:
+            return []
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT id, thread_id, project_id, source, dedup_key,
+                           payload, attempts, fire_at, created_at
+                      FROM session_wake_events
+                     WHERE id = ANY($1::bigint[])
+                       AND state = 'sending'
+                     ORDER BY created_at, id
+                     FOR UPDATE
+                    """,
+                    [int(event_id) for event_id in event_ids],
+                )
+                new_group_by_thread: Dict[str, str] = {}
+                result: List[Dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    payload = item.get("payload")
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except (TypeError, ValueError):
+                            payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    delivery_id = payload.get("_delivery_id")
+                    try:
+                        delivery_id = str(UUID(str(delivery_id)))
+                    except (TypeError, ValueError, AttributeError):
+                        thread_key = str(item["thread_id"])
+                        delivery_id = new_group_by_thread.setdefault(
+                            thread_key, str(uuid4())
+                        )
+                        payload = {**payload, "_delivery_id": delivery_id}
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE session_wake_events
+                               SET payload = $2::jsonb
+                             WHERE id = $1
+                               AND state = 'sending'
+                            RETURNING id, thread_id, project_id, source,
+                                      dedup_key, payload, attempts, fire_at,
+                                      created_at
+                            """,
+                            int(item["id"]),
+                            json.dumps(payload),
+                        )
+                        if updated is None:
+                            continue
+                        item = dict(updated)
+                    item["delivery_id"] = delivery_id
+                    result.append(item)
+        return result
+
+    async def get_session_wake_delivery_group(
+        self, thread_id: str, delivery_id: str
+    ) -> List[Dict[str, Any]]:
+        """Load every retained event represented by one delivery identity.
+
+        A retry claim can be smaller than the original claim batch.  Reading
+        the whole durable group prevents that page boundary from changing the
+        event text while the stable transcript identity still denotes the
+        original accepted wake.
+        """
+        thread_uuid = UUID(str(thread_id))
+        delivery_uuid = str(UUID(str(delivery_id)))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, project_id, source, dedup_key, payload,
+                       attempts, fire_at, created_at, state, sent_at
+                  FROM session_wake_events
+                 WHERE thread_id = $1
+                   AND payload->>'_delivery_id' = $2
+                 ORDER BY created_at, id
+                """,
+                thread_uuid,
+                delivery_uuid,
             )
         return [dict(row) for row in rows]
 
@@ -10742,6 +10924,26 @@ class PostgresDB:
                    SET state = 'pending',
                        claimed_at = NULL,
                        fire_at = $2
+                 WHERE id = ANY($1::bigint[])
+                   AND state = 'sending'
+                """,
+                event_ids,
+                fire_at,
+            )
+
+    async def defer_session_wake_events_for_input(
+        self, event_ids: List[int], *, fire_at: datetime
+    ) -> None:
+        """Retry a persisted delivery without charging a network failure."""
+
+        if not event_ids:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_wake_events
+                   SET state = 'pending', claimed_at = NULL, fire_at = $2,
+                       attempts = GREATEST(0, attempts - 1)
                  WHERE id = ANY($1::bigint[])
                    AND state = 'sending'
                 """,
@@ -18279,6 +18481,40 @@ class PostgresDB:
                 turn_number,
             )
         return str(row["id"])
+
+    async def persist_thread_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        role: str,
+        content: str,
+        source: str,
+        turn_number: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Persist an unclaimed pinned input for a future/current runtime."""
+
+        from src.shared.persistent_input_delivery import persist_input_delivery
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await persist_input_delivery(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    role=role,
+                    content=content,
+                    source=source,
+                    turn_number=turn_number,
+                )
+
+    async def get_thread_input_delivery(
+        self, delivery_id: str
+    ) -> Optional[Dict[str, Any]]:
+        from src.shared.persistent_input_delivery import get_input_delivery
+
+        async with self.acquire() as conn:
+            return await get_input_delivery(conn, delivery_id)
 
     @staticmethod
     def _thread_message_to_dict(row: Any) -> Dict[str, Any]:

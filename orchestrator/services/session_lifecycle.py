@@ -74,7 +74,12 @@ async def wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
     return False
 
 
-async def probe_ready(pod_ip: str, pod_port: int) -> bool:
+async def probe_ready(
+    pod_ip: str,
+    pod_port: int,
+    *,
+    required_capability: str | None = None,
+) -> bool:
     """Single-shot probe of the agent pod's /ready endpoint.
 
     Returns True iff the agent's three-way ``_session_ready()`` check
@@ -90,6 +95,16 @@ async def probe_ready(pod_ip: str, pod_port: int) -> bool:
     try:
         async with httpx.AsyncClient(timeout=2) as client:
             resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
-            return resp.status_code == 200 and bool(resp.json().get("ready"))
+            if resp.status_code != 200:
+                return False
+            payload = resp.json()
+            if not bool(payload.get("ready")):
+                return False
+            if required_capability is None:
+                return True
+            capabilities = payload.get("capabilities")
+            return isinstance(capabilities, dict) and bool(
+                capabilities.get(required_capability)
+            )
     except Exception:
         return False

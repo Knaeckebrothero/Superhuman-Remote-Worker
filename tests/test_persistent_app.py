@@ -4823,7 +4823,12 @@ class TestCreatePersistentApp:
         payload = json.loads(response.body)
 
         assert response.status_code == 200
-        assert payload == {"ready": True, "mode": "persistent", "thread_id": "tid"}
+        assert payload == {
+            "ready": True,
+            "mode": "persistent",
+            "thread_id": "tid",
+            "capabilities": {"durable_input_delivery": True},
+        }
 
     def test_app_guide_health_reports_reader_registration_loss(self, monkeypatch):
         import src.api.persistent_app as mod
