@@ -1788,15 +1788,49 @@ class PostgresDB:
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
-        # One row beyond the page makes has_more exact even when the total is
-        # capped or was not computed at all.
+        # Paging is over DISPLAY ROOTS, not rows. A display root is a matching
+        # job whose parent is not itself matching; its matching children ride
+        # along with it and are never counted against the page size.
+        #
+        # Without this, expanding a parent could reveal children that live on
+        # another page — the row set and the tree disagree — and "page 2 of 9"
+        # stops meaning anything once a parent contributes a variable number of
+        # rows. It also delivers §7.2's `origin=subjob` special case for free:
+        # when only children match, every one of them has a non-matching parent
+        # and so becomes a display root, i.e. the view flattens by itself.
+        #
+        # Scale note: `matched` materialises id/parent/created_at for the whole
+        # filtered set. Fine at thousands; revisit at millions, where the
+        # NOT IN anti-join is what would need rewriting into a NOT EXISTS.
         page_values = [*values, limit + 1, offset]
         limit_param = f"${len(page_values) - 1}"
         offset_param = f"${len(page_values)}"
 
+        matched_cte = f"""
+            matched AS (
+                SELECT j.id, j.parent_job_id, j.created_at
+                  FROM jobs j
+                  LEFT JOIN projects p ON p.id = j.project_id
+                {where_clause}
+            ),
+            display_roots AS (
+                SELECT m.id, m.created_at
+                  FROM matched m
+                 WHERE m.parent_job_id IS NULL
+                    OR m.parent_job_id NOT IN (SELECT id FROM matched)
+            )
+        """
+
         async with self.acquire() as conn:
             fetched = await conn.fetch(
                 f"""
+                WITH {matched_cte},
+                page AS (
+                    SELECT id, created_at
+                      FROM display_roots
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT {limit_param} OFFSET {offset_param}
+                )
                 SELECT j.id, j.description, j.status, j.origin,
                        j.config_name, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
@@ -1808,8 +1842,14 @@ class PostgresDB:
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        (pa.id IS NOT NULL) AS pending_approval,
-                       pa.id AS pending_approval_request_id
-                FROM jobs j
+                       pa.id AS pending_approval_request_id,
+                       page.id AS display_root_id,
+                       (page.id = j.id) AS is_display_root
+                FROM page
+                JOIN jobs j
+                  ON j.id = page.id
+                  OR (j.parent_job_id = page.id
+                      AND j.id IN (SELECT id FROM matched))
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN LATERAL (
                     SELECT s.id FROM sudo_approval_requests s
@@ -1818,9 +1858,9 @@ class PostgresDB:
                     ORDER BY s.requested_at DESC
                     LIMIT 1
                 ) pa ON TRUE
-                {where_clause}
-                ORDER BY j.created_at DESC, j.id DESC
-                LIMIT {limit_param} OFFSET {offset_param}
+                ORDER BY page.created_at DESC, page.id DESC,
+                         (page.id = j.id) DESC,
+                         j.created_at DESC, j.id DESC
                 """,
                 *page_values,
             )
@@ -1829,20 +1869,15 @@ class PostgresDB:
             total_is_capped = False
             if include_total:
                 # Counting inside a LIMIT bounds the work: past the cap we
-                # stop counting and say "N+". The projects join stays because
-                # the archived filter references it; the LATERAL sudo lookup
-                # goes, since it is ON TRUE with an inner LIMIT 1 and so
-                # cannot change the count.
+                # stop counting and say "N+". Counts display roots, so it is
+                # the same unit the page size is expressed in.
                 count_values = [*values, JOB_COUNT_CAP + 1]
                 cap_param = f"${len(count_values)}"
                 counted = await conn.fetchval(
                     f"""
+                    WITH {matched_cte}
                     SELECT count(*) FROM (
-                        SELECT 1
-                        FROM jobs j
-                        LEFT JOIN projects p ON p.id = j.project_id
-                        {where_clause}
-                        LIMIT {cap_param}
+                        SELECT 1 FROM display_roots LIMIT {cap_param}
                     ) capped
                     """,
                     *count_values,
@@ -1853,9 +1888,21 @@ class PostgresDB:
                     total_is_capped = True
 
         rows = [dict(row) for row in fetched]
-        has_more = len(rows) > limit
+
+        # has_more is measured in display roots, because that is what the page
+        # size counts. Fetching limit+1 roots and dropping the surplus root
+        # WITH ITS CHILDREN keeps the page a whole number of trees.
+        root_order: list[Any] = []
+        seen_roots: set[Any] = set()
+        for row in rows:
+            root_id = row["display_root_id"]
+            if root_id not in seen_roots:
+                seen_roots.add(root_id)
+                root_order.append(root_id)
+        has_more = len(root_order) > limit
         if has_more:
-            rows = rows[:limit]
+            keep = set(root_order[:limit])
+            rows = [row for row in rows if row["display_root_id"] in keep]
 
         return JobQueryResult(
             jobs=rows,
