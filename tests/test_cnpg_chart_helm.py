@@ -351,3 +351,82 @@ def test_every_rendered_cluster_gets_a_credential_object():
     clusters = {c["metadata"]["name"] for c in _cluster(*_all_cnpg())}
     credentials = set(_credentials(*_all_cnpg()))
     assert {f"{name}-app" for name in clusters} == credentials
+
+
+# --- network policies ------------------------------------------------------
+#
+# There is no giteadb NetworkPolicy in the chart -- a pre-existing gap, not one
+# this phase introduces. Nothing restricts that database today, so CNPG
+# replication is not blocked there either; adding a policy would be a new
+# restriction and belongs in its own change.
+POLICIES = "templates/databases/network-policies.yaml"
+POLICY_COMPONENTS = {
+    "postgres": "postgres",
+    "vector": "pgvector",
+    "audit": "auditdb",
+    "keycloak": "keycloakdb",
+}
+
+
+def _policies(*settings: str) -> dict[str, dict]:
+    documents = _render(*settings, show_only=POLICIES)
+    return {d["metadata"]["name"]: d for d in _kinds(documents, "NetworkPolicy")}
+
+
+def _sources(policy: dict, kind: str) -> list[dict]:
+    return [
+        rule[kind]
+        for entry in policy["spec"]["ingress"]
+        for rule in entry.get("from", [])
+        if kind in rule
+    ]
+
+
+@pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
+def test_replication_between_instances_is_allowed(key, component):
+    """Multi-instance CNPG streams WAL between its own pods on 5432. The
+    current from-list names orchestrator/agent/etc but not the DB itself."""
+    policy = _policies(f"databases.{key}.engine=cnpg", f"databases.{key}.instances=2")[
+        f"{FULLNAME}-{component}"
+    ]
+    selectors = _sources(policy, "podSelector")
+    assert any(
+        s["matchLabels"].get("app.kubernetes.io/component") == component
+        for s in selectors
+    ), (
+        "the database must accept connections from its own pods, or streaming replication is silently blocked"
+    )
+
+
+@pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
+def test_operator_namespace_is_allowed_to_reach_instances(key, component):
+    """If the operator cannot poll instance health it cannot fail over --
+    which is the entire feature."""
+    policy = _policies(f"databases.{key}.engine=cnpg")[f"{FULLNAME}-{component}"]
+    namespaces = _sources(policy, "namespaceSelector")
+    assert namespaces, "no namespaceSelector allows the CNPG operator in"
+    assert any(
+        n["matchLabels"].get("kubernetes.io/metadata.name") == "cnpg-system"
+        for n in namespaces
+    )
+
+
+def test_operator_namespace_is_configurable():
+    policy = _policies(
+        "databases.postgres.engine=cnpg", "databases.operator.namespace=pg-ops"
+    )[f"{FULLNAME}-postgres"]
+    assert any(
+        n["matchLabels"].get("kubernetes.io/metadata.name") == "pg-ops"
+        for n in _sources(policy, "namespaceSelector")
+    )
+
+
+@pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
+def test_statefulset_policy_is_unchanged_when_inert(key, component):
+    policy = _policies()[f"{FULLNAME}-{component}"]
+    components = [
+        s["matchLabels"].get("app.kubernetes.io/component")
+        for s in _sources(policy, "podSelector")
+    ]
+    assert component not in components
+    assert _sources(policy, "namespaceSelector") == []
