@@ -336,3 +336,84 @@ def test_first_backup_is_immediate_by_default():
     install must not wait for the first scheduled window."""
     backup = _scheduled(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres-backup"]
     assert backup["spec"]["immediate"] is True
+
+
+# --- NOTES.txt -------------------------------------------------------------
+#
+# `helm template` does not render NOTES.txt, and `helm install --dry-run` needs
+# a live cluster carrying every CRD the chart references. So the warnings live
+# in a named template (`srw.backupNotes`) and are rendered here through a probe
+# chart -- a copy with one extra manifest that emits the template into a
+# ConfigMap, which `helm template --show-only` can reach.
+
+
+@pytest.fixture(scope="session")
+def probe_chart(tmp_path_factory) -> Path:
+    chart = tmp_path_factory.mktemp("notes-probe") / "chart"
+    shutil.copytree(CHART, chart)
+    (chart / "templates" / "zz-notes-probe.yaml").write_text(
+        "apiVersion: v1\n"
+        "kind: ConfigMap\n"
+        "metadata:\n"
+        "  name: notes-probe\n"
+        "data:\n"
+        "  notes: |\n"
+        '{{ include "srw.backupNotes" . | indent 4 }}\n'
+    )
+    return chart
+
+
+def _notes(probe_chart: Path, *settings: str) -> str:
+    command = [
+        "helm",
+        "template",
+        RELEASE,
+        str(probe_chart),
+        "-f",
+        str(CHART / "ci/test-values.yaml"),
+        "--show-only",
+        "templates/zz-notes-probe.yaml",
+    ]
+    for setting in settings:
+        command.extend(["--set", setting])
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True
+    ).stdout
+    document = next(d for d in yaml.safe_load_all(rendered) if d)
+    return (document["data"].get("notes") or "").lower()
+
+
+def test_notes_warn_when_a_cnpg_cluster_has_no_backups(probe_chart):
+    assert "no backups" in _notes(probe_chart, *_all_cnpg())
+
+
+def test_notes_are_quiet_when_no_cluster_exists(probe_chart):
+    """The Phase 2 default: databases are StatefulSets, which this warning is
+    not about. Crying wolf on every install trains operators to ignore it."""
+    assert _notes(probe_chart).strip() == ""
+
+
+def test_notes_stop_warning_once_backups_are_configured(probe_chart):
+    assert "no backups" not in _notes(probe_chart, *BACKUP_ON, *_all_cnpg())
+
+
+def test_notes_warn_when_backups_point_at_this_releases_own_garage(probe_chart):
+    notes = _notes(
+        probe_chart,
+        *_all_cnpg(),
+        "garage.enabled=true",
+        "databases.backup.method=objectstore",
+        "databases.backup.destinationPath=s3://srw-pgbackup/x",
+        f"databases.backup.endpointURL=http://{FULLNAME}-garage:3900",
+    )
+    assert "same cluster" in notes
+
+
+def test_notes_do_not_warn_about_an_external_endpoint(probe_chart):
+    assert "same cluster" not in _notes(
+        probe_chart,
+        *_all_cnpg(),
+        "databases.backup.method=objectstore",
+        "databases.backup.destinationPath=s3://srw-pgbackup/x",
+        "databases.backup.endpointURL=https://s3.eu-central-1.amazonaws.com",
+    )

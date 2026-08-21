@@ -920,3 +920,39 @@ the data tier has actually moved.
 {{- end -}}
 {{- $any -}}
 {{- end }}
+
+{{/*
+Backup warnings for NOTES.txt. A named template because `helm template` cannot
+render NOTES.txt at all and `helm install --dry-run` needs a live cluster with
+every CRD present -- so this is the only form the warnings can be tested in.
+Both warnings exist because the failure they describe is otherwise silent.
+*/}}
+{{- define "srw.backupNotes" -}}
+{{- if (include "srw.anyDbRendersCnpg" .) }}
+{{- if ne .Values.databases.backup.method "objectstore" }}
+
+  ⚠  DATABASES ARE RUNNING WITH NO BACKUPS
+
+     One or more databases run on CloudNativePG and databases.backup.method is
+     "none". There is no WAL archive and no base backup, so there is no
+     point-in-time recovery and no recovery at all from a lost volume.
+
+     Set databases.backup.method=objectstore and databases.backup.destinationPath,
+     and install the Barman Cloud plugin — this chart cannot install it, because
+     it is a raw manifest pinned to the operator's namespace. See
+     knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+{{- else if and (include "srw.garageEnabled" .) (contains (printf "%s-garage" (include "srw.fullname" .)) .Values.databases.backup.endpointURL) }}
+
+  ⚠  BACKUPS POINT AT THIS RELEASE'S OWN OBJECT STORE
+
+     databases.backup.endpointURL resolves to the Garage service in this same
+     release. Garage here is a single node on a single PVC in the same cluster
+     as the databases it would be backing up, so a node loss, a storage-class
+     failure or a mistaken namespace delete takes the databases AND their
+     backups together.
+
+     This is worse than having no backups, because it looks like having them.
+     Point it at storage in a different failure domain.
+{{- end }}
+{{- end }}
+{{- end }}

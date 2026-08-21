@@ -81,3 +81,4 @@ durable Canvas presentations, workspace snapshots, and the virtual tier.
 Inspect the one-time bootstrap (layout + buckets + keys):
   kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-garage-bootstrap
 {{- end }}
+{{ include "srw.backupNotes" . }}
