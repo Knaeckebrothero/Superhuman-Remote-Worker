@@ -199,3 +199,68 @@ def test_objectstore_validates_against_the_real_crd():
         (ROOT / "tests/data/barman_objectstore_crd.yaml").read_text()
     )
     jsonschema.validate(_store(*BACKUP_ON, *_all_cnpg()), schema)
+
+
+# --- cluster wiring --------------------------------------------------------
+
+
+def _clusters(*settings: str) -> dict[str, dict]:
+    return {
+        c["metadata"]["name"]: c
+        for c in _kinds(_render(*settings, show_only=CLUSTER), "Cluster")
+    }
+
+
+def _plugins(cluster: dict) -> list[dict]:
+    return cluster["spec"].get("plugins", [])
+
+
+def test_no_plugin_entry_when_backups_are_off():
+    for cluster in _clusters(*_all_cnpg()).values():
+        assert _plugins(cluster) == []
+
+
+def test_backing_up_cluster_gets_the_wal_archiver():
+    cluster = _clusters(*BACKUP_ON, *_all_cnpg())[f"{FULLNAME}-postgres"]
+    entry = _plugins(cluster)[0]
+    assert entry["name"] == "barman-cloud.cloudnative-pg.io"
+    assert entry["isWALArchiver"] is True
+    assert entry["parameters"]["barmanObjectName"] == f"{FULLNAME}-backups"
+
+
+def test_plugin_points_at_the_objectstore_that_actually_renders():
+    clusters = _clusters(*BACKUP_ON, *_all_cnpg())
+    referenced = {
+        entry["parameters"]["barmanObjectName"]
+        for cluster in clusters.values()
+        for entry in _plugins(cluster)
+    }
+    assert referenced == {_store(*BACKUP_ON, *_all_cnpg())["metadata"]["name"]}
+
+
+def test_audit_is_excluded_by_default():
+    """Append-heavy, so it dominates WAL volume, and it is non-fatal by
+    contract and already retention-bounded."""
+    clusters = _clusters(*BACKUP_ON, *_all_cnpg())
+    assert _plugins(clusters[f"{FULLNAME}-auditdb"]) == []
+    assert _plugins(clusters[f"{FULLNAME}-postgres"]) != []
+
+
+def test_audit_can_be_opted_in():
+    clusters = _clusters(*BACKUP_ON, *_all_cnpg(), "databases.audit.backupEnabled=true")
+    assert _plugins(clusters[f"{FULLNAME}-auditdb"]) != []
+
+
+def test_a_database_can_opt_out():
+    clusters = _clusters(
+        *BACKUP_ON, *_all_cnpg(), "databases.gitea.backupEnabled=false"
+    )
+    assert _plugins(clusters[f"{FULLNAME}-giteadb"]) == []
+
+
+def test_unmigrated_databases_are_untouched():
+    """Backups configured, only one database migrated: exactly one Cluster,
+    and no plugin entry leaks onto anything else."""
+    clusters = _clusters(*BACKUP_ON, "databases.postgres.engine=cnpg")
+    assert set(clusters) == {f"{FULLNAME}-postgres"}
+    assert _plugins(clusters[f"{FULLNAME}-postgres"]) != []

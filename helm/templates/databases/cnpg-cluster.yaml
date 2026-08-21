@@ -57,6 +57,15 @@ spec:
     extensions:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+  {{- if (include "srw.dbBacksUp" (dict "context" $ctx "key" .key)) }}
+  # Continuous WAL archiving. Base backups come from the ScheduledBackup beside
+  # this; both go through the same plugin and the same ObjectStore.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ include "srw.fullname" $ctx }}-backups
+  {{- end }}
   bootstrap:
     initdb:
       database: {{ .database | quote }}
@@ -68,25 +77,25 @@ spec:
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "key" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "key" "vector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "key" "audit" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "gitea")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "key" "gitea" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "key" "keycloak" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak") }}
 {{- end }}
