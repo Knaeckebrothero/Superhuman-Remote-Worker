@@ -54,8 +54,9 @@ class VMReadinessService:
         self._provisioner = provisioner
         self._trigger_dispatch = trigger_dispatch
         configured = max_inflight or int(os.getenv("VM_READINESS_MAX_INFLIGHT", "8"))
-        self._semaphore = asyncio.Semaphore(max(1, configured))
+        self._max_inflight = max(1, configured)
         self._inflight: set[tuple[str, str, str]] = set()
+        self._tasks: set[asyncio.Task[None]] = set()
         self._retry_after: dict[tuple[str, str, str], float] = {}
         self._failures: dict[tuple[str, str, str], int] = {}
         self._ready_rescan_s = ready_rescan_s
@@ -72,6 +73,10 @@ class VMReadinessService:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=3.0)
             except asyncio.TimeoutError:
                 pass
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         logger.info("Same-cluster VM readiness prober stopped")
 
     async def run_cycle(self) -> None:
@@ -93,30 +98,77 @@ class VMReadinessService:
             rows.extend(("thread", row, True) for row in ready_threads)
             self._last_ready_scan = now
 
-        tasks = [
-            self._schedule(entity_type, row, reprobe)
-            for entity_type, row, reprobe in rows
-        ]
-        if tasks:
-            await asyncio.gather(*tasks)
+        candidate_keys = {
+            key
+            for entity_type, row, _reprobe in rows
+            if (key := self._candidate_key(entity_type, row)) is not None
+        }
+        self._failures = {
+            key: failures
+            for key, failures in self._failures.items()
+            if key in candidate_keys
+        }
+        self._retry_after = {
+            key: retry_at
+            for key, retry_at in self._retry_after.items()
+            if key in candidate_keys
+        }
+        for entity_type, row, reprobe in rows:
+            if len(self._inflight) >= self._max_inflight:
+                break
+            key = self._candidate_key(entity_type, row)
+            if (
+                key is None
+                or key in self._inflight
+                or time.monotonic() < self._retry_after.get(key, 0.0)
+            ):
+                continue
+            self._inflight.add(key)
+            task = asyncio.create_task(
+                self._run_probe_task(entity_type, row, reprobe, key)
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._probe_done)
 
-    async def _schedule(
-        self, entity_type: str, row: Mapping[str, Any], reprobe: bool
-    ) -> None:
+        # Give freshly-created tasks a chance to start without making a DB scan
+        # wait for controller/SSH timeouts. The next cycle deduplicates them via
+        # ``_inflight``.
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _candidate_key(
+        entity_type: str, row: Mapping[str, Any]
+    ) -> tuple[str, str, str] | None:
         entity_id = str(row.get("entity_id") or "")
-        vm = _vm_object(row.get("vm"))
-        generation = _generation(vm.get("provision_generation"))
+        generation = _generation(_vm_object(row.get("vm")).get("provision_generation"))
         if not entity_id or generation is None:
-            return
-        key = (entity_type, entity_id, generation)
-        if key in self._inflight or time.monotonic() < self._retry_after.get(key, 0.0):
-            return
-        self._inflight.add(key)
+            return None
+        return entity_type, entity_id, generation
+
+    async def _run_probe_task(
+        self,
+        entity_type: str,
+        row: Mapping[str, Any],
+        reprobe: bool,
+        key: tuple[str, str, str],
+    ) -> None:
+        _, entity_id, generation = key
+        vm = _vm_object(row.get("vm"))
         try:
-            async with self._semaphore:
-                await self._probe(entity_type, entity_id, generation, vm, row, reprobe)
+            await self._probe(entity_type, entity_id, generation, vm, row, reprobe)
         finally:
             self._inflight.discard(key)
+
+    def _probe_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "VM readiness probe task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def _probe(
         self,
@@ -132,6 +184,13 @@ class VMReadinessService:
             entity_id, entity_type=entity_type
         )
         if not isinstance(status, Mapping):
+            if reprobe:
+                logger.debug(
+                    "Ready VM %s %s status query unavailable; preserving readiness",
+                    entity_type,
+                    entity_id,
+                )
+                return
             await self._transient_failure(
                 key,
                 entity_type,
@@ -139,6 +198,26 @@ class VMReadinessService:
                 generation,
                 vm,
                 "controller status unavailable",
+                reprobe=False,
+            )
+            return
+
+        reported_generation = status.get("provision_generation")
+        if reported_generation not in (None, generation):
+            logger.debug(
+                "Ignoring VM status for stale generation on %s %s",
+                entity_type,
+                entity_id,
+            )
+            return
+
+        if status.get("status") == "not_found":
+            await self._provisioner._set_context_if_generation(
+                entity_type,
+                entity_id,
+                generation,
+                {"status": "ssh_unreachable", "ssh_probe_error": "vm not found"},
+                require_status_not_ready=not reprobe,
             )
             return
 
@@ -149,6 +228,7 @@ class VMReadinessService:
                 entity_id,
                 generation,
                 {"status": "ssh_unreachable", "ssh_probe_error": "vm stopped"},
+                require_status_not_ready=not reprobe,
             )
             return
 
@@ -170,8 +250,21 @@ class VMReadinessService:
             return
 
         if not await probe_workspace_ssh(pod_ip, 22):
+            if reprobe:
+                logger.debug(
+                    "Ready VM %s %s failed changed-pod TCP probe; preserving readiness",
+                    entity_type,
+                    entity_id,
+                )
+                return
             await self._transient_failure(
-                key, entity_type, entity_id, generation, vm, "TCP probe failed"
+                key,
+                entity_type,
+                entity_id,
+                generation,
+                vm,
+                "TCP probe failed",
+                reprobe=reprobe,
             )
             return
         ready, _attempts, error = await wait_for_agent_ssh(
@@ -183,6 +276,13 @@ class VMReadinessService:
             interval_s=0.5,
         )
         if not ready:
+            if reprobe:
+                logger.debug(
+                    "Ready VM %s %s failed changed-pod SSH auth; preserving readiness",
+                    entity_type,
+                    entity_id,
+                )
+                return
             await self._transient_failure(
                 key,
                 entity_type,
@@ -190,6 +290,7 @@ class VMReadinessService:
                 generation,
                 vm,
                 error or "SSH authentication failed",
+                reprobe=reprobe,
             )
             return
 
@@ -206,7 +307,7 @@ class VMReadinessService:
                 "active_pod_uid": active_pod_uid,
                 "ssh_ready_source": "provisioner_probe",
                 "ssh_verified_at": verified_at,
-                "ssh_registration_id": str(uuid4()),
+                "ssh_registration_id": uuid4().hex,
                 "ssh_probe_error": None,
                 "recovering": False,
             },
@@ -233,6 +334,8 @@ class VMReadinessService:
         generation: str,
         vm: Mapping[str, Any],
         error: str,
+        *,
+        reprobe: bool,
     ) -> None:
         failures = self._failures.get(key, 0) + 1
         self._failures[key] = failures
@@ -248,6 +351,7 @@ class VMReadinessService:
                 "ssh_probe_error": error[:500],
                 "ssh_probe_attempts": int(vm.get("ssh_probe_attempts") or 0) + 1,
             },
+            require_status_not_ready=not reprobe,
         )
 
 

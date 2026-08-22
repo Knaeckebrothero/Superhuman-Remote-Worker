@@ -16,6 +16,7 @@ from src.shared.workspace_contract import (
     resolve_workspace_runtime,
     strip_and_stamp_workspace_creation,
     validate_worker_workspace_projection,
+    vm_mode_from_env,
     workspace_contract_projection,
 )
 
@@ -27,6 +28,25 @@ HISTORICAL_K8S_JOB_RUNTIME = {
     "port": 30022,
     "host": "workspace-job.internal",
 }
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, "external"),
+        (" SAME-CLUSTER ", "same-cluster"),
+        ("off", "off"),
+        ("invalid", "external"),
+    ],
+)
+def test_vm_mode_from_env_normalizes_without_changing_pure_resolver(
+    monkeypatch, configured, expected
+):
+    if configured is None:
+        monkeypatch.delenv("VM_MODE", raising=False)
+    else:
+        monkeypatch.setenv("VM_MODE", configured)
+    assert vm_mode_from_env() == expected
 
 
 def _runtime_attestation(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
@@ -27,6 +28,21 @@ WORKSPACE_CONTRACT_VERSION = 1
 CANONICAL_WORKSPACE_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
 REMOTE_WORKSPACE_BACKENDS = frozenset({"sandbox", "vm"})
 _ALIASES = {"container": "sandbox", "remote": "vm"}
+_VM_MODES = frozenset({"off", "same-cluster", "external"})
+
+
+def vm_mode_from_env() -> str:
+    """Return the normalized deployment VM mode for impure API projections.
+
+    Runtime resolution remains pure: callers that project persisted rows read
+    the process configuration here and pass the result explicitly.
+    """
+
+    mode = os.getenv("VM_MODE")
+    if mode is None:
+        return "external"
+    normalized = mode.strip().lower()
+    return normalized if normalized in _VM_MODES else "external"
 
 
 class WorkspaceContractError(ValueError):

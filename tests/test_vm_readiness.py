@@ -47,11 +47,14 @@ class FakeDB:
 
 
 class FakeProvisioner:
-    def __init__(self, status):
+    def __init__(self, status, *, write_result=True):
         self.status = status
+        self.write_result = write_result
         self.writes = []
+        self.queries = []
 
     async def query_status(self, entity_id, *, entity_type="job"):
+        self.queries.append((entity_type, entity_id))
         value = (
             self.status(entity_id, entity_type)
             if callable(self.status)
@@ -73,7 +76,7 @@ class FakeProvisioner:
         self.writes.append(
             (entity_type, entity_id, generation, updates, require_status_not_ready)
         )
-        return True
+        return self.write_result
 
 
 @pytest.fixture
@@ -121,6 +124,7 @@ async def test_first_probe_success_promotes_once_with_cas(successful_ssh):
     assert updates["recovering"] is False
     successful_ssh[2].assert_awaited_once()
     trigger.assert_called_once()
+    assert len(provisioner.writes) == 1
 
 
 @pytest.mark.asyncio
@@ -145,6 +149,58 @@ async def test_transient_failure_records_pending_attempt(monkeypatch):
     assert updates["status"] == "ssh_pending"
     assert updates["ssh_probe_attempts"] == 3
     assert "TCP" in updates["ssh_probe_error"]
+    assert provisioner.writes[-1][4] is True
+
+
+@pytest.mark.asyncio
+async def test_reprobe_controller_blip_preserves_ready_row(successful_ssh):
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(None)
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes == []
+    successful_ssh[0].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprobe_probe_failure_preserves_ready_row(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.probe_workspace_ssh",
+        AsyncMock(return_value=False),
+    )
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.21",
+            "active_pod_uid": "pod-new",
+            "phase": "Running",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes == []
+
+
+@pytest.mark.asyncio
+async def test_not_found_marks_ready_vm_unreachable(successful_ssh):
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner({"status": "not_found"})
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes[-1][3] == {
+        "status": "ssh_unreachable",
+        "ssh_probe_error": "vm not found",
+    }
 
 
 @pytest.mark.asyncio
@@ -181,6 +237,111 @@ async def test_ip_change_reprobes_ready_vm(successful_ssh):
     await service.run_cycle()
     assert provisioner.writes[-1][3]["ssh_host"] == "10.42.0.21"
     assert provisioner.writes[-1][4] is False
+
+
+@pytest.mark.asyncio
+async def test_reprobe_unchanged_identity_is_noop(successful_ssh):
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.20",
+            "phase": "Running",
+            "active_pod_uid": "pod-old",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes == []
+    successful_ssh[0].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_controller_generation_is_ignored(successful_ssh):
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.21",
+            "active_pod_uid": "pod-new",
+            "provision_generation": "33333333-3333-4333-8333-333333333333",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(jobs=[candidate()]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes == []
+    successful_ssh[0].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_promotion_suppresses_seed_and_dispatch(successful_ssh):
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.22",
+            "phase": "Running",
+            "active_pod_uid": "pod-new",
+        },
+        write_result=False,
+    )
+    trigger = MagicMock()
+
+    await VMReadinessService(
+        FakeDB(jobs=[candidate()]), provisioner, trigger_dispatch=trigger
+    ).run_cycle()
+
+    assert len(provisioner.writes) == 1
+    successful_ssh[2].assert_not_awaited()
+    trigger.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_backoff_skips_candidate(successful_ssh):
+    row = candidate()
+    provisioner = FakeProvisioner({"ready": False})
+    service = VMReadinessService(
+        FakeDB(jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    )
+    key = ("job", row["entity_id"], GENERATION)
+    service._retry_after[key] = asyncio.get_running_loop().time() + 60
+
+    await service.run_cycle()
+
+    assert provisioner.queries == []
+
+
+@pytest.mark.asyncio
+async def test_inflight_key_deduplicates_candidate(successful_ssh):
+    row = candidate()
+    provisioner = FakeProvisioner({"ready": False})
+    service = VMReadinessService(
+        FakeDB(jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    )
+    service._inflight.add(("job", row["entity_id"], GENERATION))
+
+    await service.run_cycle()
+
+    assert provisioner.queries == []
+
+
+@pytest.mark.asyncio
+async def test_retry_state_pruned_for_non_candidates(successful_ssh):
+    service = VMReadinessService(
+        FakeDB(), FakeProvisioner({"ready": False}), trigger_dispatch=lambda: None
+    )
+    stale = ("job", "11111111-1111-4111-8111-111111111199", GENERATION)
+    service._failures[stale] = 4
+    service._retry_after[stale] = 999999999.0
+
+    await service.run_cycle()
+
+    assert service._failures == {}
+    assert service._retry_after == {}
 
 
 @pytest.mark.asyncio
@@ -281,3 +442,36 @@ async def test_database_generation_merge_includes_ready_cas(
     assert status_expression in query
     assert "IS DISTINCT FROM 'ready'" in query
     assert args[-1] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "terminal_predicate"),
+    [
+        (
+            "list_job_vm_readiness_candidates",
+            "jobs.status NOT IN ('completed','failed','cancelled')",
+        ),
+        (
+            "list_thread_vm_readiness_candidates",
+            "threads.status <> 'ended' AND threads.ended_at IS NULL",
+        ),
+    ],
+)
+async def test_readiness_queries_filter_finished_fake_row(
+    method_name, terminal_predicate
+):
+    stale_row = candidate(status="created")
+
+    class Connection:
+        async def fetch(self, query):
+            return [] if terminal_predicate in query else [stale_row]
+
+    db = PostgresDB("postgresql://unused")
+
+    @asynccontextmanager
+    async def acquire():
+        yield Connection()
+
+    db.acquire = acquire
+    assert await getattr(db, method_name)() == []
