@@ -387,3 +387,33 @@ def test_keycloak_jdbc_url_flips():
     assert (
         env["KC_DB_URL"] == f"jdbc:postgresql://{FULLNAME}-keycloakdb-rw:5432/keycloak"
     )
+
+
+# --- storage ---------------------------------------------------------------
+
+
+def test_cluster_storage_defaults_to_the_shared_size():
+    cluster = _clusters("databases.postgres.engine=cnpg")[f"{FULLNAME}-postgres"]
+    assert cluster["spec"]["storage"]["size"] == "16Gi"
+
+
+def test_cluster_storage_can_be_sized_independently():
+    """A logical restore needs room for the data, the indexes it rebuilds AND
+    the WAL it generates, all on one PVC -- so a Cluster wants more than the
+    legacy pod ever did."""
+    cluster = _clusters(
+        "databases.vector.engine=cnpg", "databases.vector.cnpgStorageSize=64Gi"
+    )[f"{FULLNAME}-pgvector"]
+    assert cluster["spec"]["storage"]["size"] == "64Gi"
+
+
+def test_legacy_pvc_is_untouched_by_the_cluster_size():
+    """storageSize also sizes the legacy PVC, and a PVC cannot shrink. Raising
+    it there to give the Cluster headroom would be a one-way change to a live
+    database's volume."""
+    documents = _render("databases.vector.cnpgStorageSize=64Gi")
+    claims = {
+        d["metadata"]["name"]: d["spec"]["resources"]["requests"]["storage"]
+        for d in _kinds(documents, "PersistentVolumeClaim")
+    }
+    assert claims[f"{FULLNAME}-pgvector-data"] == "16Gi"
