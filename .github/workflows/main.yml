@@ -847,7 +847,7 @@ jobs:
       - name: Build sudo-gated (Go daemon)
         working-directory: vm/sudo-daemon
         run: |
-          go mod tidy
+          go mod verify
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
             -ldflags "-s -w -X main.version=sha-${GITHUB_SHA::7}" \
             -o sudo-gated ./cmd/sudo-gated/
@@ -1027,7 +1027,6 @@ jobs:
         with:
           name: sudo-gate-binaries
           path: docker/agent-vm-base/files/
-        continue-on-error: true
       - name: Prepare sudo gate binaries for Packer
         working-directory: docker/agent-vm-base
         # upload-artifact@v4 roots the archive at the LONGEST COMMON ANCESTOR
@@ -1035,20 +1034,12 @@ jobs:
         # sudo-plugin/... — no vm/ prefix. This step checked files/vm/... and
         # silently shipped empty placeholders (VM images had no sudo gate).
         run: |
-          if [ -f files/sudo-daemon/sudo-gated ]; then
-            mv files/sudo-daemon/sudo-gated files/sudo-gated-bin
-            echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
-          else
-            touch files/sudo-gated-bin
-            echo "sudo-gated binary not available — creating empty placeholder"
-          fi
-          if [ -f files/sudo-plugin/sudo_gate.so ]; then
-            mv files/sudo-plugin/sudo_gate.so files/sudo_gate.so
-            echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
-          else
-            touch files/sudo_gate.so
-            echo "sudo_gate.so not available — creating empty placeholder"
-          fi
+          mv files/sudo-daemon/sudo-gated files/sudo-gated-bin
+          mv files/sudo-plugin/sudo_gate.so files/sudo_gate.so
+          test -s files/sudo-gated-bin || { echo "::error::sudo-gated artifact is empty"; exit 1; }
+          test -s files/sudo_gate.so || { echo "::error::sudo_gate.so artifact is empty"; exit 1; }
+          echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
+          echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
           ls -la files/
       - name: Free disk space
         # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
