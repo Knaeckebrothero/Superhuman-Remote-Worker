@@ -5685,8 +5685,7 @@ class PostgresDB:
             "    COALESCE(metadata, '{}'::jsonb), "
             "    '{ide_session}', "
             "    COALESCE(metadata->'ide_session', '{}'::jsonb) || $1::jsonb"
-            "), "
-            "    last_activity = CURRENT_TIMESTAMP "
+            ") "
             "WHERE id = $2"
         )
         async with self.acquire() as conn:

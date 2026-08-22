@@ -40,7 +40,7 @@ def vm_mode_from_env() -> str:
 
     mode = os.getenv("VM_MODE")
     if mode is None:
-        return "external"
+        return "off"
     normalized = mode.strip().lower()
     return normalized if normalized in _VM_MODES else "external"
 

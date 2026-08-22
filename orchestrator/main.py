@@ -165,7 +165,6 @@ from security.access import (  # noqa: E402
     user_can_access_any_job,
     user_can_access_datasource,
     user_can_access_ide_entity,
-    user_can_access_job,
     user_can_access_job_or_thread,
     user_visible_project_ids,
 )
@@ -18140,7 +18139,8 @@ async def list_sudo_requests(
         return rows
     visible: list[dict] = []
     for row in rows:
-        if await user_can_access_job(caller, postgres_db, row.get("job_id")):
+        entity_id = row.get("thread_id") or row.get("job_id")
+        if await user_can_access_job_or_thread(caller, postgres_db, entity_id):
             visible.append(row)
     return visible
 
@@ -18154,7 +18154,8 @@ async def get_sudo_request(request: Request, request_id: str) -> dict:
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
         )
-    if not await user_can_access_job(caller, postgres_db, result.get("job_id")):
+    entity_id = result.get("thread_id") or result.get("job_id")
+    if not await user_can_access_job_or_thread(caller, postgres_db, entity_id):
         raise HTTPException(
             status_code=403, detail="Not authorized to access this sudo request"
         )

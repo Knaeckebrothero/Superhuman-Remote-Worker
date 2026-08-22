@@ -33,7 +33,7 @@ HISTORICAL_K8S_JOB_RUNTIME = {
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
-        (None, "external"),
+        (None, "off"),
         (" SAME-CLUSTER ", "same-cluster"),
         ("off", "off"),
         ("invalid", "external"),

@@ -31,7 +31,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from orchestrator.services.sudo_gate import SudoGateService, _SHELL_META_RE  # noqa: E402
-from orchestrator.services.sudo_gate import SudoRequestConflict  # noqa: E402
+from orchestrator.services.sudo_gate import (  # noqa: E402
+    SudoEntityUnavailable,
+    SudoRequestConflict,
+)
 
 
 # =============================================================================
@@ -87,6 +90,13 @@ def make_db_pool(
 
     pool = MagicMock()
     pool.acquire = acquire
+    pool.get_thread = AsyncMock(return_value=None)
+    pool.get_job = AsyncMock(
+        return_value={
+            "id": "job-aaa",
+            "context": {"vm": {"provision_generation": "nats-generation"}},
+        }
+    )
     return pool, conn
 
 
@@ -147,6 +157,17 @@ def make_sudo_request_data(
 
 
 HTTP_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+HTTP_GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
+def http_identity(**overrides):
+    values = {
+        "entity_type": "job",
+        "entity_id": "job-aaa",
+        "provision_generation": HTTP_GENERATION,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def make_http_sudo_body(**overrides):
@@ -176,6 +197,7 @@ def make_http_row(**overrides):
         "command": "apt-get",
         "arguments": ["install", "-y", "curl"],
         "working_directory": "/workspace",
+        "metadata": {"provision_generation": HTTP_GENERATION},
     }
     row.update(overrides)
     return row
@@ -188,12 +210,17 @@ class TestHttpSudoBridge:
         db = AsyncMock()
         db.get_job.return_value = {
             "id": "job-aaa",
-            "context": {"vm": {"vm_name": "vm-from-context"}},
+            "context": {
+                "vm": {
+                    "vm_name": "vm-from-context",
+                    "provision_generation": HTTP_GENERATION,
+                }
+            },
         }
         svc.connect(db)
         svc._get_request_by_reply_subject = AsyncMock(return_value=None)
         svc._insert_request = AsyncMock(return_value=HTTP_REQUEST_ID)
-        svc._get_request = AsyncMock(return_value=make_http_row())
+        svc._get_request = AsyncMock(side_effect=[None, make_http_row()])
         svc._broadcast_sse = AsyncMock()
         svc._notify_project_officer = AsyncMock()
         return svc
@@ -203,9 +230,13 @@ class TestHttpSudoBridge:
         svc = self.service()
         svc._evaluate_auto_rules = AsyncMock(return_value="approve")
         svc._finalize_request = AsyncMock()
+        svc._get_request.side_effect = [
+            None,
+            make_http_row(status="auto_approved", decision_reason="auto-approval rule"),
+        ]
 
         result = await svc.open_request(
-            SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+            http_identity(),
             make_http_sudo_body(),
         )
 
@@ -213,6 +244,17 @@ class TestHttpSudoBridge:
         assert result.reason == "auto-approval rule"
         svc._finalize_request.assert_awaited_once()
         svc._broadcast_sse.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_rule_finalize_failure_returns_actual_pending_state(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value="approve")
+        svc._finalize_request = AsyncMock()
+
+        result = await svc.open_request(http_identity(), make_http_sudo_body())
+
+        assert result.status == "pending"
+        assert result.reason is None
 
     @pytest.mark.asyncio
     async def test_pending_becomes_approved_across_polls(self, monkeypatch):
@@ -239,7 +281,7 @@ class TestHttpSudoBridge:
         svc._get_request_by_reply_subject.return_value = make_http_row()
 
         result = await svc.open_request(
-            SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+            http_identity(),
             make_http_sudo_body(),
         )
 
@@ -253,9 +295,57 @@ class TestHttpSudoBridge:
 
         with pytest.raises(SudoRequestConflict):
             await svc.open_request(
-                SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+                http_identity(),
                 make_http_sudo_body(cwd="/different"),
             )
+
+    @pytest.mark.asyncio
+    async def test_repost_from_new_vm_generation_conflicts(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+        new_generation = "33333333-3333-4333-8333-333333333333"
+        svc._db.get_job.return_value["context"]["vm"]["provision_generation"] = (
+            new_generation
+        )
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(
+                http_identity(provision_generation=new_generation),
+                make_http_sudo_body(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_client_request_id_collision_with_other_claim_conflicts(self):
+        svc = self.service()
+        svc._get_request.side_effect = None
+        svc._get_request.return_value = make_http_row(
+            nats_reply_subject="_INBOX.some-other-request"
+        )
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(http_identity(), make_http_sudo_body())
+
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_entity_vanishing_between_auth_and_open_is_rejected(self):
+        svc = self.service()
+        svc._db.get_job.return_value = None
+
+        with pytest.raises(SudoEntityUnavailable):
+            await svc.open_request(http_identity(), make_http_sudo_body())
+
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_open_stores_current_provision_generation(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value=None)
+
+        await svc.open_request(http_identity(), make_http_sudo_body())
+
+        metadata = svc._insert_request.await_args.kwargs["metadata"]
+        assert metadata["provision_generation"] == HTTP_GENERATION
 
     @pytest.mark.asyncio
     async def test_sweep_expiry_ends_wait(self, monkeypatch):

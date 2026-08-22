@@ -20,6 +20,7 @@ import re
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from typing import Any, Optional
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,10 @@ _SHELL_META_RE = re.compile(r"[|;&`$><]|\$\(|\|\||&&")
 
 class SudoRequestConflict(ValueError):
     """The HTTP idempotency key is already bound to a different payload."""
+
+
+class SudoEntityUnavailable(ValueError):
+    """The VM entity disappeared or changed generation during authentication."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +51,18 @@ def _public_status(value: object) -> str:
         "auto_approved": "approved",
         "auto_denied": "denied",
     }.get(str(value), str(value))
+
+
+def _object(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
 
 
 class SudoGateService:
@@ -71,27 +88,41 @@ class SudoGateService:
         payload = (
             body.model_dump(mode="json") if hasattr(body, "model_dump") else dict(body)
         )
+        payload["provision_generation"] = identity.provision_generation
         client_request_id = str(payload["request_id"])
         reply_subject = f"http:{client_request_id}"
+        entity = (
+            await self._db.get_thread(identity.entity_id)
+            if identity.entity_type == "thread"
+            else await self._db.get_job(identity.entity_id)
+        )
+        if not isinstance(entity, Mapping):
+            raise SudoEntityUnavailable("VM entity is no longer available")
+        container = (
+            entity.get("metadata")
+            if identity.entity_type == "thread"
+            else entity.get("context")
+        )
+        vm = _object(_object(container).get("vm"))
+        if vm.get("provision_generation") != identity.provision_generation:
+            raise SudoEntityUnavailable("VM generation is no longer current")
+
         existing = await self._get_request_by_reply_subject(reply_subject)
         if existing:
             self._assert_http_entity(existing, identity)
             self._assert_same_http_payload(existing, payload)
             return self._open_result(existing, created=False)
 
-        entity = (
-            await self._db.get_thread(identity.entity_id)
-            if identity.entity_type == "thread"
-            else await self._db.get_job(identity.entity_id)
-        )
-        container = (
-            entity.get("metadata")
-            if identity.entity_type == "thread"
-            else entity.get("context")
-        )
-        if isinstance(container, str):
-            container = json.loads(container)
-        vm = container.get("vm", {}) if isinstance(container, Mapping) else {}
+        existing_id = await self._get_request(client_request_id)
+        if existing_id:
+            if existing_id.get("nats_reply_subject") != reply_subject:
+                raise SudoRequestConflict(
+                    "request_id is already bound to a different request"
+                )
+            self._assert_http_entity(existing_id, identity)
+            self._assert_same_http_payload(existing_id, payload)
+            return self._open_result(existing_id, created=False)
+
         vm_name = vm.get("vm_name") or "vm"
         job_id = identity.entity_id if identity.entity_type == "job" else None
         thread_id = identity.entity_id if identity.entity_type == "thread" else None
@@ -110,11 +141,16 @@ class SudoGateService:
         )
         if request_id is None:
             existing = await self._get_request_by_reply_subject(reply_subject)
-            if not existing:
-                raise RuntimeError("sudo request claim disappeared")
-            self._assert_http_entity(existing, identity)
-            self._assert_same_http_payload(existing, payload)
-            return self._open_result(existing, created=False)
+            if existing:
+                self._assert_http_entity(existing, identity)
+                self._assert_same_http_payload(existing, payload)
+                return self._open_result(existing, created=False)
+            existing_id = await self._get_request(client_request_id)
+            if existing_id:
+                raise SudoRequestConflict(
+                    "request_id is already bound to a different request"
+                )
+            raise RuntimeError("sudo request claim disappeared")
 
         command_string = (
             " ".join(payload["argv"]) if payload["argv"] else payload["command"]
@@ -157,20 +193,11 @@ class SudoGateService:
 
         row = await self._get_request(request_id)
         if row:
-            result = self._open_result(row, created=True)
-            if decided_status is not None and result.status == "pending":
-                return SudoOpenResult(
-                    request_id,
-                    _public_status(decided_status),
-                    reason,
-                    row.get("expires_at"),
-                    True,
-                )
-            return result
+            return self._open_result(row, created=True)
         return SudoOpenResult(
             request_id,
-            _public_status(decided_status or "pending"),
-            reason,
+            "pending",
+            None,
             None,
             True,
         )
@@ -182,13 +209,17 @@ class SudoGateService:
         *,
         entity_type: str | None = None,
         entity_id: str | None = None,
+        provision_generation: str | None = None,
     ) -> dict[str, Any] | None:
         """Poll row truth without retaining a pool connection during sleeps."""
 
         deadline = asyncio.get_running_loop().time() + min(max(float(max_wait), 0), 30)
         while True:
             row = await self._get_scoped_request(
-                request_id, entity_type=entity_type, entity_id=entity_id
+                request_id,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                provision_generation=provision_generation,
             )
             if not row:
                 return None
@@ -227,7 +258,11 @@ class SudoGateService:
     @staticmethod
     def _assert_http_entity(row: Mapping[str, Any], identity: Any) -> None:
         column = "thread_id" if identity.entity_type == "thread" else "job_id"
-        if str(row.get(column) or "") != identity.entity_id:
+        metadata = _object(row.get("metadata"))
+        if (
+            str(row.get(column) or "") != identity.entity_id
+            or metadata.get("provision_generation") != identity.provision_generation
+        ):
             raise SudoRequestConflict("request_id is already bound to another entity")
 
     @staticmethod
@@ -274,7 +309,7 @@ class SudoGateService:
             logger.error("Malformed sudo request payload: %s", e)
             return
 
-        job_id = data.get("job_id", "")
+        entity_id = data.get("job_id", "")
         vm_id = data.get("vm_id", "")
         command = data.get("command", "")
         argv = data.get("argv", [])
@@ -284,7 +319,7 @@ class SudoGateService:
 
         logger.info(
             "Sudo request: job=%s vm=%s user=%s cmd=%s",
-            job_id,
+            entity_id,
             vm_id,
             command,
             " ".join(argv),
@@ -296,8 +331,16 @@ class SudoGateService:
         # reply subject (migration 0040) and only the winner proceeds. (HA / M2-L4)
         reply_subject = msg.reply if hasattr(msg, "reply") else None
         try:
+            from services.vm_guest_events import resolve_vm_entity
+
+            identity = await resolve_vm_entity(self._db, entity_id)
+            if identity is None:
+                raise SudoEntityUnavailable("unknown VM entity")
+            job_id = identity.entity_id if identity.entity_type == "job" else None
+            thread_id = identity.entity_id if identity.entity_type == "thread" else None
             request_id = await self._insert_request(
                 job_id=job_id,
+                thread_id=thread_id,
                 vm_name=vm_id,
                 command=command,
                 arguments=argv,
@@ -305,7 +348,10 @@ class SudoGateService:
                 requesting_user=user,
                 target_user=runas_user,
                 nats_reply_subject=reply_subject,
-                metadata=data,
+                metadata={
+                    **data,
+                    "provision_generation": identity.provision_generation,
+                },
             )
         except Exception as e:
             # Genuine DB failure — deny so the daemon doesn't hang.
@@ -369,6 +415,7 @@ class SudoGateService:
         event = {
             "id": str(request_id),
             "job_id": job_id,
+            "thread_id": thread_id,
             "vm_name": vm_id,
             "command": command,
             "arguments": argv,
@@ -379,7 +426,11 @@ class SudoGateService:
         }
         await self._broadcast_sse("new_request", event)
         await self._notify_project_officer(
-            str(request_id), job_id, command, "sudo_command"
+            str(request_id),
+            job_id,
+            command,
+            "sudo_command",
+            thread_id=thread_id,
         )
 
     # =========================================================================
@@ -833,8 +884,7 @@ class SudoGateService:
                 VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5,
                         $6, $7, $8, $9, $10, $11,
                         NOW() + INTERVAL '300 seconds')
-                ON CONFLICT (nats_reply_subject) WHERE nats_reply_subject IS NOT NULL
-                DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 request_id,
@@ -974,16 +1024,30 @@ class SudoGateService:
         *,
         entity_type: str | None,
         entity_id: str | None,
+        provision_generation: str | None = None,
     ):
         if not self._db:
             return None
+        try:
+            request_uuid = UUID(str(request_id))
+        except (TypeError, ValueError):
+            return None
         if entity_type not in {"job", "thread"} or not entity_id:
-            return await self._get_request(request_id)
+            return await self._get_request(str(request_uuid))
         column = "thread_id" if entity_type == "thread" else "job_id"
         async with self._db.acquire() as conn:
+            if provision_generation is not None:
+                return await conn.fetchrow(
+                    f"SELECT * FROM sudo_approval_requests "
+                    f"WHERE id = $1 AND {column} = $2 "
+                    "AND metadata->>'provision_generation' = $3",
+                    request_uuid,
+                    entity_id,
+                    provision_generation,
+                )
             return await conn.fetchrow(
                 f"SELECT * FROM sudo_approval_requests WHERE id = $1 AND {column} = $2",
-                request_id,
+                request_uuid,
                 entity_id,
             )
 

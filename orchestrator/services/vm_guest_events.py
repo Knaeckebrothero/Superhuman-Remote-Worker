@@ -186,5 +186,13 @@ async def record_heartbeat(
             if identity.entity_type == "thread"
             else db.merge_ide_session_context
         )
-        await method(identity.entity_id, updates)
+        try:
+            await method(identity.entity_id, updates)
+        except Exception:
+            logger.warning(
+                "Could not update IDE session heartbeat for %s %s",
+                identity.entity_type,
+                identity.entity_id,
+                exc_info=True,
+            )
     return merged
