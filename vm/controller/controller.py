@@ -46,6 +46,7 @@ try:
         AUTH_FIELD,
         AUTH_VERSION,
         configured_secret,
+        guest_token,
         sign_payload,
         unsigned_payload,
         verify_payload,
@@ -55,6 +56,7 @@ except ImportError:  # Standalone controller image executes controller.py direct
         AUTH_FIELD,
         AUTH_VERSION,
         configured_secret,
+        guest_token,
         sign_payload,
         unsigned_payload,
         verify_payload,
@@ -82,7 +84,22 @@ NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4
 # vm.lifecycle.create and provision duplicate VMs.
 ORCHESTRATOR_ID = os.environ.get("ORCHESTRATOR_ID", "").strip()
 VM_TEMPLATE_PATH = os.environ.get("VM_TEMPLATE_PATH", "/config/vm-template.yaml")
+VM_CLOUD_INIT_PATH = os.environ.get("VM_CLOUD_INIT_PATH", "/config/cloud-init.yaml")
 VM_NAMESPACE = os.environ.get("VM_NAMESPACE", "agent-vms")
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").strip()
+VM_DEFAULT_NETWORK_TIER = os.environ.get("VM_DEFAULT_NETWORK_TIER", "").strip()
+VM_MAX_CONCURRENT = max(0, int(os.environ.get("VM_MAX_CONCURRENT", "0")))
+VM_NODE_SELECTOR = json.loads(os.environ.get("VM_NODE_SELECTOR", "{}") or "{}")
+VM_TOLERATIONS = json.loads(os.environ.get("VM_TOLERATIONS", "[]") or "[]")
+if not isinstance(VM_NODE_SELECTOR, dict) or not all(
+    isinstance(key, str) and isinstance(value, str)
+    for key, value in VM_NODE_SELECTOR.items()
+):
+    raise ValueError("VM_NODE_SELECTOR must be a JSON object with string values")
+if not isinstance(VM_TOLERATIONS, list) or not all(
+    isinstance(item, dict) for item in VM_TOLERATIONS
+):
+    raise ValueError("VM_TOLERATIONS must be a JSON array of objects")
 DEFAULT_VM_IMAGE = os.environ.get(
     "DEFAULT_VM_IMAGE",
     "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
@@ -174,6 +191,7 @@ _LIFECYCLE_NONCE_LABEL = "srw.io/vm-lifecycle-nonce"
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_PLURAL = "virtualmachines"
+KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
 
 # CDI (Containerized Data Importer) API coordinates — golden DataVolumes
 CDI_GROUP = "cdi.kubevirt.io"
@@ -196,6 +214,7 @@ MAX_DESCRIPTION_LEN = 200
 
 _OWNER_KINDS = frozenset({"job", "thread"})
 _PROVISION_GENERATION_ANNOTATION = "srw.io/provision-generation"
+_NETWORK_TIER_PATTERN = re.compile(r"^[a-z0-9-]{1,63}$")
 
 
 def _owner_identity(job_config: dict) -> tuple[str, str]:
@@ -393,6 +412,7 @@ class VMController:
         self.core_api = None  # kubernetes CoreV1Api (read-only PVC identity)
         self.coordination_api = None  # durable lifecycle replay claims
         self.template_text: str = ""  # Raw YAML template (for string substitution)
+        self.cloud_init_text: str = ""  # Optional Secret-backed cloud-init payload
         self.headscale = HeadscaleClient()
         self._shutdown = asyncio.Event()
         self._seen_lifecycle_requests: OrderedDict[str, float] = OrderedDict()
@@ -405,6 +425,10 @@ class VMController:
         self._lifecycle_locks = tuple(
             asyncio.Lock() for _ in range(LIFECYCLE_LOCK_STRIPES)
         )
+        # Admission capacity is process-wide, not per entity. Holding this
+        # lock from the live-VM count through VirtualMachine admission makes
+        # VM_MAX_CONCURRENT a hard cap for concurrent creates.
+        self._capacity_lock = asyncio.Lock()
 
     def _lifecycle_lock_for(self, entity_id: str) -> asyncio.Lock:
         locks = getattr(self, "_lifecycle_locks", None)
@@ -612,6 +636,16 @@ class VMController:
         with open(path) as f:
             self.template_text = f.read()
 
+        cloud_init_path = VM_CLOUD_INIT_PATH
+        if os.path.exists(cloud_init_path):
+            with open(cloud_init_path) as f:
+                self.cloud_init_text = f.read()
+            log.info("Loaded cloud-init template from %s", cloud_init_path)
+        else:
+            # The parked external chart embeds userData in its VM template.
+            # Keeping this optional preserves that image/transport contract.
+            self.cloud_init_text = ""
+
         log.info("Loaded VM template from %s", path)
 
     @staticmethod
@@ -649,6 +683,29 @@ class VMController:
         """
         headscale_url = os.environ.get("HEADSCALE_URL", "")
         owner_kind, owner_id = _owner_identity(job_config)
+        # The orchestrator resolves the project's tier per job; the chart's
+        # VM_DEFAULT_NETWORK_TIER is only the fallback for payloads that omit it.
+        network_tier = (
+            str(job_config.get("network_tier") or "").strip()
+            or VM_DEFAULT_NETWORK_TIER
+            or "internet-only"
+        )
+        if not _NETWORK_TIER_PATTERN.fullmatch(network_tier):
+            raise ValueError("network_tier must match ^[a-z0-9-]{1,63}$")
+        orchestrator_url = (
+            ORCHESTRATOR_URL or str(job_config.get("orchestrator_url") or "").strip()
+        )
+        generation = _provision_generation(job_config.get("provision_generation"))
+        vm_auth_token = (
+            guest_token(
+                LIFECYCLE_HMAC_SECRET,
+                owner_kind,
+                owner_id,
+                generation,
+            )
+            if LIFECYCLE_HMAC_SECRET is not None and generation is not None
+            else ""
+        )
 
         replacements = {
             "${JOB_ID}": job_config["job_id"],
@@ -679,6 +736,9 @@ class VMController:
             # Secret. The inline-key branch contains no such placeholder, so
             # an absent environment value is harmless there.
             "${SSH_AUTHORIZED_KEY}": os.environ.get("SSH_AUTHORIZED_KEY", ""),
+            "${VM_AUTH_TOKEN}": vm_auth_token,
+            "${ORCHESTRATOR_URL}": orchestrator_url,
+            "${NETWORK_TIER}": network_tier,
         }
 
         rendered = self.template_text
@@ -686,8 +746,19 @@ class VMController:
             rendered = rendered.replace(placeholder, value)
 
         manifest = yaml.safe_load(rendered)
+        vmi_spec = manifest["spec"]["template"]["spec"]
+        if VM_NODE_SELECTOR:
+            vmi_spec["nodeSelector"] = dict(VM_NODE_SELECTOR)
+        if VM_TOLERATIONS:
+            vmi_spec["tolerations"] = list(VM_TOLERATIONS)
+        if cloud_init_text := getattr(self, "cloud_init_text", ""):
+            rendered_cloud_init = cloud_init_text
+            for placeholder, value in replacements.items():
+                rendered_cloud_init = rendered_cloud_init.replace(placeholder, value)
+            # Internal hand-off only; removed before the VM is sent to KubeVirt.
+            manifest["_srwCloudInitUserData"] = rendered_cloud_init
         _stamp_owner_identity(manifest, owner_kind, owner_id)
-        if generation := _provision_generation(job_config.get("provision_generation")):
+        if generation:
             _stamp_provision_generation(manifest, generation)
         return manifest
 
@@ -732,11 +803,149 @@ class VMController:
     # payload. Both NATS and HTTP transports wrap these.
     # =========================================================================
 
+    async def _capacity_wait(self, vm_name: str) -> dict | None:
+        """Return waiting_capacity when the live VM cap is already occupied."""
+
+        if VM_MAX_CONCURRENT == 0:
+            return None
+        response = await asyncio.to_thread(
+            self.k8s_client.list_namespaced_custom_object,
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+        )
+        live_names = []
+        for item in response.get("items", []):
+            metadata = item.get("metadata", {})
+            name = metadata.get("name", "")
+            if (
+                name.startswith("agent-vm-")
+                and not name.startswith("agent-vm-golden-")
+                and not metadata.get("deletionTimestamp")
+            ):
+                live_names.append(name)
+        # A retried create for an admitted VM remains idempotent even at cap.
+        if vm_name in live_names or len(live_names) < VM_MAX_CONCURRENT:
+            return None
+        return {
+            "status": "waiting_capacity",
+            "running_vms": len(live_names),
+            "max_concurrent_vms": VM_MAX_CONCURRENT,
+        }
+
+    async def _ensure_cloud_init_secret(
+        self,
+        *,
+        job_id: str,
+        owner_kind: str,
+        generation: str | None,
+        user_data: str,
+    ) -> bool:
+        """Ensure the NoCloud Secret and report whether this call created it."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        secret_name = f"agent-vm-{job_id}-cloudinit"
+        metadata: dict[str, object] = {
+            "name": secret_name,
+            "namespace": VM_NAMESPACE,
+            "labels": {
+                "srw.io/owner-kind": owner_kind,
+                "srw.io/owner-id": job_id,
+            },
+        }
+        if generation is not None:
+            metadata["annotations"] = {_PROVISION_GENERATION_ANNOTATION: generation}
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": metadata,
+            "type": "Opaque",
+            "stringData": {"userdata": user_data},
+        }
+        try:
+            await asyncio.to_thread(
+                self.core_api.create_namespaced_secret,
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+            return True
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            existing = await asyncio.to_thread(
+                self.core_api.read_namespaced_secret,
+                name=secret_name,
+                namespace=VM_NAMESPACE,
+            )
+            existing_metadata = getattr(existing, "metadata", None)
+            labels = getattr(existing_metadata, "labels", None) or {}
+            annotations = getattr(existing_metadata, "annotations", None) or {}
+            if (
+                labels.get("srw.io/owner-kind") != owner_kind
+                or labels.get("srw.io/owner-id") != job_id
+                or (
+                    generation is not None
+                    and annotations.get(_PROVISION_GENERATION_ANNOTATION) != generation
+                )
+            ):
+                raise RuntimeError(
+                    "existing cloud-init Secret belongs to another VM generation"
+                ) from exc
+            return False
+
+    async def _patch_cloud_init_secret_owner(
+        self, *, job_id: str, vm_name: str, vm_uid: str
+    ) -> None:
+        """Make the admitted VirtualMachine own its token-bearing Secret."""
+
+        await asyncio.to_thread(
+            self.core_api.patch_namespaced_secret,
+            name=f"agent-vm-{job_id}-cloudinit",
+            namespace=VM_NAMESPACE,
+            body={
+                "metadata": {
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "kubevirt.io/v1",
+                            "kind": "VirtualMachine",
+                            "name": vm_name,
+                            "uid": vm_uid,
+                            "controller": True,
+                            "blockOwnerDeletion": False,
+                        }
+                    ]
+                }
+            },
+        )
+
+    async def _delete_cloud_init_secret(self, job_id: str) -> None:
+        """Delete a VM's NoCloud Secret, tolerating an already-absent Secret."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.core_api.delete_namespaced_secret,
+                name=f"agent-vm-{job_id}-cloudinit",
+                namespace=VM_NAMESPACE,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
     async def _do_create(self, job_config: dict) -> dict:
         """Create a KubeVirt VirtualMachine for a job."""
         job_id = job_config.get("job_id", "unknown")
         async with self._lifecycle_lock_for(str(job_id)):
-            return await self._do_create_serialized(job_config)
+            capacity_lock = getattr(self, "_capacity_lock", None)
+            if capacity_lock is None:
+                # A few unit-test fixtures intentionally construct via __new__.
+                capacity_lock = asyncio.Lock()
+                self._capacity_lock = capacity_lock
+            async with capacity_lock:
+                return await self._do_create_serialized(job_config)
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
         """Create while holding the reusable entity-name lifecycle lock."""
@@ -750,6 +959,13 @@ class VMController:
                 "authenticated VM create requires a canonical provision_generation"
             )
         log.info("Creating VM for job %s", job_id)
+
+        capacity = await self._capacity_wait(f"agent-vm-{job_id}")
+        if capacity is not None:
+            result = {"job_id": job_id, **capacity}
+            if generation is not None:
+                result["provision_generation"] = generation
+            return result
 
         # Golden-image acceleration: import the base image once into a shared
         # golden PVC and clone the rootdisk from it, instead of a per-VM registry
@@ -820,7 +1036,16 @@ class VMController:
                     result["provision_generation"] = generation
                 return result
 
+        if (
+            "${SSH_AUTHORIZED_KEY}" in getattr(self, "cloud_init_text", "")
+            and not os.environ.get("SSH_AUTHORIZED_KEY", "").strip()
+        ):
+            raise ValueError(
+                "SSH_AUTHORIZED_KEY must be non-empty for Secret-backed cloud-init"
+            )
+
         manifest = self.render_template(job_config, tailscale_auth_key)
+        cloud_init_user_data = manifest.pop("_srwCloudInitUserData", None)
         vm_name = manifest["metadata"]["name"]
         if golden_name:
             self._apply_clone_source(manifest, golden_name)
@@ -831,63 +1056,81 @@ class VMController:
         if VM_PERSISTENT_ROOTDISK:
             await self._ensure_rootdisk(manifest, job_id, owner_kind=owner_kind)
 
+        cloud_init_secret_created = False
+        if cloud_init_user_data is not None:
+            cloud_init_secret_created = await self._ensure_cloud_init_secret(
+                job_id=job_id,
+                owner_kind=owner_kind,
+                generation=generation,
+                user_data=cloud_init_user_data,
+            )
+
         max_retries = 12  # ~60s total
         admitted_vm: object | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                admitted_vm = self.k8s_client.create_namespaced_custom_object(
-                    group=KUBEVIRT_GROUP,
-                    version=KUBEVIRT_VERSION,
-                    namespace=VM_NAMESPACE,
-                    plural=KUBEVIRT_PLURAL,
-                    body=manifest,
-                )
-                break
-            except ApiException as e:
-                if e.status == 409 and "is being deleted" in (e.body or ""):
-                    if attempt < max_retries:
-                        log.info(
-                            "VM %s still being deleted, waiting... (attempt %d/%d)",
-                            vm_name,
-                            attempt + 1,
-                            max_retries,
-                        )
-                        await asyncio.sleep(5)
-                        continue
-                    log.error(
-                        "VM %s still being deleted after %d retries, giving up",
-                        vm_name,
-                        max_retries,
-                    )
-                elif e.status == 409:
-                    # Plain AlreadyExists: the name is agent-vm-<job_id>, so a
-                    # live VM with this name IS this job's VM — a duplicate or
-                    # racing create lost to one that already succeeded. Treat
-                    # as idempotent success; propagating the 409 as a 'failed'
-                    # status parked two healthy loop jobs (see knowledge-base/knowledge/issues/
-                    # golden_image_cold_import_fails_inflight_vm_jobs.md §B).
-                    log.info(
-                        "VM %s already exists (job %s) — idempotent create",
-                        vm_name,
-                        job_id,
-                    )
-                    # A 409 response has no admitted object. Read the exact
-                    # existing VM so its immutable metadata.uid crosses the
-                    # transport boundary just like a successful create result.
-                    admitted_vm = self.k8s_client.get_namespaced_custom_object(
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    admitted_vm = await asyncio.to_thread(
+                        self.k8s_client.create_namespaced_custom_object,
                         group=KUBEVIRT_GROUP,
                         version=KUBEVIRT_VERSION,
                         namespace=VM_NAMESPACE,
                         plural=KUBEVIRT_PLURAL,
-                        name=vm_name,
+                        body=manifest,
                     )
-                    admitted_generation = _admitted_provision_generation(admitted_vm)
-                    if generation is not None and admitted_generation != generation:
-                        raise RuntimeError(
-                            "existing VM belongs to another provision generation"
-                        )
                     break
-                raise
+                except ApiException as e:
+                    if e.status == 409 and "is being deleted" in (e.body or ""):
+                        if attempt < max_retries:
+                            log.info(
+                                "VM %s still being deleted, waiting... (attempt %d/%d)",
+                                vm_name,
+                                attempt + 1,
+                                max_retries,
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        log.error(
+                            "VM %s still being deleted after %d retries, giving up",
+                            vm_name,
+                            max_retries,
+                        )
+                    elif e.status == 409:
+                        # Plain AlreadyExists: the name is agent-vm-<job_id>, so a
+                        # live VM with this name IS this job's VM — a duplicate or
+                        # racing create lost to one that already succeeded. Treat
+                        # as idempotent success; propagating the 409 as a 'failed'
+                        # status parked two healthy loop jobs (see knowledge-base/knowledge/issues/
+                        # golden_image_cold_import_fails_inflight_vm_jobs.md §B).
+                        log.info(
+                            "VM %s already exists (job %s) — idempotent create",
+                            vm_name,
+                            job_id,
+                        )
+                        # A 409 response has no admitted object. Read the exact
+                        # existing VM so its immutable metadata.uid crosses the
+                        # transport boundary just like a successful create result.
+                        admitted_vm = await asyncio.to_thread(
+                            self.k8s_client.get_namespaced_custom_object,
+                            group=KUBEVIRT_GROUP,
+                            version=KUBEVIRT_VERSION,
+                            namespace=VM_NAMESPACE,
+                            plural=KUBEVIRT_PLURAL,
+                            name=vm_name,
+                        )
+                        admitted_generation = _admitted_provision_generation(
+                            admitted_vm
+                        )
+                        if generation is not None and admitted_generation != generation:
+                            raise RuntimeError(
+                                "existing VM belongs to another provision generation"
+                            )
+                        break
+                    raise
+        except Exception:
+            if cloud_init_secret_created:
+                await self._delete_cloud_init_secret(job_id)
+            raise
 
         vm_uid = _admitted_vm_uid(admitted_vm, expected_name=vm_name)
         admitted_generation = _admitted_provision_generation(admitted_vm)
@@ -898,7 +1141,8 @@ class VMController:
             # A defensive GET covers proxies/older clients that omit the body;
             # failure remains fail-closed instead of publishing name-only
             # ownership as exact.
-            admitted_vm = self.k8s_client.get_namespaced_custom_object(
+            admitted_vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
                 group=KUBEVIRT_GROUP,
                 version=KUBEVIRT_VERSION,
                 namespace=VM_NAMESPACE,
@@ -912,6 +1156,13 @@ class VMController:
         if generation is not None and admitted_generation != generation:
             raise RuntimeError(
                 "Kubernetes admitted VM response has another provision generation"
+            )
+
+        if cloud_init_user_data is not None:
+            await self._patch_cloud_init_secret_owner(
+                job_id=job_id,
+                vm_name=vm_name,
+                vm_uid=vm_uid,
             )
 
         rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
@@ -1017,7 +1268,8 @@ class VMController:
         admitted_vm_uid = None
         if generation is not None:
             try:
-                current_vm = self.k8s_client.get_namespaced_custom_object(
+                current_vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
                     group=KUBEVIRT_GROUP,
                     version=KUBEVIRT_VERSION,
                     namespace=VM_NAMESPACE,
@@ -1075,7 +1327,8 @@ class VMController:
         try:
             if vm_already_absent:
                 raise ApiException(status=404)
-            self.k8s_client.delete_namespaced_custom_object(
+            await asyncio.to_thread(
+                self.k8s_client.delete_namespaced_custom_object,
                 group=KUBEVIRT_GROUP,
                 version=KUBEVIRT_VERSION,
                 namespace=VM_NAMESPACE,
@@ -1098,6 +1351,8 @@ class VMController:
                 log.info("VM %s already gone (404), treating as deleted", vm_name)
             else:
                 raise
+
+        await self._delete_cloud_init_secret(job_id)
 
         if purge_disk:
             # Non-fatal: a disk we failed to delete is a leak the GC backstop
@@ -1206,7 +1461,8 @@ class VMController:
 
         vm_name = f"agent-vm-{job_id}"
         try:
-            vm = self.k8s_client.get_namespaced_custom_object(
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
                 group=KUBEVIRT_GROUP,
                 version=KUBEVIRT_VERSION,
                 namespace=VM_NAMESPACE,
@@ -1259,6 +1515,36 @@ class VMController:
             result["provision_generation"] = generation
         if entity_type in _OWNER_KINDS:
             result["entity_type"] = entity_type
+
+        try:
+            vmi = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_VMI_PLURAL,
+                name=vm_name,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+        else:
+            vmi_status = vmi.get("status", {})
+            interfaces = vmi_status.get("interfaces") or []
+            pod_ip = interfaces[0].get("ipAddress") if interfaces else None
+            active_pods = vmi_status.get("activePods") or {}
+            active_pod_uid = next(iter(active_pods), None)
+            if active_pod_uid is None and self.core_api is not None:
+                pods = await asyncio.to_thread(
+                    self.core_api.list_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    label_selector=f"vm.kubevirt.io/name={vm_name}",
+                )
+                items = getattr(pods, "items", None) or []
+                if isinstance(items, list) and items:
+                    active_pod_uid = getattr(items[0].metadata, "uid", None)
+            result["pod_ip"] = pod_ip
+            result["active_pod_uid"] = active_pod_uid
         if exact_absence:
             rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
                 _rootdisk_name(job_id),
