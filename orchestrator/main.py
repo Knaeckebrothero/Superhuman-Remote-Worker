@@ -18936,12 +18936,7 @@ async def approve_job(
                 if local_frozen.exists():
                     local_frozen.unlink()
                 # Pinned agent is still parked in-process and resumes directly.
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
-                        "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
-                        job_id,
-                    )
+                await postgres_db.resume_pinned_job_in_process(job_id)
             if (
                 job.get("execution_lane") == "stateless" or control_claim is not None
             ) and local_frozen.exists():

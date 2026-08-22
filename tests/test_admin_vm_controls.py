@@ -213,9 +213,27 @@ class TestJobNeedsVm:
         job = {"config_override": {"workspace": {"backend": "sandbox"}}}
         assert orch_main._job_needs_vm(job) is False
 
-    def test_context_vm_requested_triggers(self):
-        job = {"context": {"vm": {"requested": True}}}
+    def test_context_vm_requested_with_provenance_triggers(self):
+        """A legacy VM request counts only with provisioner-written provenance."""
+        job = {
+            "context": {
+                "vm": {
+                    "requested": True,
+                    "provision_generation": "6f1d1e02-4d24-4d6e-9f7e-6a0d1c2b3a45",
+                }
+            }
+        }
         assert orch_main._job_needs_vm(job) is True
+
+    def test_bare_context_vm_request_is_ambiguous_not_a_vm_tier(self):
+        """A bare context.vm.requested flag no longer assigns the VM tier.
+
+        The contract is the sole authority for the tier; a request with no
+        authoritative provenance is refused by the resolver, and the gate
+        feeder must fail closed rather than guess a tier from context.
+        """
+        job = {"context": {"vm": {"requested": True}}}
+        assert orch_main._job_needs_vm(job) is False
 
     def test_empty_job_does_not_trigger(self):
         assert orch_main._job_needs_vm({}) is False

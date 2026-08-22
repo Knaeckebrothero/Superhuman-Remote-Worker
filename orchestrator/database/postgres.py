@@ -55,6 +55,8 @@ from src.shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     configured_workspace_backend,
+    normalized_workspace_backend_sql,
+    pinned_dispatch_authority_jsonb_sql,
     strip_and_stamp_workspace_creation,
     workspace_contract_projection,
 )
@@ -9852,11 +9854,10 @@ class PostgresDB:
             if allow_failed
             else "AND status IN ('created', 'paused')"
         )
-        normalized_backend_sql = (
-            "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
-            "'sandbox')) WHEN 'container' THEN 'sandbox' WHEN 'remote' THEN "
-            "'vm' ELSE lower(COALESCE(config_override->'workspace'->>'backend', "
-            "'sandbox')) END"
+        normalized_backend_sql = normalized_workspace_backend_sql()
+        dispatch_authority_sql = pinned_dispatch_authority_jsonb_sql(
+            agent_expr="$2::uuid",
+            lease_expr="NOW() + make_interval(secs => $3::int)",
         )
         async with self.acquire() as conn:
             query = f"""
@@ -9869,24 +9870,7 @@ class PostgresDB:
                            context = jsonb_set(
                                COALESCE(context, '{{}}'::jsonb),
                                '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
-                               jsonb_build_object(
-                                   'version', 1,
-                                   'dispatch_kind', 'pinned',
-                                   'contract_version', CASE
-                                       WHEN context
-                                           ? '{WORKSPACE_CONTRACT_CONTEXT_KEY}'
-                                       THEN 1 ELSE 0
-                                   END,
-                                   'assigned_backend', COALESCE(
-                                       context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
-                                           ->>'assigned_backend',
-                                       {normalized_backend_sql}
-                                   ),
-                                   'agent_id', ($2::uuid)::text,
-                                   'lease_expires_at', to_jsonb(
-                                       NOW() + make_interval(secs => $3::int)
-                                   )
-                               ),
+                               {dispatch_authority_sql},
                                true
                            ),
                            error_message = NULL,
@@ -15402,6 +15386,41 @@ class PostgresDB:
                 completion_owner,
             )
         )
+
+    async def resume_pinned_job_in_process(self, job_id: str) -> bool:
+        """Resume a parked pinned agent's job without re-entering dispatch.
+
+        The agent is still running in-process and holds the job's lease, so
+        this only sheds the freeze and flips the status back. Landing on
+        processing with the agent still assigned is a dispatch boundary to
+        migration 0175's fence, so the statement re-affirms authority for the
+        agent and lease the row already carries; omitting the marker makes
+        Postgres refuse the resume outright.
+        """
+
+        authority_sql = pinned_dispatch_authority_jsonb_sql(
+            agent_expr="assigned_agent_id",
+            lease_expr="lease_expires_at",
+        )
+        async with self.acquire() as conn:
+            updated = await conn.fetchval(
+                f"""
+                UPDATE jobs
+                   SET status = 'processing',
+                       freeze_data = NULL,
+                       context = jsonb_set(
+                           COALESCE(context, '{{}}'::jsonb),
+                           '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
+                           {authority_sql},
+                           true
+                       ),
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1::uuid
+                RETURNING id
+                """,
+                UUID(job_id) if isinstance(job_id, str) else job_id,
+            )
+        return updated is not None
 
     async def queue_job_for_resume(
         self,

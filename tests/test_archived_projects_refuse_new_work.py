@@ -253,6 +253,19 @@ class TestCreateJobRefusesArchivedProjects:
         fake_request.headers = {}
         user = dict(user_a)
         fake_db.get_user = AsyncMock(return_value={"id": user["id"]})
+        # The endpoint redacts the created row before returning it, so the
+        # insert has to hand back a row shape and not a bare mock.
+        fake_db.create_job = AsyncMock(
+            return_value={
+                "id": "0f7c9a3e-1d2b-4c5a-8e9f-0a1b2c3d4e5f",
+                "user_id": str(user["id"]),
+                "project_id": None,
+                "description": "personal job",
+                "status": "created",
+                "context": {},
+                "config_override": {},
+            }
+        )
         body = JobCreate(description="personal job")
 
         with (

@@ -513,8 +513,19 @@ class TestVerificationTriggerGuards:
 
         critic_id = "11111111-2222-3333-4444-555555555555"
         create_job_mock = AsyncMock()
+        # The indexed critic row carries its OWN context — including the
+        # inherits_parent_workspace flag stamped at spawn when it copied the
+        # parent's workspace snapshot. That flag, not the parent's context, is
+        # what the handoff reads to decide the worktree path.
         round_lookup_mock = AsyncMock(
-            return_value={"id": critic_id, "config_name": "critic"}
+            return_value={
+                "id": critic_id,
+                "config_name": "critic",
+                "context": {
+                    "workspace_container": {"status": "ready"},
+                    "inherits_parent_workspace": True,
+                },
+            }
         )
         monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
@@ -580,6 +591,81 @@ class TestVerificationTriggerGuards:
             critic_id,
         )
         trigger_dispatch.assert_called_once_with()
+        assert actions == [f"critic job {critic_id} reconciled"]
+
+    @pytest.mark.asyncio
+    async def test_replay_leaves_worktree_null_for_a_non_inheriting_critic(
+        self, monkeypatch
+    ):
+        """A critic that did NOT copy the parent workspace gets no worktree.
+
+        The parent still carries a workspace_container here — presence of that
+        key on the PARENT is exactly the ambiguous signal this handoff must not
+        gate on. A stateless-lane critic provisions its own workspace, so a
+        parent-derived worktree path would point at a directory that never
+        exists on its host.
+        """
+        from orchestrator import main
+
+        critic_id = "11111111-2222-3333-4444-555555555555"
+        monkeypatch.setattr(main.postgres_db, "create_job", AsyncMock())
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            AsyncMock(
+                return_value={
+                    "id": critic_id,
+                    "config_name": "critic",
+                    "context": {"verification_target": "aaaaaaaa"},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            main.postgres_db, "merge_job_context", AsyncMock(return_value=True)
+        )
+
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 1"
+        acquired = MagicMock()
+        acquired.__aenter__ = AsyncMock(return_value=conn)
+        acquired.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+        )
+
+        gitea = MagicMock()
+        gitea.is_initialized = True
+        gitea.create_branch = AsyncMock(return_value=True)
+        monkeypatch.setattr(main, "gitea_client", gitea)
+        monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+
+        job = self._passing_job(
+            context={
+                "git_remote_url": "http://gitea/job-aaaaaaaa.git",
+                "workspace_container": {"status": "ready"},
+            }
+        )
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(
+            job,
+            self._passing_result(),
+            actions,
+            reconcile_existing_critic=True,
+        )
+
+        update_args = conn.execute.await_args.args
+        assert update_args[1:] == (
+            "subjob/11111111/critic",
+            "job-aaaaaaaa",
+            None,
+            critic_id,
+        )
         assert actions == [f"critic job {critic_id} reconciled"]
 
     @pytest.mark.asyncio

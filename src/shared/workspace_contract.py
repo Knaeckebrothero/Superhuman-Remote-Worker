@@ -415,6 +415,58 @@ def resolve_workspace_runtime(job: Mapping[str, Any]) -> WorkspaceRuntimeDecisio
     )
 
 
+def normalized_workspace_backend_sql(config_expr: str = "config_override") -> str:
+    """SQL that canonicalizes a job's configured backend the way 0175 does.
+
+    The trigger normalizes ``container``/``remote`` before comparing, so every
+    statement it fences has to normalize identically or fail the comparison.
+    """
+
+    coalesced = f"lower(COALESCE({config_expr}->'workspace'->>'backend', 'sandbox'))"
+    return (
+        f"CASE {coalesced} WHEN 'container' THEN 'sandbox' "
+        f"WHEN 'remote' THEN 'vm' ELSE {coalesced} END"
+    )
+
+
+def pinned_dispatch_authority_jsonb_sql(
+    *,
+    agent_expr: str,
+    lease_expr: str,
+    context_expr: str = "context",
+    config_expr: str = "config_override",
+) -> str:
+    """SQL that builds the pinned dispatch-authority marker for a jobs UPDATE.
+
+    Migration 0175 fences every write that lands a job on the claimed pinned
+    shape (processing, with an assigned agent) on this marker, and matches it
+    field-by-field against the row the same statement writes.  Both the
+    dispatcher's claim CAS and the in-process resume of a parked agent have to
+    emit it, so the fragment lives here rather than being retyped per call
+    site — a marker that drifts from the trigger fails closed at runtime, not
+    in review.
+
+    ``agent_expr`` and ``lease_expr`` are SQL expressions for the agent and
+    lease values the SAME statement assigns; passing anything else produces a
+    marker the trigger rejects.
+    """
+
+    normalized_backend = normalized_workspace_backend_sql(config_expr)
+    return f"""jsonb_build_object(
+    'version', 1,
+    'dispatch_kind', 'pinned',
+    'contract_version', CASE
+        WHEN {context_expr} ? '{WORKSPACE_CONTRACT_CONTEXT_KEY}' THEN 1 ELSE 0
+    END,
+    'assigned_backend', COALESCE(
+        {context_expr}->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'->>'assigned_backend',
+        {normalized_backend}
+    ),
+    'agent_id', ({agent_expr})::text,
+    'lease_expires_at', to_jsonb({lease_expr})
+)"""
+
+
 def workspace_contract_projection(job: Mapping[str, Any]) -> dict[str, Any]:
     """Safe, coordinate-free API/formatter projection."""
 
@@ -543,6 +595,8 @@ __all__ = [
     "canonicalize_workspace_config",
     "configured_workspace_backend",
     "normalize_workspace_backend",
+    "normalized_workspace_backend_sql",
+    "pinned_dispatch_authority_jsonb_sql",
     "resolve_workspace_contract",
     "resolve_workspace_runtime",
     "strip_and_stamp_workspace_creation",
