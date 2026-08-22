@@ -75,33 +75,75 @@ spec:
       owner: {{ .owner | quote }}
       secret:
         name: {{ include "srw.fullname" $ctx }}-{{ .component }}-app
+      {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "migrating" }}
+      # Logical dump/restore straight from the legacy Service. Chosen over
+      # pg_basebackup because the fleet spans PG15 and PG16, the legacy pods
+      # have no replication user or pg_hba entry, and no bytes pass through
+      # `kubectl cp` -- which silently truncated a 31MB file during the Gitea
+      # migration and left a short file that still opened cleanly.
+      #
+      # .spec.bootstrap is consulted ONLY at creation, so this stanza goes
+      # inert once the Cluster exists. That is what makes the later flip to
+      # `cnpg` a no-op rather than a re-import.
+      import:
+        type: microservice
+        databases:
+          - {{ .database | quote }}
+        source:
+          externalCluster: {{ .component }}-legacy
+        {{- with $db.importRestoreJobs }}
+        # pg_restore builds indexes in the post-data section, so this is the
+        # lever on a slow rebuild -- and the only one that matters for a
+        # database whose indexes dominate its restore.
+        pgRestorePostdataOptions:
+          - {{ printf "--jobs=%v" . | quote }}
+        {{- end }}
+      {{- end }}
   # cnpgResources when set: the shared `resources` also sizes the legacy
   # StatefulSet, and a Cluster rebuilding indexes needs a ceiling that pod
   # never does.
   resources:
     {{- toYaml ($db.cnpgResources | default $db.resources) | nindent 4 }}
+  {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "migrating" }}
+  externalClusters:
+    - name: {{ .component }}-legacy
+      connectionParameters:
+        # The LEGACY Service, which shares its name with the Cluster. The
+        # Cluster's own endpoint is "-rw"; pointing here at that would have it
+        # bootstrap from itself.
+        host: {{ include "srw.fullname" $ctx }}-{{ .component }}
+        port: "5432"
+        user: {{ .owner | quote }}
+        dbname: {{ .database | quote }}
+        # The bundled StatefulSet serves no TLS -- verified on k3d 2026-08-21,
+        # where "require" fails with 'rejected SSL upgrade'.
+        sslmode: prefer
+      password:
+        name: {{ include "srw.secretName" $ctx }}
+        key: {{ .passwordKey | quote }}
+  {{- end }}
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "key" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "postgres" "key" "postgres" "db" .Values.databases.postgres "database" "srw" "owner" "srw" "passwordKey" "POSTGRES_PASSWORD") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "key" "vector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "pgvector" "key" "vector" "db" .Values.databases.vector "database" "srw_vector" "owner" "srw" "passwordKey" "VECTOR_POSTGRES_PASSWORD") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "key" "audit" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "auditdb" "key" "audit" "db" .Values.databases.audit "database" "srw_audit" "owner" "srw" "passwordKey" "AUDIT_POSTGRES_PASSWORD") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "gitea")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "key" "gitea" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "giteadb" "key" "gitea" "db" .Values.databases.gitea "database" "gitea" "owner" "gitea" "passwordKey" "GITEA_DB_PASSWORD") }}
 ---
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
-{{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "key" "keycloak" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak") }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "key" "keycloak" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak" "passwordKey" "KC_DB_PASSWORD") }}
 {{- end }}

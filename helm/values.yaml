@@ -1097,6 +1097,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
@@ -1172,6 +1176,12 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. This database's restore is dominated by rebuilding
+    #    3.9 GB of HNSW across ~850k rows, and index builds are exactly what
+    #    the post-data section contains -- so parallelism here is the lever.
+    #    Keep it at or below max_parallel_maintenance_workers above.
+    importRestoreJobs: 4
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
@@ -1279,6 +1289,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
@@ -1351,6 +1365,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
@@ -1409,6 +1427,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
