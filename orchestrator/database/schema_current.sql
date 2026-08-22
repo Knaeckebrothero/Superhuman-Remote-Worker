@@ -9236,7 +9236,7 @@ COMMENT ON TABLE public.storage_volume_incarnations IS 'Kubernetes PV incarnatio
 
 CREATE TABLE public.sudo_approval_requests (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    job_id uuid NOT NULL,
+    job_id uuid,
     vm_name character varying(255) NOT NULL,
     command text NOT NULL,
     arguments text[] DEFAULT '{}'::text[],
@@ -9252,7 +9252,9 @@ CREATE TABLE public.sudo_approval_requests (
     expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
     nats_reply_subject text,
     metadata jsonb DEFAULT '{}'::jsonb,
-    request_type character varying(20) DEFAULT 'sudo_command'::character varying NOT NULL
+    request_type character varying(20) DEFAULT 'sudo_command'::character varying NOT NULL,
+    thread_id uuid,
+    CONSTRAINT sudo_approval_requests_one_entity CHECK ((num_nonnulls(job_id, thread_id) = 1))
 );
 
 
@@ -13147,6 +13149,13 @@ CREATE INDEX idx_sudo_pending ON public.sudo_approval_requests USING btree (stat
 
 
 --
+-- Name: idx_sudo_requests_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sudo_requests_thread ON public.sudo_approval_requests USING btree (thread_id, requested_at DESC);
+
+
+--
 -- Name: idx_sudo_rules_active; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15935,6 +15944,14 @@ ALTER TABLE ONLY public.storage_volume_incarnations
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: sudo_approval_requests sudo_approval_requests_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sudo_approval_requests
+    ADD CONSTRAINT sudo_approval_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --
