@@ -1103,10 +1103,14 @@ databases:
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
-    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
-    #    picks its own default operand image, so the PostgreSQL major is the
-    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
-    cnpgImage: ""
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    Built from docker/Dockerfile.postgres and published by its own
+    #    workflow, NOT the per-commit one: imageName is part of the Cluster
+    #    spec, so changing it rolls every Postgres cluster. The tag is the real
+    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
+    #    CNPG refuses downgrades based on it, so it must not lie.
+    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
     # -- Deploy StatefulSet within chart (false = external database — set
     # externalHost/externalPort/externalDb below)
     internal: true
@@ -1170,10 +1174,14 @@ databases:
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
-    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
-    #    picks its own default operand image, so the PostgreSQL major is the
-    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
-    cnpgImage: ""
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    Built from docker/Dockerfile.postgres and published by its own
+    #    workflow, NOT the per-commit one: imageName is part of the Cluster
+    #    spec, so changing it rolls every Postgres cluster. The tag is the real
+    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
+    #    CNPG refuses downgrades based on it, so it must not lie.
+    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
     # -- PostgreSQL extensions mounted as image volumes (CloudNativePG >= 1.29).
     #    REQUIRES Kubernetes >= 1.35, or 1.33/1.34 with the ImageVolume feature
     #    gate enabled on the API server and every kubelet, plus containerd
@@ -1243,10 +1251,14 @@ databases:
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
-    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
-    #    picks its own default operand image, so the PostgreSQL major is the
-    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
-    cnpgImage: ""
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    Built from docker/Dockerfile.postgres and published by its own
+    #    workflow, NOT the per-commit one: imageName is part of the Cluster
+    #    spec, so changing it rolls every Postgres cluster. The tag is the real
+    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
+    #    CNPG refuses downgrades based on it, so it must not lie.
+    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
     internal: true
     # -- External mode connection parts (credentials live in the Secret).
     externalHost: ""
@@ -1305,10 +1317,14 @@ databases:
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
-    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
-    #    picks its own default operand image, so the PostgreSQL major is the
-    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
-    cnpgImage: ""
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    Built from docker/Dockerfile.postgres and published by its own
+    #    workflow, NOT the per-commit one: imageName is part of the Cluster
+    #    spec, so changing it rolls every Postgres cluster. The tag is the real
+    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
+    #    CNPG refuses downgrades based on it, so it must not lie.
+    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
     # -- When false, the bundled Gitea points at externalHost/Port/Db below
     #    (managed Postgres — RDS, Cloud SQL, CloudNativePG). Credentials still
     #    come from the Secret (GITEA_DB_USER / GITEA_DB_PASSWORD).
@@ -1355,10 +1371,14 @@ databases:
     #    `statefulset`. Deliberately separate from `image` above: CNPG's
     #    admission webhook parses the tag as a PostgreSQL version and rejects
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
-    #    tag", verified against the live CRD 2026-08-21). Empty means CNPG
-    #    picks its own default operand image, so the PostgreSQL major is the
-    #    OPERATOR'S choice, not yours -- pin this before migrating real data.
-    cnpgImage: ""
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    Built from docker/Dockerfile.postgres and published by its own
+    #    workflow, NOT the per-commit one: imageName is part of the Cluster
+    #    spec, so changing it rolls every Postgres cluster. The tag is the real
+    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
+    #    CNPG refuses downgrades based on it, so it must not lie.
+    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
     # -- When false, KC_DB_URL on the Keycloak pod uses externalUrl below.
     #    Lets the bundled Keycloak point at a managed Postgres (RDS, Cloud SQL).
     internal: true

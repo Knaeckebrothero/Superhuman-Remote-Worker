@@ -1,0 +1,21 @@
+# CloudNativePG operand image for the SRW data tier.
+#
+# CNPG parses spec.imageName's TAG as a PostgreSQL version, which is the whole
+# reason this file exists: pgvector publishes `pgvector/pgvector:pg16`, and
+# "pg16" fails that parse outright — `spec.imageName: Invalid value:
+# "pgvector/pgvector:pg15": invalid version tag`, verified against the live
+# CNPG 1.29.1 CRD. This is a passthrough re-tag, not a rebuild: the contents
+# are pgvector's own official image, which is itself FROM postgres:16.
+#
+# The alternative — CNPG's ImageVolume extensions — needs Kubernetes >= 1.35
+# and publishes pgvector for PostgreSQL 18 only. Dev is on 1.33.x across all
+# four nodes, so that route would mean a feature gate on every node.
+#
+# TAG THIS WITH THE REAL PostgreSQL VERSION INSIDE IT. CNPG makes decisions
+# from that tag, notably refusing downgrades, so a tag that lies is worse than
+# no tag at all. Re-check `postgres --version` when bumping the base image.
+#
+# Contents: PostgreSQL 16.15 (Debian, PGDG) + pgvector 0.8.6.
+# Verified against CNPG's operand contract: initdb, postgres, pg_ctl,
+# pg_controldata, pg_basebackup and du all on PATH; LANG=en_US.utf8.
+FROM docker.io/pgvector/pgvector:pg16
