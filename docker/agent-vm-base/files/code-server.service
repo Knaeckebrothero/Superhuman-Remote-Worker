@@ -4,10 +4,10 @@ Documentation=https://github.com/Knaeckebrothero/Superhuman-Remote-Worker
 After=network-online.target
 Wants=network-online.target
 
-# NOTE: intentionally NOT enabled at image-build time. The management daemon
-# runs `systemctl start code-server` on IDE request and stops it when the
-# session ends, so it stays dormant during normal headless job runs. Reached
-# only via the agent's SSH direct-tcpip channel to 127.0.0.1:8080 (see
+# NOTE: intentionally NOT enabled at image-build time. The orchestrator starts
+# and stops this unit over SSH for live-VM IDE sessions, so it stays dormant
+# during normal headless job runs. Reached only via the agent's SSH
+# direct-tcpip channel to 127.0.0.1:8080 (see
 # knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent").
 
 [Service]

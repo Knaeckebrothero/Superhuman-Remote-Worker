@@ -10,7 +10,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"golang.org/x/time/rate"
 
 	"github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated/internal/peer"
@@ -33,55 +32,47 @@ type ApprovalResponse struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
-// NATSRequest is the payload sent to the orchestrator via NATS.
-type NATSRequest struct {
-	ApprovalRequest
-	VMID  string `json:"vm_id"`
-	JobID string `json:"job_id"`
-	PID   int32  `json:"pid"`
-}
-
 // Handler processes approval requests from the C plugin via Unix socket,
-// forwarding them to the orchestrator over NATS request/reply.
+// forwarding them to the configured orchestrator transport.
 type Handler struct {
-	nc          *nats.Conn
-	vmID        string
-	jobID       string
-	subject     string
-	natsTimeout time.Duration
-	readTimeout time.Duration
-	limiter     *rate.Limiter
-	skipVerify  bool
-	log         *slog.Logger
+	approver        Approver
+	approvalTimeout time.Duration
+	vmID            string
+	jobID           string
+	readTimeout     time.Duration
+	limiter         *rate.Limiter
+	skipVerify      bool
+	log             *slog.Logger
 }
 
 // HandlerConfig holds parameters for creating a Handler.
 type HandlerConfig struct {
-	NC          *nats.Conn
-	VMID        string
-	JobID       string
-	Subject     string
-	NATSTimeout time.Duration
-	ReadTimeout time.Duration
-	Limiter     *rate.Limiter
-	SkipVerify  bool
-	Logger      *slog.Logger
+	Approver        Approver
+	ApprovalTimeout time.Duration
+	VMID            string
+	JobID           string
+	ReadTimeout     time.Duration
+	Limiter         *rate.Limiter
+	SkipVerify      bool
+	Logger          *slog.Logger
 }
 
 // NewHandler creates a request handler.
 func NewHandler(cfg HandlerConfig) *Handler {
 	return &Handler{
-		nc:          cfg.NC,
-		vmID:        cfg.VMID,
-		jobID:       cfg.JobID,
-		subject:     cfg.Subject,
-		natsTimeout: cfg.NATSTimeout,
-		readTimeout: cfg.ReadTimeout,
-		limiter:     cfg.Limiter,
-		skipVerify:  cfg.SkipVerify,
-		log:         cfg.Logger,
+		approver:        cfg.Approver,
+		approvalTimeout: cfg.ApprovalTimeout,
+		vmID:            cfg.VMID,
+		jobID:           cfg.JobID,
+		readTimeout:     cfg.ReadTimeout,
+		limiter:         cfg.Limiter,
+		skipVerify:      cfg.SkipVerify,
+		log:             cfg.Logger,
 	}
 }
+
+// ApprovalTimeout returns the full decision budget used for one invocation.
+func (h *Handler) ApprovalTimeout() time.Duration { return h.approvalTimeout }
 
 // Handle processes a single connection from the C plugin.
 // It reads the length-prefixed JSON request, forwards it to NATS,
@@ -119,7 +110,7 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Clear the read deadline — we'll wait for NATS now.
+	// Clear the read deadline — we'll wait for the orchestrator now.
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		h.log.Error("clear read deadline", "error", err)
 	}
@@ -133,49 +124,23 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 		"pid", pid,
 	)
 
-	// Build the NATS payload.
-	natsReq := NATSRequest{
+	gateReq := GateRequest{
 		ApprovalRequest: *req,
 		VMID:            h.vmID,
 		JobID:           h.jobID,
 		PID:             pid,
 	}
 
-	payload, err := json.Marshal(natsReq)
+	approvalCtx, cancel := context.WithTimeout(ctx, h.approvalTimeout)
+	defer cancel()
+	resp, err := h.approver.Approve(approvalCtx, gateReq)
 	if err != nil {
-		h.log.Error("marshal NATS request", "error", err)
-		h.writeResponse(conn, ApprovalResponse{Approved: false, Reason: "internal error"})
-		return
-	}
-
-	// Forward to orchestrator via NATS request/reply.
-	// Use a dedicated timeout context for the NATS request (300s default).
-	subject := fmt.Sprintf("%s.%s.%s", h.subject, h.vmID, h.jobID)
-	h.log.Debug("forwarding to NATS", "subject", subject)
-
-	natsCtx, natsCancel := context.WithTimeout(ctx, h.natsTimeout)
-	defer natsCancel()
-
-	msg, err := h.nc.RequestWithContext(natsCtx, subject, payload)
-	if err != nil {
-		reason := "orchestrator unreachable"
-		if err == nats.ErrTimeout || err == context.DeadlineExceeded {
-			reason = "approval timed out"
-		} else if err == nats.ErrNoResponders {
-			reason = "no orchestrator listening"
-		} else if err == context.Canceled {
-			reason = "daemon shutting down"
+		if resp.Reason == "" {
+			resp.Reason = "approval failed"
 		}
-		h.log.Warn("NATS request failed", "error", err, "reason", reason, "command", req.Command)
-		h.writeResponse(conn, ApprovalResponse{Approved: false, Reason: reason})
-		return
-	}
-
-	// Parse the orchestrator's reply.
-	var resp ApprovalResponse
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		h.log.Error("unmarshal NATS response", "error", err, "data", string(msg.Data))
-		h.writeResponse(conn, ApprovalResponse{Approved: false, Reason: "malformed orchestrator response"})
+		resp.Approved = false
+		h.log.Warn("approval request failed", "error", err, "reason", resp.Reason, "command", req.Command)
+		h.writeResponse(conn, resp)
 		return
 	}
 

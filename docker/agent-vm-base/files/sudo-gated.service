@@ -12,12 +12,13 @@ Restart=always
 RestartSec=5
 WatchdogSec=30
 EnvironmentFile=/etc/default/sudo-gated
+EnvironmentFile=-/etc/default/srw-guest
 
 # Run as dedicated service user
 User=sudo-gated
 Group=sudo-gated
 
-# Hardening — daemon only needs Unix socket + NATS TCP + /proc/pid/exe reads
+# Hardening — daemon only needs Unix socket + orchestrator TCP + /proc/pid/exe reads
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
