@@ -379,6 +379,23 @@ kubectl --context=k3d-srw -n srw get pods -l app.kubernetes.io/component=workspa
 
 > The local stack runs **Nextcloud**, not OpenCloud (`nextcloud.enabled=true` + `opencloud.enabled=false` in `values-local.yaml.example`). Sections below that describe an OpenCloud `hostAliases` workaround are leftovers from before that switch and no longer apply — the example values file has no `hostAliases` block.
 
+### 6. VM workspaces (optional)
+
+The VM tier (KubeVirt VMs as agent workspaces, with gated `sudo`) runs on the same k3d
+cluster. Install KubeVirt + CDI with the bootstrap script — it picks the KubeVirt line for the
+cluster's Kubernetes minor, uses your host's KVM when `/dev/kvm` is visible inside the node,
+patches the `local-path` StorageProfile, and ends with a boot + import smoke test:
+
+```bash
+./scripts/local-kubevirt-up.sh
+kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
+  --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+```
+
+Then uncomment the `vm:` / `vmController:` block in `deployment/values-local.yaml` (pin a
+published `agent-vm-base` tag) and let Tilt apply it on the next image rebuild. Prerequisites,
+sizing and troubleshooting: `helm/README.md` → "VM workspaces on your cluster".
+
 ### Daily usage
 
 ```bash

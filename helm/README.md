@@ -368,47 +368,173 @@ openssl rand -base64 48  # MCP_INTERNAL_KEY
 
 ---
 
-## Same-cluster VMs (optional)
+## VM workspaces on your cluster
 
-By default the chart does not deploy any VM infrastructure — VMs live on a
-separate `vm` cluster managed by the Fleet bundles in `deployment-vms/`,
-and the orchestrator reaches them via NATS. To run KubeVirt VMs in the same
-cluster as the orchestrator, enable the bundled VM controller:
+Agent workspaces run as containers by default. Enabling the VM tier gives an agent a full
+virtual machine instead — its own kernel, `systemd`, `sudo` (gated by a human approval in
+the cockpit) and a root disk that survives a crash or a suspend. In this mode the VMs run on
+**the same cluster as the rest of the stack**, managed by KubeVirt; the chart deploys a
+small controller and the rest of the platform talks to the VMs over the pod network.
 
-```yaml
-vmController:
-  enabled: true
-  transport: http       # http | nats | both
-  namespace: agent-vms
-  vmStorageClass: longhorn
-  vmDiskSize: 30Gi
-  vmSshPublicKey: "ssh-ed25519 AAAA... agent@srw"
+What you get, honestly stated: VMs are isolated from each other and from the control plane by
+a hypervisor boundary, the workspace NetworkPolicy, and a node taint you apply — not by a
+separate Kubernetes control plane. That is a stronger boundary than the container tier, and
+the right trade for a single box or a small cluster. If you run untrusted tenants and need a
+separate control plane for the VMs, that is the cross-cluster topology (`vm.mode: external`,
+NATS + Headscale), which is not covered here.
+
+### Prerequisites
+
+The chart does **not** install KubeVirt or CDI — they are cluster-scoped operators with
+their own lifecycle. Install them first; the chart's pre-install hook refuses to proceed
+while the CRDs are missing and prints a pointer to this section.
+
+**Hardware.** Every node that will run VMs needs hardware virtualization:
+
+```bash
+egrep -c '(vmx|svm)' /proc/cpuinfo     # > 0
+test -c /dev/kvm && echo kvm-ok
+virt-host-validate qemu                # optional, needs libvirt-client
+lsmod | grep -E 'kvm|vhost_net'        # kvm_intel|kvm_amd and vhost_net loaded
 ```
 
-Prerequisites the chart does **not** install (the cluster operator must
-provide these before enabling the toggle):
+If the node is itself a VM, enable nested virtualization on its hypervisor (KVM: `nested=1`
+on `kvm_intel`/`kvm_amd`; Proxmox: `qm set <id> --cpu host`; Hyper-V:
+`Set-VMProcessor -VMName <vm> -ExposeVirtualizationExtensions $true`; vSphere: "Expose
+hardware assisted virtualization to the guest OS"). VirtualBox cannot. Without KVM, KubeVirt
+can fall back to software emulation (`useEmulation: true`), which is fine for a smoke test
+and useless for the real agent image.
 
-- **KubeVirt** operator + `KubeVirt` CR (cluster-scoped)
-- **CDI** operator (the bundled VM template uses `DataVolume`)
-- **Nodes with hardware virtualization** (`vmx`/`svm`) and the relevant
-  KubeVirt feature gates enabled
+**Sizing.** Budget ~2 GiB for KubeVirt's control plane (with `infra.replicas: 1`) plus,
+per VM, the guest memory and about `guest/512 + 240 MiB + 8 MiB × vCPU` of launcher
+overhead — a 4 vCPU / 8 GiB VM requests roughly 8.3 GiB. Disk: one 20 GiB golden image per
+image digest plus 20 GiB per VM (root disks are full copies on `local-path`). The chart's
+defaults (`vmController.defaultCpu: 4`, `defaultMemory: 8Gi`, `maxConcurrentVms: 4`) fit a
+64 GiB node; 16 GiB total is the practical floor for the platform plus one small VM.
 
-The `transport` choice trades off features:
+**Kubernetes version and the KubeVirt line.** KubeVirt supports the three newest Kubernetes
+minors at each release. Pick the line that covers your cluster:
 
-- `http` (default for same-cluster) — orchestrator → controller over a
-  ClusterIP Service. Carries lifecycle only (create / delete / query).
-  Does **not** support in-VM daemon events (register, heartbeat, freeze,
-  resume) because those use NATS subjects. Use this when you only need
-  workspace VMs and your jobs don't pause/resume.
-- `nats` — same path as the cross-cluster bundle, but with the controller
-  co-located. Requires `nats.url` set to a reachable NATS server. Full
-  feature set.
-- `both` — controller listens on both transports. Useful while migrating
-  or when only some clients have been moved to HTTP.
+| Kubernetes | KubeVirt | CDI |
+|---|---|---|
+| 1.34 and newer | v1.9.x | v1.66.0 |
+| 1.33 | v1.8.x (e.g. v1.8.4) | v1.66.0 |
+| 1.31 / 1.32 | v1.6.x (e.g. v1.6.6) | v1.66.0 |
 
-When `vmController.enabled=false`, none of these resources render and the
-orchestrator's behavior is identical to today (NATS / direct K8s / docker
-selection).
+**Install KubeVirt and CDI.**
+
+```bash
+export KUBEVIRT_VERSION=v1.8.4   # see the table
+export CDI_VERSION=v1.66.0
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml
+# single node: one replica of each control-plane component is enough
+kubectl -n kubevirt patch kubevirt kubevirt --type merge -p '{"spec":{"infra":{"replicas":1}}}'
+kubectl -n kubevirt wait kv kubevirt --for condition=Available --timeout=10m
+
+kubectl apply --server-side -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-operator.yaml
+kubectl apply --server-side -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-cr.yaml
+kubectl patch cdi cdi --type merge -p '{"spec":{"config":{"featureGates":["HonorWaitForFirstConsumer"],"scratchSpaceStorageClass":"local-path"}}}'
+kubectl wait cdi cdi --for condition=Available --timeout=5m
+```
+
+No KubeVirt feature gates are needed for importing, cloning and booting DataVolumes. On a
+dedicated VM node, also tolerate your taint in the KubeVirt CR (`spec.workloads.nodePlacement`)
+and the CDI CR (`spec.workload`), or the image import and the first bind of each root disk land
+on another node and the VM never schedules.
+
+`scripts/local-kubevirt-up.sh` does all of the above for the local k3d cluster (version
+selection, KVM detection, the patches below, and a smoke test).
+
+**Storage.** The VM root disks are CDI DataVolumes on `vmController.vmStorageClass`
+(default `local-path`). With `local-path`:
+
+- the StorageProfile has no capabilities entry, so CDI cannot infer access modes — the chart's
+  template sets them explicitly; if you write your own DataVolumes, patch the profile once:
+  `kubectl patch storageprofile local-path --type merge -p '{"spec":{"claimPropertySets":[{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]}}'`
+- clones are host-assisted full copies (no snapshots), and volumes are pinned to the node
+  they were created on — set `vmController.nodeSelector` on any multi-node cluster;
+- set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster has
+  several default StorageClasses, every VM-related object must name its class.
+
+**Network.** The workspace NetworkPolicy must actually be enforced by your CNI. Calico,
+Cilium, OVN-Kubernetes and Antrea enforce natively; **k3s** enforces through its embedded
+kube-router controller (ingress and egress) unless you started it with
+`--disable-network-policy`; Flannel alone does not.
+
+### Chart values
+
+```yaml
+vm:
+  mode: same-cluster
+  lifecycleAuthSecretName: srw-vm-lifecycle-hmac   # see below
+  preflight:
+    enabled: true          # pre-install/upgrade hook: fails when the CRDs are missing
+
+vmController:
+  image:
+    tag: <release or sha tag>
+  defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:<tag>
+  defaultCpu: 4
+  defaultMemory: 8Gi
+  maxConcurrentVms: 4
+  vmStorageClass: local-path
+  vmDiskSize: 20Gi
+  nodeSelector: {}         # mandatory on multi-node clusters, e.g. {srw.io/vm-node: "true"}
+  tolerations: []          #   and the matching toleration for your taint
+  goldenImage:
+    enabled: true          # import the base image once, clone per VM
+
+agent:
+  tailscale:
+    enabled: false         # the mesh belongs to the cross-cluster topology
+```
+
+Two Secrets must exist in the release namespace:
+
+- **`<release>-vm-ssh-key`** with `ssh-privatekey` and `ssh-publickey` — the key the
+  platform uses to reach every workspace. The chart mounts the private half into the
+  orchestrator and agents and injects the public half into each VM. `scripts/local-dev-up.sh`
+  mints it locally; in production provide it via `secrets.existingVmSshKeySecret` or
+  `externalSecrets.vmSshKeyVaultPath`.
+- **`vm.lifecycleAuthSecretName`** with key `VM_LIFECYCLE_HMAC_SECRET` (≥ 32 random bytes,
+  e.g. `python3 -c 'import secrets; print(secrets.token_hex(32))'`). The orchestrator and the
+  controller share it to sign lifecycle requests, and the controller derives each VM's guest
+  token from it. Keep it separate from the application Secret.
+
+Pin `vmController.defaultVmImage` to a published tag. The default points at the tag that
+matches the chart's `appVersion`, which exists only for released charts.
+
+### Verify
+
+```bash
+kubectl get nodes -l kubevirt.io/schedulable=true
+kubectl get pods -l app.kubernetes.io/component=vm-controller
+```
+
+Then create a job with the VM backend (Cockpit → Create → workspace: VM, or
+`"workspace": {"backend": "vm"}` in the API call) and watch:
+
+```bash
+kubectl get vm,vmi,dv             # the VM reaches Running, the DataVolume Succeeded
+kubectl get pod -l srw.io/component=agent-workspace -o wide
+```
+
+The job's VM context should show `ssh_ready_source: provisioner_probe` once the orchestrator
+has proven SSH to the VM's pod IP. Inside the job, `sudo apt-get install -y <pkg>` raises an
+approval request in the cockpit; approve it and the command runs.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `helm install` fails in the `vm-preflight` hook | KubeVirt/CDI CRDs not installed; install the operators first |
+| VMI stuck in `Scheduling` | no node with `kubevirt.io/schedulable=true` that matches `nodeSelector`/tolerations, or `devices.kubevirt.io/kvm` missing (no KVM) |
+| DataVolume `Pending` forever | WaitForFirstConsumer with no consumer — normal until the VM starts; for a standalone DataVolume add the `cdi.kubevirt.io/storage.bind.immediate.requested: "true"` annotation |
+| DataVolume stuck in `ImportScheduled` | CDI has no scratch space: set `scratchSpaceStorageClass` |
+| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart sets access modes explicitly |
+| VM `Stopped` after the guest powered off | KubeVirt does not restart a voluntary shutdown; the orchestrator recovers the job with the kept root disk |
+| `sudo` inside the VM is denied with "orchestrator unreachable" | the guest daemon cannot reach the orchestrator Service on 8085 — check the workspace NetworkPolicy and that `vm.mode` is `same-cluster` |
 
 ### Network isolation
 
