@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import time
 from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, UUID4
 
 from security.vm_guest import require_vm_guest
-from services.sudo_gate import SudoRequestConflict
+from services.sudo_gate import SudoEntityUnavailable, SudoRequestConflict
 from services.vm_guest_events import record_heartbeat, record_register
 
 router = APIRouter(prefix="/api/internal/vm", include_in_schema=False)
@@ -150,6 +151,8 @@ async def create_sudo_request(
         raise _limited(5)
     try:
         result = await gate.open_request(identity, body)
+    except SudoEntityUnavailable as exc:
+        raise HTTPException(status_code=401, detail="Unauthorized") from exc
     except SudoRequestConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     response.status_code = 201 if result.created else 200
@@ -164,7 +167,7 @@ async def create_sudo_request(
 @router.get("/{entity_id}/sudo/{request_id}")
 async def wait_for_sudo_decision(
     entity_id: str,
-    request_id: str,
+    request_id: UUID,
     request: Request,
     wait: Annotated[float, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
@@ -182,10 +185,11 @@ async def wait_for_sudo_decision(
         _rate_limits.waiters += 1
     try:
         result = await _get_sudo_gate().wait_for_decision(
-            request_id,
+            str(request_id),
             min(wait, 30),
             entity_type=identity.entity_type,
             entity_id=identity.entity_id,
+            provision_generation=identity.provision_generation,
         )
     finally:
         async with _rate_limits.waiter_lock:

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,9 +9,14 @@ import pytest
 import pytest_asyncio
 
 from orchestrator.security.vm_guest import VmGuestIdentity
-from orchestrator.services.vm_guest_events import record_register
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.vm_guest_events import record_heartbeat, record_register
 from routers import vm_guest
-from services.sudo_gate import SudoOpenResult, SudoRequestConflict
+from services.sudo_gate import (
+    SudoEntityUnavailable,
+    SudoOpenResult,
+    SudoRequestConflict,
+)
 
 ENTITY_ID = "11111111-1111-4111-8111-111111111111"
 REQUEST_ID = "22222222-2222-4222-8222-222222222222"
@@ -135,6 +141,18 @@ async def test_sudo_wait_route_caps_wait_at_30(route_env):
     )
     assert response.status_code == 200
     assert route_env.gate.wait_for_decision.await_args.args[1] == 30
+    assert (
+        route_env.gate.wait_for_decision.await_args.kwargs["provision_generation"]
+        == GENERATION
+    )
+
+
+async def test_sudo_wait_rejects_non_uuid_request_id(route_env):
+    response = await route_env.client.get(
+        f"/api/internal/vm/{ENTITY_ID}/sudo/not-a-uuid?wait=0"
+    )
+    assert response.status_code == 422
+    route_env.gate.wait_for_decision.assert_not_awaited()
 
 
 async def test_auth_failure_is_401(route_env):
@@ -160,6 +178,15 @@ async def test_idempotency_payload_conflict_is_409(route_env):
         f"/api/internal/vm/{ENTITY_ID}/sudo", json=sudo_body()
     )
     assert response.status_code == 409
+
+
+async def test_entity_vanishing_during_sudo_open_is_401(route_env):
+    route_env.gate.open_request.side_effect = SudoEntityUnavailable("gone")
+    response = await route_env.client.post(
+        f"/api/internal/vm/{ENTITY_ID}/sudo", json=sudo_body()
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized"
 
 
 async def test_malformed_body_is_422(route_env):
@@ -256,3 +283,53 @@ async def test_non_authoritative_register_never_writes_readiness():
     }
     assert "status" not in updates
     assert "ssh_host" not in updates
+
+
+async def test_zero_connection_thread_heartbeat_does_not_touch_thread_activity():
+    executed = []
+
+    class Connection:
+        async def execute(self, query, *args):
+            executed.append((query, args))
+            return "UPDATE 1"
+
+    db = PostgresDB("postgresql://unused")
+    db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
+
+    @asynccontextmanager
+    async def acquire():
+        yield Connection()
+
+    db.acquire = acquire
+    identity = VmGuestIdentity("thread", ENTITY_ID, GENERATION)
+
+    await record_heartbeat(db, identity, {"code_server_connections": 0})
+
+    query, args = executed[0]
+    assert "last_activity" not in query
+    assert "last_activity" not in args[0]
+
+
+async def test_heartbeat_ide_merge_failure_is_non_fatal():
+    db = AsyncMock()
+    db.merge_vm_context_if_provision_generation.return_value = True
+    db.merge_ide_session_context.side_effect = RuntimeError("database unavailable")
+    identity = VmGuestIdentity("job", ENTITY_ID, GENERATION)
+
+    assert await record_heartbeat(db, identity, {"code_server_connections": 1})
+
+
+async def test_main_app_registers_all_vm_guest_routes():
+    from main import app
+
+    registered = {
+        (route.path, method)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert {
+        ("/api/internal/vm/{entity_id}/register", "POST"),
+        ("/api/internal/vm/{entity_id}/heartbeat", "POST"),
+        ("/api/internal/vm/{entity_id}/sudo", "POST"),
+        ("/api/internal/vm/{entity_id}/sudo/{request_id}", "GET"),
+    } <= registered

@@ -3,9 +3,8 @@
 --                Separate file from 0178 so the CHECK can be validated on its
 --                own (squawk: constraint additions are their own step).
 -- depends-on:    0178_sudo_requests_thread_scope.sql
--- expected:      < 1s. Validates existing rows (all have job_id) in one scan
---                of a small table.
--- locks:         SHARE ROW EXCLUSIVE on sudo_approval_requests during validation.
+-- expected:      < 1s. NOT VALID records the constraint without scanning rows.
+-- locks:         brief SHARE ROW EXCLUSIVE on sudo_approval_requests.
 -- transactional: yes
 
 BEGIN;
@@ -16,6 +15,6 @@ SET LOCAL timezone                            = 'UTC';
 
 ALTER TABLE public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_one_entity
-    CHECK (num_nonnulls(job_id, thread_id) = 1);
+    CHECK (num_nonnulls(job_id, thread_id) = 1) NOT VALID;
 
 COMMIT;

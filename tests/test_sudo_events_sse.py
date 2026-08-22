@@ -104,6 +104,33 @@ class TestSudoSseFilter:
         assert '"id": "other"' not in text
 
     @pytest.mark.asyncio
+    async def test_thread_owner_can_list_and_get_thread_sudo_request(
+        self, user_a, thread_a, fake_db
+    ):
+        from main import get_sudo_request, list_sudo_requests
+
+        row = {
+            "id": "thread-sudo",
+            "job_id": None,
+            "thread_id": str(thread_a["id"]),
+        }
+        request = MagicMock(cookies={}, headers={})
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main.sudo_gate.list_requests", AsyncMock(return_value=[row])):
+                listed = await list_sudo_requests(
+                    request,
+                    job_id=None,
+                    status=None,
+                    request_type=None,
+                    limit=50,
+                )
+            with patch("main.sudo_gate.get_request", AsyncMock(return_value=row)):
+                fetched = await get_sudo_request(request, "thread-sudo")
+
+        assert listed == [row]
+        assert fetched == row
+
+    @pytest.mark.asyncio
     async def test_user_sees_only_own_jobs_events(self, user_a, job_a, job_b, fake_db):
         """user_a should see events for job_a (owned), not for job_b."""
         from main import sudo_sse_events

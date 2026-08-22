@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 from fastapi import HTTPException
 import pytest
 
+import orchestrator.security.vm_guest as vm_guest_auth
 from orchestrator.security.vm_guest import VmGuestIdentity, require_vm_guest
 from orchestrator.services.vm_lifecycle_auth import guest_token
 
@@ -18,6 +19,7 @@ OLD_GENERATION = "22222222-2222-4222-8222-222222222223"
 def request_with(token: str | None) -> MagicMock:
     request = MagicMock()
     request.headers = {} if token is None else {"authorization": f"Bearer {token}"}
+    request.client.host = "192.0.2.10"
     return request
 
 
@@ -42,6 +44,8 @@ def configured_secret(monkeypatch):
     monkeypatch.setattr(
         "orchestrator.security.vm_guest.log_security_event", AsyncMock()
     )
+    vm_guest_auth._preauth_rate_limiter.reset()
+    vm_guest_auth._security_log_last_at.clear()
 
 
 @pytest.mark.asyncio
@@ -126,4 +130,22 @@ async def test_unknown_entity_is_indistinguishable_401():
     db.get_thread.return_value = None
     db.get_job.return_value = None
     token = guest_token(SECRET.encode(), "job", JOB_ID, GENERATION)
-    await assert_unauthorized(request_with(token), db, JOB_ID)
+    token_spy = MagicMock(wraps=vm_guest_auth.guest_token)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(vm_guest_auth, "guest_token", token_spy)
+        await assert_unauthorized(request_with(token), db, JOB_ID)
+    token_spy.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_bad_mac_audit_is_sampled_and_pre_auth_rate_limited():
+    db = AsyncMock()
+    db.get_thread.return_value = None
+    db.get_job.return_value = job_row()
+    request = request_with("f" * 64)
+
+    for _ in range(vm_guest_auth._PREAUTH_REQUESTS_PER_MINUTE + 1):
+        await assert_unauthorized(request, db, JOB_ID)
+
+    assert db.get_thread.await_count == vm_guest_auth._PREAUTH_REQUESTS_PER_MINUTE
+    assert vm_guest_auth.log_security_event.await_count == 1
