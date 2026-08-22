@@ -1,0 +1,226 @@
+{{- $metering := .Values.infrastructureMetering | default dict -}}
+{{- if and (include "srw.vmSameCluster" .) ($metering.vmInventoryEnabled | default false) }}
+{{- $collectorName := printf "%s-vmi-metering" (include "srw.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- $vmNamespace := $metering.vmNamespace | default .Release.Namespace -}}
+{{- $stableClusterId := $metering.vmStableClusterId | default $metering.stableClusterId -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vmi-metering") | nindent 4 }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ $vmNamespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vmi-metering") | nindent 4 }}
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ $vmNamespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vmi-metering") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $collectorName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $collectorName }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vmi-metering") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    # One Pod UID is one controller epoch. Never overlap collector epochs.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vmi-metering") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vmi-metering") | nindent 8 }}
+      annotations:
+        checksum/vmi-metering-settings: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
+        checksum/vmi-metering-credential-revision: {{ .Values.infrastructureMetering.credentialRevision | default "" | sha256sum | quote }}
+    spec:
+      serviceAccountName: {{ $collectorName }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with $metering.orchestratorHostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command: ["python", "-m", "services.infrastructure_metering.collector_runtime"]
+          env:
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+              value: "true"
+            - name: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+              value: "dedicated"
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ID
+              value: "kubevirt-vmis"
+            - name: INFRASTRUCTURE_METERING_ORCHESTRATOR_URL
+              value: {{ .Values.infrastructureMetering.orchestratorUrl | quote }}
+            - name: INFRASTRUCTURE_METERING_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $metering.vmIngestionSecretName | quote }}
+                  key: {{ $metering.vmIngestionSecretKey | quote }}
+            # The runtime combines the downward-API Pod UID with a process
+            # nonce for the remote controller epoch, then pairs it with a
+            # per-process monotonic sequence. A container restart therefore
+            # cannot silently reuse sequence zero under the old authority.
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.uid
+            # The current fail-closed settings contract requires the generic
+            # collector identity fields too; this dedicated runtime maps them
+            # to the same exact VMI authority and does not create Pod scopes.
+            - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+              value: {{ $stableClusterId | quote }}
+            - name: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+              value: {{ $vmNamespace | quote }}
+            - name: INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED
+              value: "true"
+            - name: INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED
+              value: {{ .Values.infrastructureMetering.vmShadowEnabled | quote }}
+            - name: INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID
+              value: {{ $stableClusterId | quote }}
+            - name: INFRASTRUCTURE_METERING_VM_NAMESPACE
+              value: {{ $vmNamespace | quote }}
+            - name: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+              value: {{ .Values.infrastructureMetering.vmShadowEnabled | quote }}
+            - name: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_V2_READS_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_CUTOVER_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+              value: "false"
+            - name: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+              value: {{ .Values.infrastructureMetering.relistIntervalSeconds | quote }}
+            - name: INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS
+              value: {{ .Values.infrastructureMetering.staleAfterSeconds | quote }}
+            - name: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+              value: {{ .Values.infrastructureMetering.listPageSize | quote }}
+            - name: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+              value: "1"
+            - name: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+              value: {{ .Values.infrastructureMetering.watchQueueSize | quote }}
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+              value: {{ .Values.infrastructureMetering.maxSnapshotItems | quote }}
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+              value: {{ .Values.infrastructureMetering.maxSnapshotBytes | quote }}
+          resources:
+            {{- toYaml .Values.infrastructureMetering.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- if .Values.infrastructureMetering.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vmi-metering") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vmi-metering") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.infrastructureMetering.networkPolicy.dnsNamespace | default "kube-system" | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml (.Values.infrastructureMetering.networkPolicy.dnsPodSelector | default (dict "k8s-app" "kube-dns")) | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- range .Values.infrastructureMetering.networkPolicy.apiServerCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+    {{- range .Values.infrastructureMetering.networkPolicy.orchestratorCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        {{- range $.Values.infrastructureMetering.networkPolicy.orchestratorPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
