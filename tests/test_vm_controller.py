@@ -128,6 +128,344 @@ from vm.controller.controller import (  # noqa: E402
 _restore_k8s_modules()
 
 
+class TestSameClusterContracts:
+    def test_render_injects_placement_after_yaml_parse(self):
+        ctrl = _make_controller(headscale_available=False)
+        with (
+            patch(
+                "vm.controller.controller.VM_NODE_SELECTOR",
+                {"srw.io/vm-node": "true"},
+            ),
+            patch(
+                "vm.controller.controller.VM_TOLERATIONS",
+                [{"key": "srw.io/vm-node", "operator": "Exists"}],
+            ),
+        ):
+            manifest = ctrl.render_template(SAMPLE_JOB_CONFIG)
+
+        vmi_spec = manifest["spec"]["template"]["spec"]
+        assert vmi_spec["nodeSelector"] == {"srw.io/vm-node": "true"}
+        assert vmi_spec["tolerations"] == [
+            {"key": "srw.io/vm-node", "operator": "Exists"}
+        ]
+
+    def test_payload_network_tier_overrides_env_default(self):
+        """The per-project tier sent by the orchestrator beats the chart default."""
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        config = {**SAMPLE_JOB_CONFIG, "network_tier": "home-allowed"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+            manifest = ctrl.render_template(config)
+        assert manifest.pop("_srwCloudInitUserData") == "tier=home-allowed\n"
+
+    def test_env_default_network_tier_applies_when_payload_omits_it(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        config = {k: v for k, v in SAMPLE_JOB_CONFIG.items() if k != "network_tier"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+            manifest = ctrl.render_template(config)
+        assert manifest.pop("_srwCloudInitUserData") == "tier=internet-only\n"
+
+    def test_payload_network_tier_is_validated_when_env_default_is_empty(self):
+        ctrl = _make_controller(headscale_available=False)
+        config = {**SAMPLE_JOB_CONFIG, "network_tier": "NOT_VALID"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""):
+            with pytest.raises(ValueError, match="network_tier"):
+                ctrl.render_template(config)
+
+    def test_cloud_init_receives_guest_token_url_and_tier(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "token=${VM_AUTH_TOKEN}\nurl=${ORCHESTRATOR_URL}\ntier=${NETWORK_TIER}\n"
+        )
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+            "orchestrator_url": "http://payload-orchestrator:8085",
+            "network_tier": "home-allowed",
+        }
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.ORCHESTRATOR_URL", ""),
+            patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""),
+        ):
+            manifest = ctrl.render_template(config)
+
+        rendered = manifest.pop("_srwCloudInitUserData")
+        assert "url=http://payload-orchestrator:8085" in rendered
+        assert "tier=home-allowed" in rendered
+        assert "token=" in rendered
+        assert len(rendered.splitlines()[0].removeprefix("token=")) == 64
+
+    @pytest.mark.asyncio
+    async def test_capacity_gate_reports_live_vm_count(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": [
+                {"metadata": {"name": "agent-vm-one"}},
+                {"metadata": {"name": "not-managed"}},
+                {
+                    "metadata": {
+                        "name": "agent-vm-deleting",
+                        "deletionTimestamp": "now",
+                    }
+                },
+            ]
+        }
+        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+            result = await ctrl._capacity_wait("agent-vm-two")
+
+        assert result == {
+            "status": "waiting_capacity",
+            "running_vms": 1,
+            "max_concurrent_vms": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_concurrent_creates_cannot_oversubscribe_capacity(self, monkeypatch):
+        ctrl = _make_controller(headscale_available=False)
+        live_names: list[str] = []
+        list_call = ctrl.k8s_client.list_namespaced_custom_object
+        create_call = ctrl.k8s_client.create_namespaced_custom_object
+
+        async def _interleaving_to_thread(func, /, *args, **kwargs):
+            if func is list_call:
+                return {"items": [{"metadata": {"name": name}} for name in live_names]}
+            if func is create_call:
+                # Give the competing task a chance to count before admission.
+                # The controller-wide lock must prevent it from doing so.
+                await asyncio.sleep(0)
+                admitted = func(*args, **kwargs)
+                live_names.append(kwargs["body"]["metadata"]["name"])
+                return admitted
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _interleaving_to_thread)
+        first = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-one"}
+        second = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-two"}
+        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+            results = await asyncio.gather(
+                ctrl._do_create(first), ctrl._do_create(second)
+            )
+
+        assert sorted(result["status"] for result in results) == [
+            "created",
+            "waiting_capacity",
+        ]
+        assert create_call.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_create_and_delete_calls_core_api(self):
+        ctrl = _make_controller(headscale_available=False)
+        await ctrl._ensure_cloud_init_secret(
+            job_id=SAMPLE_JOB_CONFIG["job_id"],
+            owner_kind="job",
+            generation=PROVISION_GENERATION,
+            user_data="#cloud-config\n",
+        )
+        body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
+        assert body["stringData"] == {"userdata": "#cloud-config\n"}
+        assert (
+            body["metadata"]["labels"]["srw.io/owner-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        )
+
+        await ctrl._delete_cloud_init_secret(SAMPLE_JOB_CONFIG["job_id"])
+        ctrl.core_api.delete_namespaced_secret.assert_called_once_with(
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit",
+            namespace=VM_NAMESPACE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_409_owner_or_generation_mismatch_raises(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.core_api.create_namespaced_secret.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.core_api.read_namespaced_secret.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                labels={
+                    "srw.io/owner-kind": "thread",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+                annotations={
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    )
+                },
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="another VM generation"):
+            await ctrl._ensure_cloud_init_secret(
+                job_id=SAMPLE_JOB_CONFIG["job_id"],
+                owner_kind="job",
+                generation=PROVISION_GENERATION,
+                user_data="#cloud-config\n",
+            )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_is_created_before_vm_and_owned_after_admission(
+        self,
+    ):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+        )
+        events: list[str] = []
+        original_admit = ctrl.k8s_client.create_namespaced_custom_object.side_effect
+
+        def _create_secret(**_kwargs):
+            events.append("secret-create")
+
+        def _create_vm(**kwargs):
+            events.append("vm-create")
+            return original_admit(**kwargs)
+
+        def _patch_secret(**_kwargs):
+            events.append("secret-owner-patch")
+
+        ctrl.core_api.create_namespaced_secret.side_effect = _create_secret
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _create_vm
+        ctrl.core_api.patch_namespaced_secret.side_effect = _patch_secret
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
+            ),
+        ):
+            result = await ctrl._do_create(config)
+
+        assert result["status"] == "created"
+        assert events == ["secret-create", "vm-create", "secret-owner-patch"]
+        vm_body = ctrl.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        assert "_srwCloudInitUserData" not in vm_body
+        owner = ctrl.core_api.patch_namespaced_secret.call_args.kwargs["body"][
+            "metadata"
+        ]["ownerReferences"][0]
+        assert owner == {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+            "uid": "admitted-vm-uid-001",
+            "controller": True,
+            "blockOwnerDeletion": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_empty_rendered_ssh_authorized_key(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "key=${SSH_AUTHORIZED_KEY}\n"
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": ""},
+            ),
+            pytest.raises(ValueError, match="SSH_AUTHORIZED_KEY must be non-empty"),
+        ):
+            await ctrl._do_create(SAMPLE_JOB_CONFIG)
+
+        ctrl.core_api.create_namespaced_secret.assert_not_called()
+        ctrl.k8s_client.create_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_vm_create_deletes_new_cloud_init_secret(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+        )
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
+            status=409, body="VirtualMachine is being deleted"
+        )
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(_FakeApiException),
+        ):
+            await ctrl._do_create(config)
+
+        ctrl.core_api.delete_namespaced_secret.assert_called_once_with(
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit",
+            namespace=VM_NAMESPACE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_vm_409_other_provision_generation_raises(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": "different-generation-vm",
+                "annotations": {
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    )
+                },
+            }
+        }
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="another provision generation"),
+        ):
+            await ctrl._do_create(config)
+
+    @pytest.mark.asyncio
+    async def test_status_returns_vmi_pod_ip_and_active_pod_uid(self):
+        ctrl = _make_controller(headscale_available=False)
+        job_id = SAMPLE_JOB_CONFIG["job_id"]
+
+        def _get(**kwargs):
+            if kwargs["plural"] == "virtualmachineinstances":
+                return {
+                    "status": {
+                        "interfaces": [{"ipAddress": "10.42.1.23"}],
+                        "activePods": {"launcher-pod-uid": "node-a"},
+                    }
+                }
+            return {
+                "metadata": {"name": f"agent-vm-{job_id}"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "printableStatus": "Running",
+                },
+            }
+
+        ctrl.k8s_client.get_namespaced_custom_object.side_effect = _get
+        result = await ctrl._do_status(job_id)
+
+        assert result["ready"] is True
+        assert result["pod_ip"] == "10.42.1.23"
+        assert result["active_pod_uid"] == "launcher-pod-uid"
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _kubernetes_stubs_live_for_this_module():
     """Keep the stubs installed only while THIS module's tests run.
@@ -318,6 +656,16 @@ def _scoped_orchestrator_id():
     """
     with patch("vm.controller.controller.ORCHESTRATOR_ID", "test-oid"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _run_sync_kubernetes_mocks_inline(monkeypatch):
+    """Keep MagicMock K8s calls deterministic while production uses to_thread."""
+
+    async def _inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline)
 
 
 @pytest.fixture
@@ -1386,11 +1734,16 @@ class TestHandleStatusQuery:
         msg = make_nats_msg({"job_id": job_id}, reply="reply.test")
         await controller.handle_status_query(msg)
 
-        kw = controller.k8s_client.get_namespaced_custom_object.call_args[1]
-        assert kw["group"] == "kubevirt.io"
-        assert kw["version"] == "v1"
-        assert kw["plural"] == "virtualmachines"
-        assert kw["name"] == f"agent-vm-{job_id}"
+        calls = controller.k8s_client.get_namespaced_custom_object.call_args_list
+        coordinates = {
+            (call.kwargs["group"], call.kwargs["version"], call.kwargs["plural"])
+            for call in calls
+        }
+        assert coordinates == {
+            ("kubevirt.io", "v1", "virtualmachines"),
+            ("kubevirt.io", "v1", "virtualmachineinstances"),
+        }
+        assert {call.kwargs["name"] for call in calls} == {f"agent-vm-{job_id}"}
 
     @pytest.mark.asyncio
     async def test_status_query_with_extra_fields(self, controller):

@@ -124,6 +124,18 @@ def test_present_short_key_never_downgrades_to_legacy() -> None:
         orchestrator_auth.configured_secret({"VM_LIFECYCLE_HMAC_SECRET": "short"})
 
 
+def test_guest_token_known_vector() -> None:
+    assert (
+        controller_auth.guest_token(
+            SECRET,
+            "job",
+            "11111111-2222-4333-8444-555555555555",
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        )
+        == "42e877b1219d604802f241eca001f27ec0ebc337bd8e05e9fffe22a8b46e3f33"
+    )
+
+
 def test_response_must_correlate_to_the_exact_request() -> None:
     correlation_id = "00000000-0000-4000-8000-000000000010"
     response = controller_auth.sign_payload(
