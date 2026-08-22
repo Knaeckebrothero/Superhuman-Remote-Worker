@@ -538,8 +538,18 @@ class TestVerificationTriggerGuards:
             "get_verification_critic_for_round",
             round_lookup_mock,
         )
-        merge_context = AsyncMock(return_value=True)
-        monkeypatch.setattr(main.postgres_db, "merge_job_context", merge_context)
+        bind_repo = AsyncMock(return_value=True)
+        monkeypatch.setattr(main.postgres_db, "bind_job_managed_repository", bind_repo)
+        # The handoff branches from the parent's PROVEN authority, not from a
+        # repo name guessed off the job id, so the resolver is the collaborator
+        # under stub here.
+        authority = AsyncMock(
+            return_value={
+                "repo_name": "job-aaaaaaaa",
+                "clean_repo_url": "http://gitea/job-aaaaaaaa.git",
+            }
+        )
+        monkeypatch.setattr(main, "prepare_job_primary_repository_authority", authority)
 
         conn = AsyncMock()
         conn.execute.return_value = "UPDATE 1"
@@ -579,14 +589,14 @@ class TestVerificationTriggerGuards:
             "subjob/11111111/critic",
             from_branch="main",
         )
-        merge_context.assert_awaited_once_with(
+        bind_repo.assert_awaited_once_with(
             critic_id,
-            {"git_remote_url": "http://gitea/job-aaaaaaaa.git"},
+            repo_name="job-aaaaaaaa",
+            clean_url="http://gitea/job-aaaaaaaa.git",
         )
         update_args = conn.execute.await_args.args
         assert update_args[1:] == (
             "subjob/11111111/critic",
-            "job-aaaaaaaa",
             "/home/agent-host/workspace/worktrees/11111111-critic",
             critic_id,
         )
@@ -626,7 +636,19 @@ class TestVerificationTriggerGuards:
             ),
         )
         monkeypatch.setattr(
-            main.postgres_db, "merge_job_context", AsyncMock(return_value=True)
+            main.postgres_db,
+            "bind_job_managed_repository",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main,
+            "prepare_job_primary_repository_authority",
+            AsyncMock(
+                return_value={
+                    "repo_name": "job-aaaaaaaa",
+                    "clean_repo_url": "http://gitea/job-aaaaaaaa.git",
+                }
+            ),
         )
 
         conn = AsyncMock()
@@ -662,7 +684,6 @@ class TestVerificationTriggerGuards:
         update_args = conn.execute.await_args.args
         assert update_args[1:] == (
             "subjob/11111111/critic",
-            "job-aaaaaaaa",
             None,
             critic_id,
         )

@@ -67,6 +67,9 @@ class FakeDB:
         self.conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         self.conn.fetchval = AsyncMock(return_value=True)
         self.datasource_lock_calls = []
+        # Bundle assembly rechecks repository authority the same way it
+        # rechecks the lease: nothing current here, so nothing to invalidate.
+        self.managed_repository_authorities_are_current = AsyncMock(return_value=True)
 
     def acquire(self):
         return _AsyncCM(self.conn)
@@ -614,6 +617,72 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
 
     assert exc.value.status_code == 403
     assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_rejects_rotated_repository_authority(monkeypatch):
+    """A repository authority rotated during assembly invalidates the bundle.
+
+    The lease can still be exactly ours while the credentials the builder
+    already baked into the bundle have been revoked underneath it, so this
+    recheck is independent of the lease recheck above.
+    """
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+            }
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    db.managed_repository_authorities_are_current.return_value = False
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    credentials = [
+        {
+            "authority_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 3,
+            "repo_name": "job-stateless",
+            "access_mode": "write",
+            "private_key": "hidden-runtime-bearer",
+        }
+    ]
+    monkeypatch.setattr(
+        orch_main,
+        "_build_job_start_request",
+        AsyncMock(
+            return_value=orch_main.JobStartRequest(
+                job_id=UNIT_ID,
+                description="secret-bearing",
+                managed_repository_credentials=credentials,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    _patch_worker_attestation(monkeypatch, orch_main)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job repository authority changed during bundle assembly"
+    # The lease was still exactly ours; only the authority moved.
+    db.conn.fetchval.assert_awaited_once()
+    db.managed_repository_authorities_are_current.assert_awaited_once_with(credentials)
 
 
 @pytest.mark.asyncio
