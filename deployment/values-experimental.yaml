@@ -522,14 +522,8 @@ agent:
   # tiers stay pinned/refused.
   stateless:
     enabled: true
-    # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. This
-    # opens a door, it does not move traffic — a job runs stateless only if
-    # its create request asks for `execution_lane: stateless` AND the gate
-    # validates it (in-cluster provisioner + Kubernetes sandbox workspace;
-    # VM jobs are pinned by capability regardless). Every existing job,
-    # every default-created job and everything the loop schedules stays
-    # pinned until a lane default is chosen — which waits on Job Bench
-    # numbers (§9 S3), not on this flag.
+    # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. Admission
+    # remains independently rollbackable from the default-selection flag.
     #
     # Safe to open now because the whole worker-lane failure set is closed
     # in the images this overlay pins: the continue-frontier fix at the
@@ -542,6 +536,14 @@ agent:
     # be the real one, not k3d's 60 s acceptance value.
     worker:
       enabled: true
+      # WHY NOW (2026-08-21): the parked Job-Bench gate is satisfied by
+      # lane-ab-03-overhead-proof — 12/12 jobs completed, median per-claim
+      # overhead was 1.51% (<2% target), D1 measured −24% wall, and parity
+      # PASS included an unplanned mid-campaign pool roll. Explicit-request
+      # semantics are unchanged. VM jobs and roots without an in-cluster
+      # Kubernetes sandbox fall back to pinned by capability. Rollback is this
+      # value=false; no data migration is needed.
+      defaultEnabled: true
   # Apply admin-curated DB prompt overrides to provisioned agents. ON here
   # (dev/experimental) so the admin Prompt-overrides UI takes effect; the
   # chart default (helm/values.yaml) keeps this OFF for prod.
