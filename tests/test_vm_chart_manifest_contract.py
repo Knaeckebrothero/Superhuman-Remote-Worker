@@ -143,48 +143,31 @@ def _env_key_of(node: ast.AST) -> str | None:
 
 
 def daemon_required_env(transport: str) -> set[str]:
-    """Return the current daemon guard for external mode or the HTTP contract."""
+    """The env keys each guest transport hard-requires in ``load_config``.
 
-    if transport == "http":
-        return {
+    The daemon is dual-mode (HTTP for same-cluster, NATS for external), so the
+    contract is stated per transport; the drift guard below fails if the daemon
+    stops reading any of these keys.
+    """
+
+    contracts = {
+        "http": {
             "ORCHESTRATOR_URL",
             "VM_AUTH_TOKEN",
             "ENTITY_ID",
             "ENTITY_TYPE",
             "JOB_ID",
             "VM_ID",
-        }
-    tree = ast.parse(DAEMON_SRC.read_text())
-    func = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "load_config"
+        },
+        "nats": {"NATS_URL", "JOB_ID", "ORCHESTRATOR_ID"},
+    }
+    required = contracts[transport]
+    source = DAEMON_SRC.read_text()
+    missing = {key for key in required if f'os.environ.get("{key}")' not in source}
+    assert not missing, (
+        f"daemon no longer reads {sorted(missing)} — update the contract"
     )
-    variables: dict[str, str] = {}
-    for node in ast.walk(func):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and (key := _env_key_of(node.value))
-        ):
-            variables[node.targets[0].id] = key
-    for node in ast.walk(func):
-        if isinstance(node, ast.If) and any(
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, ast.Attribute)
-            and inner.func.attr == "exit"
-            for stmt in node.body
-            for inner in ast.walk(stmt)
-        ):
-            required = {
-                variables[name.id]
-                for name in ast.walk(node.test)
-                if isinstance(name, ast.Name) and name.id in variables
-            }
-            if required:
-                return required
-    raise AssertionError("management daemon required-env guard not found")
+    return set(required)
 
 
 def _controller_docs(rendered: str) -> list[dict]:
