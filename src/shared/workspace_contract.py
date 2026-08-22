@@ -213,7 +213,9 @@ def _uuid(value: Any) -> str | None:
     return str(parsed)
 
 
-def _runtime_is_authoritative(backend: str, runtime: Mapping[str, Any]) -> bool:
+def _runtime_is_authoritative(
+    backend: str, runtime: Mapping[str, Any], *, vm_mode: str = "external"
+) -> bool:
     """Recognize only provisioner-written runtime incarnation evidence.
 
     The contract stamp establishes the assigned tier; it does not authenticate
@@ -225,10 +227,15 @@ def _runtime_is_authoritative(backend: str, runtime: Mapping[str, Any]) -> bool:
         # KubeVirt/NATS generations are server-minted.  The development Docker
         # VM pool has no generation, but only its server-side allocator writes
         # the provisioner marker.
-        return bool(
+        generation_is_authoritative = bool(
             _uuid(runtime.get("provision_generation"))
             or runtime.get("provisioner") == "docker"
         )
+        if vm_mode == "same-cluster":
+            return generation_is_authoritative and (
+                runtime.get("ssh_ready_source") == "provisioner_probe"
+            )
+        return generation_is_authoritative
     if backend == "sandbox":
         provisioner = runtime.get("provisioner")
         if provisioner == "docker":
@@ -341,7 +348,9 @@ def resolve_workspace_contract(job: Mapping[str, Any]) -> WorkspaceContract:
     )
 
 
-def resolve_workspace_runtime(job: Mapping[str, Any]) -> WorkspaceRuntimeDecision:
+def resolve_workspace_runtime(
+    job: Mapping[str, Any], *, vm_mode: str = "external"
+) -> WorkspaceRuntimeDecision:
     """Return the only tier that may enter a worker bundle for ``job``."""
 
     try:
@@ -361,7 +370,9 @@ def resolve_workspace_runtime(job: Mapping[str, Any]) -> WorkspaceRuntimeDecisio
         container.get("status") == "ready"
         and (container.get("host") or container.get("pod_ip"))
     )
-    vm_ready = vm_endpoint_ready and _runtime_is_authoritative("vm", vm)
+    vm_ready = vm_endpoint_ready and _runtime_is_authoritative(
+        "vm", vm, vm_mode=vm_mode
+    )
     container_ready = container_endpoint_ready and _runtime_is_authoritative(
         "sandbox", container
     )
@@ -467,13 +478,17 @@ def pinned_dispatch_authority_jsonb_sql(
 )"""
 
 
-def workspace_contract_projection(job: Mapping[str, Any]) -> dict[str, Any]:
+def workspace_contract_projection(
+    job: Mapping[str, Any], *, vm_mode: str = "external"
+) -> dict[str, Any]:
     """Safe, coordinate-free API/formatter projection."""
 
-    return resolve_workspace_runtime(job).safe_projection()
+    return resolve_workspace_runtime(job, vm_mode=vm_mode).safe_projection()
 
 
-def workspace_runtime_authority_digest(job: Mapping[str, Any]) -> str | None:
+def workspace_runtime_authority_digest(
+    job: Mapping[str, Any], *, vm_mode: str = "external"
+) -> str | None:
     """Hash the exact runtime authority a worker bundle would receive.
 
     Dispatch uses this immediately before network delivery to prove that the
@@ -483,7 +498,7 @@ def workspace_runtime_authority_digest(job: Mapping[str, Any]) -> str | None:
     remain server-only.
     """
 
-    decision = resolve_workspace_runtime(job)
+    decision = resolve_workspace_runtime(job, vm_mode=vm_mode)
     if not decision.ready or decision.contract is None:
         return None
     material: dict[str, Any] = {

@@ -12,13 +12,11 @@ Subjects published:
   vm.lifecycle.create.{oid}         Request VM creation
   vm.lifecycle.delete.{oid}         Request VM teardown
   vm.lifecycle.get.{oid}            Request/reply for live VM status
-  agent.vm.{oid}.{job_id}.control   Freeze/resume/terminate agent process
 
 Subjects subscribed:
   vm.lifecycle.status.{oid}         VM Controller status updates
   agent.vm.{oid}.*.register         Management Daemon registration
   agent.vm.{oid}.*.heartbeat        Management Daemon heartbeats
-  agent.vm.{oid}.*.status           Management Daemon agent exit status
   sudo.request.{oid}.>              Sudo approval requests from sudo-gated daemons
   session.events.{oid}.>            Agent pod notification events (session.events.{oid}.{tid})
 
@@ -204,10 +202,6 @@ class NatsBridge:
                 await self._nc.subscribe(
                     f"agent.vm.{oid}.*.heartbeat", cb=self._on_daemon_heartbeat
                 )
-                await self._nc.subscribe(
-                    f"agent.vm.{oid}.*.status", cb=self._on_daemon_status
-                )
-
                 # Subscribe to sudo approval requests (from sudo-gated daemons)
                 from .sudo_gate import sudo_gate
 
@@ -628,40 +622,6 @@ class NatsBridge:
             logger.debug("VM list request failed: %s", e)
             return None
 
-    async def send_control(self, job_id: str, action: str) -> bool:
-        """Send a control command to the management daemon in a VM.
-
-        Args:
-            job_id: Job UUID.
-            action: One of "freeze", "resume", "terminate".
-
-        Returns:
-            True if published, False if NATS unavailable.
-        """
-        if not self._available:
-            return False
-
-        if not self._orchestrator_id:
-            logger.error(
-                "Refusing agent.vm.*.control publish for job %s — ORCHESTRATOR_ID unset",
-                job_id,
-            )
-            return False
-
-        payload = {"action": action, "orchestrator_id": self._orchestrator_id}
-        subject = f"agent.vm.{self._orchestrator_id}.{job_id}.control"
-        try:
-            await self._nc.publish(subject, json.dumps(payload).encode())
-            logger.info("Sent control '%s' to %s", action, subject)
-            return True
-        except Exception as e:
-            logger.error("Failed to send control '%s' to %s: %s", action, subject, e)
-            return False
-
-    # =========================================================================
-    # Subscription handlers
-    # =========================================================================
-
     async def _on_vm_lifecycle_status(self, msg) -> None:
         """Handle vm.lifecycle.status — VM controller status updates.
 
@@ -853,6 +813,8 @@ class NatsBridge:
         daemon registers with when tailscale takes >60s) holds ``ssh_pending``
         until the daemon's IP-change re-register supplies a tailnet IP.
         """
+        if os.getenv("VM_MODE", "off").strip().lower() != "external":
+            return
         try:
             data = json.loads(msg.data.decode())
             job_id = data.get("job_id")
@@ -907,6 +869,15 @@ class NatsBridge:
                 )
                 return
             registered_at = datetime.now(timezone.utc).isoformat()
+            generation = await self._db.get_vm_provision_generation(
+                job_id, is_thread=is_thread
+            )
+            if not isinstance(generation, str):
+                logger.warning(
+                    "Dropping daemon register for %s without a current provision generation",
+                    job_id,
+                )
+                return
             vm_updates = {
                 "status": status,
                 "ssh_host": ssh_host,
@@ -924,7 +895,11 @@ class NatsBridge:
                 # The VM guest's NATS payload is not a provisioner-attested host
                 # identity. Slice 1 deliberately fails Canvas closed for VMs.
                 vm_updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
-                await self._set_thread_vm_context(job_id, vm_updates)
+                merged = await self._set_thread_vm_context_if_generation(
+                    job_id, generation, vm_updates
+                )
+                if not merged:
+                    return
                 if status == "ready":
                     logger.warning(
                         "VM thread %s is ready, but Canvas file serving remains "
@@ -932,7 +907,11 @@ class NatsBridge:
                         job_id,
                     )
             else:
-                await self._set_vm_context(job_id, vm_updates)
+                merged = await self._set_vm_context_if_generation(
+                    job_id, generation, vm_updates
+                )
+                if not merged:
+                    return
 
             if status == "ready":
                 logger.info(
@@ -1150,27 +1129,6 @@ class NatsBridge:
                 "params": payload.get("params", {}),
             },
         )
-
-    async def _on_daemon_status(self, msg) -> None:
-        """Handle agent.vm.*.status — agent process exited.
-
-        Payload: {job_id, status: "completed"|"failed", exit_code}
-        Informational only — the agent's HTTP /job/complete is authoritative.
-        """
-        try:
-            data = json.loads(msg.data.decode())
-            job_id = data.get("job_id")
-            if not job_id:
-                return
-
-            logger.info(
-                "Agent in VM exited for job %s: status=%s, exit_code=%s",
-                job_id,
-                data.get("status"),
-                data.get("exit_code"),
-            )
-        except Exception:
-            logger.exception("Error handling daemon status")
 
     async def _set_vm_context_if_generation(
         self, job_id: str, generation: str, updates: dict

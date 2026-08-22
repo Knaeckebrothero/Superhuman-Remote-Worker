@@ -233,6 +233,19 @@ def test_vm_assignment_uses_vm_and_reports_stale_sandbox() -> None:
     assert decision.stale_backend == "sandbox"
 
 
+def test_same_cluster_vm_requires_provisioner_probe_attestation() -> None:
+    job = _stamped_job("vm", requested="vm", vm=READY_VM)
+    unattested = resolve_workspace_runtime(job, vm_mode="same-cluster")
+    assert unattested.state == "invalid"
+    assert unattested.reason == "vm_runtime_unattested"
+
+    job["context"]["vm"] = {
+        **READY_VM,
+        "ssh_ready_source": "provisioner_probe",
+    }
+    assert resolve_workspace_runtime(job, vm_mode="same-cluster").ready
+
+
 def test_sandbox_assignment_ignores_stale_vm() -> None:
     decision = resolve_workspace_runtime(
         _stamped_job("sandbox", vm=READY_VM, container=READY_SANDBOX)

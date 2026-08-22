@@ -237,8 +237,10 @@ from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
 from services.dispatch_guards import (  # noqa: E402
+    VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
     VM_HEADSCALE_POLL,
+    VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
     VM_PARK_HEADSCALE,
@@ -497,6 +499,7 @@ from src.utils.ssh_key import (  # noqa: E402
 )
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
+from services.vm_readiness import vm_readiness_prober  # noqa: E402
 from services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
@@ -6559,7 +6562,7 @@ def _job_needs_sandbox(job: dict) -> bool:
         return False
     if contract.assigned_backend != "sandbox":
         return False
-    decision = resolve_workspace_runtime(job)
+    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
     # An opposite-tier VM must never suppress sandbox provisioning.
     return decision.effective_backend != "sandbox"
 
@@ -6761,7 +6764,7 @@ def _inject_matching_workspace_config(
 ) -> tuple[dict, Any]:
     """Apply exactly one runtime selected by the server-owned tier contract."""
 
-    decision = resolve_workspace_runtime(job)
+    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
     config = copy.deepcopy(config_override or {})
     if not decision.ready:
         return config, decision
@@ -6790,7 +6793,7 @@ async def _workspace_runtime_unchanged_before_delivery(job: dict[str, Any]) -> b
     can neither block nor replace the assigned runtime.
     """
 
-    expected = workspace_runtime_authority_digest(job)
+    expected = workspace_runtime_authority_digest(job, vm_mode=vm_provisioner.mode)
     if expected is None:
         return False
     fresh = await postgres_db.get_job(str(job["id"]))
@@ -6806,7 +6809,10 @@ async def _workspace_runtime_unchanged_before_delivery(job: dict[str, Any]) -> b
         action, _reason = await _resolve_subjob_inherited_workspace(fresh)
         if action != "proceed":
             return False
-    if workspace_runtime_authority_digest(fresh) != expected:
+    if (
+        workspace_runtime_authority_digest(fresh, vm_mode=vm_provisioner.mode)
+        != expected
+    ):
         return False
     return await verify_adopted_k8s_runtime_before_delivery(
         postgres_db, container_provisioner, fresh
@@ -6851,7 +6857,7 @@ def _resume_missing_workspace(job: dict) -> Optional[str]:
         return None
     if contract.assigned_backend in LITE_BACKENDS:
         return None
-    decision = resolve_workspace_runtime(job)
+    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
     return None if decision.ready else contract.assigned_backend
 
 
@@ -8747,7 +8753,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         or "Inherited workspace authority is unavailable.",
                     )
                     continue
-                workspace_decision = resolve_workspace_runtime(job)
+                workspace_decision = resolve_workspace_runtime(
+                    job, vm_mode=vm_provisioner.mode
+                )
                 if (
                     workspace_decision.contract is None
                     or workspace_decision.state == "invalid"
@@ -8897,6 +8905,9 @@ async def _try_dispatch_pending_jobs() -> None:
                     golden_timeout_s = int(
                         os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
                     )
+                    capacity_timeout_s = int(
+                        os.environ.get("VM_CAPACITY_WAIT_TIMEOUT_S", "2700")
+                    )
                     headscale_timeout_s = int(
                         os.environ.get("VM_HEADSCALE_WAIT_TIMEOUT_S", "900")
                     )
@@ -8907,6 +8918,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         now=time.time(),
                         timeout_s=timeout_s,
                         golden_timeout_s=golden_timeout_s,
+                        capacity_timeout_s=capacity_timeout_s,
                         headscale_timeout_s=headscale_timeout_s,
                     )
                     if vm_decision == VM_PARK_EXHAUSTED:
@@ -8946,17 +8958,19 @@ async def _try_dispatch_pending_jobs() -> None:
                             # VM explicitly requested but no provisioner — fail
                             logger.error(
                                 "Dispatcher: job %s requires VM workspace but VM "
-                                "provisioner is not available (no NATS or KubeVirt). "
+                                "provisioner is unavailable for VM_MODE=%s. "
                                 "Failing job.",
                                 job_id,
+                                vm_provisioner.mode,
                             )
                             await postgres_db.update_job_status(
                                 job_id,
                                 status="failed",
                                 error_message=(
                                     "VM workspace requested but VM provisioner is not "
-                                    "available. This deployment has no NATS or KubeVirt "
-                                    "configured. Use workspace.backend='container' or "
+                                    f"available for VM_MODE={vm_provisioner.mode!r}. "
+                                    "Configure VM_MODE and its required controller, use "
+                                    "workspace.backend='container', or "
                                     "remove the explicit backend override."
                                 ),
                             )
@@ -9012,7 +9026,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         await _fail_vm_parked_job(job_id, vm_error)
                         continue
-                    if vm_decision == VM_GOLDEN_POLL:
+                    if vm_decision in (VM_GOLDEN_POLL, VM_CAPACITY_POLL):
                         # No VM exists yet — the controller is waiting on a
                         # shared golden-image import (cold import after an
                         # agent-vm-base bump: ~30 min, longer than timeout_s).
@@ -9024,10 +9038,15 @@ async def _try_dispatch_pending_jobs() -> None:
                         # bounds VM boots, and no boot is happening. See
                         # knowledge-history/done/
                         # golden_image_cold_import_fails_inflight_vm_jobs.md.
-                        if not vm_ctx.get("golden_wait_started_at"):
+                        wait_anchor = (
+                            "capacity_wait_started_at"
+                            if vm_decision == VM_CAPACITY_POLL
+                            else "golden_wait_started_at"
+                        )
+                        if not vm_ctx.get(wait_anchor):
                             await postgres_db.merge_vm_context(
                                 job_id,
-                                {"golden_wait_started_at": time.time()},
+                                {wait_anchor: time.time()},
                             )
                         config_override = job.get("config_override") or {}
                         if isinstance(config_override, str):
@@ -9044,15 +9063,41 @@ async def _try_dispatch_pending_jobs() -> None:
                             description=job.get("description", ""),
                             fresh=False,
                         )
-                        logger.info(
-                            "Dispatcher: job %s waiting on golden image %s "
-                            "(%s) — polling",
-                            job_id,
-                            vm_ctx.get("golden") or "?",
-                            vm_ctx.get("golden_progress")
-                            or vm_ctx.get("golden_phase")
-                            or "importing",
+                        if vm_decision == VM_CAPACITY_POLL:
+                            logger.info(
+                                "Dispatcher: job %s waiting on VM capacity (%s/%s) "
+                                "— polling",
+                                job_id,
+                                vm_ctx.get("running_vms") or "?",
+                                vm_ctx.get("max_concurrent_vms") or "?",
+                            )
+                        else:
+                            logger.info(
+                                "Dispatcher: job %s waiting on golden image %s "
+                                "(%s) — polling",
+                                job_id,
+                                vm_ctx.get("golden") or "?",
+                                vm_ctx.get("golden_progress")
+                                or vm_ctx.get("golden_phase")
+                                or "importing",
+                            )
+                        continue
+                    if vm_decision == VM_PARK_CAPACITY:
+                        elapsed = int(
+                            time.time()
+                            - float(vm_ctx.get("capacity_wait_started_at") or 0)
                         )
+                        park_error = (
+                            "VM capacity did not become available within "
+                            f"{capacity_timeout_s}s (running "
+                            f"{vm_ctx.get('running_vms') or 'unknown'}/"
+                            f"{vm_ctx.get('max_concurrent_vms') or 'unknown'}, "
+                            f"waited {elapsed}s) — VM never created"
+                        )
+                        await postgres_db.merge_vm_context(
+                            job_id, {"status": "failed", "error": park_error}
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
                         continue
                     if vm_decision == VM_PARK_GOLDEN:
                         # The golden import outlived even the golden budget —
@@ -12006,6 +12051,21 @@ async def lifespan(app: FastAPI):
     dispatcher_task = asyncio.create_task(
         run_when_leader(auto_assign_dispatcher, _shutdown_event)
     )
+    vm_readiness_task = (
+        asyncio.create_task(
+            run_when_leader(
+                lambda shutdown: vm_readiness_prober(
+                    shutdown,
+                    db=postgres_db,
+                    provisioner=vm_provisioner,
+                    trigger_dispatch=_trigger_dispatch,
+                ),
+                _shutdown_event,
+            )
+        )
+        if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
+        else None
+    )
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
@@ -12362,6 +12422,8 @@ async def lifespan(app: FastAPI):
     await token_cleanup_task
     await session_cleanup_task
     await dispatcher_task
+    if vm_readiness_task is not None:
+        await vm_readiness_task
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task
@@ -13210,7 +13272,9 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
         not isinstance(job.get("workspace_contract"), dict)
         or "state" not in job["workspace_contract"]
     ):
-        job["workspace_contract"] = workspace_contract_projection(job)
+        job["workspace_contract"] = workspace_contract_projection(
+            job, vm_mode=vm_provisioner.mode
+        )
     job = _redact_nested_workspace_state(job, field="context")
     context = job.get("context")
     context_was_str = isinstance(context, str)
@@ -14657,12 +14721,6 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
 
     async def _cleanup_child(child: dict) -> None:
         child_id = str(child["id"])
-        vm_ctx = _get_vm_context(child)
-        if vm_ctx:
-            try:
-                await vm_provisioner.send_control(child_id, "terminate")
-            except Exception as e:
-                logger.warning(f"VM terminate signal failed for child {child_id}: {e}")
         try:
             await _archive_and_cleanup_workspace(child_id)
         except Exception as e:
@@ -14839,17 +14897,6 @@ async def _cascade_pause_to_children(job_id: str) -> None:
                         )
                         if require_positive_quiescence:
                             return False
-
-        vm_ctx = _get_vm_context(child)
-        if vm_ctx:
-            try:
-                vm_frozen = bool(await vm_provisioner.send_control(child_id, "freeze"))
-                if require_positive_quiescence and not vm_frozen:
-                    return False
-            except Exception as e:
-                logger.warning(f"VM freeze failed for child {child_id}: {e}")
-                if require_positive_quiescence:
-                    return False
 
         if not already_paused:
             await postgres_db.pause_job(child_id)
@@ -15141,11 +15188,6 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                     # Agent might be unreachable — still cancel in DB
                     logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
-        # Send terminate signal to VM management daemon (if applicable)
-        vm_ctx = _get_vm_context(job)
-        if vm_ctx:
-            await vm_provisioner.send_control(job_id, "terminate")
-
         # Archive workspace (snapshot to S3) and clean up VM/container
         try:
             await _archive_and_cleanup_workspace(job_id)
@@ -15294,21 +15336,6 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                             f"Could not reach agent to pause job {job_id}: {e}"
                         )
 
-            vm_ctx = (
-                (job.get("context") or {}).get("vm")
-                if isinstance(job.get("context"), dict)
-                else None
-            )
-            vm_quiescent = True
-            if vm_ctx:
-                try:
-                    vm_quiescent = bool(
-                        await vm_provisioner.send_control(job_id, "freeze")
-                    )
-                except Exception:
-                    vm_quiescent = False
-                    raise
-
             if pause_claim is None:
                 success = await postgres_db.pause_job(job_id)
                 if not success:
@@ -15316,7 +15343,7 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                         status_code=400,
                         detail="Job cannot be paused (status may have changed)",
                     )
-            release_pause_claim = agent_quiescent and vm_quiescent
+            release_pause_claim = agent_quiescent
         finally:
             if pause_claim is not None and release_pause_claim:
                 await _abort_completion_control_claim(pause_claim)
@@ -31011,7 +31038,7 @@ async def assign_job_to_agent(
                 },
             )
 
-        workspace_decision = resolve_workspace_runtime(job)
+        workspace_decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
         if workspace_decision.contract is None or workspace_decision.state == "invalid":
             raise HTTPException(
                 status_code=409,
@@ -46516,7 +46543,7 @@ async def internal_unit_claim_bundle(
                 status_code=409,
                 detail="Job workspace authority is not ready",
             )
-        workspace_decision = resolve_workspace_runtime(job)
+        workspace_decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
         if (
             workspace_decision.contract is None
             or workspace_decision.contract.assigned_backend != "sandbox"
@@ -46525,7 +46552,9 @@ async def internal_unit_claim_bundle(
                 status_code=409,
                 detail="Job workspace contract is not stateless-compatible",
             )
-        initial_runtime_digest = workspace_runtime_authority_digest(job)
+        initial_runtime_digest = workspace_runtime_authority_digest(
+            job, vm_mode=vm_provisioner.mode
+        )
         if initial_runtime_digest is None:
             raise HTTPException(
                 status_code=409,
@@ -46659,7 +46688,10 @@ async def internal_unit_claim_bundle(
             or final_job.get("execution_lane") != LANE_STATELESS
             or final_contract != workspace_decision.contract
             or final_contract.assigned_backend != "sandbox"
-            or workspace_runtime_authority_digest(final_job) != initial_runtime_digest
+            or workspace_runtime_authority_digest(
+                final_job, vm_mode=vm_provisioner.mode
+            )
+            != initial_runtime_digest
         ):
             raise HTTPException(
                 status_code=409,
