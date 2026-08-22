@@ -355,6 +355,20 @@ local(
 # command with a preflight that clears a stale pending revision first. See
 # knowledge-base/knowledge/features/tilt_inner_loop_dev.md "Risks and known gotchas".
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# VM controller (same-cluster KubeVirt tier). Only rendered by the chart when
+# `vm.mode: same-cluster`; built here unconditionally so the local k3d gate
+# always runs the controller from the working tree, not from GHCR
+# (knowledge-base/knowledge/features/single_cluster_vm_deployment.md §6 Lane D).
+# No live_update: the image is three Python files and rebuilds in seconds.
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-vm-controller',
+    context='vm/controller',
+    dockerfile='vm/controller/Dockerfile',
+    ignore=['**/__pycache__', '**/*.pyc'],
+)
+
 # (image name, chart repository key, chart tag key)
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
@@ -362,6 +376,7 @@ _srw_images = [
     ('srw-agent', 'image.agent.repository', 'image.agent.tag'),
     ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
     ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
+    ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
