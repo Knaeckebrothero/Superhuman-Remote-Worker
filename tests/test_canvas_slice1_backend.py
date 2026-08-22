@@ -2618,6 +2618,9 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
 
     context = json.dumps(
         {
+            # Top-level repo identity is the public half of the job context and
+            # survives redaction; the provisioner branch below does not.
+            "git_remote_url": "http://gitea/job.git",
             "workspace_container": {
                 "status": "quarantined",
                 "_canvas_workspace_generation": str(GENERATION),
@@ -2626,8 +2629,8 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
                 "_docker_workspace_attested": True,
                 "_docker_workspace_host_key_fingerprint": "SHA256:private-job",
                 "quarantine_reason": "private-job-reason",
-                "git_remote_url": "http://gitea/job.git",
-            }
+                "git_remote_url": "http://gitea/private-job-branch.git",
+            },
         }
     )
     redacted = main._redact_job_config_override(
@@ -2640,7 +2643,13 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
     assert "private-job-reason" not in serialized
     assert "trusted_dev" not in serialized
     assert "SHA256:private-job" not in serialized
-    assert "http://gitea/job.git" in serialized
+    # The whole provisioner branch is dropped from the public job shape — the
+    # coordinate-free workspace_contract projection is what replaces it — so
+    # even its non-secret members (a nested git remote) do not leak out.
+    assert "workspace_container" not in serialized
+    assert "private-job-branch" not in serialized
+    assert json.loads(redacted["context"]) == {"git_remote_url": "http://gitea/job.git"}
+    assert redacted["workspace_contract"]["assigned_backend"] is not None
 
 
 def test_workspace_host_key_material_is_root_only_and_pod_persistent() -> None:
