@@ -339,9 +339,14 @@ def test_no_template_hardcodes_a_database_service_name():
             for line in body.splitlines():
                 if f'"srw.fullname" . }}}}-{component}' not in line:
                     continue
-                # `name:` is the resource's own name, which legitimately
-                # matches the Service. Anything else is a reference to it.
-                if line.strip().startswith("name:"):
+                # Identity references, not connection targets:
+                #   name:            the resource's own name
+                #   cnpg.io/cluster: a label selector naming the CNPG cluster,
+                #                    which shares the Service's name by design
+                # Anything else spelling the Service name is something trying
+                # to CONNECT to it, which is what must go through the helper.
+                key = line.strip().split(":", 1)[0].lstrip("- ")
+                if key in {"name", "cnpg.io/cluster"}:
                     continue
                 offenders.append(f"{template.relative_to(CHART)} spells -{component}")
     assert not offenders, "; ".join(offenders)

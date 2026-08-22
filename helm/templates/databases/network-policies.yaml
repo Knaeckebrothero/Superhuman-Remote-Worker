@@ -60,10 +60,15 @@ spec:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
         {{- end }}
         {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
-        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-postgres
         # The operator polls instance health; without this, failover never fires.
         - namespaceSelector:
             matchLabels:
@@ -109,10 +114,15 @@ spec:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
         {{- end }}
         {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
-        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 14 }}
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-pgvector
         # The operator polls instance health; without this, failover never fires.
         - namespaceSelector:
             matchLabels:
@@ -159,10 +169,15 @@ spec:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
         {{- end }}
         {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
-        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 14 }}
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-auditdb
         # The operator polls instance health; without this, failover never fires.
         - namespaceSelector:
             matchLabels:
@@ -261,10 +276,15 @@ spec:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 14 }}
         {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
-        # CloudNativePG streams WAL between the cluster's own instances on 5432.
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloakdb") | nindent 14 }}
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-keycloakdb
         # The operator polls instance health; without this, failover never fires.
         - namespaceSelector:
             matchLabels:
