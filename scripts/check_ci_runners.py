@@ -112,6 +112,16 @@ WORKFLOWS: dict[str, Policy] = {
     "stage1-rebuild.yml": Policy(
         triggers=frozenset({"schedule", "workflow_dispatch"}),
     ),
+    "postgres-image.yml": Policy(
+        triggers=frozenset({"push", "pull_request", "workflow_dispatch"}),
+        hosted_only=True,
+        why=(
+            "it publishes the PostgreSQL operand image every database in the "
+            "fleet runs on, and it is a tiny, rare passthrough build with no "
+            "reason to consume homelab capacity or to be built on a machine "
+            "sitting next to the databases it will serve"
+        ),
+    ),
     "ci-policy.yml": Policy(
         triggers=frozenset({"push", "pull_request", "workflow_dispatch"}),
         hosted_only=True,
