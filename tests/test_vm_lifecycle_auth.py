@@ -1,5 +1,7 @@
 """Cross-image contract tests for VM lifecycle HMAC envelopes."""
 
+import hashlib
+import hmac
 from uuid import uuid4
 
 import pytest
@@ -11,6 +13,24 @@ from vm.controller import lifecycle_auth as controller_auth
 SECRET = b"a-dedicated-lifecycle-secret-at-least-32-bytes"
 ISSUED_AT = 1_800_000_000
 REQUEST_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def test_guest_token_matches_cross_image_formula() -> None:
+    secret = b"0123456789abcdef0123456789abcdef"
+    entity_type = "job"
+    entity_id = "11111111-1111-4111-8111-111111111111"
+    generation = "22222222-2222-4222-8222-222222222222"
+    guest_key = hmac.new(secret, b"srw-kdf|vm-guest-token|v1", hashlib.sha256).digest()
+    expected = hmac.new(
+        guest_key,
+        (f"srw.vm.guest.v1\n{entity_type}\n{entity_id}\n{generation}\n").encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    assert (
+        orchestrator_auth.guest_token(secret, entity_type, entity_id, generation)
+        == expected
+    )
 
 
 def _signed_by_orchestrator(operation: str = "create") -> dict:

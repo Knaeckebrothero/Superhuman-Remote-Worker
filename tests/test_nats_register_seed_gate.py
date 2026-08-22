@@ -38,10 +38,15 @@ def _payload():
 
 
 @pytest.fixture
-def bridge():
+def bridge(monkeypatch):
+    monkeypatch.setenv("VM_MODE", "external")
     b = NatsBridge()
     b._db = AsyncMock()
     b._db.merge_vm_context = AsyncMock(return_value=True)
+    b._db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    b._db.get_vm_provision_generation = AsyncMock(
+        return_value="11111111-1111-4111-8111-111111111111"
+    )
     b._on_vm_ready = None  # skip the dispatch poke
     # job-1 takes the job (not thread) path. Routing is a DB lookup, so these
     # must be explicit — a bare AsyncMock get_thread returns a truthy mock.
@@ -69,7 +74,7 @@ async def test_skips_seed_on_follower(bridge):
     await bridge._on_daemon_register(FakeMsg(_payload()))
     await asyncio.sleep(0)
     bridge._seed_vm_ide_config.assert_not_called()
-    bridge._db.merge_vm_context.assert_not_awaited()
+    bridge._db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -83,4 +88,4 @@ async def test_no_seed_while_not_ready(bridge):
     finally:
         is_leader.clear()
     bridge._seed_vm_ide_config.assert_not_called()
-    bridge._db.merge_vm_context.assert_awaited_once()  # context still recorded
+    bridge._db.merge_vm_context_if_provision_generation.assert_awaited_once()

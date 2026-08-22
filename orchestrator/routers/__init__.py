@@ -14,6 +14,7 @@ from routers.project_loops import router as project_loops_router
 from routers.product_capabilities import router as product_capabilities_router
 from routers.shared_browser import router as shared_browser_router
 from routers.wopi import router as wopi_router
+from routers.vm_guest import router as vm_guest_router
 
 __all__ = [
     "automations_router",
@@ -23,4 +24,5 @@ __all__ = [
     "product_capabilities_router",
     "shared_browser_router",
     "wopi_router",
+    "vm_guest_router",
 ]

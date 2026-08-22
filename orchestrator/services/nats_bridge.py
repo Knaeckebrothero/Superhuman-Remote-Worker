@@ -31,9 +31,8 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
 try:
     import nats
@@ -46,7 +45,8 @@ except ImportError:
     NATS_AVAILABLE = False
 
 from .notification_feed import notification_feed
-from .ssh_helpers import is_tailnet_addr, orchestrator_can_reach
+from .ssh_helpers import orchestrator_can_reach
+from .vm_guest_events import record_heartbeat, record_register, resolve_vm_entity
 from .workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from .vm_lifecycle_auth import (
     AUTH_FIELD,
@@ -628,6 +628,8 @@ class NatsBridge:
         Payload: {job_id, status, vm_name, vm_uid, rootdisk_pvc_uid,
                   namespace, error?}
         """
+        if os.getenv("VM_MODE", "off").strip().lower() != "external":
+            return
         try:
             data = json.loads(msg.data.decode())
             if not isinstance(data, Mapping):
@@ -795,24 +797,7 @@ class NatsBridge:
             logger.exception("Error handling vm.lifecycle.status")
 
     async def _on_daemon_register(self, msg) -> None:
-        """Handle agent.vm.*.register — daemon announces VM network coordinates.
-
-        Payload: {job_id, hostname, ip, pid, ssh_ready?}
-
-        Readiness evidence comes from the daemon itself: ``ssh_ready`` is true
-        once local sshd accepts connections AND the VM holds a tailnet IP. The
-        orchestrator has NO route to the tailnet, so it cannot probe SSH from
-        here — an orchestrator-vantage probe gate wedged 100% of VM jobs (see
-        knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
-        The residual path-establishment window (agent sidecar peer session,
-        O(seconds)) is covered by the agent's VM-sized first-connect budget.
-
-        Golden images that predate the ``ssh_ready`` report omit the field;
-        for those, a tailnet ``ssh_host`` is accepted as ready (pre-gate
-        behavior), while a non-tailnet address (the QEMU NAT fallback the
-        daemon registers with when tailscale takes >60s) holds ``ssh_pending``
-        until the daemon's IP-change re-register supplies a tailnet IP.
-        """
+        """Decode and delegate external-mode daemon registration evidence."""
         if os.getenv("VM_MODE", "off").strip().lower() != "external":
             return
         try:
@@ -824,113 +809,45 @@ class NatsBridge:
             if not self._is_leader():
                 logger.debug("Ignoring daemon register for %s on follower", job_id)
                 return
-
-            # Daemon reports its Tailscale IP — directly reachable from agent pods
-            ssh_host = data.get("ip") or data.get("hostname")
-            ssh_port = 22
-            ssh_ready = data.get("ssh_ready")
-
-            if not ssh_host:
-                status = "ssh_unreachable"
-                ready_source = None
-                not_ready_reason = "daemon register did not include an SSH host"
-            elif ssh_ready is True:
-                status = "ready"
-                ready_source = "daemon"
-                not_ready_reason = None
-            elif ssh_ready is False:
-                status = "ssh_pending"
-                ready_source = None
-                not_ready_reason = (
-                    "daemon reports SSH not ready yet (sshd or tailnet IP "
-                    "pending); waiting for re-register"
-                )
-            elif is_tailnet_addr(ssh_host):
-                # Legacy golden image (no ssh_ready report): a tailnet address
-                # is the best evidence available — accept it.
-                status = "ready"
-                ready_source = "legacy_tailnet_ip"
-                not_ready_reason = None
-            else:
-                status = "ssh_pending"
-                ready_source = None
-                not_ready_reason = (
-                    f"registered address {ssh_host} is not a tailnet IP; "
-                    "waiting for tailscale re-register"
-                )
-
-            is_thread = await self._vm_entity_is_thread(job_id)
-            if is_thread is None:
+            identity = await resolve_vm_entity(self._db, job_id)
+            if identity is None:
                 logger.warning(
                     "Dropping daemon register for %s — not a known thread or job; "
-                    "refusing to guess a table (its ssh_host would be lost either "
-                    "way, but a wrong-table write also hides the problem).",
+                    "refusing to guess a table.",
                     job_id,
                 )
                 return
-            registered_at = datetime.now(timezone.utc).isoformat()
-            generation = await self._db.get_vm_provision_generation(
-                job_id, is_thread=is_thread
+            result = await record_register(
+                self._db,
+                identity,
+                data,
+                authoritative=True,
+                on_ready=lambda resolved, host, port: self._notify_vm_ready(
+                    resolved.entity_id,
+                    resolved.entity_type == "thread",
+                    host,
+                    port,
+                ),
             )
-            if not isinstance(generation, str):
-                logger.warning(
-                    "Dropping daemon register for %s without a current provision generation",
-                    job_id,
-                )
+            if not result.merged:
                 return
-            vm_updates = {
-                "status": status,
-                "ssh_host": ssh_host,
-                "ssh_port": ssh_port,
-                "hostname": data.get("hostname"),
-                "daemon_pid": data.get("pid"),
-                "recovering": False,  # Clear recovery guard
-                "registered_at": registered_at,
-                "ssh_registration_id": uuid4().hex,
-                "ssh_ready_source": ready_source,
-                "ssh_verified_at": registered_at if status == "ready" else None,
-                "ssh_probe_error": not_ready_reason,
-            }
-            if is_thread:
-                # The VM guest's NATS payload is not a provisioner-attested host
-                # identity. Slice 1 deliberately fails Canvas closed for VMs.
-                vm_updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
-                merged = await self._set_thread_vm_context_if_generation(
-                    job_id, generation, vm_updates
-                )
-                if not merged:
-                    return
-                if status == "ready":
-                    logger.warning(
-                        "VM thread %s is ready, but Canvas file serving remains "
-                        "disabled until host identity is provisioner-attested",
-                        job_id,
-                    )
-            else:
-                merged = await self._set_vm_context_if_generation(
-                    job_id, generation, vm_updates
-                )
-                if not merged:
-                    return
-
-            if status == "ready":
+            if result.status == "ready":
                 logger.info(
                     "VM SSH ready for %s %s (%s:%d, evidence: %s)",
-                    "thread" if is_thread else "job",
+                    identity.entity_type,
                     job_id,
-                    ssh_host,
-                    ssh_port,
-                    ready_source,
+                    result.ssh_host,
+                    result.ssh_port,
+                    result.ready_source,
                 )
-                self._notify_vm_ready(job_id, is_thread, ssh_host, ssh_port)
             else:
                 logger.info(
-                    "Daemon registered for %s %s (ssh=%s:%d) but not ready: %s",
-                    "thread" if is_thread else "job",
+                    "Daemon registered for %s %s (ssh=%s:%d), status=%s",
+                    identity.entity_type,
                     job_id,
-                    ssh_host,
-                    ssh_port,
-                    not_ready_reason,
+                    result.ssh_host,
+                    result.ssh_port,
+                    result.status,
                 )
         except Exception:
             logger.exception("Error handling daemon register")
@@ -1013,47 +930,21 @@ class NatsBridge:
             logger.debug("ide seed (vm) failed for %s", entity_id, exc_info=True)
 
     async def _on_daemon_heartbeat(self, msg) -> None:
-        """Handle agent.vm.*.heartbeat — periodic health updates.
-
-        Payload: {job_id, agent_pid, agent_running, cpu_percent, memory_percent,
-                  disk_percent, code_server_connections?}
-        """
+        """Decode and delegate external-mode daemon heartbeat evidence."""
+        if os.getenv("VM_MODE", "off").strip().lower() != "external":
+            return
         try:
             data = json.loads(msg.data.decode())
             job_id = data.get("job_id")
             if not job_id:
                 return
-
-            is_thread = await self._vm_entity_is_thread(job_id)
-            logger.debug(
-                "Heartbeat for %s %s: agent_running=%s",
-                _entity_label(is_thread),
-                job_id,
-                data.get("agent_running"),
-            )
-            now = datetime.now(timezone.utc).isoformat()
-            if is_thread:
-                await self._set_thread_vm_context(job_id, {"last_heartbeat": now})
-            elif is_thread is False:
-                await self._set_vm_context(job_id, {"last_heartbeat": now})
-
-            # Track code-server activity for IDE session idle detection.
-            # When the daemon reports active code-server connections, update
-            # last_activity in the IDE session context so the TTL sweeper
-            # knows the session is still in use.
-            cs_connections = data.get("code_server_connections")
-            if cs_connections is not None and self._db:
-                try:
-                    updates = {"code_server_connections": cs_connections}
-                    if cs_connections > 0:
-                        updates["last_activity"] = now
-                        updates["status"] = "active"
-                    else:
-                        # No connections — mark as idle (if currently active)
-                        updates["status"] = "idle"
-                    await self._db.merge_ide_session_context(job_id, updates)
-                except Exception:
-                    pass  # Non-critical, don't break heartbeat processing
+            if not self._is_leader():
+                logger.debug("Ignoring daemon heartbeat for %s on follower", job_id)
+                return
+            identity = await resolve_vm_entity(self._db, job_id)
+            if identity is None:
+                return
+            await record_heartbeat(self._db, identity, data)
 
         except Exception:
             logger.exception("Error handling daemon heartbeat")

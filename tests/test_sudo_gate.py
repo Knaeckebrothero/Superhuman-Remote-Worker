@@ -18,7 +18,9 @@ import asyncio
 import json
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -29,6 +31,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from orchestrator.services.sudo_gate import SudoGateService, _SHELL_META_RE  # noqa: E402
+from orchestrator.services.sudo_gate import SudoRequestConflict  # noqa: E402
 
 
 # =============================================================================
@@ -141,6 +144,139 @@ def make_sudo_request_data(
         "runas_user": runas_user,
         "cwd": cwd,
     }
+
+
+HTTP_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def make_http_sudo_body(**overrides):
+    body = {
+        "request_id": HTTP_REQUEST_ID,
+        "command": "apt-get",
+        "argv": ["install", "-y", "curl"],
+        "runas_user": "root",
+        "user": "agent-host",
+        "host": "vm-one",
+        "tty": "pts/1",
+        "cwd": "/workspace",
+        "pid": 42,
+    }
+    body.update(overrides)
+    return body
+
+
+def make_http_row(**overrides):
+    row = {
+        "id": HTTP_REQUEST_ID,
+        "job_id": "job-aaa",
+        "thread_id": None,
+        "status": "pending",
+        "decision_reason": None,
+        "expires_at": datetime.now(timezone.utc),
+        "command": "apt-get",
+        "arguments": ["install", "-y", "curl"],
+        "working_directory": "/workspace",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestHttpSudoBridge:
+    @staticmethod
+    def service():
+        svc = SudoGateService()
+        db = AsyncMock()
+        db.get_job.return_value = {
+            "id": "job-aaa",
+            "context": {"vm": {"vm_name": "vm-from-context"}},
+        }
+        svc.connect(db)
+        svc._get_request_by_reply_subject = AsyncMock(return_value=None)
+        svc._insert_request = AsyncMock(return_value=HTTP_REQUEST_ID)
+        svc._get_request = AsyncMock(return_value=make_http_row())
+        svc._broadcast_sse = AsyncMock()
+        svc._notify_project_officer = AsyncMock()
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_auto_rule_returns_immediate_decision(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value="approve")
+        svc._finalize_request = AsyncMock()
+
+        result = await svc.open_request(
+            SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+            make_http_sudo_body(),
+        )
+
+        assert result.status == "approved"
+        assert result.reason == "auto-approval rule"
+        svc._finalize_request.assert_awaited_once()
+        svc._broadcast_sse.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pending_becomes_approved_across_polls(self, monkeypatch):
+        svc = self.service()
+        svc._get_scoped_request = AsyncMock(
+            side_effect=[
+                make_http_row(),
+                make_http_row(status="approved", decision_reason="operator approved"),
+            ]
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        result = await svc.wait_for_decision(HTTP_REQUEST_ID, 25)
+
+        assert result == {
+            "request_id": HTTP_REQUEST_ID,
+            "status": "approved",
+            "reason": "operator approved",
+        }
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repost_returns_existing_state(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+
+        result = await svc.open_request(
+            SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+            make_http_sudo_body(),
+        )
+
+        assert result.created is False
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repost_payload_mismatch_conflicts(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(
+                SimpleNamespace(entity_type="job", entity_id="job-aaa"),
+                make_http_sudo_body(cwd="/different"),
+            )
+
+    @pytest.mark.asyncio
+    async def test_sweep_expiry_ends_wait(self, monkeypatch):
+        svc = self.service()
+        svc._get_scoped_request = AsyncMock(
+            side_effect=[make_http_row(), make_http_row(status="expired")]
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        result = await svc.wait_for_decision(HTTP_REQUEST_ID, 25)
+
+        assert result["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_nats_reply_skips_http_claim(self):
+        svc = self.service()
+        svc._nc = AsyncMock()
+
+        await svc._nats_reply(f"http:{HTTP_REQUEST_ID}", True, "approved")
+
+        svc._nc.publish.assert_not_awaited()
 
 
 # =============================================================================
@@ -337,13 +473,13 @@ class TestOnSudoRequest:
         conn.fetchrow.assert_called_once()
         args = conn.fetchrow.call_args[0]
         # job_id defaults to ""
-        assert args[1] == ""
-        # vm_name defaults to ""
         assert args[2] == ""
+        # vm_name defaults to ""
+        assert args[4] == ""
         # requesting_user defaults to "unknown"
-        assert args[6] == "unknown"
+        assert args[8] == "unknown"
         # target_user defaults to "root"
-        assert args[7] == "root"
+        assert args[9] == "root"
 
     @pytest.mark.asyncio
     async def test_nats_reply_subject_from_msg(self):
@@ -360,7 +496,7 @@ class TestOnSudoRequest:
 
         # The reply subject should be passed to the insert
         args = conn.fetchrow.call_args[0]
-        assert args[8] == "_INBOX.custom_reply"
+        assert args[10] == "_INBOX.custom_reply"
 
     @pytest.mark.asyncio
     async def test_msg_without_reply_attribute(self):
@@ -379,7 +515,7 @@ class TestOnSudoRequest:
 
         # reply subject should be None
         args = conn.fetchrow.call_args[0]
-        assert args[8] is None
+        assert args[10] is None
 
 
 # =============================================================================
@@ -1798,7 +1934,7 @@ class TestInsertRequest:
 
         # The metadata param (last positional arg) should be a JSON string
         args = conn.fetchrow.call_args[0]
-        metadata_arg = args[9]  # $9 in the query
+        metadata_arg = args[11]  # $11 in the query
         parsed = json.loads(metadata_arg)
         assert parsed["extra"] == [1, 2, 3]
 

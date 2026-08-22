@@ -775,9 +775,9 @@ async def require_sudo_request_authority(
 ) -> dict[str, Any]:
     """Require caller to be allowed to approve/deny a sudo request.
 
-    Authority = admin, OR project-owner of the related job. Job owners
-    CANNOT self-approve their own sudo requests — that would defeat the
-    gate. Orphan requests (no job or no project) are admin-only.
+    Authority = admin, project-owner of the related job, OR owner of the
+    related persistent thread. Job owners CANNOT self-approve their own sudo
+    requests — that would defeat the gate. Orphan requests are admin-only.
 
     Returns the sudo request dict. Raises 404 if unknown, 403 otherwise.
 
@@ -793,9 +793,26 @@ async def require_sudo_request_authority(
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
         )
-    # Resolve the underlying job's project so we can apply the scope check
-    # uniformly even for the admin path.
+    thread_id = sudo_req.get("thread_id")
     job_id = sudo_req.get("job_id")
+    entity_id = thread_id or job_id
+    if not await user_can_access_job_or_thread(user, db, entity_id):
+        raise await _denied(
+            request,
+            db,
+            user,
+            resource_type="sudo_request",
+            resource_id=request_id,
+            detail="Not authorized to act on this sudo request",
+        )
+
+    # A personal thread has no project authority tier: its owner decides.
+    # ``user_can_access_job_or_thread`` already enforces owner/admin + scope.
+    if thread_id:
+        return sudo_req
+
+    # Resolve the underlying job's project so the existing project-owner
+    # authority rule remains intact for batch jobs.
     job_project_id = None
     if job_id:
         job = await db.get_job(str(job_id))
