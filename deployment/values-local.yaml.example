@@ -228,6 +228,11 @@ canvas:
 # Agent pool — no warm/buffer slots; agents spin up on demand only
 # -----------------------------------------------------------------------------
 agent:
+  # Keep ordinary local jobs pinned unless a developer explicitly exercises
+  # the stateless-default path alongside the stateless worker admission gate.
+  stateless:
+    worker:
+      defaultEnabled: false
   pool:
     minAgents: "0"
     buffer: "0"
