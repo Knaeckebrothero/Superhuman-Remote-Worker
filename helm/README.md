@@ -439,6 +439,7 @@ that implement the standard policy resource on virt-launcher pods:
 | Cilium             | yes                     |
 | OVN-Kubernetes     | yes                     |
 | Antrea             | yes                     |
+| K3s (Flannel + embedded kube-router) | yes (ingress and egress) |
 | **Flannel**        | **no** (any policy)     |
 | Kube-OVN           | partial (KubeVirt bugs) |
 
