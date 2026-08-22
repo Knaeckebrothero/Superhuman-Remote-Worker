@@ -299,9 +299,27 @@ JDBC URL the bundled Keycloak uses to talk to its own Postgres. Resolves to the
 in-cluster `srw-keycloakdb` Service when databases.keycloak.internal is true,
 or to the operator-supplied externalUrl otherwise (e.g. managed Postgres).
 */}}
+{{/*
+Host of the Keycloak database, for anything that needs a hostname rather than
+a JDBC URL -- notably the wait-for-db init container, which polls it with nc.
+Internal only; in external mode the URL is opaque and there is nothing to wait
+for that the chart deployed.
+*/}}
+{{- define "srw.keycloakDbHost" -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-keycloakdb%s" (include "srw.fullname" .) $suffix -}}
+{{- end }}
+
 {{- define "srw.keycloakDbJdbcUrl" -}}
 {{- if .Values.databases.keycloak.internal -}}
-jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb:5432/keycloak
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb{{ $suffix }}:5432/keycloak
 {{- else -}}
 {{- required "databases.keycloak.externalUrl is required when databases.keycloak.internal is false" .Values.databases.keycloak.externalUrl -}}
 {{- end -}}
@@ -316,7 +334,11 @@ GITEA__database__USER / __PASSWD from the Secret.
 */}}
 {{- define "srw.giteaDbHost" -}}
 {{- if .Values.databases.gitea.internal -}}
-{{- printf "%s-giteadb" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.gitea)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-giteadb%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.gitea.externalHost is required when databases.gitea.internal is false" .Values.databases.gitea.externalHost -}}
 {{- end -}}
@@ -541,9 +563,19 @@ For external mode, set databases.<which>.externalHost/externalPort/
 externalDb in values; the chart still injects the host/port/db via
 ConfigMap, and only the credentials come from the Secret.
 */}}
+{{/*
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
+*/}}
 {{- define "srw.postgresHost" -}}
 {{- if .Values.databases.postgres.internal -}}
-{{- printf "%s-postgres" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-postgres%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.postgres.externalHost is required when internal=false" .Values.databases.postgres.externalHost -}}
 {{- end -}}
@@ -565,9 +597,19 @@ srw
 {{- end -}}
 {{- end }}
 
+{{/*
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
+*/}}
 {{- define "srw.vectorPostgresHost" -}}
 {{- if .Values.databases.vector.internal -}}
-{{- printf "%s-pgvector" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.vector)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-pgvector%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.vector.externalHost is required when internal=false" .Values.databases.vector.externalHost -}}
 {{- end -}}
@@ -589,9 +631,19 @@ srw_vector
 {{- end -}}
 {{- end }}
 
+{{/*
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
+*/}}
 {{- define "srw.auditPostgresHost" -}}
 {{- if .Values.databases.audit.internal -}}
-{{- printf "%s-auditdb" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.audit)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-auditdb%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.audit.externalHost is required when internal=false" .Values.databases.audit.externalHost -}}
 {{- end -}}

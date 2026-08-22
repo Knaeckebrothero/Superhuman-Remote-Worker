@@ -572,7 +572,7 @@ spec:
         {{- if .Values.databases.keycloak.internal }}
         - name: wait-for-keycloakdb
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-keycloakdb 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.keycloakDbHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if .Values.keycloak.bridgeCert.enabled }}
         - name: extract-bridge-cert

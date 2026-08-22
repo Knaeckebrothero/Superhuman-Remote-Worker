@@ -40,7 +40,7 @@ spec:
         {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
         - name: wait-for-postgres
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.postgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         - name: wait-for-orchestrator
           # The orchestrator runs ensure_schema() on startup — delay the seed
