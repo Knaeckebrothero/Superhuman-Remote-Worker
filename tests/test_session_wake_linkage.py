@@ -409,6 +409,9 @@ class TestLinkagePersistence:
             project_id=project_id,
             thread_id=THREAD_ID,
             requested_slot="line",
+            # No config_override on the request, so admission resolves the
+            # default workspace backend for the officer it is about to seat.
+            requested_config_override=None,
         )
         admit.assert_awaited_once()
         assert admit.await_args.kwargs["preparation"] is preparation

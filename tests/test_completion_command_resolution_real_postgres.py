@@ -19,6 +19,10 @@ from orchestrator.services.completion_command_resolution import (
 )
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_PLAN
 from orchestrator.services.completion_monitor import CompletionMonitor
+from src.shared.workspace_contract import (
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    pinned_dispatch_authority_jsonb_sql,
+)
 
 
 SCHEMA_FILE = (
@@ -72,6 +76,37 @@ async def _agent(conn, *, status: str = "working") -> UUID:
         "VALUES ('developer', $1, $2) RETURNING id",
         f"resolution-{uuid4().hex[:10]}",
         status,
+    )
+
+
+async def _assign_pinned_agent(conn, job_id: UUID, agent_id: UUID, *, lease: str):
+    """Attach an agent and lease the way the dispatcher's claim CAS does.
+
+    Landing a pinned job on processing-with-an-agent is a dispatch boundary,
+    and migration 0175 refuses one that carries no matching authority marker.
+    The marker SQL comes from the same builder the real claim uses so this
+    fixture cannot drift away from what the fence accepts.
+    """
+    # now() is transaction-stable, so the marker and the column it must match
+    # evaluate the same lease expression to the same instant.
+    authority_sql = pinned_dispatch_authority_jsonb_sql(
+        agent_expr="$2::uuid", lease_expr=lease
+    )
+    await conn.execute(
+        f"""
+        UPDATE jobs
+           SET assigned_agent_id = $2::uuid,
+               lease_expires_at = {lease},
+               context = jsonb_set(
+                   COALESCE(context, '{{}}'::jsonb),
+                   '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
+                   {authority_sql},
+                   true
+               )
+         WHERE id = $1
+        """,
+        job_id,
+        agent_id,
     )
 
 
@@ -618,11 +653,8 @@ async def test_stale_pinned_assignment_does_not_block_parked_unpark(pg):
     async with pg.acquire() as conn:
         agent_id = await _agent(conn, status="ready")
         job_id = await _job(conn)
-        await conn.execute(
-            "UPDATE jobs SET assigned_agent_id=$2, "
-            "lease_expires_at=now()+interval '1 hour' WHERE id=$1",
-            job_id,
-            agent_id,
+        await _assign_pinned_agent(
+            conn, job_id, agent_id, lease="now()+interval '1 hour'"
         )
         command_id = await _command(conn, job_id, state="parked")
         await conn.execute(
@@ -646,11 +678,8 @@ async def test_expired_pinned_job_lease_allows_parked_force(pg):
         await conn.execute(
             "UPDATE agents SET current_job_id=$2 WHERE id=$1", agent_id, job_id
         )
-        await conn.execute(
-            "UPDATE jobs SET assigned_agent_id=$2, "
-            "lease_expires_at=now()-interval '1 second' WHERE id=$1",
-            job_id,
-            agent_id,
+        await _assign_pinned_agent(
+            conn, job_id, agent_id, lease="now()-interval '1 second'"
         )
         command_id = await _command(conn, job_id, state="parked")
         await conn.execute(
@@ -679,11 +708,8 @@ async def test_exact_live_pinned_executor_holds_operator_resolution(pg, agent_st
         await conn.execute(
             "UPDATE agents SET current_job_id=$2 WHERE id=$1", agent_id, job_id
         )
-        await conn.execute(
-            "UPDATE jobs SET assigned_agent_id=$2, "
-            "lease_expires_at=now()+interval '1 hour' WHERE id=$1",
-            job_id,
-            agent_id,
+        await _assign_pinned_agent(
+            conn, job_id, agent_id, lease="now()+interval '1 hour'"
         )
         command_id = await _command(conn, job_id, state="parked")
         await conn.execute(

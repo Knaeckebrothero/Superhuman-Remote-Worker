@@ -36,6 +36,10 @@ from orchestrator.services.infrastructure_metering.inventory import (
     TransportNonceClaim,
     inventory_manifest_digest,
 )
+from src.shared.workspace_contract import (
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    pinned_dispatch_authority_jsonb_sql,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -1525,7 +1529,25 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
                         second_agent_id,
                         owner_id,
                     )
-                    owner_mutation = "UPDATE jobs SET status='processing' WHERE id=$1"
+                    # Flipping a pinned job to processing with an agent still
+                    # attached is a dispatch boundary, so migration 0175's
+                    # fence wants the authority marker in the same statement.
+                    # The lock ordering under test is unaffected by it.
+                    authority_sql = pinned_dispatch_authority_jsonb_sql(
+                        agent_expr="assigned_agent_id",
+                        lease_expr="lease_expires_at",
+                    )
+                    owner_mutation = f"""
+                        UPDATE jobs
+                           SET status='processing',
+                               context = jsonb_set(
+                                   COALESCE(context, '{{}}'::jsonb),
+                                   '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
+                                   {authority_sql},
+                                   true
+                               )
+                         WHERE id=$1
+                    """
                 else:
                     await conn.execute(
                         "INSERT INTO threads (id,title,user_id,agent_id,status) "

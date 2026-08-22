@@ -346,10 +346,22 @@ class CompletionControl:
                             else "unassigned"
                         )
 
+                    # The pinned lane fences on the assigned agent, so the
+                    # claim detaches it. The stateless lane fences on the queue
+                    # lease closed just above and keeps assigned_agent_id NULL
+                    # by construction — naming the column there would drag this
+                    # release into migration 0175's dispatch trigger, which
+                    # classifies a processing/stateless/unassigned row as a
+                    # worker claim and refuses it for lacking a dispatch marker.
+                    release_agent_sql = (
+                        ""
+                        if expected_lane == "stateless"
+                        else "assigned_agent_id=NULL,"
+                    )
                     updated = await conn.fetchrow(
                         f"""
                         UPDATE jobs
-                        SET assigned_agent_id=NULL,
+                        SET {release_agent_sql}
                             context=jsonb_set(
                                 COALESCE(context, '{{}}'::jsonb),
                                 '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
