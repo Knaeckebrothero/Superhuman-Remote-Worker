@@ -31,6 +31,10 @@ from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
 from ..core.workspace import get_logs_path
 from ..core.workspace_backend import completion_error_payload
+from ..shared.workspace_contract import (
+    WorkspaceContractError,
+    validate_worker_workspace_projection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -924,6 +928,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        try:
+            validate_worker_workspace_projection(
+                config_override=request.config_override,
+                resolved_config=request.resolved_config,
+                workspace_runtime=request.workspace_runtime,
+            )
+        except WorkspaceContractError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+
         # Check if already processing a job
         if _current_job_id is not None:
             raise HTTPException(
@@ -936,6 +949,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         _clear_stop()
 
         # Start processing in background
+        start_context = dict(request.context or {})
+        start_context["workspace_runtime"] = request.workspace_runtime
         _current_job_task = asyncio.create_task(
             _process_orchestrator_job(
                 job_id=request.job_id,
@@ -945,7 +960,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 instructions_upload_id=request.instructions_upload_id,
                 document_path=request.document_path,
                 document_dir=request.document_dir,
-                context=request.context,
+                context=start_context,
                 instructions=request.instructions,
                 config_name=request.config_name,
                 expert_id=request.expert_id,
@@ -1113,6 +1128,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        try:
+            validate_worker_workspace_projection(
+                config_override=request.config_override,
+                resolved_config=None,
+                workspace_runtime=request.workspace_runtime,
+            )
+        except WorkspaceContractError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+
         # Log config mismatch as warning (don't reject - checkpoint discovery handles it)
         if request.config_name and request.config_name != _agent.config.agent_id:
             logger.warning(
@@ -1148,6 +1172,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["project_id"] = request.project_id
         if request.runtime_actor:
             resume_metadata["runtime_actor"] = request.runtime_actor
+        resume_metadata["workspace_runtime"] = request.workspace_runtime
         if request.git_remote_url:
             # Feeds the pod-handoff clone fallback in _setup_job_workspace
             # (resume_fresh_workspace_no_clone_fallback.md).

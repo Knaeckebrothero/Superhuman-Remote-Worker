@@ -181,6 +181,10 @@ async def create_job(
             use {"llm": {"model": "<model_id>"}} — e.g.
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
+            A typed Officer slot may pin both model and workspace backend. An
+            explicit model/backend that contradicts the selected slot is
+            refused before job/ticket-claim creation; select a compatible slot
+            instead of retrying the same override.
         context: Additional context dictionary
         project_id: Project UUID to file the job under. Omit to use the
             caller's own project lineage. Membership is validated
@@ -192,7 +196,10 @@ async def create_job(
             seal. Shown to the worker at dispatch; missing deliverables
             bounce the seal back to the worker with the precise list.
         slot: Officer roster slot for this dispatch. Translated to
-            context.officer_slot; when both are supplied, this value wins.
+            context.officer_slot. Slot-pinned model/backend values are an
+            allocation contract, not silent overrides: conflicting explicit
+            choices are returned as stable slot_model_conflict or
+            slot_backend_conflict errors.
         ticket: Backlog ticket this job claims — the knowledge-note slug of
             the ready ticket being dispatched. REQUIRED when working a
             backlog ticket: the server resolves the current ready generation

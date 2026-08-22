@@ -6,6 +6,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def _workspace_bundle() -> dict:
+    return {
+        "config_override": {
+            "workspace": {
+                "backend": "sandbox",
+                "remote": {"host": "workspace.internal"},
+            }
+        },
+        "workspace_runtime": {
+            "requested_backend": None,
+            "assigned_backend": "sandbox",
+            "effective_backend": "sandbox",
+            "state": "ready",
+        },
+    }
+
+
 class TestJobStartEndpoint:
     """Tests for POST /job/start endpoint."""
 
@@ -75,6 +92,7 @@ class TestJobStartEndpoint:
             json={
                 "job_id": "test-job-123",
                 "description": "Test task",
+                **_workspace_bundle(),
             },
         )
 
@@ -82,6 +100,21 @@ class TestJobStartEndpoint:
         data = response.json()
         assert data["job_id"] == "test-job-123"
         assert data["status"] == "accepted"
+
+    def test_pre_contract_job_start_is_refused(self, test_client, mock_agent):
+        import src.api.app as app_module
+
+        app_module._current_job_id = None
+        app_module._agent = mock_agent
+        response = test_client.post(
+            "/job/start",
+            json={"job_id": "old-orchestrator", "description": "old bundle"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == (
+            "workspace_runtime_authority_missing"
+        )
 
     def test_job_start_rejects_when_busy(self, test_client, mock_agent):
         """Test that /job/start returns 409 when agent is busy."""
@@ -96,6 +129,7 @@ class TestJobStartEndpoint:
             json={
                 "job_id": "new-job-789",
                 "description": "Another task",
+                **_workspace_bundle(),
             },
         )
 
@@ -222,6 +256,7 @@ class TestJobResumeEndpoint:
             json={
                 "job_id": "resume-job-123",
                 "feedback": "Please continue with step 2",
+                **_workspace_bundle(),
             },
         )
 

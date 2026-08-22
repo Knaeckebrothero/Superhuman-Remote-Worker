@@ -1489,6 +1489,13 @@ class StatelessTurnExecutor:
         request = JobStartRequest.model_validate(bundle.get("job") or {})
         if request.job_id != job_id:
             raise ValueError("worker claim bundle job payload id mismatch")
+        from ..shared.workspace_contract import validate_worker_workspace_projection
+
+        validate_worker_workspace_projection(
+            config_override=request.config_override,
+            resolved_config=request.resolved_config,
+            workspace_runtime=request.workspace_runtime,
+        )
         authority = {
             "workspace_generation": request.workspace_generation,
             "workspace_runtime_incarnation": request.workspace_runtime_incarnation,
@@ -1561,6 +1568,7 @@ class StatelessTurnExecutor:
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
             ("runtime_actor", "runtime_actor"),
+            ("workspace_runtime", "workspace_runtime"),
             ("workspace_generation", "workspace_generation"),
             (
                 "workspace_runtime_incarnation",

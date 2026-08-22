@@ -49,6 +49,25 @@ def _resume_endpoint():
     )
 
 
+def _sandbox_runtime() -> dict[str, str]:
+    """Production-shaped server authority attached to every worker resume."""
+    return {
+        "requested_backend": "sandbox",
+        "assigned_backend": "sandbox",
+        "effective_backend": "sandbox",
+        "state": "ready",
+    }
+
+
+def _sandbox_config() -> dict[str, object]:
+    return {
+        "workspace": {
+            "backend": "sandbox",
+            "remote": {"host": "workspace-test.svc"},
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_resume_endpoint_forwards_git_remote_into_metadata(monkeypatch):
     agent = _wire_idle_agent(monkeypatch)
@@ -59,6 +78,8 @@ async def test_resume_endpoint_forwards_git_remote_into_metadata(monkeypatch):
             job_id="j1",
             previous_status="paused",
             git_remote_url="http://srw-gitea:3000/srw/job-j1.git",
+            config_override=_sandbox_config(),
+            workspace_runtime=_sandbox_runtime(),
         )
     )
     await dual_app._current_job_task
@@ -75,7 +96,14 @@ async def test_resume_endpoint_omits_git_remote_when_not_sent(monkeypatch):
     agent = _wire_idle_agent(monkeypatch)
     resume_ep = _resume_endpoint()
 
-    await resume_ep(JobResumeRequest(job_id="j2", previous_status="paused"))
+    await resume_ep(
+        JobResumeRequest(
+            job_id="j2",
+            previous_status="paused",
+            config_override=_sandbox_config(),
+            workspace_runtime=_sandbox_runtime(),
+        )
+    )
     await dual_app._current_job_task
 
     metadata = agent.process_job.await_args.kwargs["metadata"]

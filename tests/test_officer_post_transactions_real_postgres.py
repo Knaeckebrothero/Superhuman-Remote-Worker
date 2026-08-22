@@ -43,6 +43,13 @@ from src.shared.persistent_input_delivery import (
     persist_input_delivery,
     transition_input_delivery,
 )
+from src.shared.workspace_contract import (
+    LEGACY_K8S_RUNTIME_ADOPTION_KEY,
+    WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    resolve_workspace_runtime,
+)
+from src.shared.worker_queue import claim_worker_batch
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -208,6 +215,7 @@ async def _prepare(
     seed: dict[str, str],
     *,
     auto_pull: bool = False,
+    requested_config_override: dict | None = None,
 ):
     return await prepare_officer_admission(
         db,
@@ -216,6 +224,7 @@ async def _prepare(
         requested_slot="line",
         require_auto_pull=auto_pull,
         expected_category="executor" if auto_pull else None,
+        requested_config_override=requested_config_override,
     )
 
 
@@ -257,6 +266,847 @@ def _plan_index_names(node: dict) -> set[str]:
     for child in node.get("Plans") or []:
         names.update(_plan_index_names(child))
     return names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "code"),
+    [
+        ({"workspace": {"backend": "vm"}}, "slot_backend_conflict"),
+        ({"llm": {"model": "gpt-5.6-sol"}}, "slot_model_conflict"),
+    ],
+)
+async def test_slot_pin_conflict_precedes_job_and_ticket_claim(db, override, code):
+    seed = await _seed_post(db)
+
+    with pytest.raises(OfficerAdmissionConflict) as raised:
+        await _prepare(db, seed, requested_config_override=override)
+
+    assert raised.value.code == code
+    assert raised.value.fields["slot"] == "line"
+    assert await _job_count(db) == 0
+    assert await _claim_rows(db, seed["project_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_slot_default_stamps_one_server_owned_workspace_contract(db):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    job = await admit_and_create_job(
+        db,
+        preparation=preparation,
+        job_kwargs=_job_kwargs("slot default contract"),
+        ticket_note_id="slot-default-contract",
+        ticket_ready_at=READY_GENERATION,
+    )
+    stored = await db.get_job(str(job["id"]))
+    context = _json(stored["context"])
+    config = _json(stored["config_override"])
+
+    assert config["workspace"]["backend"] == "sandbox"
+    assert context["_workspace_contract"] == {
+        "version": 1,
+        "requested_backend": None,
+        "assigned_backend": "sandbox",
+        "assignment_source": "officer_slot:line",
+    }
+    assert len(await _claim_rows(db, seed["project_id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_common_create_funnel_strips_forged_workspace_authority(db):
+    job = await db.create_job(
+        description="forged workspace authority",
+        config_override={
+            "workspace": {
+                "backend": "remote",
+                "remote": {"host": "foreign.internal", "key_path": "/secret"},
+            }
+        },
+        context={
+            "workspace_backend": "sandbox",
+            "_workspace_contract": {
+                "version": 1,
+                "assigned_backend": "sandbox",
+                "assignment_source": "caller",
+            },
+            "workspace_runtime": {"effective_backend": "sandbox"},
+            "workspace_container": {
+                "status": "ready",
+                "host": "foreign.internal",
+            },
+            "vm": {"status": "ready", "ssh_host": "foreign-vm.internal"},
+        },
+    )
+    stored = await db.get_job(str(job["id"]))
+    context = _json(stored["context"])
+    config = _json(stored["config_override"])
+
+    assert config["workspace"] == {"backend": "vm"}
+    assert context["_workspace_contract"] == {
+        "version": 1,
+        "requested_backend": "vm",
+        "assigned_backend": "vm",
+        "assignment_source": "resolved_config",
+    }
+    assert not {
+        "workspace_backend",
+        "workspace_runtime",
+        "workspace_container",
+        "vm",
+    }.intersection(context)
+
+
+@pytest.mark.asyncio
+async def test_opposite_tier_callbacks_cannot_change_effective_backend(db):
+    vm_job = await db.create_job(
+        description="vm callback race",
+        config_override={"workspace": {"backend": "vm"}},
+        requested_workspace_backend="vm",
+        workspace_assignment_source="request",
+    )
+    await db.merge_workspace_container_context(
+        str(vm_job["id"]),
+        {
+            "status": "ready",
+            "host": "stale-container.internal",
+            "_runtime_incarnation": str(uuid4()),
+        },
+    )
+    vm_mismatch = resolve_workspace_runtime(await db.get_job(str(vm_job["id"])))
+    assert vm_mismatch.state == "mismatch"
+    assert vm_mismatch.effective_backend is None
+
+    await db.merge_vm_context(
+        str(vm_job["id"]),
+        {
+            "status": "ready",
+            "ssh_host": "current-vm.internal",
+            "provision_generation": str(uuid4()),
+        },
+    )
+    vm_ready = resolve_workspace_runtime(await db.get_job(str(vm_job["id"])))
+    assert vm_ready.effective_backend == "vm"
+    assert vm_ready.stale_backend == "sandbox"
+
+    sandbox_job = await db.create_job(
+        description="sandbox callback race",
+        config_override={"workspace": {"backend": "sandbox"}},
+        requested_workspace_backend="sandbox",
+        workspace_assignment_source="request",
+    )
+    await asyncio.gather(
+        db.merge_vm_context(
+            str(sandbox_job["id"]),
+            {
+                "status": "ready",
+                "ssh_host": "late-vm.internal",
+                "provision_generation": str(uuid4()),
+            },
+        ),
+        db.merge_workspace_container_context(
+            str(sandbox_job["id"]),
+            {
+                "status": "ready",
+                "host": "current-container.internal",
+                "_runtime_incarnation": str(uuid4()),
+            },
+        ),
+    )
+    sandbox_ready = resolve_workspace_runtime(await db.get_job(str(sandbox_job["id"])))
+    assert sandbox_ready.effective_backend == "sandbox"
+    assert sandbox_ready.stale_backend == "vm"
+
+
+@pytest.mark.asyncio
+async def test_stateless_admission_cannot_claim_vm_or_ambiguous_legacy_job(db):
+    vm_job = await db.create_job(
+        description="stateless VM refusal",
+        config_override={"workspace": {"backend": "vm"}},
+        requested_workspace_backend="vm",
+        workspace_assignment_source="request",
+        execution_lane="stateless",
+    )
+    await db.merge_workspace_container_context(
+        str(vm_job["id"]),
+        {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.10",
+            "_runtime_incarnation": str(uuid4()),
+        },
+    )
+    assert await db.admit_stateless_worker_job(
+        str(vm_job["id"]), fair_key=None, priority=5
+    ) == (False, None)
+
+    legacy = await db.create_job(
+        description="observed legacy ambiguity",
+        config_override={"workspace": {"backend": "sandbox"}},
+        execution_lane="stateless",
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET context = (context - '_workspace_contract')
+                   || jsonb_build_object(
+                       'workspace_backend', 'vm',
+                       'workspace_container', jsonb_build_object(
+                           'status', 'ready',
+                           'provisioner', 'k8s',
+                           'pod_ip', '10.42.0.11',
+                           '_runtime_incarnation', $2::text
+                       )
+                   )
+             WHERE id = $1
+            """,
+            legacy["id"],
+            str(uuid4()),
+        )
+    assert await db.admit_stateless_worker_job(
+        str(legacy["id"]), fair_key=None, priority=5
+    ) == (False, None)
+
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM run_queue WHERE unit_id=ANY($1::uuid[]))",
+            [vm_job["id"], legacy["id"]],
+        )
+
+
+@pytest.mark.asyncio
+async def test_stateless_claim_is_bound_to_exact_queue_lease_and_tier(db):
+    job = await db.create_job(
+        description="stateless dispatch fence",
+        config_override={"workspace": {"backend": "sandbox"}},
+        requested_workspace_backend="sandbox",
+        workspace_assignment_source="request",
+        execution_lane="stateless",
+    )
+    await db.merge_workspace_container_context(
+        str(job["id"]),
+        {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.12",
+            "_runtime_incarnation": str(uuid4()),
+        },
+    )
+    admitted, _queue_result = await db.admit_stateless_worker_job(
+        str(job["id"]), fair_key=None, priority=5
+    )
+    assert admitted is True
+
+    # The immediately previous worker CAS leased the queue then changed only
+    # jobs.status. Migration 0175 must roll back both writes rather than let an
+    # old replica dispatch without the tier/lease marker.
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as raised:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE run_queue
+                       SET state='leased', lease_token=lease_token+1,
+                           leased_by='pre-contract-worker',
+                           last_leased_by='pre-contract-worker',
+                           leased_until=now()+interval '60 seconds'
+                     WHERE unit_id=$1
+                    """,
+                    job["id"],
+                )
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET status='processing', assigned_agent_id=NULL,
+                           lease_expires_at=NULL
+                     WHERE id=$1
+                    """,
+                    job["id"],
+                )
+        assert (
+            raised.value.constraint_name == "job_workspace_dispatch_requires_authority"
+        )
+        queue = await conn.fetchrow(
+            "SELECT state, lease_token, leased_by FROM run_queue WHERE unit_id=$1",
+            job["id"],
+        )
+        stored = await conn.fetchrow(
+            "SELECT status, context FROM jobs WHERE id=$1", job["id"]
+        )
+        assert dict(queue) == {
+            "state": "queued",
+            "lease_token": 0,
+            "leased_by": None,
+        }
+        assert stored["status"] == "created"
+        assert WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY not in _json(stored["context"])
+
+    claim = await claim_worker_batch(
+        db,
+        pod_name="workspace-contract-worker",
+        affinity_grace_seconds=0,
+    )
+    assert claim is not None
+    stored = await db.get_job(str(job["id"]))
+    marker = _json(stored["context"])[WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY]
+    assert marker["dispatch_kind"] == "stateless"
+    assert marker["assigned_backend"] == "sandbox"
+    assert marker["worker_pod"] == "workspace-contract-worker"
+    assert marker["queue_lease_token"] == claim.lease_token
+    assert marker["queue_leased_until"]
+
+
+@pytest.mark.asyncio
+async def test_lite_to_sandbox_contract_transition_has_one_cas_winner(db):
+    job = await db.create_job(
+        description="atomic tier transition",
+        config_override={"workspace": {"backend": "virtual"}},
+        requested_workspace_backend="virtual",
+        workspace_assignment_source="request",
+    )
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='processing' WHERE id=$1", job["id"])
+
+    outcomes = await asyncio.gather(
+        *(
+            db.begin_job_workspace_tier_transition(
+                str(job["id"]),
+                expected_backend="virtual",
+                target_backend="sandbox",
+                requested_backend="virtual",
+                assignment_source="runtime_workspace_upgrade",
+                expected_status="processing",
+            )
+            for _ in range(2)
+        )
+    )
+    assert sorted(outcomes) == [False, True]
+
+    stored = await db.get_job(str(job["id"]))
+    context = _json(stored["context"])
+    config = _json(stored["config_override"])
+    assert config["workspace"]["backend"] == "sandbox"
+    assert context["workspace_container"]["status"] == "pending"
+    assert context["_workspace_contract"] == {
+        "version": 1,
+        "requested_backend": "virtual",
+        "assigned_backend": "sandbox",
+        "assignment_source": "runtime_workspace_upgrade",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pre_contract_officer_insert_rolls_back_ticket_claim(db):
+    """A pre-0175 admission replica cannot commit half of BP-05's pair."""
+
+    seed = await _seed_post(db)
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as raised:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO officer_ticket_claims (
+                        project_id, ticket_note_id, ready_generation_at,
+                        source, officer_thread_id, officer_incarnation,
+                        officer_slot, work_category,
+                        admission_config_fingerprint,
+                        admission_lineage_size, job_id
+                    ) VALUES (
+                        $1, 'old-replica-ticket', $3, 'manual', $2, 0,
+                        'line', 'executor', $4, 1, $5
+                    )
+                    """,
+                    UUID(seed["project_id"]),
+                    UUID(seed["thread_id"]),
+                    READY_GENERATION,
+                    "a" * 64,
+                    job_id,
+                )
+                # This is the production shape an immediately previous
+                # Officer-admission replica could emit: valid BP-05 authority,
+                # but no workspace-contract stamp.
+                await conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, description, status, project_id,
+                        created_by_thread_id, origin, execution_lane,
+                        config_override, context
+                    ) VALUES (
+                        $1, 'old replica Officer job', 'created', $2, $3,
+                        'officer', 'pinned',
+                        '{"workspace":{"backend":"sandbox"}}'::jsonb,
+                        '{}'::jsonb
+                    )
+                    """,
+                    job_id,
+                    UUID(seed["project_id"]),
+                    UUID(seed["thread_id"]),
+                )
+        assert raised.value.constraint_name == "officer_job_requires_workspace_contract"
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE id=$1)", job_id
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM officer_ticket_claims WHERE job_id=$1)",
+            job_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_claim_requires_atomic_workspace_authority_marker(db):
+    """An old claimant fails closed; the current claimant binds agent + lease."""
+
+    job = await db.create_job(
+        description="mixed-version dispatch fence",
+        config_override={"workspace": {"backend": "sandbox"}},
+        requested_workspace_backend="sandbox",
+        workspace_assignment_source="request",
+    )
+    agent_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agents (
+                id, config_name, hostname, pod_ip, pod_uid, status, agent_mode
+            ) VALUES ($1, 'worker_base', $2, '127.0.0.1', $3, 'ready', 'worker')
+            """,
+            agent_id,
+            f"workspace-contract-{agent_id}",
+            f"workspace-contract-pod-{agent_id}",
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as raised:
+            await conn.execute(
+                """
+                UPDATE jobs
+                   SET status='processing', assigned_agent_id=$2,
+                       lease_expires_at=now()+interval '60 seconds'
+                 WHERE id=$1
+                """,
+                job["id"],
+                agent_id,
+            )
+        assert (
+            raised.value.constraint_name == "job_workspace_dispatch_requires_authority"
+        )
+        unchanged = await conn.fetchrow(
+            "SELECT status, assigned_agent_id FROM jobs WHERE id=$1", job["id"]
+        )
+        assert unchanged["status"] == "created"
+        assert unchanged["assigned_agent_id"] is None
+
+    assert await db.claim_job_for_agent(str(job["id"]), str(agent_id)) is True
+    stored = await db.get_job(str(job["id"]))
+    context = _json(stored["context"])
+    marker = context[WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY]
+    assert marker["version"] == 1
+    assert marker["dispatch_kind"] == "pinned"
+    assert marker["contract_version"] == 1
+    assert marker["assigned_backend"] == "sandbox"
+    assert marker["agent_id"] == str(agent_id)
+    assert marker["lease_expires_at"]
+    assert not any(
+        private in repr(marker)
+        for private in ("host", "port", "token", "credential", "key")
+    )
+
+    public = orch_main._redact_job_config_override(stored)
+    assert WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY not in repr(public)
+    assert WORKSPACE_CONTRACT_CONTEXT_KEY not in repr(public.get("context"))
+
+
+@pytest.mark.asyncio
+async def test_legacy_workspace_claim_is_conservative_and_fenced(db):
+    agent_id = uuid4()
+    good = await db.create_job(
+        description="unambiguous legacy sandbox",
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    bad = await db.create_job(
+        description="contradictory legacy workspace",
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agents (
+                id, config_name, hostname, pod_ip, pod_uid, status, agent_mode
+            ) VALUES ($1, 'worker_base', $2, '127.0.0.1', $3, 'ready', 'worker')
+            """,
+            agent_id,
+            f"legacy-workspace-{agent_id}",
+            f"legacy-workspace-pod-{agent_id}",
+        )
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET context=(context - $2::text)
+             WHERE id=$1
+            """,
+            good["id"],
+            WORKSPACE_CONTRACT_CONTEXT_KEY,
+        )
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET context=(context - $2::text)
+                    || jsonb_build_object('workspace_backend', 'vm')
+             WHERE id=$1
+            """,
+            bad["id"],
+            WORKSPACE_CONTRACT_CONTEXT_KEY,
+        )
+
+    assert await db.claim_job_for_agent(str(bad["id"]), str(agent_id)) is False
+    assert await db.claim_job_for_agent(str(good["id"]), str(agent_id)) is True
+    stored = await db.get_job(str(good["id"]))
+    marker = _json(stored["context"])[WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY]
+    assert marker["contract_version"] == 0
+    assert marker["assigned_backend"] == "sandbox"
+
+
+async def _seed_exact_pre_0175_k8s_job(db, *, status="created"):
+    """Persist the exact K8s job-runtime JSON emitted by the prior release."""
+
+    job = await db.create_job(
+        description="pre-0175 Kubernetes job runtime",
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    historical_context = {
+        "workspace_container": {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.1.17",
+            "port": 30022,
+            "host": "workspace-job.internal",
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET status=$2,
+                   config_override='{"workspace":{"backend":"container"}}'::jsonb,
+                   context=$3::jsonb
+             WHERE id=$1
+            """,
+            job["id"],
+            status,
+            json.dumps(historical_context),
+        )
+    stored = await db.get_job(str(job["id"]))
+    assert _json(stored["context"]) == historical_context
+    return stored
+
+
+def _k8s_job_attestation(
+    *,
+    runtime_incarnation=None,
+    host="workspace-job.internal",
+    pod_ip="10.42.1.17",
+):
+    from services.container_provisioner import WorkspaceRuntimeAttestation
+
+    backing = str(uuid4())
+    return WorkspaceRuntimeAttestation(
+        backing_id=f"k8s-pvc:test:{backing}",
+        workspace_generation=backing,
+        runtime_incarnation=runtime_incarnation or str(uuid4()),
+        ssh_host_key_fingerprint="SHA256:" + ("a" * 43),
+        host=host,
+        pod_ip=pod_ip,
+        port=30022,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["created", "paused"])
+async def test_pre_0175_k8s_job_runtime_adopts_after_live_attestation(db, status):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db, status=status)
+    attestation = _k8s_job_attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=attestation)
+    )
+
+    result = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+
+    assert result.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+    stored = await db.get_job(str(job["id"]))
+    runtime = _json(stored["context"])["workspace_container"]
+    assert runtime["_runtime_incarnation"] == attestation.runtime_incarnation
+    assert runtime["_legacy_k8s_runtime_adoption"] == {
+        "version": 1,
+        "runtime_incarnation": attestation.runtime_incarnation,
+        "workspace_generation": attestation.workspace_generation,
+        "ssh_host_key_fingerprint": attestation.ssh_host_key_fingerprint,
+    }
+    assert resolve_workspace_runtime(stored).ready
+
+
+@pytest.mark.asyncio
+async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db)
+    inventory = await db.list_uidless_k8s_job_workspace_rows()
+    assert [str(row["id"]) for row in inventory] == [str(job["id"])]
+    attestation = _k8s_job_attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=attestation)
+    )
+
+    outcomes = await asyncio.gather(
+        ensure_legacy_k8s_job_runtime_authority(db, provisioner, job),
+        ensure_legacy_k8s_job_runtime_authority(db, provisioner, job),
+    )
+
+    assert {outcome.outcome for outcome in outcomes} == {
+        LegacyK8sAdoptionOutcome.ADOPTED,
+        LegacyK8sAdoptionOutcome.CONVERGED,
+    }
+    assert await db.list_uidless_k8s_job_workspace_rows() == []
+
+    agent_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agents (
+                id, config_name, hostname, pod_ip, pod_uid, status, agent_mode
+            ) VALUES ($1, 'worker_base', $2, '127.0.0.1', $3, 'ready', 'worker')
+            """,
+            agent_id,
+            f"legacy-adoption-{agent_id}",
+            f"legacy-adoption-pod-{agent_id}",
+        )
+    assert await db.claim_job_for_agent(str(job["id"]), str(agent_id)) is True
+    claimed = await db.get_job(str(job["id"]))
+    context = _json(claimed["context"])
+    assert context["workspace_container"]["_runtime_incarnation"] == (
+        attestation.runtime_incarnation
+    )
+    assert (
+        context[WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY]["assigned_backend"]
+        == "sandbox"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    attestation = _k8s_job_attestation()
+
+    async def delayed_attestation(_owner):
+        started.set()
+        await release.wait()
+        return attestation
+
+    provisioner = SimpleNamespace(attest_workspace_runtime=delayed_attestation)
+    adopting = asyncio.create_task(
+        ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    vm_generation = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET config_override='{"workspace":{"backend":"vm"}}'::jsonb,
+                   context=$2::jsonb
+             WHERE id=$1
+            """,
+            job["id"],
+            json.dumps(
+                {
+                    "_workspace_contract": {
+                        "version": 1,
+                        "requested_backend": "vm",
+                        "assigned_backend": "vm",
+                        "assignment_source": "operator",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "vm.internal",
+                        "ssh_port": 22,
+                        "provision_generation": vm_generation,
+                    },
+                }
+            ),
+        )
+    release.set()
+    outcome = await asyncio.wait_for(adopting, timeout=2)
+
+    assert outcome.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
+    assert outcome.reason == "workspace_snapshot_changed"
+    stored = await db.get_job(str(job["id"]))
+    assert resolve_workspace_runtime(stored).effective_backend == "vm"
+    assert "_legacy_k8s_runtime_adoption" not in repr(stored)
+
+
+@pytest.mark.asyncio
+async def test_pre_0175_post_cas_pod_replacement_reverts_tentative_stamp(db):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db)
+    predecessor = _k8s_job_attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(
+            side_effect=[
+                predecessor,
+                predecessor,
+                _k8s_job_attestation(),
+            ]
+        )
+    )
+
+    outcome = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+
+    assert outcome.outcome is LegacyK8sAdoptionOutcome.RETRY
+    assert outcome.reason == "kubernetes_runtime_changed_after_persistence"
+    stored = await db.get_job(str(job["id"]))
+    assert _json(stored["context"]) == {
+        "workspace_container": {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.1.17",
+            "port": 30022,
+            "host": "workspace-job.internal",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_adopted_deleted_runtime_reprovisions_and_refreshes_exact_cas(db):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db, status="paused")
+    predecessor = _k8s_job_attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=predecessor)
+    )
+    adopted = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+    assert adopted.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+
+    assert await db.merge_workspace_container_context(
+        str(job["id"]), {"status": "deleted"}
+    )
+    provisioner.attest_workspace_runtime.reset_mock()
+    deleted = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(job["id"]))
+    )
+    assert deleted.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
+    provisioner.attest_workspace_runtime.assert_not_awaited()
+
+    replacement = _k8s_job_attestation(
+        host="workspace-replacement.internal", pod_ip="10.42.2.19"
+    )
+    assert await db.merge_workspace_container_context(
+        str(job["id"]),
+        {
+            "status": "ready",
+            "provisioner": "k8s",
+            "host": replacement.host,
+            "pod_ip": replacement.pod_ip,
+            "port": replacement.port,
+            "_runtime_incarnation": replacement.runtime_incarnation,
+        },
+    )
+    provisioner.attest_workspace_runtime.return_value = replacement
+    refreshed = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(job["id"]))
+    )
+
+    assert refreshed.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+    stored = await db.get_job(str(job["id"]))
+    runtime = _json(stored["context"])["workspace_container"]
+    assert runtime["_runtime_incarnation"] == replacement.runtime_incarnation
+    assert runtime[LEGACY_K8S_RUNTIME_ADOPTION_KEY]["workspace_generation"] == (
+        replacement.workspace_generation
+    )
+    assert resolve_workspace_runtime(stored).ready
+
+
+@pytest.mark.asyncio
+async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db):
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    stamped = await db.create_job(
+        description="stamped sandbox with stale VM residue",
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    vm_generation = str(uuid4())
+    await db.merge_job_context(
+        str(stamped["id"]),
+        {
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.1.17",
+                "port": 30022,
+                "host": "workspace-job.internal",
+            },
+            "vm": {
+                "status": "ready",
+                "ssh_host": "stale-vm.internal",
+                "ssh_port": 22,
+                "provision_generation": vm_generation,
+            },
+        },
+    )
+    ambiguous = await _seed_exact_pre_0175_k8s_job(db)
+    await db.merge_job_context(
+        str(ambiguous["id"]),
+        {
+            "vm": {
+                "status": "ready",
+                "ssh_host": "stale-vm.internal",
+                "ssh_port": 22,
+                "provision_generation": str(uuid4()),
+            }
+        },
+    )
+    attestation = _k8s_job_attestation()
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=attestation)
+    )
+
+    accepted = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(stamped["id"]))
+    )
+    refused = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(ambiguous["id"]))
+    )
+
+    assert accepted.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+    assert resolve_workspace_runtime(accepted.authority_job).stale_backend == "vm"
+    assert refused.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
+    assert refused.reason == "authority_ambiguous"
+    ambiguous_stored = await db.get_job(str(ambiguous["id"]))
+    assert LEGACY_K8S_RUNTIME_ADOPTION_KEY not in repr(ambiguous_stored)
 
 
 @pytest.mark.asyncio

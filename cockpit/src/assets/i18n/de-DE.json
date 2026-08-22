@@ -660,6 +660,13 @@
     "projectNone": "Kein Projekt",
     "projectUnknown": "Unbekanntes Projekt",
     "failureReason": "Grund",
+    "workspace": {
+      "summary": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}} · wirksam {{effective}}",
+      "state": "Arbeitsbereichsstatus: {{state}} · Detail: {{failure}}",
+      "default": "Standard",
+      "unavailable": "nicht verfügbar",
+      "none": "keines"
+    },
     "filter": {
       "token": {
         "status": "Status: {{value}}",

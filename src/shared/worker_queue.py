@@ -36,6 +36,12 @@ from .run_queue import (
     complete_unit,
     enqueue_unit,
 )
+from .workspace_contract import (
+    WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    WorkspaceContractError,
+    resolve_workspace_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +83,38 @@ WHERE job.id = $1::uuid
 FOR UPDATE OF job
 """
 
-_CAS_JOB_SQL = """
+_CAS_JOB_SQL = f"""
 UPDATE jobs
 SET status = 'processing',
     assigned_agent_id = NULL,
     lease_expires_at = NULL,
+    context = jsonb_set(
+        COALESCE(context, '{{}}'::jsonb),
+        '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
+        jsonb_build_object(
+            'version', 1,
+            'dispatch_kind', 'stateless',
+            'contract_version', CASE
+                WHEN context ? '{WORKSPACE_CONTRACT_CONTEXT_KEY}' THEN 1 ELSE 0
+            END,
+            'assigned_backend', COALESCE(
+                context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'->>'assigned_backend',
+                CASE lower(COALESCE(
+                    config_override->'workspace'->>'backend', 'sandbox'
+                ))
+                    WHEN 'container' THEN 'sandbox'
+                    WHEN 'remote' THEN 'vm'
+                    ELSE lower(COALESCE(
+                        config_override->'workspace'->>'backend', 'sandbox'
+                    ))
+                END
+            ),
+            'worker_pod', $3::text,
+            'queue_lease_token', $4::bigint,
+            'queue_leased_until', to_jsonb($5::timestamptz)
+        ),
+        true
+    ),
     error_message = NULL,
     error_details = NULL,
     updated_at = CURRENT_TIMESTAMP
@@ -443,13 +476,13 @@ def _job_requests_vm(job: Any) -> bool:
     inheritance and ordinary K8s attestation remain control-plane concerns.
     """
 
-    context = _json_object(job.get("context"))
-    vm = _json_object(context.get("vm"))
-    if vm.get("requested"):
+    try:
+        # The stateless worker plane supports exactly the sandbox tier. Treat
+        # malformed/ambiguous legacy state and every other tier as ineligible;
+        # a claimant must never infer authority from a ready container alone.
+        return resolve_workspace_contract(job).assigned_backend != "sandbox"
+    except WorkspaceContractError:
         return True
-    config_override = _json_object(job.get("config_override"))
-    workspace = _json_object(config_override.get("workspace"))
-    return workspace.get("backend") in {"vm", "remote"}
 
 
 async def enqueue_worker_batch(
@@ -696,6 +729,9 @@ async def claim_worker_batch(
                     _CAS_JOB_SQL,
                     unit.unit_id,
                     prior_status,
+                    pod_name,
+                    unit.lease_token,
+                    unit.leased_until,
                 )
                 if updated is None:
                     # The row is locked, so this can only mean a violated

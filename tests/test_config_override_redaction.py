@@ -181,3 +181,74 @@ class TestRedactThreadMetadataShape:
         )
         assert "_workspace_binding" not in out["metadata"]
         assert out["metadata"]["keep"] is True
+
+
+class TestRedactJobWorkspaceAuthority:
+    def test_public_job_projection_is_coordinate_and_credential_free(self):
+        import orchestrator.main as main
+
+        out = main._redact_job_config_override(
+            {
+                "id": "job-1",
+                "config_override": {
+                    "workspace": {
+                        "backend": "vm",
+                        "remote": {
+                            "host": "private-vm.internal",
+                            "key_path": "/run/private/key",
+                        },
+                    }
+                },
+                "context": {
+                    "_workspace_contract": {
+                        "version": 1,
+                        "requested_backend": "vm",
+                        "assigned_backend": "vm",
+                        "assignment_source": "request",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "private-vm.internal",
+                        "provision_generation": (
+                            "11111111-1111-4111-8111-111111111111"
+                        ),
+                    },
+                    "workspace_container": {
+                        "status": "ready",
+                        "host": "private-sandbox.internal",
+                        "_runtime_incarnation": (
+                            "22222222-2222-4222-8222-222222222222"
+                        ),
+                        "_legacy_k8s_runtime_adoption": {
+                            "version": 1,
+                            "runtime_incarnation": (
+                                "22222222-2222-4222-8222-222222222222"
+                            ),
+                            "workspace_generation": (
+                                "33333333-3333-4333-8333-333333333333"
+                            ),
+                            "ssh_host_key_fingerprint": "SHA256:" + ("a" * 43),
+                        },
+                    },
+                    "ordinary": "kept",
+                },
+            }
+        )
+
+        assert out["context"] == {"ordinary": "kept"}
+        assert out["config_override"]["workspace"] == {"backend": "vm"}
+        assert out["workspace_contract"] == {
+            "requested_backend": "vm",
+            "assigned_backend": "vm",
+            "effective_backend": "vm",
+            "assignment_source": "request",
+            "state": "ready",
+            "failure": None,
+            "stale_backend": "sandbox",
+            "compatibility_derived": False,
+        }
+        rendered = repr(out)
+        assert "private-vm" not in rendered
+        assert "private-sandbox" not in rendered
+        assert "/run/private" not in rendered
+        assert "SHA256:" not in rendered

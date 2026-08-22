@@ -10,6 +10,7 @@ wrong lane / assembly refused.
 """
 
 import asyncio
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -79,6 +80,45 @@ class FakeDB:
     def thread_datasource_lock(self, tid):
         self.datasource_lock_calls.append(tid)
         return _AsyncCM()
+
+
+class MultiJobFakeDB(FakeDB):
+    """Production-shaped parent/child reads for inherited worker bundles."""
+
+    def __init__(self, *, run_queue_row, jobs):
+        super().__init__(run_queue_row=run_queue_row, thread=None, job=None)
+        self.jobs = {str(job["id"]): deepcopy(job) for job in jobs}
+        self.adoption_calls = []
+
+    async def get_job(self, jid):
+        job = self.jobs.get(str(jid))
+        return deepcopy(job) if job is not None else None
+
+    async def adopt_legacy_k8s_job_workspace_runtime(self, job_id, **kwargs):
+        self.adoption_calls.append((str(job_id), deepcopy(kwargs)))
+        current = self.jobs.get(str(job_id))
+        if current is None:
+            return False
+        context = current.get("context") or {}
+        config = current.get("config_override") or {}
+        if not (
+            str(current.get("status") or "") == kwargs["expected_status"]
+            and current.get("execution_lane") == kwargs["expected_execution_lane"]
+            and (
+                str(current["parent_job_id"]) if current.get("parent_job_id") else None
+            )
+            == kwargs["expected_parent_job_id"]
+            and context.get("_workspace_contract") == kwargs["expected_contract"]
+            and context.get("workspace_backend") == kwargs["expected_legacy_backend"]
+            and config.get("workspace") == kwargs["expected_workspace_config"]
+            and context.get("workspace_container") == kwargs["expected_workspace"]
+        ):
+            return False
+        current["context"] = {
+            **context,
+            "workspace_container": deepcopy(kwargs["adopted_workspace"]),
+        }
+        return True
 
 
 def _thread(**over):
@@ -152,6 +192,40 @@ def _patch_worker_attestation(monkeypatch, orch_main, *attestations):
         attest,
     )
     return attest
+
+
+def _worker_job_context(container, **extra):
+    return {
+        "_workspace_contract": {
+            "version": 1,
+            "requested_backend": "sandbox",
+            "assigned_backend": "sandbox",
+            "assignment_source": "test",
+        },
+        "workspace_container": {
+            **container,
+            "_runtime_incarnation": WORKSPACE_RUNTIME,
+        },
+        **extra,
+    }
+
+
+def _adopted_worker_container(orch_main, **overrides):
+    attestation = _worker_attestation(orch_main, **overrides)
+    return {
+        "status": "ready",
+        "provisioner": "k8s",
+        "host": attestation.host,
+        "pod_ip": attestation.pod_ip,
+        "port": attestation.port,
+        "_runtime_incarnation": attestation.runtime_incarnation,
+        "_legacy_k8s_runtime_adoption": {
+            "version": 1,
+            "runtime_incarnation": attestation.runtime_incarnation,
+            "workspace_generation": attestation.workspace_generation,
+            "ssh_host_key_fingerprint": (attestation.ssh_host_key_fingerprint),
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -428,15 +502,16 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     job = {
         "id": UNIT_ID,
         "execution_lane": "stateless",
-        "context": {
-            "workspace_container": {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
                 "status": "ready",
                 "provisioner": "k8s",
                 "pod_ip": "10.0.0.8",
             },
-            "worker_batch_target_wall_seconds": 360,
-            "worker_batch_iteration_cap": 9,
-        },
+            worker_batch_target_wall_seconds=360,
+            worker_batch_iteration_cap=9,
+        ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
@@ -462,6 +537,7 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
         "pod_ip": "10.0.0.9",
         "host": "10.0.0.9",
         "port": 30022,
+        "_runtime_incarnation": WORKSPACE_RUNTIME,
     }
     assert attested_job["config_override"]["workspace"]["remote"]["host"] == (
         "10.0.0.9"
@@ -502,13 +578,14 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
     job = {
         "id": UNIT_ID,
         "execution_lane": "stateless",
-        "context": {
-            "workspace_container": {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
                 "status": "ready",
                 "provisioner": "k8s",
                 "host": "workspace.example",
             }
-        },
+        ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
     db.conn.fetchval.return_value = False
@@ -547,13 +624,14 @@ async def test_worker_bundle_rejects_workspace_drift_after_slow_assembly(monkeyp
     job = {
         "id": UNIT_ID,
         "execution_lane": "stateless",
-        "context": {
-            "workspace_container": {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
                 "status": "ready",
                 "provisioner": "k8s",
                 "pod_ip": "10.0.0.8",
             }
-        },
+        ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
@@ -597,14 +675,15 @@ async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkey
         "id": UNIT_ID,
         "parent_job_id": parent_id,
         "execution_lane": "stateless",
-        "context": {
-            "inherits_parent_workspace": True,
-            "workspace_container": {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
                 "status": "ready",
                 "provisioner": "k8s",
                 "host": "stale.example",
             },
-        },
+            inherits_parent_workspace=True,
+        ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
@@ -635,6 +714,187 @@ async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkey
     assert out["job"]["job_id"] == UNIT_ID
     assert out["job"]["workspace_owner_kind"] == "job"
     assert out["job"]["workspace_owner_id"] == parent_id
+
+
+@pytest.mark.asyncio
+async def test_pre_0175_inherited_worker_final_reread_converges_parent(monkeypatch):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    parent = {
+        "id": parent_id,
+        "status": "waiting",
+        "execution_lane": "pinned",
+        "config_override": {"workspace": {"backend": "container"}},
+        # Exact previous-release parent runtime: neither contract nor UID.
+        "context": {
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": "10.0.0.7",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            }
+        },
+    }
+    child = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "status": "created",
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "container"}},
+        # Exact pre-0175 child shape: the inherited snapshot has no contract,
+        # adoption marker or Pod UID. Only the live parent may supply them.
+        "context": {
+            "inherits_parent_workspace": True,
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            },
+        },
+    }
+    db = MultiJobFakeDB(run_queue_row=row, jobs=[parent, child])
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    exact = _worker_attestation(orch_main)
+    attest = _patch_worker_attestation(
+        monkeypatch, orch_main, exact, exact, exact, exact, exact, exact, exact
+    )
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    builder.assert_awaited_once()
+    db.conn.fetchval.assert_awaited_once()
+    assert out["job"]["workspace_owner_id"] == parent_id
+    assert out["job"]["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
+    assert attest.await_count == 7
+    assert all(
+        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
+        for call in attest.await_args_list
+    )
+    # The historical child row remains a snapshot; both the initial and final
+    # contract checks obtained current authority from the parent overlay.
+    stored_child = await db.get_job(UNIT_ID)
+    assert "_runtime_incarnation" not in stored_child["context"]["workspace_container"]
+    stored_parent = await db.get_job(parent_id)
+    assert (
+        stored_parent["context"]["workspace_container"]["_runtime_incarnation"]
+        == WORKSPACE_RUNTIME
+    )
+    assert len(db.adoption_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["replacement", "tier"], ids=["pod", "tier"])
+async def test_inherited_worker_rejects_parent_change_after_assembly(
+    monkeypatch, change
+):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    parent = {
+        "id": parent_id,
+        "status": "waiting",
+        "execution_lane": "pinned",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(_adopted_worker_container(orch_main)),
+    }
+    child = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "status": "created",
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": {
+            "inherits_parent_workspace": True,
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            },
+        },
+    }
+    db = MultiJobFakeDB(run_queue_row=row, jobs=[parent, child])
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    predecessor = _worker_attestation(orch_main)
+    replacement = _worker_attestation(
+        orch_main,
+        runtime_incarnation="33333333-3333-4333-8333-333333333333",
+        workspace_generation="44444444-4444-4444-8444-444444444444",
+        host="10.0.0.10",
+        pod_ip="10.0.0.10",
+    )
+    calls = 0
+
+    async def attest(owner):
+        nonlocal calls
+        assert owner == orch_main.WorkspaceOwner.job(parent_id)
+        calls += 1
+        if calls == 4:
+            if change == "replacement":
+                db.jobs[parent_id]["context"]["workspace_container"] = (
+                    _adopted_worker_container(
+                        orch_main,
+                        runtime_incarnation=replacement.runtime_incarnation,
+                        workspace_generation=replacement.workspace_generation,
+                        host=replacement.host,
+                        pod_ip=replacement.pod_ip,
+                    )
+                )
+            else:
+                db.jobs[parent_id]["config_override"] = {"workspace": {"backend": "vm"}}
+                db.jobs[parent_id]["context"] = {
+                    "_workspace_contract": {
+                        "version": 1,
+                        "requested_backend": "vm",
+                        "assigned_backend": "vm",
+                        "assignment_source": "operator",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "vm.internal",
+                        "ssh_port": 22,
+                        "provision_generation": (
+                            "55555555-5555-4555-8555-555555555555"
+                        ),
+                    },
+                }
+            # The replacement/tier transition begins just after the final live
+            # attestation used by assembly, forcing the database reread fence.
+            return predecessor
+        return replacement if change == "replacement" and calls >= 5 else predecessor
+
+    monkeypatch.setattr(
+        orch_main.container_provisioner,
+        "attest_workspace_runtime",
+        AsyncMock(side_effect=attest),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job workspace contract changed during bundle assembly"
+    builder.assert_awaited_once()
+    db.conn.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio

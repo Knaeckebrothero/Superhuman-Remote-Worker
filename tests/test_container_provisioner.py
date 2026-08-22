@@ -3643,6 +3643,7 @@ class TestWorkspaceService:
             self._ready_ctx(p).get("host")
             == f"workspace-abcdef123456.{p._namespace}.svc.cluster.local"
         )
+        assert self._ready_ctx(p).get("_runtime_incarnation") == _TEST_POD_UID
 
     @pytest.mark.asyncio
     async def test_pvc_mode_creates_headless_service_for_sessions_too(self):

@@ -15,6 +15,7 @@ from services.officer_slots import (
     capacity_lines,
     validate_slots_spec,
 )
+from services.officer_admission import OfficerAdmissionConflict, _validate_slot_pins
 
 ROSTER_META = {
     "enabled": True,
@@ -128,6 +129,50 @@ class TestAdmitRoster:
         meta = {"slots": {"line": "not-a-dict"}, "max_concurrent_workers": 1}
         name, patch = admit(meta, None, {})
         assert name is None and patch == {}
+
+
+class TestExplicitSlotPinConflicts:
+    def test_backend_conflict_is_loud_and_structured(self):
+        with pytest.raises(OfficerAdmissionConflict) as raised:
+            _validate_slot_pins(
+                slot_name="line",
+                slot_patch={"workspace": {"backend": "sandbox"}},
+                requested_model=None,
+                requested_backend="vm",
+            )
+
+        assert raised.value.code == "slot_backend_conflict"
+        assert raised.value.fields == {
+            "slot": "line",
+            "pinned_backend": "sandbox",
+            "requested_backend": "vm",
+        }
+        assert "Select a compatible Officer slot" in raised.value.detail
+
+    def test_model_conflict_is_loud_and_structured(self):
+        with pytest.raises(OfficerAdmissionConflict) as raised:
+            _validate_slot_pins(
+                slot_name="line",
+                slot_patch={"llm": {"model": "MiniMax-M3"}},
+                requested_model="gpt-5.6-sol",
+                requested_backend=None,
+            )
+
+        assert raised.value.code == "slot_model_conflict"
+        assert raised.value.fields["slot"] == "line"
+        assert raised.value.fields["pinned_model"] == "MiniMax-M3"
+        assert raised.value.fields["requested_model"] == "gpt-5.6-sol"
+
+    def test_matching_explicit_values_remain_valid(self):
+        _validate_slot_pins(
+            slot_name="heavy",
+            slot_patch={
+                "llm": {"model": "gpt-5.6-sol"},
+                "workspace": {"backend": "vm"},
+            },
+            requested_model="gpt-5.6-sol",
+            requested_backend="vm",
+        )
 
 
 class TestCapacityLines:

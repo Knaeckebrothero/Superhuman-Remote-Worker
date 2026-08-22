@@ -660,6 +660,13 @@
     "projectNone": "No project",
     "projectUnknown": "Unknown project",
     "failureReason": "Reason",
+    "workspace": {
+      "summary": "Workspace: requested {{requested}} · assigned {{assigned}} · effective {{effective}}",
+      "state": "Workspace state: {{state}} · detail: {{failure}}",
+      "default": "default",
+      "unavailable": "unavailable",
+      "none": "none"
+    },
     "filter": {
       "token": {
         "status": "Status: {{value}}",

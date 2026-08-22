@@ -115,6 +115,21 @@ def format_job_list_item(job: dict[str, Any]) -> list[str]:
     ]
     if job.get("config_name") or job.get("config"):
         lines.append(f"  Config: {job.get('config_name') or job.get('config')}")
+    workspace = job.get("workspace_contract")
+    if isinstance(workspace, dict):
+        requested = workspace.get("requested_backend") or "default"
+        assigned = workspace.get("assigned_backend") or "unknown"
+        effective = workspace.get("effective_backend") or "unavailable"
+        state = workspace.get("state") or "unknown"
+        lines.append(
+            "  Workspace: "
+            f"requested={requested}, assigned={assigned}, "
+            f"effective={effective} ({state})"
+        )
+        if workspace.get("stale_backend"):
+            lines.append(
+                f"  Workspace residue: stale {workspace['stale_backend']} runtime"
+            )
     if job.get("project_id"):
         lines.append(f"  Project ID: {job['project_id']}")
     if job.get("parent_job_id"):
@@ -226,6 +241,21 @@ def format_job_detail(job: dict[str, Any]) -> str:
         lines.append(f"Description: {truncate_text(job.get('description'), limit=500)}")
     if job.get("config_name") or job.get("config"):
         lines.append(f"Config: {job.get('config_name') or job.get('config')}")
+    workspace = job.get("workspace_contract")
+    if isinstance(workspace, dict):
+        lines.append(
+            "Workspace: "
+            f"requested={workspace.get('requested_backend') or 'default'}, "
+            f"assigned={workspace.get('assigned_backend') or 'unknown'}, "
+            f"effective={workspace.get('effective_backend') or 'unavailable'}, "
+            f"state={workspace.get('state') or 'unknown'}"
+        )
+        if workspace.get("failure"):
+            lines.append(f"Workspace mismatch/failure: {workspace['failure']}")
+        if workspace.get("stale_backend"):
+            lines.append(
+                f"Workspace residue: stale {workspace['stale_backend']} runtime"
+            )
     if job.get("project_id"):
         lines.append(f"Project ID: {job['project_id']}")
     if job.get("user_id"):
@@ -1019,6 +1049,14 @@ def format_created_job(
         f"Config: {config_name}",
         f"Status: {result.get('status', 'created')}",
     ]
+    workspace = result.get("workspace_contract")
+    if isinstance(workspace, dict):
+        lines.append(
+            "Workspace: "
+            f"requested={workspace.get('requested_backend') or 'default'}, "
+            f"assigned={workspace.get('assigned_backend') or 'unknown'}, "
+            f"effective={workspace.get('effective_backend') or 'pending'}"
+        )
 
     if result.get("description"):
         desc = result["description"]

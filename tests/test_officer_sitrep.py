@@ -106,6 +106,39 @@ class TestSitrepBuild:
         assert patch["sitrep"]["watermark"]
 
     @pytest.mark.asyncio
+    async def test_workspace_contract_is_visible_without_transport_coordinates(self):
+        jobs = [
+            {
+                "id": JOB_A,
+                "status": "processing",
+                "description": "VM work",
+                "workspace_contract": {
+                    "requested_backend": "vm",
+                    "assigned_backend": "vm",
+                    "effective_backend": None,
+                    "state": "mismatch",
+                    "failure": "sandbox_ready_for_vm_assignment",
+                    "stale_backend": "sandbox",
+                },
+            }
+        ]
+        text, _patch = await sitrep.build_wake_message(
+            _fake_db(jobs=jobs),
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=_audit(counts={JOB_A: 1}),
+            usage_ledger=None,
+        )
+
+        assert "workspace requested=vm, assigned=vm" in text
+        assert (
+            "effective=unavailable, state=mismatch, "
+            "failure=sandbox_ready_for_vm_assignment, stale=sandbox"
+        ) in text
+        assert "ssh_host" not in text
+        assert "pod_ip" not in text
+
+    @pytest.mark.asyncio
     async def test_delta_transitions_stall_flag_and_steady(self):
         prior = {
             "watermark": (

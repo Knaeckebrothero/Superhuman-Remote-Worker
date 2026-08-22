@@ -990,6 +990,12 @@ class ContainerProvisioner:
                     "pod_ip": pod_ip,
                     "port": 30022,
                 }
+                if owner.kind == "job":
+                    # Jobs do not use the Canvas backing bind, but their worker
+                    # bundle still needs immutable endpoint provenance.  This
+                    # is the exact Pod UID already verified above and used by
+                    # deletion/reattach fencing.
+                    ready_ctx[WORKSPACE_RUNTIME_INCARNATION_KEY] = runtime_incarnation
                 if owner.kind == "session":
                     # Pair this endpoint with the exact binding minted above.
                     # A failed/missing bind publishes null and Canvas fails closed.

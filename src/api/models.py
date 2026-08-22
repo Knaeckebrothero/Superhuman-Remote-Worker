@@ -328,6 +328,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Hidden server-derived runtime actor context",
     )
+    workspace_runtime: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=("Safe server-owned requested/assigned/effective tier observation"),
+    )
     workspace_generation: Optional[str] = Field(
         default=None,
         description="Control-plane-attested Kubernetes backing UID",
@@ -419,6 +423,10 @@ class JobResumeRequest(BaseModel):
     runtime_actor: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Hidden server-derived runtime actor context",
+    )
+    workspace_runtime: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=("Safe server-owned requested/assigned/effective tier observation"),
     )
     previous_status: Optional[str] = Field(
         default=None,

@@ -13,7 +13,14 @@ AGENT_ID = "00000000-0000-0000-0000-000000000201"
 
 
 def _job(status: str, *, workspace_status: str | None = None) -> dict:
-    context = {}
+    context = {
+        "_workspace_contract": {
+            "version": 1,
+            "requested_backend": "sandbox",
+            "assigned_backend": "sandbox",
+            "assignment_source": "test",
+        }
+    }
     if workspace_status:
         context["workspace_container"] = {
             "status": workspace_status,
@@ -23,6 +30,10 @@ def _job(status: str, *, workspace_status: str | None = None) -> dict:
                 else {}
             ),
         }
+        if workspace_status == "ready":
+            context["workspace_container"]["_runtime_incarnation"] = (
+                "11111111-1111-4111-8111-111111111111"
+            )
     return {
         "id": JOB_ID,
         "status": status,
@@ -140,6 +151,34 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
     )
 
 
+@pytest.mark.asyncio
+async def test_manual_assign_waits_for_legacy_runtime_adoption_before_claim(
+    collaborators, monkeypatch
+):
+    job = _job("created", workspace_status="ready")
+    job["context"]["workspace_container"].update(
+        {"provisioner": "k8s", "pod_ip": "10.42.0.17"}
+    )
+    job["context"]["workspace_container"].pop("_runtime_incarnation")
+    main.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    prepare = AsyncMock(
+        return_value=("wait", job, "kubernetes_attestation_unavailable")
+    )
+    monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+
+    with pytest.raises(main.HTTPException) as raised:
+        await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["code"] == "workspace_runtime_adoption_pending"
+    assert raised.value.detail["retryable"] is True
+    prepare.assert_awaited_once_with(job)
+    main.postgres_db.claim_job_for_agent.assert_not_awaited()
+    main.postgres_db.get_agent.assert_not_awaited()
+    main._dispatch_job_to_agent.assert_not_awaited()
+
+
 class TestManualAssignWorkspacePreflight:
     @pytest.mark.asyncio
     async def test_stateless_job_rejects_direct_assignment(self, collaborators):
@@ -203,6 +242,12 @@ class TestManualAssignWorkspacePreflight:
             "job_id": JOB_ID,
         }
         main.postgres_db.shed_workspace_context.assert_not_awaited()
+        main.postgres_db.claim_job_for_agent.assert_awaited_once_with(
+            JOB_ID,
+            AGENT_ID,
+            completion_commands_enabled=False,
+            allow_failed=True,
+        )
         main._dispatch_job_to_agent.assert_awaited_once()
         main._trigger_dispatch.assert_not_called()
 
@@ -248,6 +293,30 @@ class TestAssignLaneChoice:
 
 
 class TestPinnedDispatchDefenseInDepth:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "helper_name", ["_dispatch_job_to_agent", "_resume_job_on_agent"]
+    )
+    async def test_legacy_adoption_waits_before_agent_network(
+        self, helper_name, monkeypatch
+    ):
+        job = _job("paused", workspace_status="ready")
+        job["context"]["workspace_container"].update(
+            {"provisioner": "k8s", "pod_ip": "10.42.0.17"}
+        )
+        job["context"]["workspace_container"].pop("_runtime_incarnation")
+        prepare = AsyncMock(
+            return_value=("wait", job, "kubernetes_attestation_unavailable")
+        )
+        monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+        network = MagicMock(side_effect=AssertionError("agent I/O attempted"))
+        monkeypatch.setattr(main.httpx, "AsyncClient", network)
+
+        assert await getattr(main, helper_name)(job, _agent()) is False
+
+        prepare.assert_awaited_once_with(job)
+        network.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_fresh_helper_refuses_stateless_job_before_network(self):
         job = _job("created", workspace_status="ready")

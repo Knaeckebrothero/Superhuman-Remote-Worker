@@ -1,3 +1,5 @@
+import type { WorkspaceContractProjection } from './api.model';
+
 /**
  * Audit step types from MongoDB agent_audit collection.
  */
@@ -153,6 +155,8 @@ export interface JobSummary {
   display_root_id?: string;
   /** True when this row IS its display root, false when it is a child of one. */
   is_display_root?: boolean;
+  /** Safe requested/assigned/effective workspace tier observation. */
+  workspace_contract?: WorkspaceContractProjection;
 }
 
 /**

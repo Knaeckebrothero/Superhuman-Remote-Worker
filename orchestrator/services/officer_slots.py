@@ -13,7 +13,10 @@ Legate assigns a kit at provision time::
 and the officer names a slot per dispatch (``create_job(...,
 slot="heavy")``). The job-creation funnel stamps the slot's model/backend
 onto the job config server-side — the officer chooses WHICH troops to send,
-never what they are made of — and enforces the per-slot count under the
+never what they are made of. An explicit per-job model/backend that disagrees
+with the selected slot is rejected by the authoritative admission service
+before job or ticket-claim insertion; compatible/defaulted requests receive
+this patch. Per-slot count is enforced under the
 durable Officer Post row lock (knowledge-base/knowledge/features/centurion.md §6).
 
 Pure module by design: validation and admission are plain functions over
@@ -161,10 +164,11 @@ def admit(
     """Decide whether one more dispatch fits the officer's allocation.
 
     Returns ``(slot_name, config_patch)`` — slot_name is None on the flat-cap
-    path; config_patch is the slot's model/backend fragment to deep-merge ON
-    TOP of the job's config (the assignment always wins over whatever the
-    tool call carried). Raises SlotAdmissionError with an actionable message
-    when the dispatch does not fit.
+    path; config_patch is the slot's authoritative model/backend fragment.
+    The caller must reject any contradictory explicit per-job choice before
+    merging this patch; :mod:`services.officer_admission` does so both during
+    preparation and again under the Post lock. Raises SlotAdmissionError with
+    an actionable message when the dispatch does not fit.
 
     ``in_flight_by_slot`` maps stamp → count for the officer's slot-occupying
     jobs — non-terminal minus paused, which vacates its slot (None key =

@@ -27,8 +27,19 @@ import pytest
 VM_JOB = {"config_override": {"workspace": {"backend": "vm"}}}
 SANDBOX_JOB = {"config_override": {"workspace": {"backend": "sandbox"}}}
 
-READY_VM = {"status": "ready", "ssh_host": "100.64.0.7", "ssh_port": 22}
-READY_CONTAINER = {"status": "ready", "host": "workspace-abc.svc", "port": 22}
+RUNTIME_ID = "00000000-0000-0000-0000-000000000901"
+READY_VM = {
+    "status": "ready",
+    "ssh_host": "100.64.0.7",
+    "ssh_port": 22,
+    "provision_generation": RUNTIME_ID,
+}
+READY_CONTAINER = {
+    "status": "ready",
+    "host": "workspace-abc.svc",
+    "port": 22,
+    "_runtime_incarnation": RUNTIME_ID,
+}
 
 
 def _job(base: dict, **context) -> dict:
@@ -91,7 +102,12 @@ class TestResumeMissingWorkspace:
         import orchestrator.main as om
 
         job = _job(
-            SANDBOX_JOB, workspace_container={"status": "ready", "pod_ip": "10.1.2.3"}
+            SANDBOX_JOB,
+            workspace_container={
+                "status": "ready",
+                "pod_ip": "10.1.2.3",
+                "_runtime_incarnation": RUNTIME_ID,
+            },
         )
         assert om._resume_missing_workspace(job) is None
 
