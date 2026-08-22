@@ -38,7 +38,8 @@ async def gate(pg_dsn):
             """
             CREATE TABLE IF NOT EXISTS sudo_approval_requests (
                 id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                job_id             uuid NOT NULL,
+                job_id             uuid,
+                thread_id          uuid,
                 vm_name            varchar(255) NOT NULL,
                 command            text NOT NULL,
                 arguments          text[] DEFAULT '{}',
@@ -49,7 +50,8 @@ async def gate(pg_dsn):
                 requested_at       timestamptz NOT NULL DEFAULT now(),
                 expires_at         timestamptz NOT NULL DEFAULT (now() + interval '300 seconds'),
                 nats_reply_subject text,
-                metadata           jsonb DEFAULT '{}'
+                metadata           jsonb DEFAULT '{}',
+                CHECK (num_nonnulls(job_id, thread_id) = 1)
             )
             """
         )

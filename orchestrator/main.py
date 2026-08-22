@@ -188,6 +188,7 @@ from services.completion_effect_policy import (  # noqa: E402
 from routers import project_loops_router  # noqa: E402
 from routers import product_capabilities_router  # noqa: E402
 from routers import shared_browser_router  # noqa: E402
+from routers import vm_guest_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from routers.contacts import project_router as contacts_project_router  # noqa: E402
 from routers.contacts import router as contacts_router  # noqa: E402
@@ -12729,6 +12730,7 @@ app.include_router(wopi_router)
 app.include_router(project_loops_router)
 app.include_router(product_capabilities_router)
 app.include_router(shared_browser_router)
+app.include_router(vm_guest_router)
 app.include_router(sessions_router)
 app.include_router(contacts_router)
 app.include_router(contacts_project_router)
@@ -18054,8 +18056,8 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
       - request_decided: a request was approved/denied/expired
 
     F6: per-user filtering. Admins see every event; non-admins see only
-    events for jobs they can access (owner OR project member). Orphan
-    events with no ``job_id`` are admin-only. Filtering is applied per
+    events for jobs they can access or threads they own. Orphan events with
+    neither ``job_id`` nor ``thread_id`` are admin-only. Filtering is applied per
     event inside the stream rather than at connect time so a member who
     later gains access doesn't have to reconnect.
     """
@@ -18075,8 +18077,12 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
                     break
                 try:
                     event_type, data = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    job_id = data.get("job_id") if isinstance(data, dict) else None
-                    if not await user_can_access_job(user, postgres_db, job_id):
+                    entity_id = None
+                    if isinstance(data, dict):
+                        entity_id = data.get("thread_id") or data.get("job_id")
+                    if not await user_can_access_job_or_thread(
+                        user, postgres_db, entity_id
+                    ):
                         # Silently drop — the caller isn't authorized to
                         # see this event. We don't reveal existence.
                         continue

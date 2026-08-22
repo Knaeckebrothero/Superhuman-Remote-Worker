@@ -31,10 +31,26 @@ MAX_MESSAGE_AGE_SECONDS = 60
 MAX_FUTURE_SKEW_SECONDS = 10
 
 Direction = Literal["request", "response"]
+GUEST_KDF_LABEL = b"srw-kdf|vm-guest-token|v1"
 
 
 class LifecycleAuthConfigurationError(ValueError):
     """The lifecycle authentication secret is present but unsafe."""
+
+
+def guest_token(
+    secret: bytes,
+    entity_type: str,
+    entity_id: str,
+    provision_generation: str,
+) -> str:
+    """Derive the per-incarnation guest credential from the lifecycle root."""
+
+    guest_key = hmac.new(secret, GUEST_KDF_LABEL, hashlib.sha256).digest()
+    message = (
+        f"srw.vm.guest.v1\n{entity_type}\n{entity_id}\n{provision_generation}\n"
+    ).encode()
+    return hmac.new(guest_key, message, hashlib.sha256).hexdigest()
 
 
 def configured_secret(source: Mapping[str, str] | None = None) -> bytes | None:

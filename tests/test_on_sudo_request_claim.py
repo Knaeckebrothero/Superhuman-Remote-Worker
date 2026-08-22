@@ -78,5 +78,9 @@ async def test_winner_with_no_automatch_broadcasts():
 
     await g.on_sudo_request(msg)
 
+    insert = g._insert_request.await_args.kwargs
+    assert insert["job_id"] == "job-1"
+    assert insert.get("thread_id") is None
+    assert insert.get("request_id") is None
     g._broadcast_sse.assert_awaited_once()
     assert g._pending_msgs.get("req-1") is msg

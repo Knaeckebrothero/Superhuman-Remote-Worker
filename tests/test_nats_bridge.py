@@ -91,6 +91,7 @@ def mock_db():
     db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.get_vm_provision_generation = AsyncMock(return_value=PROVISION_GENERATION)
     db.merge_ide_session_context = AsyncMock()
+    db.merge_thread_ide_session_context = AsyncMock()
     db.bind_thread_workspace_backing = AsyncMock()
     # VM callbacks resolve thread-vs-job by DB lookup (never process-local
     # state), so these must be explicit: a bare AsyncMock returns a truthy mock
@@ -684,6 +685,19 @@ class TestQueryVmStatus:
 
 class TestOnVmLifecycleStatus:
     """Tests for NatsBridge._on_vm_lifecycle_status()."""
+
+    @pytest.mark.asyncio
+    async def test_same_cluster_ignores_nats_lifecycle_evidence(
+        self, bridge_with_db, mock_db, monkeypatch
+    ):
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "job-001", "status": "ready"})
+        )
+
+        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_basic_status_update(self, bridge_with_db, mock_db):
@@ -1463,17 +1477,25 @@ class TestVmEntityRoutingIsDurable:
 
     @pytest.mark.asyncio
     async def test_heartbeat_routes_to_thread_on_non_publishing_replica(
-        self, bridge_with_db, mock_db
+        self, bridge_with_db, mock_db, leader
     ):
         tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
         mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
 
         await bridge_with_db._on_daemon_heartbeat(
-            make_msg({"job_id": tid, "agent_running": True})
+            make_msg(
+                {
+                    "job_id": tid,
+                    "agent_running": True,
+                    "code_server_connections": 1,
+                }
+            )
         )
 
-        mock_db.merge_thread_vm_context.assert_awaited()
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_thread_ide_session_context.assert_awaited_once()
+        mock_db.merge_ide_session_context.assert_not_awaited()
 
 
 # =============================================================================
@@ -1481,6 +1503,7 @@ class TestVmEntityRoutingIsDurable:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("leader")
 class TestOnDaemonHeartbeat:
     """Tests for NatsBridge._on_daemon_heartbeat()."""
 
@@ -1499,10 +1522,10 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
-        call_args = mock_db.merge_vm_context.call_args
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        call_args = mock_db.merge_vm_context_if_provision_generation.call_args
         assert call_args.args[0] == "job-hb-001"
-        updates = call_args.args[1]
+        updates = call_args.args[2]
         assert "last_heartbeat" in updates
         # Should be an ISO format timestamp
         assert "T" in updates["last_heartbeat"]
@@ -1524,7 +1547,7 @@ class TestOnDaemonHeartbeat:
         await bridge_with_db._on_daemon_heartbeat(msg)
 
         # Should update both VM context and IDE session
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_awaited_once()
 
         ide_call = mock_db.merge_ide_session_context.call_args
@@ -1570,7 +1593,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1593,7 +1616,7 @@ class TestOnDaemonHeartbeat:
         await bridge_with_db._on_daemon_heartbeat(msg)
 
         # VM context should still be updated
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_heartbeat_missing_job_id(self, bridge_with_db, mock_db):
@@ -1606,7 +1629,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_heartbeat_malformed_json(self, bridge_with_db, mock_db):
@@ -1614,7 +1637,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_heartbeat_no_db_skips_ide_update(self, bridge, mock_nc):
@@ -1811,7 +1834,7 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_heartbeat_with_none_code_server_connections(
-        self, bridge_with_db, mock_db
+        self, bridge_with_db, mock_db, leader
     ):
         """Explicit null for code_server_connections should not update IDE session.
 
@@ -1828,7 +1851,7 @@ class TestEdgeCases:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1927,7 +1950,7 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_heartbeat_negative_code_server_connections(
-        self, bridge_with_db, mock_db
+        self, bridge_with_db, mock_db, leader
     ):
         """Negative connection count (edge case) should still be processed.
 

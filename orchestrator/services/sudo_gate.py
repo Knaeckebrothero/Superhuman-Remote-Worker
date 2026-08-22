@@ -12,6 +12,8 @@ and agents operate with unrestricted sudo (the pre-gate default).
 """
 
 import asyncio
+from collections.abc import Mapping
+from dataclasses import dataclass
 import json
 import logging
 import re
@@ -24,6 +26,26 @@ logger = logging.getLogger(__name__)
 # Shell metacharacters that prevent auto-approval.
 # Commands containing these are always forwarded to human review.
 _SHELL_META_RE = re.compile(r"[|;&`$><]|\$\(|\|\||&&")
+
+
+class SudoRequestConflict(ValueError):
+    """The HTTP idempotency key is already bound to a different payload."""
+
+
+@dataclass(frozen=True, slots=True)
+class SudoOpenResult:
+    request_id: str
+    status: str
+    reason: str | None
+    expires_at: Any
+    created: bool
+
+
+def _public_status(value: object) -> str:
+    return {
+        "auto_approved": "approved",
+        "auto_denied": "denied",
+    }.get(str(value), str(value))
 
 
 class SudoGateService:
@@ -40,6 +62,194 @@ class SudoGateService:
         """Bind to database and optional NATS connection."""
         self._db = db
         self._nc = nc
+
+    async def open_request(self, identity: Any, body: Any) -> SudoOpenResult:
+        """Idempotently create and evaluate an HTTP guest sudo request."""
+
+        if not self._db:
+            raise RuntimeError("sudo gate is not connected")
+        payload = (
+            body.model_dump(mode="json") if hasattr(body, "model_dump") else dict(body)
+        )
+        client_request_id = str(payload["request_id"])
+        reply_subject = f"http:{client_request_id}"
+        existing = await self._get_request_by_reply_subject(reply_subject)
+        if existing:
+            self._assert_http_entity(existing, identity)
+            self._assert_same_http_payload(existing, payload)
+            return self._open_result(existing, created=False)
+
+        entity = (
+            await self._db.get_thread(identity.entity_id)
+            if identity.entity_type == "thread"
+            else await self._db.get_job(identity.entity_id)
+        )
+        container = (
+            entity.get("metadata")
+            if identity.entity_type == "thread"
+            else entity.get("context")
+        )
+        if isinstance(container, str):
+            container = json.loads(container)
+        vm = container.get("vm", {}) if isinstance(container, Mapping) else {}
+        vm_name = vm.get("vm_name") or "vm"
+        job_id = identity.entity_id if identity.entity_type == "job" else None
+        thread_id = identity.entity_id if identity.entity_type == "thread" else None
+        request_id = await self._insert_request(
+            job_id=job_id,
+            thread_id=thread_id,
+            request_id=client_request_id,
+            vm_name=vm_name,
+            command=payload["command"],
+            arguments=payload["argv"],
+            cwd=payload["cwd"],
+            requesting_user=payload["user"],
+            target_user=payload["runas_user"],
+            nats_reply_subject=reply_subject,
+            metadata=payload,
+        )
+        if request_id is None:
+            existing = await self._get_request_by_reply_subject(reply_subject)
+            if not existing:
+                raise RuntimeError("sudo request claim disappeared")
+            self._assert_http_entity(existing, identity)
+            self._assert_same_http_payload(existing, payload)
+            return self._open_result(existing, created=False)
+
+        command_string = (
+            " ".join(payload["argv"]) if payload["argv"] else payload["command"]
+        )
+        auto_result = await self._evaluate_auto_rules(command_string)
+        decided_status: str | None = None
+        reason: str | None = None
+        if auto_result in {"approve", "deny"}:
+            decided_status = (
+                "auto_approved" if auto_result == "approve" else "auto_denied"
+            )
+            reason = (
+                "auto-approval rule" if auto_result == "approve" else "auto-denial rule"
+            )
+            await self._finalize_request(
+                request_id, decided_status, reason, "system", reply_subject
+            )
+        else:
+            event = {
+                "id": request_id,
+                "job_id": job_id,
+                "thread_id": thread_id,
+                "vm_name": vm_name,
+                "command": payload["command"],
+                "arguments": payload["argv"],
+                "requesting_user": payload["user"],
+                "target_user": payload["runas_user"],
+                "working_directory": payload["cwd"],
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "request_type": "sudo_command",
+            }
+            await self._broadcast_sse("new_request", event)
+            await self._notify_project_officer(
+                request_id,
+                job_id,
+                payload["command"],
+                "sudo_command",
+                thread_id=thread_id,
+            )
+
+        row = await self._get_request(request_id)
+        if row:
+            result = self._open_result(row, created=True)
+            if decided_status is not None and result.status == "pending":
+                return SudoOpenResult(
+                    request_id,
+                    _public_status(decided_status),
+                    reason,
+                    row.get("expires_at"),
+                    True,
+                )
+            return result
+        return SudoOpenResult(
+            request_id,
+            _public_status(decided_status or "pending"),
+            reason,
+            None,
+            True,
+        )
+
+    async def wait_for_decision(
+        self,
+        request_id: str,
+        max_wait: float,
+        *,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Poll row truth without retaining a pool connection during sleeps."""
+
+        deadline = asyncio.get_running_loop().time() + min(max(float(max_wait), 0), 30)
+        while True:
+            row = await self._get_scoped_request(
+                request_id, entity_type=entity_type, entity_id=entity_id
+            )
+            if not row:
+                return None
+            result = {
+                "request_id": str(row["id"]),
+                "status": _public_status(row["status"]),
+                "reason": row.get("decision_reason"),
+            }
+            remaining = deadline - asyncio.get_running_loop().time()
+            if result["status"] != "pending" or remaining <= 0:
+                return result
+            await asyncio.sleep(min(1.0, remaining))
+
+    async def count_pending_for_entity(self, identity: Any) -> int:
+        if not self._db:
+            return 0
+        column = "thread_id" if identity.entity_type == "thread" else "job_id"
+        async with self._db.acquire() as conn:
+            return int(
+                await conn.fetchval(
+                    f"SELECT count(*) FROM sudo_approval_requests "
+                    f"WHERE {column} = $1 AND status = 'pending' "
+                    "AND expires_at > NOW()",
+                    identity.entity_id,
+                )
+                or 0
+            )
+
+    async def http_request_exists(self, identity: Any, request_id: str) -> bool:
+        row = await self._get_request_by_reply_subject(f"http:{request_id}")
+        if not row:
+            return False
+        self._assert_http_entity(row, identity)
+        return True
+
+    @staticmethod
+    def _assert_http_entity(row: Mapping[str, Any], identity: Any) -> None:
+        column = "thread_id" if identity.entity_type == "thread" else "job_id"
+        if str(row.get(column) or "") != identity.entity_id:
+            raise SudoRequestConflict("request_id is already bound to another entity")
+
+    @staticmethod
+    def _assert_same_http_payload(
+        row: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> None:
+        if (
+            row.get("command") != payload.get("command")
+            or list(row.get("arguments") or []) != list(payload.get("argv") or [])
+            or (row.get("working_directory") or "") != (payload.get("cwd") or "")
+        ):
+            raise SudoRequestConflict("request_id is already bound to another payload")
+
+    @staticmethod
+    def _open_result(row: Mapping[str, Any], *, created: bool) -> SudoOpenResult:
+        return SudoOpenResult(
+            str(row["id"]),
+            _public_status(row["status"]),
+            row.get("decision_reason"),
+            row.get("expires_at"),
+            created,
+        )
 
     # =========================================================================
     # NATS subscription handler
@@ -211,6 +421,7 @@ class SudoGateService:
             {
                 "id": str(request_id),
                 "job_id": str(row["job_id"]) if row.get("job_id") else None,
+                "thread_id": str(row["thread_id"]) if row.get("thread_id") else None,
                 "status": "approved",
                 "decided_by": decided_by,
             },
@@ -219,7 +430,8 @@ class SudoGateService:
         return {
             "id": str(request_id),
             "status": "approved",
-            "job_id": str(row["job_id"]),
+            "job_id": str(row["job_id"]) if row.get("job_id") else None,
+            "thread_id": str(row["thread_id"]) if row.get("thread_id") else None,
         }
 
     async def deny_request(
@@ -257,6 +469,7 @@ class SudoGateService:
             {
                 "id": str(request_id),
                 "job_id": str(row["job_id"]) if row.get("job_id") else None,
+                "thread_id": str(row["thread_id"]) if row.get("thread_id") else None,
                 "status": "denied",
                 "decided_by": decided_by,
                 "reason": reason,
@@ -266,7 +479,8 @@ class SudoGateService:
         return {
             "id": str(request_id),
             "status": "denied",
-            "job_id": str(row["job_id"]),
+            "job_id": str(row["job_id"]) if row.get("job_id") else None,
+            "thread_id": str(row["thread_id"]) if row.get("thread_id") else None,
         }
 
     # =========================================================================
@@ -291,7 +505,7 @@ class SudoGateService:
                         decided_by = 'system',
                         decision_reason = 'TTL expired'
                     WHERE status = 'pending' AND expires_at < NOW()
-                    RETURNING id, job_id, nats_reply_subject
+                    RETURNING id, job_id, thread_id, nats_reply_subject
                     """
                 )
 
@@ -321,6 +535,9 @@ class SudoGateService:
                     {
                         "id": str(row["id"]),
                         "job_id": str(row["job_id"]) if row.get("job_id") else None,
+                        "thread_id": (
+                            str(row["thread_id"]) if row.get("thread_id") else None
+                        ),
                         "status": "expired",
                         "decided_by": "system",
                     },
@@ -471,7 +688,7 @@ class SudoGateService:
             async with self._db.acquire() as conn:
                 rows = await conn.fetch(
                     f"""
-                    SELECT id, job_id, vm_name, command, arguments,
+                    SELECT id, job_id, thread_id, vm_name, command, arguments,
                            working_directory, requesting_user, target_user,
                            status, requested_at, decided_at, decided_by,
                            decision_reason, ttl_seconds, expires_at, metadata,
@@ -515,7 +732,13 @@ class SudoGateService:
             pass
 
     async def _notify_project_officer(
-        self, request_id: str, job_id: Any, command: str, request_type: str
+        self,
+        request_id: str,
+        job_id: Any,
+        command: str,
+        request_type: str,
+        *,
+        thread_id: Any = None,
     ) -> None:
         """Wake the project's officer about a pending approval. Never raises.
 
@@ -524,13 +747,17 @@ class SudoGateService:
         of coverage — the human notification path remains the fallback
         (centurion implementation notes, S4).
         """
-        if not self._db or not job_id:
+        if not self._db or not (job_id or thread_id):
             return
         try:
             from services import session_wake
 
-            job = await self._db.get_job(str(job_id))
-            project_id = (job or {}).get("project_id")
+            entity = (
+                await self._db.get_thread(str(thread_id))
+                if thread_id
+                else await self._db.get_job(str(job_id))
+            )
+            project_id = (entity or {}).get("project_id")
             if not project_id:
                 return
             enqueued = await session_wake.notify_officer(
@@ -540,7 +767,8 @@ class SudoGateService:
                 dedup_key=f"sudo:{request_id}",
                 payload={
                     "request_id": str(request_id),
-                    "job_id": str(job_id),
+                    "job_id": str(job_id) if job_id else None,
+                    "thread_id": str(thread_id) if thread_id else None,
                     "request_type": request_type,
                     "summary": (command or "")[:160],
                 },
@@ -571,7 +799,7 @@ class SudoGateService:
 
     async def _insert_request(
         self,
-        job_id: str,
+        job_id: Optional[str],
         vm_name: str,
         command: str,
         arguments: list,
@@ -580,6 +808,9 @@ class SudoGateService:
         target_user: str,
         nats_reply_subject: Optional[str],
         metadata: dict,
+        *,
+        thread_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Optional[str]:
         """Claim-and-insert a sudo approval request.
 
@@ -596,16 +827,19 @@ class SudoGateService:
             row = await conn.fetchrow(
                 """
                 INSERT INTO sudo_approval_requests
-                    (job_id, vm_name, command, arguments, working_directory,
+                    (id, job_id, thread_id, vm_name, command, arguments, working_directory,
                      requesting_user, target_user, nats_reply_subject, metadata,
                      expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5,
+                        $6, $7, $8, $9, $10, $11,
                         NOW() + INTERVAL '300 seconds')
                 ON CONFLICT (nats_reply_subject) WHERE nats_reply_subject IS NOT NULL
                 DO NOTHING
                 RETURNING id
                 """,
+                request_id,
                 job_id,
+                thread_id,
                 vm_name,
                 command,
                 arguments,
@@ -725,6 +959,34 @@ class SudoGateService:
             logger.error("Failed to get sudo request %s: %s", request_id, e)
             return None
 
+    async def _get_request_by_reply_subject(self, reply_subject: str):
+        if not self._db:
+            return None
+        async with self._db.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM sudo_approval_requests WHERE nats_reply_subject = $1",
+                reply_subject,
+            )
+
+    async def _get_scoped_request(
+        self,
+        request_id: str,
+        *,
+        entity_type: str | None,
+        entity_id: str | None,
+    ):
+        if not self._db:
+            return None
+        if entity_type not in {"job", "thread"} or not entity_id:
+            return await self._get_request(request_id)
+        column = "thread_id" if entity_type == "thread" else "job_id"
+        async with self._db.acquire() as conn:
+            return await conn.fetchrow(
+                f"SELECT * FROM sudo_approval_requests WHERE id = $1 AND {column} = $2",
+                request_id,
+                entity_id,
+            )
+
     async def _finalize_request(
         self,
         request_id: str,
@@ -759,7 +1021,7 @@ class SudoGateService:
         self, reply_subject: Optional[str], approved: bool, reason: str = ""
     ) -> None:
         """Publish an approval/denial to the daemon via the stored reply subject."""
-        if not reply_subject or not self._nc:
+        if not reply_subject or reply_subject.startswith("http:") or not self._nc:
             return
 
         response = {"approved": approved}

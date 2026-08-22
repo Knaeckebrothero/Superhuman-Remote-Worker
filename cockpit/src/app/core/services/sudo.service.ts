@@ -4,7 +4,8 @@ import { environment } from '../environment';
 
 export interface SudoRequest {
   id: string;
-  job_id: string;
+  job_id: string | null;
+  thread_id: string | null;
   vm_name: string;
   command: string;
   arguments: string[];

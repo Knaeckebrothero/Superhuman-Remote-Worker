@@ -58,6 +58,7 @@ from src.shared.workspace_contract import (
     normalized_workspace_backend_sql,
     pinned_dispatch_authority_jsonb_sql,
     strip_and_stamp_workspace_creation,
+    vm_mode_from_env,
     workspace_contract_projection,
 )
 
@@ -1979,7 +1980,8 @@ class PostgresDB:
                 {
                     "config_override": row.pop("_workspace_config_override", None),
                     "context": row.pop("_workspace_context", None),
-                }
+                },
+                vm_mode=vm_mode_from_env(),
             )
 
         # has_more is measured in display roots, because that is what the page
@@ -2325,7 +2327,8 @@ class PostgresDB:
 
         result = dict(row)
         result["workspace_contract"] = workspace_contract_projection(
-            {"context": context, "config_override": config_override}
+            {"context": context, "config_override": config_override},
+            vm_mode=vm_mode_from_env(),
         )
         return result
 
@@ -5565,7 +5568,9 @@ class PostgresDB:
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
-            "context->'vm' AS vm FROM jobs WHERE (" + status_clause + ")"
+            "context->'vm' AS vm FROM jobs WHERE ("
+            + status_clause
+            + ") AND jobs.status NOT IN ('completed','failed','cancelled')"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
@@ -5654,6 +5659,34 @@ class PostgresDB:
             "    COALESCE(context->'ide_session', '{}'::jsonb) || $1::jsonb"
             "), "
             "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(session_updates), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
+    async def merge_thread_ide_session_context(
+        self, thread_id: str, session_updates: Dict[str, Any]
+    ) -> bool:
+        """Atomically merge updates into threads.metadata.ide_session."""
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{ide_session}', "
+            "    COALESCE(metadata->'ide_session', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
@@ -7575,7 +7608,9 @@ class PostgresDB:
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
-            "metadata->'vm' AS vm FROM threads WHERE (" + status_clause + ")"
+            "metadata->'vm' AS vm FROM threads WHERE ("
+            + status_clause
+            + ") AND threads.status <> 'ended' AND threads.ended_at IS NULL"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
