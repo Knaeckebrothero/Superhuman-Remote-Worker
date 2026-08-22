@@ -417,3 +417,47 @@ def test_legacy_pvc_is_untouched_by_the_cluster_size():
         for d in _kinds(documents, "PersistentVolumeClaim")
     }
     assert claims[f"{FULLNAME}-pgvector-data"] == "16Gi"
+
+
+# --- the migrating-mode label collision -------------------------------------
+
+
+@pytest.mark.parametrize("key", sorted(DATABASES))
+def test_migrating_cluster_pods_are_not_selected_by_the_legacy_service(key):
+    """`migrating` renders BOTH workloads. Phase 2 gives CNPG pods the chart's
+    component labels so NetworkPolicies keep matching -- but the legacy Service
+    selects on those same labels, so it would load-balance live traffic across
+    the real database and a half-imported copy, and writes landing on the new
+    one would be lost when the import is discarded."""
+    component = DATABASES[key]
+    documents = _render(f"databases.{key}.engine=migrating")
+
+    service = [
+        d
+        for d in _kinds(documents, "Service")
+        if d["metadata"]["name"] == f"{FULLNAME}-{component}"
+    ][0]
+    selector = service["spec"]["selector"]
+
+    cluster = [
+        d
+        for d in _kinds(documents, "Cluster")
+        if d["metadata"]["name"] == f"{FULLNAME}-{component}"
+    ][0]
+    inherited = cluster["spec"].get("inheritedMetadata", {}).get("labels", {})
+
+    matched = all(inherited.get(k) == v for k, v in selector.items())
+    assert not matched, (
+        f"the legacy {component} Service would select the migrating Cluster's pods: "
+        f"selector={selector} inherited={inherited}"
+    )
+
+
+@pytest.mark.parametrize("key", sorted(DATABASES))
+def test_cnpg_cluster_pods_keep_the_component_labels(key):
+    """Once the StatefulSet is gone there is no Service to collide with, and
+    the labels are what keep the NetworkPolicies matching."""
+    component = DATABASES[key]
+    cluster = _clusters(f"databases.{key}.engine=cnpg")[f"{FULLNAME}-{component}"]
+    labels = cluster["spec"]["inheritedMetadata"]["labels"]
+    assert labels["app.kubernetes.io/component"] == component
