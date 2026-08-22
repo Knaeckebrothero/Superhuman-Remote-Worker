@@ -304,6 +304,22 @@ class WorkspaceBackend(ABC):
         """
         raise NotImplementedError("resolve_home_path not supported by this backend")
 
+    def execute_with_secret_stdin(
+        self, command: str, secret: str | bytes, *, timeout: int = 30
+    ) -> bool:
+        """Run trusted setup code while delivering a secret only on stdin.
+
+        This is deliberately not part of the model-facing shell surface. It
+        exists for control-plane bootstrap material that must never be placed
+        in a command, environment variable, tmux scrollback, or workspace
+        file. Backends without a private transport fail closed.
+        """
+
+        del command, secret, timeout
+        raise NotImplementedError(
+            "secret-stdin execution not supported by this backend"
+        )
+
     @abstractmethod
     def append_file(self, path: str, content: str) -> None:
         """Append content to a file. Creates the file if it doesn't exist.

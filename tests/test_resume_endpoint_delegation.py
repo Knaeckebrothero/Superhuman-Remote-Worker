@@ -124,6 +124,7 @@ class _FakeAsyncClient:
 
     posts: list[tuple[str, dict]] = []
     next_status: int = 202
+    next_text: str = ""
 
     def __init__(self, *args, **kwargs):
         pass
@@ -136,7 +137,7 @@ class _FakeAsyncClient:
 
     async def post(self, url, json=None):
         _FakeAsyncClient.posts.append((url, json))
-        return _FakeResponse(_FakeAsyncClient.next_status)
+        return _FakeResponse(_FakeAsyncClient.next_status, _FakeAsyncClient.next_text)
 
 
 @pytest.fixture
@@ -172,12 +173,14 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     """Patch every DB/transport collaborator of `_resume_job_on_agent`."""
     _FakeAsyncClient.posts = []
     _FakeAsyncClient.next_status = 202
+    _FakeAsyncClient.next_text = ""
     monkeypatch.setattr(main.httpx, "AsyncClient", _FakeAsyncClient)
 
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(
         main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
     )
+    monkeypatch.setattr(main, "_job_project_repositories", AsyncMock(return_value=None))
     monkeypatch.setattr(main, "_apply_cloud_storage_override", MagicMock())
     monkeypatch.setattr(main, "_build_datasources_payload", MagicMock(return_value=[]))
     monkeypatch.setattr(
@@ -188,6 +191,11 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     monkeypatch.setattr(main.postgres_db, "delete_job_context_keys", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "update_job_status", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "heartbeat", AsyncMock())
+    monkeypatch.setattr(
+        main.postgres_db,
+        "managed_repository_authorities_are_current",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         main,
         "_workspace_runtime_unchanged_before_delivery",
@@ -354,6 +362,19 @@ class TestResumeJobOnAgentInjection:
 
 
 class TestResumeJobOnAgentRejection:
+    @pytest.mark.asyncio
+    async def test_rejection_log_does_not_echo_secret_response(
+        self, resume_collaborators, caplog
+    ):
+        private_material = "-----BEGIN OPENSSH PRIVATE KEY-----hidden"
+        _FakeAsyncClient.next_status = 422
+        _FakeAsyncClient.next_text = private_material
+
+        assert await main._resume_job_on_agent(_job(), _agent()) is False
+
+        assert private_material not in caplog.text
+        assert "status=422" in caplog.text
+
     @pytest.mark.asyncio
     async def test_409_demotes_stale_ready_agent(self, resume_collaborators):
         _FakeAsyncClient.next_status = 409

@@ -169,7 +169,10 @@ services:
       GITEA__server__ROOT_URL: "http://localhost:${GITEA_PORT:-3000}"
       GITEA__server__HTTP_PORT: "3000"
       GITEA__security__INSTALL_LOCK: "true"
-      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__DISABLE_SSH: "false"
+      GITEA__server__START_SSH_SERVER: "true"
+      GITEA__server__SSH_LISTEN_PORT: "2222"
+      GITEA__server__SSH_PORT: "${GITEA_SSH_PORT:-2222}"
       GITEA__service__DISABLE_REGISTRATION: "false"
       GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
       GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
@@ -185,6 +188,7 @@ services:
       - gitea_data:/var/lib/gitea
     ports:
       - "${GITEA_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:2222"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/v1/version"]
       interval: 10s
@@ -297,6 +301,10 @@ services:
       # Gitea
       GITEA_URL: http://gitea:3000
       GITEA_INTERNAL_URL: http://gitea:3000
+      GITEA_SSH_INTERNAL_HOST: gitea
+      GITEA_SSH_INTERNAL_PORT: "2222"
+      GITEA_SSH_EXTERNAL_HOST: ${GITEA_SSH_EXTERNAL_HOST:-}
+      GITEA_SSH_EXTERNAL_PORT: ${GITEA_SSH_EXTERNAL_PORT:-2222}
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
       GITEA_OIDC_CLIENT_SECRET: ${GITEA_OIDC_CLIENT_SECRET:-}

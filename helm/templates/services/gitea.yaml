@@ -149,6 +149,11 @@ spec:
           image: {{ .Values.gitea.image }}
           ports:
             - containerPort: 3000
+              name: http
+            {{- if .Values.gitea.ssh.enabled }}
+            - containerPort: {{ .Values.gitea.ssh.internalPort }}
+              name: ssh
+            {{- end }}
           env:
             {{- if (include "srw.giteaUsesPostgres" .) }}
             - name: GITEA__database__DB_TYPE
@@ -198,7 +203,17 @@ spec:
             - name: GITEA__security__INSTALL_LOCK
               value: "true"
             - name: GITEA__server__DISABLE_SSH
+              value: {{ not .Values.gitea.ssh.enabled | quote }}
+            {{- if .Values.gitea.ssh.enabled }}
+            - name: GITEA__server__START_SSH_SERVER
               value: "true"
+            - name: GITEA__server__SSH_LISTEN_PORT
+              value: {{ .Values.gitea.ssh.internalPort | quote }}
+            - name: GITEA__server__SSH_DOMAIN
+              value: {{ default (printf "%s-gitea" (include "srw.fullname" .)) .Values.gitea.ssh.externalHost | quote }}
+            - name: GITEA__server__SSH_PORT
+              value: {{ ternary .Values.gitea.ssh.externalPort .Values.gitea.ssh.internalPort (ne (.Values.gitea.ssh.externalHost | default "") "") | quote }}
+            {{- end }}
             - name: GITEA__service__DISABLE_REGISTRATION
               value: "false"
             - name: GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION
@@ -309,8 +324,34 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 3000
+    - name: http
+      port: 3000
       targetPort: 3000
+    {{- if .Values.gitea.ssh.enabled }}
+    - name: ssh
+      port: {{ .Values.gitea.ssh.internalPort }}
+      targetPort: ssh
+    {{- end }}
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+{{- if and .Values.gitea.ssh.enabled .Values.gitea.ssh.externalService.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-gitea-ssh
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea-ssh") | nindent 4 }}
+spec:
+  type: {{ .Values.gitea.ssh.externalService.type }}
+  ports:
+    - name: ssh
+      port: {{ .Values.gitea.ssh.externalPort }}
+      targetPort: ssh
+      {{- if and (eq .Values.gitea.ssh.externalService.type "NodePort") .Values.gitea.ssh.externalService.nodePort }}
+      nodePort: {{ .Values.gitea.ssh.externalService.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+{{- end }}
 {{- end }}

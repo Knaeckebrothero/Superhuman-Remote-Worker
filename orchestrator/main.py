@@ -381,6 +381,20 @@ from services.job_todos import (  # noqa: E402
     parse_current_todos,
 )
 from services.gitea import GiteaClient  # noqa: E402
+from services.managed_repository_authority import (  # noqa: E402
+    ManagedRepositoryAuthorityError,
+    authorize_job_repository_transport,
+    authorize_thread_repository_transport,
+    create_managed_repository,
+    ensure_managed_repository_authority,
+    ensure_project_repository_authority,
+    prepare_job_primary_repository_authority,
+    prepare_project_repository_authority,
+    prepare_thread_repository_authority,
+    project_repository_access_mode,
+    revoke_and_delete_managed_repository,
+    rotate_project_repository_authority,
+)
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from services.cloud import (  # noqa: E402
     CloudBackendError,
@@ -4064,6 +4078,77 @@ async def _inject_dispatch_credentials(
     return config_override
 
 
+async def _job_project_repositories(
+    project_id: str | None,
+) -> list[dict[str, Any]] | None:
+    """Return the raw internal project-repository payload for dispatch."""
+
+    if not project_id:
+        return None
+    repos = await postgres_db.get_project_repositories(str(project_id))
+    return [
+        {
+            "id": str(repository["id"]),
+            "project_id": str(repository["project_id"]),
+            "name": repository["name"],
+            "role": repository["role"],
+            "repo_url": repository.get("repo_url"),
+            "read_only": repository["read_only"],
+            "branch": repository.get("branch", "main"),
+            "clone_path": repository.get("clone_path"),
+            "credentials": repository.get("credentials"),
+            "is_managed": bool(repository.get("is_managed")),
+        }
+        for repository in repos
+    ] or None
+
+
+async def _prepare_job_repository_before_claim(job: Mapping[str, Any]) -> bool:
+    """Adopt/prove historical managed Git authority before processing CAS.
+
+    This is intentionally separate from runtime bundle assembly: the latter
+    occurs after a pinned job has been claimed, while migration 0176 requires
+    a proven scoped key at the claim boundary so an old replica cannot claim
+    and dispatch a credential-bearing URL during a rolling upgrade.
+    """
+
+    try:
+        await prepare_job_primary_repository_authority(postgres_db, gitea_client, job)
+        if job.get("project_id"):
+            repositories = await postgres_db.get_project_repositories(
+                str(job["project_id"])
+            )
+            for repository in repositories:
+                if not repository.get("is_managed"):
+                    continue
+                role = str(repository.get("role") or "")
+                if role in {"knowledge", "jobs"}:
+                    continue
+                await prepare_project_repository_authority(
+                    postgres_db, gitea_client, repository
+                )
+        return True
+    except ManagedRepositoryAuthorityError as exc:
+        logger.warning(
+            "Repository authority is not ready for job %s (%s)",
+            job.get("id"),
+            exc.code,
+        )
+        return False
+    except Exception as exc:
+        # This seam runs before the processing/lease CAS. An unavailable
+        # database or forge must leave the job unclaimed rather than turn an
+        # optional authority-tier outage into a credential-bearing dispatch
+        # or a route-local 500. Log only the exception class: transport
+        # exceptions can contain repository URLs in their message text.
+        logger.warning(
+            "Repository authority preparation failed for job %s (%s)",
+            job.get("id"),
+            type(exc).__name__,
+        )
+        return False
+
+
 async def _build_job_start_request(
     job: dict,
     *,
@@ -4117,22 +4202,9 @@ async def _build_job_start_request(
         repositories_payload = None
         if job.get("project_id"):
             try:
-                repos = await postgres_db.get_project_repositories(
+                repositories_payload = await _job_project_repositories(
                     str(job["project_id"])
                 )
-                repositories_payload = [
-                    {
-                        "id": str(r["id"]),
-                        "name": r["name"],
-                        "role": r["role"],
-                        "repo_url": r.get("repo_url"),
-                        "read_only": r["read_only"],
-                        "branch": r.get("branch", "main"),
-                        "clone_path": r.get("clone_path"),
-                        "credentials": r.get("credentials"),
-                    }
-                    for r in repos
-                ]
             except Exception as e:
                 logger.warning(
                     f"Dispatch: failed to resolve project repos for job {job_id}: {e}"
@@ -4202,19 +4274,36 @@ async def _build_job_start_request(
                 )
             return None
 
+        managed_repository_credentials: list[dict[str, Any]] | None = None
+        if workspace_decision.effective_backend in {"sandbox", "vm"}:
+            try:
+                (
+                    git_remote_url,
+                    repositories_payload,
+                    managed_repository_credentials,
+                ) = await authorize_job_repository_transport(
+                    postgres_db,
+                    gitea_client,
+                    job,
+                    repositories_payload,
+                    backend=workspace_decision.effective_backend,
+                )
+            except ManagedRepositoryAuthorityError as exc:
+                logger.warning(
+                    "Dispatch: repository authority unavailable for job %s (%s)",
+                    job_id,
+                    exc.code,
+                )
+                return None
+
         if workspace_decision.effective_backend == "vm":
-            # F29: VMs are tailnet nodes and can't resolve the cluster-internal
-            # Gitea host (GITEA_INTERNAL_URL, e.g. srw-gitea:3000). Left as-is,
-            # GitManager.clone fails and silently falls back to `git init`
-            # (src/core/workspace.py:362-372,412-418), so every push is a
-            # swallowed warning and the agent's work never lands on main. Rewrite
-            # clone + repo URLs to the ingress-routable GITEA_URL (creds
-            # preserved so the agent can still push). Pod/sandbox backends resolve
-            # the internal host fine, so this rewrite is scoped to the VM branch.
-            git_remote_url = externalize_gitea_url(git_remote_url)
-            for _repo in repositories_payload or []:
-                if _repo.get("repo_url"):
-                    _repo["repo_url"] = externalize_gitea_url(_repo["repo_url"])
+            if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
+                git_remote_url = externalize_gitea_url(git_remote_url)
+            for repository in repositories_payload or []:
+                if not repository.get("is_managed") and repository.get("repo_url"):
+                    repository["repo_url"] = externalize_gitea_url(
+                        repository["repo_url"]
+                    )
             logger.info(
                 "Dispatch: injected attested VM workspace config for job %s",
                 job_id,
@@ -4476,6 +4565,7 @@ async def _build_job_start_request(
             context=remaining_context if remaining_context else None,
             datasources=datasources_payload,
             repositories=repositories_payload,
+            managed_repository_credentials=managed_repository_credentials,
             branch_name=job.get("branch_name"),
             project_id=str(job["project_id"]) if job.get("project_id") else None,
             runtime_actor=runtime_actor.to_payload(),
@@ -4560,6 +4650,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 job_id,
             )
             return False
+        if not await postgres_db.managed_repository_authorities_are_current(
+            job_start.managed_repository_credentials
+        ):
+            logger.warning(
+                "Dispatch: repository authority changed while assembling job %s",
+                job_id,
+            )
+            return False
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -4569,10 +4667,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
         if response.status_code not in (200, 202):
             logger.warning(
-                "Dispatch: agent %s rejected job %s: %s",
+                "Dispatch: agent %s rejected job %s (status=%s)",
                 agent_id,
                 job_id,
-                response.text,
+                response.status_code,
             )
             return False
 
@@ -4714,6 +4812,17 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             job_context = json.loads(job_context)
         _apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = _build_datasources_payload(resolved_ds)
+        try:
+            repositories_payload = await _job_project_repositories(
+                str(job["project_id"]) if job.get("project_id") else None
+            )
+        except Exception:
+            logger.warning(
+                "Resume dispatch: project repositories unavailable for job %s",
+                job_id,
+                exc_info=True,
+            )
+            return False
 
         config_override = job.get("config_override")
         if isinstance(config_override, str):
@@ -4807,6 +4916,34 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 container_ctx.get("provisioner", "k8s"),
             )
 
+        try:
+            (
+                git_remote_url,
+                repositories_payload,
+                managed_repository_credentials,
+            ) = await authorize_job_repository_transport(
+                postgres_db,
+                gitea_client,
+                job,
+                repositories_payload,
+                backend=str(workspace_decision.effective_backend),
+            )
+        except ManagedRepositoryAuthorityError as exc:
+            logger.warning(
+                "Resume dispatch: repository authority unavailable for job %s (%s)",
+                job_id,
+                exc.code,
+            )
+            return False
+        if workspace_decision.effective_backend == "vm":
+            if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
+                git_remote_url = externalize_gitea_url(git_remote_url)
+            for repository in repositories_payload or []:
+                if not repository.get("is_managed") and repository.get("repo_url"):
+                    repository["repo_url"] = externalize_gitea_url(
+                        repository["repo_url"]
+                    )
+
         # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
         # sudo with the operator's reason instead of re-freezing into a new
         # approval loop.
@@ -4863,10 +5000,6 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # (knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md). VM
         # workspaces cannot resolve the cluster-internal Gitea host, so
         # mirror the fresh path's VM-scoped rewrite (F29).
-        git_remote_url = job_context.get("git_remote_url")
-        if git_remote_url and workspace_decision.effective_backend == "vm":
-            git_remote_url = externalize_gitea_url(git_remote_url)
-
         runtime_actor = await mint_worker_runtime_actor(
             postgres_db,
             project_id=str(job["project_id"]) if job.get("project_id") else None,
@@ -4883,6 +5016,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job.get("status"),
             "git_remote_url": git_remote_url,
+            "repositories": repositories_payload,
+            "managed_repository_credentials": managed_repository_credentials,
             "runtime_actor": runtime_actor.to_payload(),
             WORKSPACE_RUNTIME_CONTEXT_KEY: workspace_decision.safe_projection(),
         }
@@ -4899,6 +5034,14 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 job_id,
             )
             return False
+        if not await postgres_db.managed_repository_authorities_are_current(
+            managed_repository_credentials
+        ):
+            logger.warning(
+                "Resume dispatch: repository authority changed while assembling job %s",
+                job_id,
+            )
+            return False
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -4909,7 +5052,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
         if response.status_code not in (200, 202):
             logger.warning(
-                f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}"
+                "Dispatch: agent %s rejected resume for job %s (status=%s)",
+                agent_id,
+                job_id,
+                response.status_code,
             )
             if _resume_reject_should_requeue(response.status_code):
                 # The agent's DB 'ready' was stale — its pod is non-idle (a
@@ -5478,6 +5624,15 @@ async def _send_session_attach_locked(
             thread.get("execution_lane") if thread else None,
         )
         return False
+    try:
+        await prepare_thread_repository_authority(postgres_db, gitea_client, thread)
+    except ManagedRepositoryAuthorityError as exc:
+        logger.warning(
+            "Session attach: repository authority unavailable for thread %s (%s)",
+            thread_id,
+            exc.code,
+        )
+        return False
     agent_id = str(agent["id"])
     if not await _reserve_session_attach_binding(agent_id, thread_id):
         return False
@@ -5518,10 +5673,9 @@ async def _send_session_attach_locked(
             return True
         logger.error(
             "Persistent agent %s returned ambiguous attach response %s; "
-            "retaining reservation to prevent duplicate execution: %s",
+            "retaining reservation to prevent duplicate execution",
             agent["id"],
             response.status_code,
-            response.text[:200],
         )
         return True
     except Exception:
@@ -7306,15 +7460,44 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
     "officer_incarnation",
     "provisioning_preflight",
 }
-_SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
-    "evidence_manifest",
-    WORKSPACE_CONTRACT_CONTEXT_KEY,
-    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
-    WORKSPACE_RUNTIME_CONTEXT_KEY,
-    "workspace_backend",
-    "vm",
-    "workspace_container",
+_SERVER_OWNED_REPOSITORY_CONTEXT_KEYS = {
+    "git_remote_url",
+    "repo_name",
+    "managed_repository_credentials",
+    "managed_repository_authority",
+    "repository_auth",
+    "repository_credentials",
+    "_managed_repository_authority_pending",
 }
+_SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
+    _SERVER_OWNED_OFFICER_CONTEXT_KEYS
+    | _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS
+    | {
+        "evidence_manifest",
+        WORKSPACE_CONTRACT_CONTEXT_KEY,
+        WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+        WORKSPACE_RUNTIME_CONTEXT_KEY,
+        "workspace_backend",
+        "vm",
+        "workspace_container",
+    }
+)
+
+
+def _strip_raw_repository_authority(value: Any) -> Any:
+    """Recursively remove server-owned Git transport from request JSON."""
+
+    if isinstance(value, dict):
+        return {
+            key: _strip_raw_repository_authority(item)
+            for key, item in value.items()
+            if key not in _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_raw_repository_authority(item) for item in value]
+    return value
+
+
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
     "lifecycle_marker",
     "parent_job_id",
@@ -9157,6 +9340,11 @@ async def _try_dispatch_pending_jobs() -> None:
                             "Dispatcher: job %s — no workspace provisioner needed",
                             job_id,
                         )
+                if not await _prepare_job_repository_before_claim(job):
+                    # Retry on the next dispatcher tick. A Gitea/SSH outage is
+                    # not a worker failure and must not make the job cross the
+                    # processing boundary with unproven repository authority.
+                    continue
                 if stateless_worker:
                     (
                         admitted,
@@ -9812,11 +10000,15 @@ class JobCreate(BaseModel):
         # only after resolving server authority. The route helper and Postgres
         # funnel repeat the strip as independent defenses.
         if isinstance(self.context, dict):
-            self.context = {
-                key: value
-                for key, value in self.context.items()
-                if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
-            }
+            self.context = _strip_raw_repository_authority(
+                {
+                    key: value
+                    for key, value in self.context.items()
+                    if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
+                }
+            )
+        if isinstance(self.config_override, dict):
+            self.config_override = _strip_raw_repository_authority(self.config_override)
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
             raise ValueError("datasource_ids may be omitted or an array, not null")
         if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
@@ -9853,6 +10045,11 @@ class JobStartRequest(BaseModel):
     repositories: list[dict[str, Any]] | None = Field(
         default=None,
         description="Project repositories for workspace setup",
+    )
+    managed_repository_credentials: list[dict[str, Any]] | None = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned repository authority transport",
     )
     branch_name: str | None = Field(
         default=None,
@@ -14222,17 +14419,26 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
                     f"Log archive cleanup failed for deleted job {job_id}: {e}"
                 )
 
-        # Clean up Gitea repo/branch
-        if gitea_client.is_initialized:
-            repo_name = job.get("repo_name")
-            branch_name = job.get("branch_name")
-            isolated_repo_name = f"job-{str(job.get('id') or job_id)[:8]}"
+        # Clean up Gitea repo/branch. Root repository deletion is a security
+        # boundary: if Gitea is unavailable, retain the job row as the durable
+        # retry handle instead of orphaning a still-usable deploy key.
+        repo_name = job.get("repo_name")
+        branch_name = job.get("branch_name")
+        isolated_repo_name = f"job-{str(job.get('id') or job_id)[:8]}"
+        if repo_name or branch_name:
             if job.get("parent_job_id") and branch_name and repo_name:
                 # Subjob: delete the branch (no-op if already merged and deleted)
-                await gitea_client.delete_branch(repo_name, branch_name)
+                if gitea_client.is_initialized:
+                    await gitea_client.delete_branch(repo_name, branch_name)
             elif repo_name == isolated_repo_name:
                 # New root-job model: this repo belongs to exactly this job.
-                await gitea_client.delete_repo(repo_name)
+                if not await revoke_and_delete_managed_repository(
+                    postgres_db, gitea_client, repo_name
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Repository credential revocation is retryable",
+                    )
             elif job.get("project_id") and branch_name:
                 # Legacy project job: the repo is shared. Never delete it from a
                 # job endpoint, even when repo_name is stamped on the row (which
@@ -14248,7 +14454,13 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
             elif repo_name and not job.get("project_id"):
                 # Pre-migration loose root job: its non-project repo is private
                 # to the job even if it predates the deterministic short name.
-                await gitea_client.delete_repo(repo_name)
+                if not await revoke_and_delete_managed_repository(
+                    postgres_db, gitea_client, repo_name
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Repository credential revocation is retryable",
+                    )
         # Clean up vector DB tables (no FK cascade across databases)
         try:
             async with vector_db.acquire() as conn:
@@ -18724,6 +18936,10 @@ async def resume_job(
         # authority/agent/lease boundary used by the normal dispatcher. Rows
         # outside the claimable created/paused/failed set (or rows won by a
         # concurrent actor) return through the durable queue path below.
+        if not await _prepare_job_repository_before_claim(job):
+            return await _queue_for_dispatch(
+                "Repository authority is not ready; job remains queued"
+            )
         if not await postgres_db.claim_job_for_agent(
             job_id,
             str(agent_id),
@@ -20004,13 +20220,15 @@ async def _spawn_scholar_subjob(
 
     # Set up Gitea branch for the scholar subjob
     if gitea_client.is_initialized:
-        parent_repo_name = job.get("repo_name")
-        if not parent_repo_name:
-            parent_repo_name = f"job-{str(job['id'])[:8]}"
-
         from_branch = job.get("branch_name") or "main"
         branch_name = f"subjob/{short_id}/{scholar_config_name}"
         try:
+            parent_authority = await prepare_job_primary_repository_authority(
+                postgres_db, gitea_client, job
+            )
+            if parent_authority is None:
+                raise RuntimeError("Parent repository authority is unavailable")
+            parent_repo_name = str(parent_authority["repo_name"])
             branch_ok = await gitea_client.create_branch(
                 parent_repo_name, branch_name, from_branch=from_branch
             )
@@ -20019,18 +20237,12 @@ async def _spawn_scholar_subjob(
                     f"Failed to create branch '{branch_name}' from '{from_branch}' "
                     f"in '{parent_repo_name}' for scholar {scholar_job_id}"
                 )
-            # Propagate git remote URL
-            parent_context = job.get("context") or {}
-            if isinstance(parent_context, str):
-                try:
-                    parent_context = json.loads(parent_context)
-                except (json.JSONDecodeError, ValueError):
-                    parent_context = {}
-            git_remote_url = parent_context.get("git_remote_url", "")
-
-            await postgres_db.merge_job_context(
-                scholar_job_id, {"git_remote_url": git_remote_url}
-            )
+            if not await postgres_db.bind_job_managed_repository(
+                scholar_job_id,
+                repo_name=parent_repo_name,
+                clean_url=str(parent_authority["clean_repo_url"]),
+            ):
+                raise RuntimeError("Scholar repository binding was refused")
 
             # Set worktree_path if subjob inherits a workspace backend
             worktree_path = None
@@ -20039,9 +20251,9 @@ async def _spawn_scholar_subjob(
 
             async with postgres_db.acquire() as conn:
                 await conn.execute(
-                    "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
+                    "UPDATE jobs SET branch_name = $1, worktree_path = $2 "
+                    "WHERE id = $3::uuid",
                     branch_name,
-                    parent_repo_name,
                     worktree_path,
                     scholar_job_id,
                 )
@@ -21365,13 +21577,15 @@ async def _setup_verification_critic_workspace(
     critic_job_id = str(critic_job["id"])
     short_id = critic_job_id[:8]
     effective_config = str(critic_job.get("config_name") or critic_config)
-    parent_repo_name = target_job.get("repo_name")
-    if not parent_repo_name:
-        parent_repo_name = f"job-{str(target_job['id'])[:8]}"
-
     from_branch = target_job.get("branch_name") or "main"
     branch_name = f"subjob/{short_id}/{effective_config}"
     try:
+        parent_authority = await prepare_job_primary_repository_authority(
+            postgres_db, gitea_client, target_job
+        )
+        if parent_authority is None:
+            raise RuntimeError("Target repository authority is unavailable")
+        parent_repo_name = str(parent_authority["repo_name"])
         branch_ok = await gitea_client.create_branch(
             parent_repo_name, branch_name, from_branch=from_branch
         )
@@ -21384,16 +21598,10 @@ async def _setup_verification_critic_workspace(
             if durable_reconcile:
                 raise RuntimeError(message)
 
-        parent_context = target_job.get("context") or {}
-        if isinstance(parent_context, str):
-            try:
-                parent_context = json.loads(parent_context)
-            except (json.JSONDecodeError, ValueError):
-                parent_context = {}
-        git_remote_url = parent_context.get("git_remote_url", "")
-
-        context_updated = await postgres_db.merge_job_context(
-            critic_job_id, {"git_remote_url": git_remote_url}
+        context_updated = await postgres_db.bind_job_managed_repository(
+            critic_job_id,
+            repo_name=parent_repo_name,
+            clean_url=str(parent_authority["clean_repo_url"]),
         )
         if durable_reconcile and not context_updated:
             raise RuntimeError(
@@ -21416,9 +21624,9 @@ async def _setup_verification_critic_workspace(
 
         async with postgres_db.acquire() as conn:
             update_result = await conn.execute(
-                "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
+                "UPDATE jobs SET branch_name = $1, worktree_path = $2 "
+                "WHERE id = $3::uuid",
                 branch_name,
-                parent_repo_name,
                 worktree_path,
                 critic_job_id,
             )
@@ -30817,6 +31025,11 @@ async def assign_job_to_agent(
                 detail="Agent has no pod IP configured",
             )
 
+        if not await _prepare_job_repository_before_claim(job):
+            raise HTTPException(
+                status_code=409,
+                detail="Job repository authority is not ready",
+            )
         if not await postgres_db.claim_job_for_agent(
             job_id,
             agent_id,
@@ -35693,6 +35906,22 @@ async def register_agent(
                         detail="thread execution lane does not accept persistent agents",
                     )
 
+                try:
+                    await prepare_thread_repository_authority(
+                        postgres_db, gitea_client, thread
+                    )
+                except ManagedRepositoryAuthorityError as exc:
+                    logger.warning(
+                        "register_agent: repository authority unavailable for "
+                        "thread %s (%s)",
+                        registration.thread_id,
+                        exc.code,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Workspace repository authority is unavailable",
+                    ) from exc
+
                 # Defense-in-depth against the double-provisioning race
                 # (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md):
                 # refuse a different live owner before the hostname upsert can
@@ -35960,12 +36189,46 @@ async def agent_create_thread(
             await gitea_client.ensure_initialized()
         if gitea_client.is_initialized:
             repo_name = f"thread-{thread_id[:8]}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id,
-                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
+            try:
+                git_remote_url, creation_intent = await create_managed_repository(
+                    postgres_db,
+                    gitea_client,
+                    repo_name=repo_name,
+                    authority_kind="thread",
+                    authority_id=thread_id,
+                    project_id=None,
+                    access_mode="write",
                 )
+                if git_remote_url:
+                    repository_authority = await ensure_managed_repository_authority(
+                        postgres_db,
+                        gitea_client,
+                        repo_name=repo_name,
+                        authority_kind="thread",
+                        authority_id=thread_id,
+                        access_mode="write",
+                        creation_intent_id=str(creation_intent["id"]),
+                    )
+                if not await postgres_db.bind_thread_managed_repository(
+                    thread_id,
+                    repo_name=repo_name,
+                    clean_url=str(repository_authority["clean_repo_url"]),
+                ):
+                    await revoke_and_delete_managed_repository(
+                        postgres_db, gitea_client, repo_name
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Scoped workspace repository binding failed",
+                    )
+            except ManagedRepositoryAuthorityError as exc:
+                await revoke_and_delete_managed_repository(
+                    postgres_db, gitea_client, repo_name
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Scoped workspace repository authority unavailable",
+                ) from exc
 
         # Provision workspace container in background if K8s is available
         # (in-cluster only) — unless this is a lite (virtual/none) session, which
@@ -36326,6 +36589,7 @@ async def _resolve_thread_repositories(
                     "branch": r.get("branch", "main"),
                     "clone_path": r.get("clone_path"),
                     "credentials": r.get("credentials"),
+                    "is_managed": bool(r.get("is_managed")),
                 }
             )
 
@@ -36791,6 +37055,49 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             agent_ws.update(co.get("workspace") or {})
     except LiteWorkspaceConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    repositories_payload = await _resolve_thread_repositories(project_ids)
+    git_remote_url = ws.get("git_remote_url")
+    managed_repository_credentials: list[dict[str, Any]] | None = None
+    runtime_repository_backend: str | None = None
+    if vm.get("status") == "ready" and vm.get("ssh_host"):
+        runtime_repository_backend = "vm"
+    elif ws.get("status") == "ready" and (ws.get("pod_ip") or ws.get("host")):
+        runtime_repository_backend = "sandbox"
+    if runtime_repository_backend is not None:
+        try:
+            (
+                git_remote_url,
+                repositories_payload,
+                managed_repository_credentials,
+            ) = await authorize_thread_repository_transport(
+                postgres_db,
+                gitea_client,
+                thread,
+                repositories_payload,
+                backend=runtime_repository_backend,
+            )
+        except ManagedRepositoryAuthorityError as exc:
+            logger.warning(
+                "Thread repository authority unavailable at attach: thread=%s code=%s",
+                thread_id,
+                exc.code,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace repository authority is unavailable",
+            ) from exc
+    if runtime_repository_backend == "vm":
+        for repository in repositories_payload or []:
+            if not repository.get("is_managed") and repository.get("repo_url"):
+                repository["repo_url"] = externalize_gitea_url(repository["repo_url"])
+    if not await postgres_db.managed_repository_authorities_are_current(
+        managed_repository_credentials
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace repository authority changed during attach",
+        )
     return {
         "status": ws.get("status", "none"),
         # Internal claim/attach identity, never exposed by owner-facing thread
@@ -36811,7 +37118,8 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         "pod_name": ws.get("pod_name"),
         "pod_port": ws.get("pod_port") or ws.get("port"),
         "namespace": ws.get("namespace"),
-        "git_remote_url": ws.get("git_remote_url"),
+        "git_remote_url": git_remote_url,
+        "managed_repository_credentials": managed_repository_credentials,
         # Public capability only. A ready endpoint without a paired trusted
         # binding must not cause the agent to advertise Canvas tools which can
         # never work.
@@ -36835,10 +37143,7 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         "datasources": datasources_payload,
         # Raw project repository payload for internal session tools. Public
         # repository routes intentionally redact clone credentials.
-        "repositories": await _resolve_thread_repositories(
-            project_ids,
-            externalize_urls=bool(vm.get("status") == "ready" and vm.get("ssh_host")),
-        ),
+        "repositories": repositories_payload,
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": (
             None if suppress_disposable_cloud else thread.get("nc_session_folder")
@@ -41506,17 +41811,46 @@ async def create_thread(
         # never push. Blocking on gather here is cheap (Gitea create_repo is
         # ~50ms) and makes the workspace→remote wiring race-free.
         async def _setup_gitea() -> None:
+            if lite_session:
+                return
             if not gitea_client.is_initialized and gitea_client.is_configured:
                 await gitea_client.ensure_initialized()
             if not gitea_client.is_initialized:
                 return
             repo_name = f"thread-{thread_id[:8]}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id,
-                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
+            try:
+                git_remote_url, creation_intent = await create_managed_repository(
+                    postgres_db,
+                    gitea_client,
+                    repo_name=repo_name,
+                    authority_kind="thread",
+                    authority_id=thread_id,
+                    project_id=primary_project_id,
+                    access_mode="write",
                 )
+                if git_remote_url:
+                    repository_authority = await ensure_managed_repository_authority(
+                        postgres_db,
+                        gitea_client,
+                        repo_name=repo_name,
+                        authority_kind="thread",
+                        authority_id=thread_id,
+                        project_id=primary_project_id,
+                        access_mode="write",
+                        creation_intent_id=str(creation_intent["id"]),
+                    )
+                if not await postgres_db.bind_thread_managed_repository(
+                    thread_id,
+                    repo_name=repo_name,
+                    clean_url=str(repository_authority["clean_repo_url"]),
+                ):
+                    await revoke_and_delete_managed_repository(
+                        postgres_db, gitea_client, repo_name
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Scoped workspace repository binding failed",
+                    )
                 if user.get("email"):
                     try:
                         # Pass username + full_name + sub so grant_user_repo_access
@@ -41538,6 +41872,14 @@ async def create_thread(
                             thread_id,
                             e,
                         )
+            except ManagedRepositoryAuthorityError as exc:
+                await revoke_and_delete_managed_repository(
+                    postgres_db, gitea_client, repo_name
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Scoped workspace repository authority unavailable",
+                ) from exc
 
         async def _setup_main_cloud() -> None:
             # Fresh session folder for a new thread — resolve via the owner
@@ -44056,8 +44398,11 @@ async def _end_thread_flow(
                 )
 
         repo_name = authoritative_ws.get("repo_name")
-        if repo_name and gitea_client.is_initialized:
-            await gitea_client.delete_repo(repo_name)
+        if repo_name:
+            if not await revoke_and_delete_managed_repository(
+                postgres_db, gitea_client, repo_name
+            ):
+                raise RuntimeError("Repository credential revocation is retryable")
 
         session_handle_str = authoritative_thread.get(
             "main_cloud_session_handle"
@@ -46274,6 +46619,13 @@ async def internal_unit_claim_bundle(
             )
         if not lease_still_current:
             raise HTTPException(status_code=403, detail="Lease validation failed")
+        if not await postgres_db.managed_repository_authorities_are_current(
+            job_start.managed_repository_credentials
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job repository authority changed during bundle assembly",
+            )
 
         context = job.get("context") or {}
         if isinstance(context, str):
@@ -54617,10 +54969,10 @@ async def _provision_project_knowledge_repo(
       second time under this row's UUID and every note would come back twice
       in search (§8, criterion 5).
 
-    ``connection_url`` is deliberately left null. The authenticated Gitea URL
-    would leak credentials through the connector API, and a second copy of
-    "where the vault lives" is exactly the divergence §10 warns about —
-    ``project_repositories`` is the one place that answer is kept.
+    ``connection_url`` is deliberately left null. Managed URLs are now
+    credential-free, but the connector is not repository transport authority;
+    a second copy of "where the vault lives" is exactly the divergence §10
+    warns about. ``project_repositories`` remains the one authoritative answer.
 
     Returns the created datasource row, or None when Gitea refused the repo.
     """
@@ -54629,9 +54981,19 @@ async def _provision_project_knowledge_repo(
     project_id = str(project["id"])
     id8 = project_id[:8]
     repo_name = f"project-{id8}-knowledge"
+    repository_id = str(uuid4())
 
-    repo_url = await gitea_client.create_repo(repo_name)
-    if not repo_url:
+    try:
+        repo_url, _creation_intent = await create_managed_repository(
+            postgres_db,
+            gitea_client,
+            repo_name=repo_name,
+            authority_kind="project_repository",
+            authority_id=repository_id,
+            project_id=project_id,
+            access_mode="none",
+        )
+    except ManagedRepositoryAuthorityError:
         logger.warning(
             "Gitea did not create knowledge repo '%s'; project %s has no "
             "file-backed vault until provisioning is retried",
@@ -54642,13 +55004,13 @@ async def _provision_project_knowledge_repo(
 
     await postgres_db.add_project_repository(
         project_id=project_id,
+        repository_id=repository_id,
         name=repo_name,
         repo_url=repo_url,
         role="knowledge",
         description="Project knowledge vault (OKF notes under knowledge/)",
         is_managed=True,
     )
-
     if owner_id:
         try:
             creator = await postgres_db.get_user(owner_id)
@@ -55496,8 +55858,14 @@ async def delete_project(project_id: str, request: Request) -> dict[str, str]:
     # Clean up managed repos
     repos = await postgres_db.get_project_repositories(project_id)
     for repo in repos:
-        if repo.get("is_managed") and gitea_client.is_initialized:
-            await gitea_client.delete_repo(repo["name"])
+        if repo.get("is_managed"):
+            if not await revoke_and_delete_managed_repository(
+                postgres_db, gitea_client, repo["name"]
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Repository credential revocation is retryable",
+                )
 
     # Clean up knowledge_index in vector DB (no FK cascade across databases)
     try:
@@ -55706,19 +56074,40 @@ async def add_project_repository(
 
     repo_url = body.repo_url
     is_managed = False
+    repository_id: str | None = None
+    creation_intent: dict[str, Any] | None = None
 
     # Create a managed Gitea repo if requested
     if body.create_managed and gitea_client.is_initialized:
-        repo_url = await gitea_client.create_repo(body.name)
-        if not repo_url:
+        repository_id = str(uuid4())
+        access_mode = (
+            "none"
+            if body.role == "knowledge"
+            else "read"
+            if body.role == "reference" or body.read_only
+            else "write"
+        )
+        try:
+            repo_url, creation_intent = await create_managed_repository(
+                postgres_db,
+                gitea_client,
+                repo_name=body.name,
+                authority_kind="project_repository",
+                authority_id=repository_id,
+                project_id=project_id,
+                access_mode=access_mode,
+            )
+        except ManagedRepositoryAuthorityError as exc:
             raise HTTPException(
                 status_code=502, detail="Failed to create Gitea repository"
-            )
+            ) from exc
         is_managed = True
 
+    created: dict[str, Any] | None = None
     try:
         created = await postgres_db.add_project_repository(
             project_id=project_id,
+            repository_id=repository_id,
             name=body.name,
             repo_url=repo_url,
             role=body.role,
@@ -55728,14 +56117,33 @@ async def add_project_repository(
             branch=body.branch,
             clone_path=body.clone_path,
         )
-        # A/C: the created row echoes back the credentialed internal repo_url —
-        # redact it just like the list endpoint before returning to the client.
+        if is_managed and project_repository_access_mode(created) is not None:
+            assert creation_intent is not None
+            await ensure_project_repository_authority(
+                postgres_db,
+                gitea_client,
+                created,
+                creation_intent_id=str(creation_intent["id"]),
+            )
+        # Keep the historical redaction boundary even though new managed rows
+        # are credential-free. It remains the safe projection for old data.
         return redact_repository(created)
-    except Exception as e:
+    except Exception as exc:
         # If we created a managed repo but DB insert failed, clean up
         if is_managed and repo_url:
-            await gitea_client.delete_repo(body.name)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+            contained = await revoke_and_delete_managed_repository(
+                postgres_db, gitea_client, body.name
+            )
+            if contained and created is not None:
+                await postgres_db.remove_project_repository(str(created["id"]))
+        logger.warning(
+            "Managed project repository creation failed for project %s",
+            project_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Managed repository provisioning failed",
+        ) from exc
 
 
 @app.patch("/api/projects/{project_id}/repositories/{repo_id}")
@@ -55747,6 +56155,41 @@ async def update_project_repository(
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
+    repository = await postgres_db.get_project_repository(repo_id)
+    if repository is None or str(repository.get("project_id")) != project_id:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if (
+        repository.get("is_managed")
+        and "name" in kwargs
+        and str(kwargs["name"]) != str(repository.get("name"))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "managed_repository_identity_immutable",
+                "message": "Create a new managed repository instead of renaming it",
+            },
+        )
+    if (
+        repository.get("is_managed")
+        and "read_only" in kwargs
+        and bool(kwargs["read_only"]) != bool(repository.get("read_only"))
+    ):
+        target_repository = {**repository, **kwargs}
+        try:
+            await rotate_project_repository_authority(
+                postgres_db,
+                gitea_client,
+                target_repository,
+            )
+        except ManagedRepositoryAuthorityError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "managed_repository_authority_rotation_failed",
+                    "message": "Repository access-mode rotation is retryable",
+                },
+            ) from exc
     success = await postgres_db.update_project_repository(repo_id, **kwargs)
     if not success:
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -55760,18 +56203,26 @@ async def remove_project_repository(
     """Remove a repository from a project. Owner or admin only. Cannot remove the jobs repo."""
     await require_project_owner(request, postgres_db, project_id)
     repo = await postgres_db.get_project_repository(repo_id)
-    if not repo:
+    if not repo or str(repo.get("project_id")) != project_id:
         raise HTTPException(status_code=404, detail="Repository not found")
     if repo.get("role") == "jobs":
         raise HTTPException(status_code=400, detail="Cannot remove the jobs repository")
 
+    # A managed row is the durable retry handle for key revocation. Contain
+    # its credential before deleting that row; otherwise a transient Gitea
+    # outage would turn it into an unowned, still-usable workspace bearer.
+    if repo.get("is_managed"):
+        if not await revoke_and_delete_managed_repository(
+            postgres_db, gitea_client, repo["name"]
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Repository credential revocation is retryable",
+            )
+
     removed = await postgres_db.remove_project_repository(repo_id)
     if not removed:
         raise HTTPException(status_code=500, detail="Failed to remove repository")
-
-    # Clean up managed Gitea repo
-    if removed.get("is_managed") and gitea_client.is_initialized:
-        await gitea_client.delete_repo(removed["name"])
 
     return {"status": "removed"}
 

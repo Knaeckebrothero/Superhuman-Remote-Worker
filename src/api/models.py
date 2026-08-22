@@ -316,6 +316,11 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Project repositories (jobs, source, reference)",
     )
+    managed_repository_credentials: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned repository authority transport",
+    )
     branch_name: Optional[str] = Field(
         default=None,
         description="Git branch for job workspace",
@@ -415,6 +420,15 @@ class JobResumeRequest(BaseModel):
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Resolved connector details (set by orchestrator)",
+    )
+    repositories: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Project repositories re-authorized by the orchestrator",
+    )
+    managed_repository_credentials: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned repository authority transport",
     )
     project_id: Optional[str] = Field(
         default=None,

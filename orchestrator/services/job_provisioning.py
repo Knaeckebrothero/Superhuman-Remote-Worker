@@ -29,6 +29,14 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from services.managed_repository_authority import (
+    ManagedRepositoryAuthorityError,
+    create_managed_repository,
+    ensure_job_primary_repository_authority,
+    ensure_managed_repository_authority,
+    revoke_and_delete_managed_repository,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -187,24 +195,25 @@ async def provision_job_repo(
         parent = await postgres_db.get_job(parent_job_id)
         await _permit(authority_check)
         if parent:
-            # Resolve parent's repo name (parent may be root or itself a subjob)
-            parent_repo_name = parent.get("repo_name")
-            if not parent_repo_name and parent.get("parent_job_id"):
-                root = await postgres_db.get_job(str(parent["parent_job_id"]))
-                await _permit(authority_check)
-                if root:
-                    parent_repo_name = root.get("repo_name")
-            if not parent_repo_name:
-                # Legacy fallback: try project jobs repo
-                if parent.get("project_id"):
-                    repos = await postgres_db.get_project_repositories(
-                        str(parent["project_id"]), role="jobs"
-                    )
-                    await _permit(authority_check)
-                    if repos:
-                        parent_repo_name = repos[0]["name"]
-                if not parent_repo_name:
-                    parent_repo_name = f"job-{str(parent['id'])}"
+            # Resolve and prove the exact root/shared-jobs authority before
+            # mutating Gitea. Historical parents can legitimately have no
+            # job-level repo_name and obtain their primary from the project's
+            # single managed role=jobs row.
+            try:
+                parent_authority = await ensure_job_primary_repository_authority(
+                    postgres_db, gitea_client, parent
+                )
+            except ManagedRepositoryAuthorityError as exc:
+                raise JobProvisioningError(
+                    "could not authorize inherited job repository",
+                    phase="repository",
+                ) from exc
+            if parent_authority is None:
+                raise JobProvisioningError(
+                    "inherited job repository has no scoped authority",
+                    phase="repository",
+                )
+            parent_repo_name = str(parent_authority["repo_name"])
 
             from_branch = parent.get("branch_name") or "main"
             config_name_slug = config_name or "subjob"
@@ -223,21 +232,21 @@ async def provision_job_repo(
                         f"could not create isolated job branch {branch_name}",
                         phase="repository",
                     )
-            await postgres_db.merge_job_context(
+            if not await postgres_db.bind_job_managed_repository(
                 job_id_str,
-                {
-                    "git_remote_url": parent.get("context", {}).get(
-                        "git_remote_url", ""
-                    ),
-                },
-            )
+                repo_name=parent_repo_name,
+                clean_url=str(parent_authority["clean_repo_url"]),
+            ):
+                raise JobProvisioningError(
+                    "could not bind inherited repository authority",
+                    phase="repository",
+                )
             await _permit(authority_check)
             async with postgres_db.acquire() as conn:
                 await _permit(authority_check)
                 await conn.execute(
-                    "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
+                    "UPDATE jobs SET branch_name = $1 WHERE id = $2",
                     branch_name,
-                    parent_repo_name,
                     job_row["id"],
                 )
             await _permit(authority_check)
@@ -255,39 +264,77 @@ async def provision_job_repo(
         # only newly-created roots pass through this branch.
         repo_name = f"job-{short_id}"
         await _permit(authority_check)
-        git_remote_url = await gitea_client.create_repo(repo_name)
+        creation_intent: dict[str, Any] | None = None
+        try:
+            git_remote_url, creation_intent = await create_managed_repository(
+                postgres_db,
+                gitea_client,
+                repo_name=repo_name,
+                authority_kind="job",
+                authority_id=job_id_str,
+                project_id=project_id,
+                access_mode="write",
+            )
+        except ManagedRepositoryAuthorityError:
+            git_remote_url = None
         await _permit(authority_check)
         if git_remote_url:
-            gitignore_kwargs = (
-                {"authority_check": authority_check}
-                if authority_check is not None
-                else {}
-            )
-            if loop_floor and not await _ensure_loop_job_gitignore(
-                gitea_client,
-                repo_name,
-                **gitignore_kwargs,
-            ):
-                raise JobProvisioningError(
-                    f"could not initialize isolated job repository {repo_name}",
-                    phase="repository",
+            try:
+                repository_authority = await ensure_managed_repository_authority(
+                    postgres_db,
+                    gitea_client,
+                    repo_name=repo_name,
+                    authority_kind="job",
+                    authority_id=job_id_str,
+                    access_mode="write",
+                    creation_intent_id=str(creation_intent["id"]),
+                    project_id=(
+                        str(job_row["project_id"])
+                        if job_row.get("project_id")
+                        else None
+                    ),
                 )
-            await postgres_db.merge_job_context(
-                job_id_str,
-                {
-                    "git_remote_url": git_remote_url,
-                },
-            )
-            await _permit(authority_check)
-            async with postgres_db.acquire() as conn:
-                await _permit(authority_check)
-                await conn.execute(
-                    "UPDATE jobs SET repo_name = $1 WHERE id = $2",
+                # Bind immediately after key proof. If any later provisioning
+                # step fails, the durable job row remains the exact cleanup/
+                # retry handle instead of leaving an active key known only to
+                # an authority row.
+                if not await postgres_db.bind_job_managed_repository(
+                    job_id_str,
+                    repo_name=repo_name,
+                    clean_url=str(repository_authority["clean_repo_url"]),
+                ):
+                    raise JobProvisioningError(
+                        "could not bind scoped job repository authority",
+                        phase="repository",
+                    )
+                job_row["repo_name"] = repo_name
+                gitignore_kwargs = (
+                    {"authority_check": authority_check}
+                    if authority_check is not None
+                    else {}
+                )
+                if loop_floor and not await _ensure_loop_job_gitignore(
+                    gitea_client,
                     repo_name,
-                    job_row["id"],
+                    **gitignore_kwargs,
+                ):
+                    raise JobProvisioningError(
+                        f"could not initialize isolated job repository {repo_name}",
+                        phase="repository",
+                    )
+                await _permit(authority_check)
+            except Exception as exc:
+                await revoke_and_delete_managed_repository(
+                    postgres_db, gitea_client, repo_name
                 )
-            await _permit(authority_check)
-            job_row["repo_name"] = repo_name
+                if isinstance(exc, JobProvisioningError):
+                    raise
+                if not isinstance(exc, ManagedRepositoryAuthorityError):
+                    raise
+                raise JobProvisioningError(
+                    "could not establish scoped job repository authority",
+                    phase="repository",
+                ) from exc
         elif loop_floor or require_repository:
             raise JobProvisioningError(
                 f"could not create isolated job repository {repo_name}",

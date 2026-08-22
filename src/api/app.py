@@ -539,6 +539,7 @@ async def _process_orchestrator_job(
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
+    managed_repository_credentials: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
     runtime_actor: Optional[Dict[str, Any]] = None,
@@ -594,6 +595,8 @@ async def _process_orchestrator_job(
             metadata["datasources"] = datasources
         if repositories:
             metadata["repositories"] = repositories
+        if managed_repository_credentials:
+            metadata["managed_repository_credentials"] = managed_repository_credentials
         if branch_name:
             metadata["branch_name"] = branch_name
         if project_id:
@@ -969,6 +972,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,
                 repositories=request.repositories,
+                managed_repository_credentials=(request.managed_repository_credentials),
                 branch_name=request.branch_name,
                 project_id=request.project_id,
                 runtime_actor=request.runtime_actor,
@@ -1168,6 +1172,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["config_override"] = request.config_override
         if request.datasources:
             resume_metadata["datasources"] = request.datasources
+        if request.repositories:
+            resume_metadata["repositories"] = request.repositories
+        if request.managed_repository_credentials:
+            resume_metadata["managed_repository_credentials"] = (
+                request.managed_repository_credentials
+            )
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
         if request.runtime_actor:

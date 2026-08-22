@@ -398,6 +398,17 @@ data:
   # Gitea
   GITEA_URL: {{ include "srw.gitUrl" . | quote }}
   GITEA_INTERNAL_URL: {{ include "srw.giteaInternalUrl" . | quote }}
+  {{- if .Values.gitea.ssh.enabled }}
+  GITEA_SSH_INTERNAL_HOST: {{ default (ternary (printf "%s-gitea" (include "srw.fullname" .)) "" .Values.gitea.internal) .Values.gitea.ssh.internalHost | quote }}
+  GITEA_SSH_INTERNAL_PORT: {{ .Values.gitea.ssh.internalPort | quote }}
+  GITEA_SSH_EXTERNAL_HOST: {{ .Values.gitea.ssh.externalHost | quote }}
+  GITEA_SSH_EXTERNAL_PORT: {{ .Values.gitea.ssh.externalPort | quote }}
+  {{- else }}
+  GITEA_SSH_INTERNAL_HOST: ""
+  GITEA_SSH_INTERNAL_PORT: "0"
+  GITEA_SSH_EXTERNAL_HOST: ""
+  GITEA_SSH_EXTERNAL_PORT: "0"
+  {{- end }}
 
   # Orchestrator
   ORCHESTRATOR_URL: {{ printf "http://%s:8085" (include "srw.serviceName" (dict "context" . "component" "orchestrator")) | quote }}

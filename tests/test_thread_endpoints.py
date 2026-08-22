@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -100,7 +101,7 @@ async def agent_create_thread(
 
     if gitea.is_initialized:
         repo_name = f"thread-{thread_id[:8]}"
-        git_remote_url = await gitea.create_repo(repo_name)
+        git_remote_url = await gitea.create_repo(repo_name, intent_marker=str(uuid4()))
         if git_remote_url:
             await db.merge_thread_workspace_context(
                 thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
@@ -604,7 +605,8 @@ class TestAgentCreateThread:
 
         await agent_create_thread(db, gitea, prov)
 
-        gitea.create_repo.assert_awaited_once_with("thread-aaaaaaaa")
+        assert gitea.create_repo.await_args.args == ("thread-aaaaaaaa",)
+        UUID(gitea.create_repo.await_args.kwargs["intent_marker"])
         db.merge_thread_workspace_context.assert_awaited_once_with(
             "aaaaaaaa-1111-2222-3333-444444444444",
             {

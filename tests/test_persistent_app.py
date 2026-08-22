@@ -2150,13 +2150,18 @@ class TestPollWorkspaceReady:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_failed(self):
-        """Returns None when status='failed' and no VM backup."""
+    async def test_returns_none_on_failed(self, caplog):
+        """Failure diagnostics never serialize the internal authority bundle."""
+        private_material = "PRIVATE-DEPLOY-KEY-MUST-NOT-LOG"
         client = AsyncMock()
-        client.get_thread_workspace.return_value = {"status": "failed"}
+        client.get_thread_workspace.return_value = {
+            "status": "failed",
+            "managed_repository_credentials": [{"private_key": private_material}],
+        }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
         assert result is None
+        assert private_material not in caplog.text
 
     @pytest.mark.asyncio
     async def test_polls_until_ready(self):

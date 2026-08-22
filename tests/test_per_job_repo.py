@@ -187,14 +187,23 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_db.claim_managed_repository_authority_revoke = AsyncMock(
+                return_value=None
+            )
+            mock_db.claim_managed_repository_creation_cleanup = AsyncMock(
+                return_value=None
+            )
             mock_gitea.is_initialized = True
+            mock_gitea.repository_owner = "srw"
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
             assert result == DELETE_RESULT
-            mock_gitea.delete_repo.assert_awaited_once_with("job-abcd1234")
+            mock_gitea.delete_repo.assert_awaited_once_with(
+                "job-abcd1234", intent_marker=None
+            )
             mock_gitea.delete_branch.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -295,8 +304,8 @@ class TestDeleteJobGiteaCleanup:
         mock_gitea.delete_repo.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_gitea_not_initialized_skips_cleanup(self):
-        """When Gitea is not initialized, cleanup is skipped entirely."""
+    async def test_gitea_not_initialized_retains_owner_for_revocation_retry(self):
+        """An unavailable forge may not orphan a still-usable repository key."""
         job = {"repo_name": "job-abc", "branch_name": None, "parent_job_id": None}
 
         with (
@@ -307,12 +316,24 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_db.claim_managed_repository_authority_revoke = AsyncMock(
+                return_value=None
+            )
+            mock_db.claim_managed_repository_creation_cleanup = AsyncMock(
+                return_value=None
+            )
             mock_gitea.is_initialized = False
+            mock_gitea.repository_owner = "srw"
+            mock_gitea.delete_repo = AsyncMock(return_value=False)
 
-            result = await orch_main.delete_job(_stub_request(), "some-id")
+            with pytest.raises(HTTPException) as exc:
+                await orch_main.delete_job(_stub_request(), "some-id")
 
-            assert result == DELETE_RESULT
-            mock_gitea.delete_repo.assert_not_called()
+            assert exc.value.status_code == 503
+            mock_db.delete_job.assert_not_awaited()
+            mock_gitea.delete_repo.assert_awaited_once_with(
+                "job-abc", intent_marker=None
+            )
             mock_gitea.delete_branch.assert_not_called()
 
     @pytest.mark.asyncio

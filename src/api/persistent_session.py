@@ -329,6 +329,10 @@ class PersistentSession:
                 (e.g. {"backend": "remote", "remote": {"host": ..., "port": 22, ...}})
             git_remote_url: Gitea repo URL for workspace versioning
         """
+        workspace_override = dict(workspace_override or {})
+        managed_repository_credentials = workspace_override.pop(
+            "managed_repository_credentials", None
+        )
         self._llm = llm
         self.auxiliary_llm = auxiliary_llm
         self.postgres_conn = postgres_conn
@@ -365,6 +369,7 @@ class PersistentSession:
                 vector_conn=vector_conn,
                 workspace_override=workspace_override,
                 git_remote_url=git_remote_url,
+                managed_repository_credentials=(managed_repository_credentials),
                 cloud_mount_cfg=cloud_mount_cfg,
             )
         finally:
@@ -385,6 +390,7 @@ class PersistentSession:
         workspace_override: Optional[Dict[str, Any]],
         git_remote_url: Optional[str],
         cloud_mount_cfg: Optional[Dict[str, Any]],
+        managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """The ordered setup steps of :meth:`setup` (see its docstring).
 
@@ -398,7 +404,9 @@ class PersistentSession:
 
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
-            workspace_override=workspace_override, git_remote_url=git_remote_url
+            workspace_override=workspace_override,
+            git_remote_url=git_remote_url,
+            managed_repository_credentials=managed_repository_credentials,
         )
         await self._seed_workspace_baseline_commit(postgres_conn)
         _steps["workspace"] = time.perf_counter() - _t
@@ -592,6 +600,7 @@ class PersistentSession:
         self,
         workspace_override: Optional[Dict[str, Any]] = None,
         git_remote_url: Optional[str] = None,
+        managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Create workspace using a remote backend (required).
 
@@ -768,6 +777,34 @@ class PersistentSession:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+        from ..core.managed_repository import (
+            ManagedRepositoryMaterializationError,
+            materialize_managed_repository_credentials,
+            repository_url_has_credentials,
+        )
+        from urllib.parse import urlparse
+
+        runtime_repository_urls = materialize_managed_repository_credentials(
+            managed_repository_credentials, workspace_backend
+        )
+        del managed_repository_credentials
+        if repository_url_has_credentials(git_remote_url):
+            raise ManagedRepositoryMaterializationError(
+                "credentialed_managed_repository_url_refused"
+            )
+        if git_remote_url and str(git_remote_url).startswith("ssh://srw-repo-"):
+            primary_name = (
+                urlparse(str(git_remote_url))
+                .path.rstrip("/")
+                .rsplit("/", 1)[-1]
+                .removesuffix(".git")
+            )
+            if primary_name not in runtime_repository_urls:
+                raise ManagedRepositoryMaterializationError(
+                    "managed_repository_transport_mismatch"
+                )
+            git_remote_url = runtime_repository_urls[primary_name]
 
         ws_config = WorkspaceManagerConfig(
             base_path=base_path,

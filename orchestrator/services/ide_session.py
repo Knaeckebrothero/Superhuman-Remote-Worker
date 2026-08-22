@@ -15,8 +15,14 @@ IDE button UI.
 import json
 import logging
 import os
+import shlex
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
+
+from .managed_repository_authority import (
+    ManagedRepositoryAuthorityError,
+    authorize_job_repository_transport,
+)
 
 from services import resolve_ssh_key_path
 from services.ssh_helpers import (
@@ -575,13 +581,31 @@ class IdeSessionService:
             )
             return
 
-        # Extract snapshot into the VM. Best-effort by design: a populated
-        # tree beats a hard error here, so the bool return is intentionally
-        # ignored (mirrors _extract_snapshot_to_k8s_pod's soft policy).
+        repository_ready = True
         if source == "snapshot":
             await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
+            if job.get("repo_name"):
+                repository_ready = await self._repair_git_after_snapshot(
+                    job_id, job, ssh_host, ssh_port, backend="vm"
+                )
         elif source == "gitea":
-            await self._clone_gitea_to_vm(job_id, job, ssh_host, ssh_port)
+            repository_ready = await self._clone_gitea_to_vm(
+                job_id, job, ssh_host, ssh_port
+            )
+
+        if not repository_ready:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "Repository authorization failed for IDE session",
+                },
+            )
+            try:
+                await self._delete_ide_vm(job_id, vm_name)
+            except Exception:
+                logger.warning("Failed to remove unauthorized IDE VM for %s", job_id)
+            return
 
         await self._seed_ide_profile_for_user(job_id, job, ssh_host, ssh_port)
 
@@ -629,13 +653,237 @@ class IdeSessionService:
         else:
             return await self._restore_local_ide_container(job_id, repo_name, branch)
 
+    async def _managed_repository_payload(
+        self, job_id: str, *, backend: str
+    ) -> dict[str, Any]:
+        """Return one exact internal deploy-key bundle for an IDE workspace.
+
+        IDE restore is a second workspace ingress, independent of the normal
+        dispatcher. It therefore resolves repository authority from the
+        current job row rather than rebuilding an administrator URL from
+        environment variables. The caller immediately removes the private
+        key from this mapping and sends it only over stdin to the target.
+        """
+
+        if (
+            not self._db
+            or not self._gitea_client
+            or not self._gitea_client.is_initialized
+        ):
+            raise ManagedRepositoryAuthorityError("repository_authority_unavailable")
+        current = await self._get_job(job_id)
+        if current is None or not current.get("repo_name"):
+            raise ManagedRepositoryAuthorityError("repository_authority_unavailable")
+        _url, _repositories, payloads = await authorize_job_repository_transport(
+            self._db,
+            self._gitea_client,
+            current,
+            None,
+            backend=backend,
+        )
+        if len(payloads) != 1:
+            raise ManagedRepositoryAuthorityError("repository_authority_ambiguous")
+        if not await self._db.managed_repository_authorities_are_current(payloads):
+            raise ManagedRepositoryAuthorityError("repository_authority_raced")
+        return payloads[0]
+
+    @staticmethod
+    def _managed_git_command(
+        payload: dict[str, Any],
+        *,
+        branch: str,
+        workspace_path: str,
+        require_existing: bool,
+    ) -> tuple[str, bytearray]:
+        """Build a secret-free shell command plus its stdin-only private key."""
+
+        private_text = payload.pop("private_key", None)
+        if not isinstance(private_text, str) or not private_text:
+            raise ManagedRepositoryAuthorityError("repository_authority_unavailable")
+        private_key = bytearray(private_text.encode("utf-8"))
+        del private_text
+        try:
+            version = int(payload.get("version") or 0)
+            generation = int(payload.get("generation") or 0)
+            port = int(payload.get("ssh_port") or 0)
+        except (TypeError, ValueError) as exc:
+            for index in range(len(private_key)):
+                private_key[index] = 0
+            raise ManagedRepositoryAuthorityError(
+                "repository_authority_invalid"
+            ) from exc
+        authority_id = str(payload.get("authority_id") or "").replace("-", "")
+        access_mode = str(payload.get("access_mode") or "")
+        repo_name = str(payload.get("repo_name") or "")
+        repository_owner = str(payload.get("repository_owner") or "")
+        alias = str(payload.get("alias") or "")
+        host = str(payload.get("ssh_host") or "")
+        clone_url = str(payload.get("clone_url") or "")
+        fingerprint = str(payload.get("public_key_fingerprint") or "")
+        # Values originate in the validated authority service, but keep this
+        # shell boundary independently strict so operator configuration cannot
+        # become command/config injection.
+        import re
+        from urllib.parse import urlparse
+
+        parsed_clone_url = urlparse(clone_url)
+
+        if (
+            version != 1
+            or generation < 1
+            or not re.fullmatch(r"[a-f0-9]{32}", authority_id)
+            or access_mode not in {"read", "write"}
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", repo_name)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", repository_owner)
+            or not re.fullmatch(r"srw-repo-[a-f0-9]{32}", alias)
+            or alias != f"srw-repo-{authority_id}"
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}", host)
+            or not 1 <= port <= 65535
+            or parsed_clone_url.scheme != "ssh"
+            or parsed_clone_url.hostname != alias
+            or parsed_clone_url.username is not None
+            or parsed_clone_url.password is not None
+            or parsed_clone_url.port is not None
+            or parsed_clone_url.path != f"/{repository_owner}/{repo_name}.git"
+            or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint)
+            or not branch
+            or "\x00" in branch
+        ):
+            for index in range(len(private_key)):
+                private_key[index] = 0
+            raise ManagedRepositoryAuthorityError("repository_authority_invalid")
+
+        home_path = workspace_path.removesuffix("/workspace")
+        if home_path not in {"/home/agent-host", "/home/coder"}:
+            for index in range(len(private_key)):
+                private_key[index] = 0
+            raise ManagedRepositoryAuthorityError("repository_authority_invalid")
+        managed_root = f"{home_path}/.ssh/srw-managed"
+        socket_path = f"{managed_root}/sockets/{authority_id}.sock"
+        config_path = f"{managed_root}/config.d/{authority_id}.conf"
+        ssh_config_path = f"{home_path}/.ssh/config"
+        config = (
+            f"Host {alias}\n"
+            f"  HostName {host}\n"
+            f"  Port {port}\n"
+            "  User git\n"
+            f"  IdentityAgent {socket_path}\n"
+            # The dedicated agent contains exactly this authority's key. Do
+            # not set IdentitiesOnly without an IdentityFile: OpenSSH would
+            # suppress the agent-only identity we intentionally keep off disk.
+            "  BatchMode yes\n"
+            "  StrictHostKeyChecking accept-new\n"
+            f"  UserKnownHostsFile {managed_root}/known_hosts\n"
+        )
+        quoted_workspace = shlex.quote(workspace_path)
+        quoted_url = shlex.quote(clone_url)
+        quoted_branch = shlex.quote(branch)
+        quoted_config = shlex.quote(config)
+        existing_clause = (
+            f"test -d {quoted_workspace}/.git; " if require_existing else ""
+        )
+        clone_clause = (
+            f"if test -d {quoted_workspace}/.git; then "
+            f"git -C {quoted_workspace} remote set-url origin {quoted_url}; "
+            f"git -C {quoted_workspace} fetch origin {quoted_branch}; "
+            "else "
+            f'test -z "$(ls -A {quoted_workspace} 2>/dev/null)"; '
+            f"git clone --branch {quoted_branch} {quoted_url} {quoted_workspace}; "
+            "fi"
+        )
+        command = (
+            "set -eu; umask 077; "
+            f"mkdir -p {shlex.quote(managed_root + '/config.d')} "
+            f"{shlex.quote(managed_root + '/sockets')}; "
+            f"touch {shlex.quote(ssh_config_path)}; "
+            "grep -qxF 'Include ~/.ssh/srw-managed/config.d/*.conf' "
+            f"{shlex.quote(ssh_config_path)} || "
+            "printf '\\nInclude ~/.ssh/srw-managed/config.d/*.conf\\n' "
+            f">> {shlex.quote(ssh_config_path)}; "
+            f"printf %s {quoted_config} > {shlex.quote(config_path)}; "
+            f"chmod 600 {shlex.quote(ssh_config_path)} {shlex.quote(config_path)}; "
+            + f"if test -S {shlex.quote(socket_path)}; then "
+            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} "
+            + "ssh-add -D >/dev/null 2>&1 || true; fi; "
+            + f"rm -f {shlex.quote(socket_path)}; "
+            + f"ssh-agent -a {shlex.quote(socket_path)} -s >/dev/null; "
+            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} "
+            + "ssh-add - >/dev/null 2>&1; "
+            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} ssh-add -l "
+            + f"| grep -F -- {shlex.quote(fingerprint)} >/dev/null; "
+            + f"GIT_TERMINAL_PROMPT=0 git ls-remote {quoted_url} HEAD >/dev/null; "
+            + f"mkdir -p {quoted_workspace}; "
+            + existing_clause
+            + clone_clause
+            + "; "
+            + f'case "$(git -C {quoted_workspace} remote get-url origin)" '
+            + "in *://*@*|*@*:*) exit 41;; esac"
+        )
+        return command, private_key
+
+    @staticmethod
+    async def _run_secret_stdin_process(
+        command: list[str], secret: bytearray, *, timeout: float = 120.0
+    ) -> bool:
+        """Run a trusted command without retaining or reporting its output."""
+
+        import asyncio
+
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if process.stdin is None:
+                return False
+            process.stdin.write(secret)
+            await process.stdin.drain()
+            process.stdin.close()
+            secret[:] = b"\x00" * len(secret)
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+            return process.returncode == 0
+        except (OSError, asyncio.TimeoutError):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            return False
+        finally:
+            for index in range(len(secret)):
+                secret[index] = 0
+
+    async def _install_and_sync_managed_repository_over_ssh(
+        self,
+        job_id: str,
+        *,
+        backend: str,
+        ssh_host: str,
+        ssh_port: int,
+        branch: str,
+        workspace_path: str,
+        require_existing: bool = False,
+    ) -> bool:
+        """Install repo-scoped authority into an IDE pod/VM and clone/fetch."""
+
+        try:
+            payload = await self._managed_repository_payload(job_id, backend=backend)
+            command, private_key = self._managed_git_command(
+                payload,
+                branch=branch,
+                workspace_path=workspace_path,
+                require_existing=require_existing,
+            )
+            ssh_command = build_agent_ssh_cmd(ssh_host, ssh_port, command)
+            return await self._run_secret_stdin_process(ssh_command, private_key)
+        except ManagedRepositoryAuthorityError:
+            return False
+
     async def _restore_k8s_ide_container(
         self, job_id: str, job: dict, repo_name: str, branch: str
     ) -> bool:
         """Create an IDE pod on Kubernetes, clone the repo, return code-server URL."""
-        import asyncio
-
-        clone_url = self._build_gitea_clone_url(repo_name)
         pod_name = f"ide-{job_id[:12]}"
 
         await self._set_session_context(
@@ -658,60 +906,30 @@ class IdeSessionService:
             )
             return False
 
-        # Clone the Gitea repo into the workspace via SSH. The fallback chain
-        # must be idempotent: the workspace may be non-empty with origin
-        # already configured (retry after a failed attempt, or a partial
-        # snapshot extraction that landed a captured .git), and the captured
-        # remote URL may embed stale credentials — hence add-or-set-url.
-        clone_cmd = (
-            f"git clone --branch {branch} {clone_url} /home/agent-host/workspace "
-            f"2>/dev/null || "
-            f"(cd /home/agent-host/workspace && git init && "
-            f"(git remote add origin {clone_url} 2>/dev/null || "
-            f"git remote set-url origin {clone_url}) && "
-            f"git fetch origin {branch} && "
-            f"git checkout FETCH_HEAD)"
+        # Clone through the exact repository deploy key. No Gitea credential,
+        # URL userinfo, or private-key file enters the IDE workspace.
+        installed = await self._install_and_sync_managed_repository_over_ssh(
+            job_id,
+            backend="sandbox",
+            ssh_host=pod_ip,
+            ssh_port=30022,
+            branch=branch,
+            workspace_path="/home/agent-host/workspace",
         )
-
-        try:
-            async_ssh_cmd = build_agent_ssh_cmd(pod_ip, 30022, clone_cmd)
-            proc = await asyncio.create_subprocess_exec(
-                *async_ssh_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout, stderr = await proc.communicate()
-
-            if proc.returncode != 0:
-                error_msg = (
-                    f"Git clone failed for IDE session (rc={proc.returncode}): "
-                    f"{stderr.decode(errors='replace')[:300]}"
-                )
-                logger.error(
-                    "Git clone for IDE session failed (job %s): %s",
-                    job_id,
-                    error_msg,
-                )
-                await self._set_session_context(
-                    job_id,
-                    {
-                        "status": "failed",
-                        "error": error_msg,
-                        "pod_ip": pod_ip,
-                    },
-                )
-                return False
-        except Exception as e:
-            error_msg = f"SSH git clone failed for IDE session: {e}"
-            logger.warning("SSH git clone failed for IDE session job %s: %s", job_id, e)
+        if not installed:
+            logger.warning("Scoped Git setup failed for IDE session job %s", job_id)
             await self._set_session_context(
                 job_id,
                 {
                     "status": "failed",
-                    "error": error_msg,
+                    "error": "Repository authorization failed for IDE session",
                     "pod_ip": pod_ip,
                 },
             )
+            try:
+                await self._container_provisioner.delete_ide_pod(job_id)
+            except Exception:
+                logger.warning("Failed to remove unauthorized IDE pod for %s", job_id)
             return False
 
         # code-server is already running from the workspace entrypoint
@@ -750,7 +968,6 @@ class IdeSessionService:
         import asyncio
 
         container_name = f"srw-ide-{job_id[:12]}"
-        clone_url = self._build_gitea_clone_url(repo_name)
         host_port = await self._find_free_port()
 
         code_server_image = os.environ.get(
@@ -769,8 +986,9 @@ class IdeSessionService:
             runtime = await self._detect_container_runtime()
 
             entrypoint_script = (
-                f"git clone --branch {branch} {clone_url} /home/coder/workspace && "
-                f"exec code-server --bind-addr 0.0.0.0:{host_port} --auth none /home/coder/workspace"
+                "mkdir -p /home/coder/workspace && "
+                f"exec code-server --bind-addr 0.0.0.0:{host_port} "
+                "--auth none /home/coder/workspace"
             )
 
             cmd = [
@@ -815,6 +1033,33 @@ class IdeSessionService:
                         "error": f"Container start failed: {error_msg}",
                     },
                 )
+                return False
+
+            try:
+                payload = await self._managed_repository_payload(
+                    job_id, backend="sandbox"
+                )
+                git_command, private_key = self._managed_git_command(
+                    payload,
+                    branch=branch,
+                    workspace_path="/home/coder/workspace",
+                    require_existing=False,
+                )
+                installed = await self._run_secret_stdin_process(
+                    [runtime, "exec", "-i", container_name, "sh", "-c", git_command],
+                    private_key,
+                )
+            except ManagedRepositoryAuthorityError:
+                installed = False
+            if not installed:
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": "Repository authorization failed for IDE session",
+                    },
+                )
+                await self._remove_container(runtime, container_name)
                 return False
 
             ready = await self._wait_for_code_server(
@@ -908,7 +1153,22 @@ class IdeSessionService:
         if not extracted:
             return False
 
-        await self._repair_git_after_snapshot(job_id, job, pod_ip, 30022)
+        repaired = await self._repair_git_after_snapshot(
+            job_id, job, pod_ip, 30022, backend="sandbox"
+        )
+        if job.get("repo_name") and not repaired:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "Repository authorization failed for IDE session",
+                },
+            )
+            try:
+                await self._container_provisioner.delete_ide_pod(job_id)
+            except Exception:
+                logger.warning("Failed to remove unauthorized IDE pod for %s", job_id)
+            return False
         await self._seed_ide_profile_for_user(job_id, job, pod_ip, 30022)
 
         # code-server should already be running from the workspace entrypoint
@@ -1046,58 +1306,40 @@ class IdeSessionService:
             return False
 
     async def _repair_git_after_snapshot(
-        self, job_id: str, job: dict, ssh_host: str, ssh_port: int
-    ) -> None:
-        """Best-effort: refetch git objects after a snapshot restore.
+        self,
+        job_id: str,
+        job: dict,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        backend: str = "sandbox",
+    ) -> bool:
+        """Replace legacy origin authority and refetch after snapshot restore.
 
         Snapshot capture excludes ``.git/objects`` (snapshot_service's
         exclude list — "re-cloned/regenerated on restore"), so the restored
         workspace repo has config/refs/index but no objects. A fetch
-        repopulates them; the embedded-credential remote URL from capture
-        time may also be stale, so it is refreshed first. Failure only
-        degrades the Source Control panel, never the session.
+        repopulates them. This step is now an authorization boundary: a legacy
+        snapshot can contain an administrator-bearing origin, so a repo-backed
+        IDE may not become reachable unless that origin has been replaced by
+        and proven through the scoped deploy-key transport.
         """
-        import asyncio
-
         repo_name = job.get("repo_name")
         if not repo_name:
-            return
-
-        clone_url = self._build_gitea_clone_url(repo_name)
+            return True
         branch = job.get("branch_name") or "main"
-        # --refetch skips have/want negotiation, which can die on "bad
-        # object" here: local refs point at objects the capture excluded.
-        # Older git (<2.36) lacks the flag — fall back to a plain fetch.
-        cmd = (
-            "cd /home/agent-host/workspace && "
-            f"(git remote add origin {clone_url} 2>/dev/null || "
-            f"git remote set-url origin {clone_url}) && "
-            f"(git fetch --refetch origin {branch} 2>/dev/null || "
-            f"git fetch origin {branch})"
+        repaired = await self._install_and_sync_managed_repository_over_ssh(
+            job_id,
+            backend=backend,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            branch=branch,
+            workspace_path="/home/agent-host/workspace",
+            require_existing=True,
         )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *build_agent_ssh_cmd(ssh_host, ssh_port, cmd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
-            if proc.returncode != 0:
-                logger.info(
-                    "Git repair fetch failed for job %s (rc=%d): %s",
-                    job_id,
-                    proc.returncode,
-                    err.decode(errors="replace")[:200],
-                )
-        except asyncio.TimeoutError:
-            logger.info("Git repair fetch timed out for job %s", job_id)
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.info("Git repair fetch failed for job %s: %s", job_id, e)
+        if not repaired:
+            logger.info("Scoped Git repair failed for IDE session job %s", job_id)
+        return repaired
 
     async def _seed_ide_profile_for_user(
         self, job_id: str, job: dict, ssh_host: str, ssh_port: int
@@ -1225,44 +1467,20 @@ class IdeSessionService:
 
     async def _clone_gitea_to_vm(
         self, job_id: str, job: dict, ssh_host: str, ssh_port: int
-    ) -> None:
+    ) -> bool:
         """Clone the job's Gitea repo into the VM as a fallback."""
-        import asyncio
-
         repo_name = job.get("repo_name")
         if not repo_name:
-            return
-
-        clone_url = self._build_gitea_clone_url(repo_name)
+            return False
         branch = job.get("branch_name") or "main"
-
-        cmd = (
-            f"git clone --branch {branch} {clone_url} /home/agent-host/workspace "
-            f"2>/dev/null || true"
+        return await self._install_and_sync_managed_repository_over_ssh(
+            job_id,
+            backend="vm",
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            branch=branch,
+            workspace_path="/home/agent-host/workspace",
         )
-
-        key_path = resolve_ssh_key_path()
-        ssh_cmd = [
-            "ssh",
-            *(["-i", key_path] if key_path else []),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=10",
-            "-p",
-            str(ssh_port),
-            f"agent-host@{ssh_host}",
-            cmd,
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
 
     async def _delete_ide_vm(self, job_id: str, vm_name: str) -> None:
         """Delete an IDE session VM."""
@@ -1374,32 +1592,6 @@ class IdeSessionService:
     # =========================================================================
     # Container helpers (Gitea fallback)
     # =========================================================================
-
-    @staticmethod
-    def _build_gitea_clone_url(repo_name: str) -> str:
-        """Build a Gitea clone URL with embedded credentials.
-
-        Uses GITEA_INTERNAL_URL (for container-to-host reachability),
-        falling back to GITEA_URL. Injects GITEA_ADMIN_USER/PASSWORD
-        for authentication.
-        """
-        from urllib.parse import urlparse, urlunparse
-
-        gitea_url = os.environ.get("GITEA_URL", "http://localhost:3000")
-        gitea_internal_url = os.environ.get("GITEA_INTERNAL_URL", gitea_url)
-        user = os.environ.get("GITEA_ADMIN_USER", "srw")
-        password = os.environ.get("GITEA_ADMIN_PASSWORD", "")
-
-        parsed = urlparse(gitea_internal_url)
-        if password:
-            netloc = f"{user}:{password}@{parsed.hostname}"
-        else:
-            netloc = parsed.hostname
-        if parsed.port:
-            netloc += f":{parsed.port}"
-
-        base = urlunparse(parsed._replace(netloc=netloc))
-        return f"{base}/srw/{repo_name}.git"
 
     @staticmethod
     async def _detect_container_runtime() -> str:

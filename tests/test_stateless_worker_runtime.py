@@ -150,6 +150,14 @@ def _bundle(claim: WorkerClaim) -> dict:
                 }
             },
             "context": {},
+            "managed_repository_credentials": [
+                {
+                    "authority_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 1,
+                    "repo_name": "job-stateless",
+                    "private_key": "hidden-runtime-bearer",
+                }
+            ],
             "workspace_runtime": {
                 "requested_backend": "sandbox",
                 "assigned_backend": "sandbox",
@@ -183,6 +191,14 @@ def test_worker_bundle_preserves_exact_workspace_authority_in_metadata():
     assert metadata["workspace_ssh_host_key_fingerprint"] == WORKSPACE_FINGERPRINT
     assert metadata["workspace_owner_kind"] == "job"
     assert metadata["workspace_owner_id"] == str(claim.unit.unit_id)
+    assert metadata["managed_repository_credentials"] == [
+        {
+            "authority_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "repo_name": "job-stateless",
+            "private_key": "hidden-runtime-bearer",
+        }
+    ]
     assert metadata["workspace_runtime"] == {
         "requested_backend": "sandbox",
         "assigned_backend": "sandbox",

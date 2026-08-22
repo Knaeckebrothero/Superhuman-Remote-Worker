@@ -975,8 +975,9 @@ def externalize_gitea_url(url: str | None) -> str | None:
     That address is unroutable from a VM (a tailnet node) or a browser — which
     is both the F29 clone/push failure *and* the reason the Repos tab shows an
     unusable link. Swap the internal host[:port]+scheme for ``GITEA_URL`` (the
-    ingress address), preserving any embedded ``user:pass@`` credentials and the
-    path so the result is still a working clone URL.
+    ingress address). The helper preserves legacy userinfo for compatibility;
+    every public projection immediately strips it, and managed runtime delivery
+    no longer uses this helper or an HTTP bearer.
 
     No-op when the URL doesn't point at the internal host, or when either env
     var is unset or already equal — so external repos and dev setups (where the
@@ -1015,10 +1016,12 @@ def redact_repository(repo: dict[str, Any]) -> dict[str, Any]:
 
     Two problems with the raw row, both visible on the Repos tab:
 
-    * ``repo_url`` embeds the shared Gitea admin ``user:password@`` — a
-      credential leak to every project *member* (the endpoint is member-gated,
-      not owner-gated). Same F3 policy datasources already follow: credentials
-      never leave the orchestrator over REST.
+    * historical ``repo_url`` values may embed the shared Gitea admin
+      ``user:password@`` — a credential leak to every project *member* (the
+      endpoint is member-gated, not owner-gated). Migration 0176 and scoped
+      deploy keys make new managed values clean, but this redaction remains the
+      compatibility boundary until legacy inventory is zero. Same F3 policy
+      datasources already follow: credentials never leave the orchestrator.
     * the host is the internal ``srw-gitea:3000``, unusable from a browser.
 
     Externalize the host, then strip any userinfo, so the displayed URL is both

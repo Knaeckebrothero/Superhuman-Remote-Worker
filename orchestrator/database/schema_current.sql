@@ -974,6 +974,418 @@ $$;
 
 
 --
+-- Name: enforce_managed_repository_owner_cleanup(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_managed_repository_owner_cleanup() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_kind TEXT;
+BEGIN
+    owner_kind := CASE TG_TABLE_NAME
+        WHEN 'jobs' THEN 'job'
+        WHEN 'threads' THEN 'thread'
+        WHEN 'project_repositories' THEN 'project_repository'
+        ELSE NULL
+    END;
+    IF owner_kind IS NULL THEN
+        RAISE EXCEPTION 'Unsupported managed repository owner table';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.managed_repository_authorities AS authority
+         WHERE authority.authority_kind = owner_kind
+           AND authority.authority_id = OLD.id
+           AND authority.status IN ('provisioning', 'active', 'revoking')
+    ) OR EXISTS (
+        SELECT 1 FROM public.managed_repository_creation_intents AS intent
+         WHERE intent.authority_kind = owner_kind
+           AND intent.authority_id = OLD.id
+           AND intent.status IN ('pending', 'created', 'deleting')
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_cleanup_required',
+            MESSAGE = 'Managed repository authority must be contained first',
+            HINT = 'Use the server-owned repository cleanup path and retry.';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION enforce_managed_repository_owner_cleanup(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.enforce_managed_repository_owner_cleanup() IS 'Fail-closed rolling fence: an old/direct owner delete cannot orphan a live repository creation intent or deploy-key authority.';
+
+
+--
+-- Name: enforce_managed_repository_url_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_managed_repository_url_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    repo_url TEXT;
+    scrubbed_repo_url TEXT;
+    repository_name TEXT;
+    root_job_id UUID;
+BEGIN
+    IF TG_TABLE_NAME = 'project_repositories' THEN
+        repo_url := NEW.repo_url;
+        repository_name := NEW.name;
+        IF TG_OP = 'UPDATE'
+           AND OLD.is_managed
+           AND OLD.name IS DISTINCT FROM NEW.name THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_identity_is_immutable',
+                MESSAGE = 'Managed repository identity may not be replaced',
+                HINT = 'Create a new managed repository instead.';
+        END IF;
+        IF TG_OP = 'UPDATE'
+           AND NEW.is_managed
+           AND NEW.role <> 'knowledge'
+           AND (
+               OLD.read_only IS DISTINCT FROM NEW.read_only
+               OR OLD.role IS DISTINCT FROM NEW.role
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM public.managed_repository_authorities AS authority
+                WHERE authority.authority_kind = 'project_repository'
+                  AND authority.authority_id = NEW.id
+                  AND authority.project_id = NEW.project_id
+                  AND authority.repo_name = NEW.name
+                  AND authority.status = 'active'
+                  AND authority.access_mode = CASE
+                      WHEN NEW.role = 'reference' OR NEW.read_only
+                      THEN 'read'
+                      ELSE 'write'
+                  END
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_access_mode_requires_authority',
+                MESSAGE = 'Managed repository access mode is not active',
+                HINT = 'Rotate scoped authority before changing repository access.';
+        END IF;
+        IF NEW.is_managed
+           AND NEW.credentials IS NOT NULL
+           AND NEW.credentials <> '{}'::jsonb THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_credentials_are_server_owned',
+                MESSAGE = 'Managed repository credentials may not be stored here';
+        END IF;
+        IF NEW.is_managed
+           AND public.managed_repository_url_has_userinfo(repo_url) THEN
+            scrubbed_repo_url :=
+                public.managed_repository_url_without_userinfo(repo_url);
+            IF scrubbed_repo_url IS NULL THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'managed_repository_url_must_be_credential_free',
+                    MESSAGE = 'Managed repository URLs may not contain userinfo',
+                    HINT = 'Retry from a repository-authority-aware orchestrator.';
+            END IF;
+            -- Rolling-upgrade bridge for the immediately previous release:
+            -- its managed-repository creator writes an administrator-bearing
+            -- HTTP URL. Store only the credential-free identity; dispatch by a
+            -- new replica still proves a scoped deploy key first. Project
+            -- repository credentials remain empty and cannot smuggle the old
+            -- bearer through a second column.
+            NEW.repo_url := scrubbed_repo_url;
+            NEW.credentials := '{}'::jsonb;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF TG_TABLE_NAME = 'jobs' THEN
+        repo_url := COALESCE(NEW.context, '{}'::jsonb)->>'git_remote_url';
+        repository_name := NEW.repo_name;
+        IF public.managed_repository_json_has_private_authority(NEW.context)
+           OR public.managed_repository_json_has_private_authority(
+                  NEW.config_override
+              )
+           OR public.managed_repository_json_has_private_authority(
+                  NEW.resolved_config
+              ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_credentials_are_server_owned',
+                MESSAGE = 'Managed repository credentials are server-owned';
+        END IF;
+        IF public.managed_repository_url_has_userinfo(repo_url)
+           AND (
+               TG_OP = 'INSERT'
+               OR repo_url IS DISTINCT FROM
+                    COALESCE(OLD.context, '{}'::jsonb)->>'git_remote_url'
+           ) THEN
+            scrubbed_repo_url :=
+                public.managed_repository_url_without_userinfo(repo_url);
+            IF scrubbed_repo_url IS NULL THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'managed_repository_url_must_be_credential_free',
+                    MESSAGE = 'Managed repository URLs may not contain userinfo',
+                    HINT = 'Retry from a repository-authority-aware orchestrator.';
+            END IF;
+            -- Old replicas write the URL before repo_name in a second
+            -- statement. Keep an explicit pending fence so a dispatcher can
+            -- never claim the row in that gap. The exact authority binder
+            -- removes this marker only after live key proof.
+            NEW.context := jsonb_set(
+                jsonb_set(
+                    COALESCE(NEW.context, '{}'::jsonb),
+                    '{git_remote_url}',
+                    to_jsonb(scrubbed_repo_url),
+                    true
+                ),
+                '{_managed_repository_authority_pending}',
+                'true'::jsonb,
+                true
+            );
+            repo_url := scrubbed_repo_url;
+        ELSIF public.managed_repository_url_has_userinfo(repo_url)
+           AND TG_OP = 'UPDATE'
+           AND NEW.status = 'processing'
+           AND (
+               OLD.status IS DISTINCT FROM NEW.status
+               OR OLD.assigned_agent_id IS DISTINCT FROM NEW.assigned_agent_id
+               OR OLD.lease_expires_at IS DISTINCT FROM NEW.lease_expires_at
+           ) THEN
+            -- Historical rows are permitted to remain readable until adopted,
+            -- but an old bearer may never cross a new lease/dispatch boundary.
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_url_must_be_credential_free',
+                MESSAGE = 'Managed repository URLs may not contain userinfo',
+                HINT = 'Adopt the repository before dispatch.';
+        END IF;
+        IF NEW.status = 'processing'
+           AND (
+               repository_name IS NOT NULL
+               OR COALESCE(
+                      NEW.context->>'_managed_repository_authority_pending',
+                      'false'
+                  ) = 'true'
+           )
+           AND (
+               TG_OP = 'INSERT'
+               OR OLD.status IS DISTINCT FROM NEW.status
+               OR OLD.assigned_agent_id IS DISTINCT FROM NEW.assigned_agent_id
+               OR OLD.lease_expires_at IS DISTINCT FROM NEW.lease_expires_at
+               OR OLD.repo_name IS DISTINCT FROM NEW.repo_name
+               OR COALESCE(OLD.context, '{}'::jsonb)->>'git_remote_url'
+                    IS DISTINCT FROM repo_url
+           )
+           THEN
+            WITH RECURSIVE lineage AS (
+                SELECT NEW.id AS id, NEW.parent_job_id AS parent_job_id
+                UNION ALL
+                SELECT parent.id, parent.parent_job_id
+                  FROM public.jobs AS parent
+                  JOIN lineage ON parent.id = lineage.parent_job_id
+            )
+            SELECT id INTO root_job_id
+              FROM lineage
+             WHERE parent_job_id IS NULL
+             LIMIT 1;
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM public.managed_repository_authorities AS authority
+                 WHERE authority.repo_name = repository_name
+                   AND authority.status = 'active'
+                   AND authority.access_mode = 'write'
+                   AND authority.clean_repo_url = repo_url
+                   AND (
+                       (
+                           authority.authority_kind = 'job'
+                           AND authority.authority_id = root_job_id
+                       )
+                       OR (
+                           authority.authority_kind = 'project_repository'
+                           AND EXISTS (
+                               SELECT 1
+                                 FROM public.project_repositories AS repository
+                                WHERE repository.id = authority.authority_id
+                                  AND repository.project_id = NEW.project_id
+                                  AND repository.name = repository_name
+                                  AND repository.is_managed
+                                  AND repository.role = 'jobs'
+                                  AND NOT repository.read_only
+                           )
+                       )
+                   )
+            ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'job_dispatch_requires_repository_authority',
+                MESSAGE = 'Managed repository authority is not active',
+                HINT = 'Adopt or provision the repository before dispatch.';
+            END IF;
+        END IF;
+        IF NEW.status = 'processing'
+           AND NEW.project_id IS NOT NULL
+           AND (
+               TG_OP = 'INSERT'
+               OR OLD.status IS DISTINCT FROM NEW.status
+               OR OLD.assigned_agent_id IS DISTINCT FROM NEW.assigned_agent_id
+               OR OLD.lease_expires_at IS DISTINCT FROM NEW.lease_expires_at
+           )
+           AND EXISTS (
+               SELECT 1
+                 FROM public.project_repositories AS repository
+                WHERE repository.project_id = NEW.project_id
+                  AND repository.is_managed
+                  AND repository.role <> 'knowledge'
+                  AND (
+                      repository.role <> 'jobs'
+                      OR (
+                          NEW.repo_name IS NULL
+                          AND NEW.branch_name IS NOT NULL
+                      )
+                  )
+                  AND (
+                      public.managed_repository_url_has_userinfo(
+                          repository.repo_url
+                      )
+                      OR NOT EXISTS (
+                          SELECT 1
+                            FROM public.managed_repository_authorities AS authority
+                           WHERE authority.authority_kind = 'project_repository'
+                             AND authority.authority_id = repository.id
+                             AND authority.project_id = repository.project_id
+                             AND authority.repo_name = repository.name
+                             AND authority.clean_repo_url = repository.repo_url
+                             AND authority.status = 'active'
+                             AND authority.access_mode = CASE
+                                 WHEN repository.role = 'reference'
+                                      OR repository.read_only
+                                 THEN 'read'
+                                 ELSE 'write'
+                             END
+                      )
+                  )
+           ) THEN
+            -- Old orchestrators do not carry the scoped-key runtime bundle and
+            -- omit the is_managed marker. Block them at the authoritative claim
+            -- boundary until a new replica has proven and adopted every managed
+            -- source/reference row the workspace would clone, plus the exact
+            -- shared jobs row used as the primary remote by a pre-0176 job
+            -- that has project_id + branch_name but no per-job repo_name.
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'job_dispatch_requires_project_repository_authority',
+                MESSAGE = 'Managed project repository authority is not active',
+                HINT = 'Adopt project repository authority before dispatch.';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    repo_url := COALESCE(
+        NEW.metadata, '{}'::jsonb
+    )->'workspace_container'->>'git_remote_url';
+    repository_name := COALESCE(
+        NEW.metadata, '{}'::jsonb
+    )->'workspace_container'->>'repo_name';
+    IF public.managed_repository_json_has_private_authority(NEW.metadata) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_credentials_are_server_owned',
+            MESSAGE = 'Managed repository credentials are server-owned';
+    END IF;
+    IF public.managed_repository_url_has_userinfo(repo_url)
+       AND (
+           TG_OP = 'INSERT'
+           OR repo_url IS DISTINCT FROM COALESCE(
+               OLD.metadata, '{}'::jsonb
+           )->'workspace_container'->>'git_remote_url'
+       ) THEN
+        scrubbed_repo_url :=
+            public.managed_repository_url_without_userinfo(repo_url);
+        IF scrubbed_repo_url IS NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_url_must_be_credential_free',
+                MESSAGE = 'Managed repository URLs may not contain userinfo',
+                HINT = 'Retry from a repository-authority-aware orchestrator.';
+        END IF;
+        NEW.metadata := jsonb_set(
+            jsonb_set(
+                COALESCE(NEW.metadata, '{}'::jsonb),
+                '{workspace_container,git_remote_url}',
+                to_jsonb(scrubbed_repo_url),
+                true
+            ),
+            '{workspace_container,_managed_repository_authority_pending}',
+            'true'::jsonb,
+            true
+        );
+        repo_url := scrubbed_repo_url;
+    ELSIF public.managed_repository_url_has_userinfo(repo_url)
+       AND TG_OP = 'UPDATE'
+       AND OLD.agent_id IS DISTINCT FROM NEW.agent_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_url_must_be_credential_free',
+            MESSAGE = 'Managed repository URLs may not contain userinfo',
+            HINT = 'Adopt the repository before attaching.';
+    END IF;
+    IF NEW.agent_id IS NOT NULL
+       AND (
+           repository_name IS NOT NULL
+           OR COALESCE(
+                  NEW.metadata->'workspace_container'
+                      ->>'_managed_repository_authority_pending',
+                  'false'
+              ) = 'true'
+       )
+       AND (
+           TG_OP = 'INSERT'
+           OR OLD.agent_id IS DISTINCT FROM NEW.agent_id
+           OR COALESCE(
+                  OLD.metadata, '{}'::jsonb
+              )->'workspace_container'->>'repo_name'
+                IS DISTINCT FROM repository_name
+           OR COALESCE(
+                  OLD.metadata, '{}'::jsonb
+              )->'workspace_container'->>'git_remote_url'
+                IS DISTINCT FROM repo_url
+       )
+       AND NOT EXISTS (
+           SELECT 1
+             FROM public.managed_repository_authorities AS authority
+            WHERE authority.repo_name = repository_name
+              AND authority.status = 'active'
+              AND authority.access_mode = 'write'
+              AND authority.clean_repo_url = repo_url
+              AND authority.authority_kind = 'thread'
+              AND authority.authority_id = NEW.id
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'thread_attach_requires_repository_authority',
+            MESSAGE = 'Managed repository authority is not active',
+            HINT = 'Adopt or provision the repository before attaching.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION enforce_managed_repository_url_authority(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.enforce_managed_repository_url_authority() IS 'Rolling-upgrade fence: old writers cannot persist administrator-bearing managed URLs or dispatch/bind a managed repo without active scoped authority; legacy HTTP writes are stripped and held pending exact key proof.';
+
+
+--
 -- Name: enforce_officer_runtime_agent_binding(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1505,6 +1917,57 @@ BEGIN
     END IF;
     RETURN NULL;
 END;
+$$;
+
+
+--
+-- Name: managed_repository_json_has_private_authority(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repository_json_has_private_authority(value jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $_$
+    SELECT COALESCE(
+        jsonb_path_exists(value, '$.**."managed_repository_credentials"')
+        OR jsonb_path_exists(value, '$.**."managed_repository_authority"')
+        OR jsonb_path_exists(value, '$.**."repository_auth"')
+        OR jsonb_path_exists(value, '$.**."repository_credentials"'),
+        FALSE
+    )
+$_$;
+
+
+--
+-- Name: managed_repository_url_has_userinfo(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repository_url_has_userinfo(value text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$
+    SELECT COALESCE(
+        value ~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+@'
+        OR value ~ '^[^/[:space:]]+@[^:]+:',
+        FALSE
+    )
+$$;
+
+
+--
+-- Name: managed_repository_url_without_userinfo(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repository_url_without_userinfo(value text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$
+    SELECT CASE
+        WHEN value ~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+@'
+        THEN regexp_replace(
+            value,
+            '^([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@',
+            '\1'
+        )
+        ELSE NULL
+    END
 $$;
 
 
@@ -6703,6 +7166,92 @@ COMMENT ON COLUMN public.magic_link_tokens.used_at IS 'Single-use enforcement: C
 
 
 --
+-- Name: managed_repository_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_authorities (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    repository_owner text NOT NULL,
+    repo_name text NOT NULL,
+    authority_kind text NOT NULL,
+    authority_id uuid NOT NULL,
+    project_id uuid,
+    access_mode text NOT NULL,
+    creation_intent_id uuid,
+    generation bigint DEFAULT 1 NOT NULL,
+    clean_repo_url text NOT NULL,
+    public_key text NOT NULL,
+    public_key_fingerprint text NOT NULL,
+    private_key_ciphertext text NOT NULL,
+    forge_key_id bigint,
+    status text DEFAULT 'provisioning'::text NOT NULL,
+    failure_class text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    activated_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_authority_access_mode_check CHECK ((access_mode = ANY (ARRAY['read'::text, 'write'::text]))),
+    CONSTRAINT managed_repository_authority_ciphertext_check CHECK ((private_key_ciphertext ~~ 'v1:%'::text)),
+    CONSTRAINT managed_repository_authority_generation_check CHECK ((generation > 0)),
+    CONSTRAINT managed_repository_authority_kind_check CHECK ((authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text]))),
+    CONSTRAINT managed_repository_authority_owner_check CHECK ((repository_owner ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'::text)),
+    CONSTRAINT managed_repository_authority_repo_name_check CHECK ((repo_name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'::text)),
+    CONSTRAINT managed_repository_authority_status_check CHECK ((status = ANY (ARRAY['provisioning'::text, 'active'::text, 'revoking'::text, 'revoked'::text, 'failed'::text]))),
+    CONSTRAINT managed_repository_authority_url_check CHECK (((clean_repo_url !~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+@'::text) AND (clean_repo_url !~ '^[^/[:space:]]+@[^:]+:'::text)))
+);
+
+
+--
+-- Name: TABLE managed_repository_authorities; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_authorities IS 'Server-owned encrypted per-repository Gitea deploy-key authority. Private material is decrypted only for an exact job/thread workspace delivery; ordinary repository/job/thread projections never join this table.';
+
+
+--
+-- Name: COLUMN managed_repository_authorities.private_key_ciphertext; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_authorities.private_key_ciphertext IS 'AES-GCM ciphertext produced with APP_ENCRYPTION_KEY; plaintext is never written to PostgreSQL.';
+
+
+--
+-- Name: managed_repository_creation_intents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_creation_intents (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    repository_owner text NOT NULL,
+    repo_name text NOT NULL,
+    authority_kind text NOT NULL,
+    authority_id uuid NOT NULL,
+    project_id uuid,
+    access_mode text NOT NULL,
+    generation bigint DEFAULT 1 NOT NULL,
+    intent_marker uuid DEFAULT gen_random_uuid() NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    failure_class text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    repository_created_at timestamp with time zone,
+    deleted_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_creation_access_mode_check CHECK ((access_mode = ANY (ARRAY['none'::text, 'read'::text, 'write'::text]))),
+    CONSTRAINT managed_repository_creation_generation_check CHECK ((generation > 0)),
+    CONSTRAINT managed_repository_creation_kind_check CHECK ((authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text]))),
+    CONSTRAINT managed_repository_creation_owner_check CHECK ((repository_owner ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'::text)),
+    CONSTRAINT managed_repository_creation_repo_name_check CHECK ((repo_name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'::text)),
+    CONSTRAINT managed_repository_creation_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'created'::text, 'deleting'::text, 'deleted'::text, 'conflicted'::text])))
+);
+
+
+--
+-- Name: TABLE managed_repository_creation_intents; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_creation_intents IS 'Durable exact-scope repository creation identity. The random marker is written to Gitea metadata before a 409/lost response may be adopted.';
+
+
+--
 -- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -10361,6 +10910,46 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 
 --
+-- Name: managed_repository_authorities managed_repository_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_authorities
+    ADD CONSTRAINT managed_repository_authorities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_authorities managed_repository_authority_generation_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_authorities
+    ADD CONSTRAINT managed_repository_authority_generation_unique UNIQUE (repository_owner, repo_name, generation);
+
+
+--
+-- Name: managed_repository_creation_intents managed_repository_creation_generation_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_creation_intents
+    ADD CONSTRAINT managed_repository_creation_generation_unique UNIQUE (repository_owner, repo_name, generation);
+
+
+--
+-- Name: managed_repository_creation_intents managed_repository_creation_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_creation_intents
+    ADD CONSTRAINT managed_repository_creation_intents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_creation_intents managed_repository_creation_marker_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_creation_intents
+    ADD CONSTRAINT managed_repository_creation_marker_unique UNIQUE (intent_marker);
+
+
+--
 -- Name: auth_tokens mcp_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12062,6 +12651,20 @@ CREATE INDEX idx_llm_endpoints_user ON public.llm_endpoints USING btree (user_id
 
 
 --
+-- Name: idx_managed_repository_authority_creation_intent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_authority_creation_intent ON public.managed_repository_authorities USING btree (creation_intent_id) WHERE (creation_intent_id IS NOT NULL);
+
+
+--
+-- Name: idx_managed_repository_authority_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_authority_scope ON public.managed_repository_authorities USING btree (authority_kind, authority_id);
+
+
+--
 -- Name: idx_mcp_tokens_hash; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13056,6 +13659,34 @@ CREATE UNIQUE INDEX uq_llm_endpoint_label_user ON public.llm_endpoints USING btr
 
 
 --
+-- Name: uq_managed_repository_authority_live_repo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_managed_repository_authority_live_repo ON public.managed_repository_authorities USING btree (repository_owner, repo_name) WHERE (status = ANY (ARRAY['provisioning'::text, 'active'::text, 'revoking'::text]));
+
+
+--
+-- Name: uq_managed_repository_authority_live_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_managed_repository_authority_live_scope ON public.managed_repository_authorities USING btree (authority_kind, authority_id, repository_owner, repo_name) WHERE (status = ANY (ARRAY['provisioning'::text, 'active'::text, 'revoking'::text]));
+
+
+--
+-- Name: uq_managed_repository_creation_live_repo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_managed_repository_creation_live_repo ON public.managed_repository_creation_intents USING btree (repository_owner, repo_name) WHERE (status = ANY (ARRAY['pending'::text, 'created'::text, 'deleting'::text]));
+
+
+--
+-- Name: uq_managed_repository_creation_live_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_managed_repository_creation_live_scope ON public.managed_repository_creation_intents USING btree (authority_kind, authority_id, repository_owner, repo_name) WHERE (status = ANY (ARRAY['pending'::text, 'created'::text, 'deleting'::text]));
+
+
+--
 -- Name: uq_officer_floor_wake_active_episode; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13805,6 +14436,48 @@ CREATE TRIGGER trg_job_workspace_contract_insert BEFORE INSERT ON public.jobs FO
 
 
 --
+-- Name: jobs trg_managed_job_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_job_repository_cleanup BEFORE DELETE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_owner_cleanup();
+
+
+--
+-- Name: jobs trg_managed_job_repository_url_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_job_repository_url_authority BEFORE INSERT OR UPDATE OF context, config_override, resolved_config, status, assigned_agent_id, lease_expires_at, repo_name ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_url_authority();
+
+
+--
+-- Name: project_repositories trg_managed_project_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_project_repository_cleanup BEFORE DELETE ON public.project_repositories FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_owner_cleanup();
+
+
+--
+-- Name: project_repositories trg_managed_project_repository_url_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_project_repository_url_authority BEFORE INSERT OR UPDATE OF name, repo_url, credentials, is_managed, role, read_only ON public.project_repositories FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_url_authority();
+
+
+--
+-- Name: threads trg_managed_thread_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_thread_repository_cleanup BEFORE DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_owner_cleanup();
+
+
+--
+-- Name: threads trg_managed_thread_repository_url_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_thread_repository_url_authority BEFORE INSERT OR UPDATE OF metadata, agent_id ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_url_authority();
+
+
+--
 -- Name: runtime_actor_grants trg_runtime_actor_grants_officer_agent_binding; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -14512,6 +15185,14 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 ALTER TABLE ONLY public.magic_link_tokens
     ADD CONSTRAINT magic_link_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: managed_repository_authorities managed_repository_authorities_creation_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_authorities
+    ADD CONSTRAINT managed_repository_authorities_creation_intent_id_fkey FOREIGN KEY (creation_intent_id) REFERENCES public.managed_repository_creation_intents(id) ON DELETE RESTRICT;
 
 
 --

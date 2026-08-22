@@ -110,34 +110,25 @@ async def test_restore_k8s_ide_container_fails_clone_marks_session_failed(
     """Gitea clone failures on the IDE pod should fail the IDE session."""
     svc = service_factory
     svc._container_provisioner.create_ide_pod = AsyncMock(return_value="10.0.0.10")
+    svc._install_and_sync_managed_repository_over_ssh = AsyncMock(return_value=False)
 
-    proc = AsyncMock()
-    proc.returncode = 2
-    proc.communicate = AsyncMock(return_value=(b"", b"permission denied"))
-
-    with (
-        patch(
-            "orchestrator.services.ide_session.build_agent_ssh_cmd",
-            return_value=["ssh", "-i", "k", "agent-host@10.0.0.10", "clone"],
-        ) as mock_build_ssh,
-        patch(
-            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
-        ),
-    ):
-        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-            with patch(
-                "orchestrator.services.ide_session.IdeSessionService._wait_for_code_server",
-                AsyncMock(return_value=True),
-            ):
-                ok = await svc._restore_k8s_ide_container(
-                    "job-0004",
-                    {"branch_name": "main", "repo_name": "demo/repo"},
-                    "demo/repo",
-                    "main",
-                )
+    ok = await svc._restore_k8s_ide_container(
+        "job-0004",
+        {"branch_name": "main", "repo_name": "demo/repo"},
+        "demo/repo",
+        "main",
+    )
 
     assert ok is False
-    mock_build_ssh.assert_called_once_with("10.0.0.10", 30022, ANY)
+    svc._install_and_sync_managed_repository_over_ssh.assert_awaited_once_with(
+        "job-0004",
+        backend="sandbox",
+        ssh_host="10.0.0.10",
+        ssh_port=30022,
+        branch="main",
+        workspace_path="/home/agent-host/workspace",
+    )
+    svc._container_provisioner.delete_ide_pod.assert_awaited_once_with("job-0004")
     last_ctx = svc._db.merge_ide_session_context.await_args_list[-1]
     assert last_ctx.kwargs == {}
     assert last_ctx.args[1]["status"] == "failed"
@@ -288,21 +279,11 @@ async def test_gitea_clone_chain_is_idempotent(service_factory):
     """Retries against a pre-populated workspace must not die on remote add."""
     svc = service_factory
     svc._container_provisioner.create_ide_pod = AsyncMock(return_value="10.0.0.10")
+    svc._install_and_sync_managed_repository_over_ssh = AsyncMock(return_value=True)
 
-    proc = AsyncMock()
-    proc.returncode = 0
-    proc.communicate = AsyncMock(return_value=(b"", b""))
-
-    with (
-        patch(
-            "orchestrator.services.ide_session.build_agent_ssh_cmd",
-            return_value=["ssh", "cmd"],
-        ) as mock_build_ssh,
-        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-        patch(
-            "orchestrator.services.ide_session.IdeSessionService._wait_for_code_server",
-            AsyncMock(return_value=True),
-        ),
+    with patch(
+        "orchestrator.services.ide_session.IdeSessionService._wait_for_code_server",
+        AsyncMock(return_value=True),
     ):
         ok = await svc._restore_k8s_ide_container(
             "job-0011",
@@ -312,8 +293,33 @@ async def test_gitea_clone_chain_is_idempotent(service_factory):
         )
 
     assert ok is True
-    clone_cmd = mock_build_ssh.call_args_list[0].args[2]
-    assert "git remote set-url origin" in clone_cmd
+    svc._install_and_sync_managed_repository_over_ssh.assert_awaited_once()
+
+    payload = {
+        "version": 1,
+        "authority_id": "2fd83ae5-f72c-41db-ae18-02e69d598aef",
+        "generation": 1,
+        "access_mode": "write",
+        "repo_name": "demo",
+        "repository_owner": "srw",
+        "alias": "srw-repo-2fd83ae5f72c41dbae1802e69d598aef",
+        "ssh_host": "srw-gitea",
+        "ssh_port": 2222,
+        "clone_url": ("ssh://srw-repo-2fd83ae5f72c41dbae1802e69d598aef/srw/demo.git"),
+        "public_key_fingerprint": f"SHA256:{'A' * 43}",
+        "private_key": "private-material",
+    }
+    clone_cmd, secret = svc._managed_git_command(
+        payload,
+        branch="main",
+        workspace_path="/home/agent-host/workspace",
+        require_existing=False,
+    )
+    assert "remote set-url origin" in clone_cmd
+    assert "private-material" not in clone_cmd
+    assert "IdentitiesOnly" not in clone_cmd
+    assert bytes(secret) == b"private-material"
+    assert "private_key" not in payload
 
 
 @pytest.mark.asyncio
@@ -332,7 +338,7 @@ async def test_snapshot_restore_runs_git_repair_fetch(service_factory):
 
     assert ok is True
     svc._repair_git_after_snapshot.assert_awaited_once_with(
-        "job-0012", ANY, "10.0.0.10", 30022
+        "job-0012", ANY, "10.0.0.10", 30022, backend="sandbox"
     )
 
 
