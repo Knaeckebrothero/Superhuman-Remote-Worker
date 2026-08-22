@@ -493,6 +493,17 @@ databases:
   # Without the sweep fix this refills, exactly as postgres did in ~4 days.
   vector:
     storageSize: "32Gi"
+    # REHEARSAL 2026-08-22. `migrating` renders both workloads and the Cluster
+    # imports from the legacy Service -- it only ever READS, so writers keep
+    # writing to the StatefulSet throughout and this is safe on a live system.
+    # Purpose is measurement: 20 GB with 3.9 GB of HNSW to rebuild, and every
+    # duration in the plan is currently reasoning rather than a number.
+    # Revert to statefulset and delete the Cluster when done.
+    engine: "migrating"
+    # 64Gi, not the 32Gi the legacy PVC has: a logical import writes the data,
+    # rebuilds every index and generates WAL onto this one volume. Measuring
+    # what it actually consumes is half the point of the rehearsal.
+    cnpgStorageSize: "64Gi"
 # Other DBs stay internal (chart defaults). Externalize here if needed.
 # NOTE: `vector:` is a REAL key above — add externalUrl to that block rather
 # than uncommenting a second one here, or it silently shadows the storageSize
