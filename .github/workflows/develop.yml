@@ -129,6 +129,7 @@ jobs:
           - customer-external
           - eval
           - vm
+          - vm-external
           - installer-evaluation
           - installer-production
           - installer-production-vms

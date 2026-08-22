@@ -725,9 +725,11 @@
     "nats": {
       "type": "object",
       "properties": {
-        "internal": { "type": "boolean" }
+        "internal": { "type": "boolean" },
+        "url": { "type": "string" }
       }
     },
+    "orchestratorId": { "type": "string" },
     "databases": {
       "type": "object",
       "properties": {
@@ -783,13 +785,44 @@
         }
       }
     },
+    "vm": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["off", "same-cluster", "external"] },
+        "lifecycleAuthSecretName": { "type": "string" },
+        "lifecycleAuthSecretKey": { "type": "string", "minLength": 1 },
+        "preflight": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "renderTime": { "type": "boolean" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "same-cluster" } }, "required": ["mode"] },
+          "then": {
+            "required": ["lifecycleAuthSecretName", "lifecycleAuthSecretKey", "preflight"]
+          }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "external" } }, "required": ["mode"] },
+          "then": { "required": ["lifecycleAuthSecretKey"] }
+        }
+      ]
+    },
     "vmController": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
         "transport": { "type": "string", "enum": ["http", "nats", "both"] },
-        "lifecycleAuthSecretName": { "type": "string" },
-        "lifecycleAuthSecretKey": { "type": "string", "minLength": 1 }
+        "namespace": { "type": "string" },
+        "maxConcurrentVms": { "type": "integer", "minimum": 0 },
+        "defaultNetworkTier": { "type": "string", "pattern": "^[a-z0-9-]{1,63}$" },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object" } }
       }
     },
     "garage": {
@@ -850,5 +883,31 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "vm": {
+            "properties": { "mode": { "const": "same-cluster" } },
+            "required": ["mode"]
+          }
+        },
+        "required": ["vm"]
+      },
+      "then": { "required": ["vm", "vmController"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "vm": {
+            "properties": { "mode": { "const": "external" } },
+            "required": ["mode"]
+          }
+        },
+        "required": ["vm"]
+      },
+      "then": { "required": ["nats", "orchestratorId"] }
+    }
+  ]
 }

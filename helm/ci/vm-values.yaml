@@ -14,11 +14,14 @@ secrets:
   values: {}
 
 vmController:
-  enabled: true
-  transport: http
-  namespace: agent-vms
-  # Dummy key — only needs to be a non-empty string to render the mount.
-  vmSshPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYFORCIRENDERONLY00000000000000000 agent@srw"
+  nodeSelector:
+    srw.io/vm-node: "true"
+
+vm:
+  mode: same-cluster
+  lifecycleAuthSecretName: test-vm-lifecycle
+  preflight:
+    enabled: false
 
 ingress:
   enabled: true

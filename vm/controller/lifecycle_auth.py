@@ -44,6 +44,25 @@ def configured_secret(source: Mapping[str, str] | None = None) -> bytes | None:
     return secret
 
 
+def guest_token(
+    secret: bytes,
+    entity_type: str,
+    entity_id: str,
+    provision_generation: str,
+) -> str:
+    """Derive the generation-scoped bearer token installed in one VM guest."""
+
+    guest_key = hmac.new(
+        secret,
+        b"srw-kdf|vm-guest-token|v1",
+        hashlib.sha256,
+    ).digest()
+    message = (
+        f"srw.vm.guest.v1\n{entity_type}\n{entity_id}\n{provision_generation}\n"
+    ).encode()
+    return hmac.new(guest_key, message, hashlib.sha256).hexdigest()
+
+
 def _unsigned_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key != AUTH_FIELD}
 

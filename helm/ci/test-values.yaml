@@ -18,9 +18,10 @@ externalSecrets:
 headscale:
   enabled: true
 
-# Render-only key for tests that enable the co-located VM controller.
-vmController:
-  vmSshPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYFORCIRENDERONLY00000000000000000 agent@srw"
+vm:
+  mode: external
+
+orchestratorId: test-orchestrator
 
 pgadmin:
   enabled: true

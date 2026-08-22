@@ -17,8 +17,9 @@ raw substitution fragile in two different ways:
      the same way, producing a manifest that passes yaml.safe_load and is
      accepted by KubeVirt while its userData is malformed.
 
-Both render sites are covered (they are separate deployment units and cannot
-share code): the orchestrator's direct-K8s path and the vm-controller's.
+The parked external vm-controller render site remains covered. Same-cluster
+mode no longer has a direct-K8s renderer and its job-config intentionally omits
+the unused description field.
 
 These tests render the REAL chart templates rather than a simplified fixture.
 That is deliberate: the defect lives in the real template's *structure*, so the
@@ -48,7 +49,6 @@ if str(PROJECT_ROOT) not in sys.path:
 # KubeVirt reject the VM.
 USER_DATA_LIMIT = 2048
 
-ORCHESTRATOR_CHART = "helm/templates/vm-controller/configmap.yaml"
 VM_CLUSTER_CHART = "helm-vm-cluster/templates/vm-controller/configmap.yaml"
 
 JOB_CONFIG_PATH = "/run/agent/job-config.json"
@@ -127,7 +127,7 @@ def _runcmd(manifest: dict) -> list:
 
 
 # =============================================================================
-# The two render sites
+# The external render site
 # =============================================================================
 
 BASE_JOB_CONFIG = {
@@ -138,15 +138,6 @@ BASE_JOB_CONFIG = {
     "memory": "16Gi",
     "nats_url": "nats://srw-vm-nats.srw-vm.svc.cluster.local:4222",
 }
-
-
-def _orchestrator_render(description: str) -> dict:
-    """Render via the orchestrator's direct-K8s path."""
-    from orchestrator.services.vm_provisioner import VMProvisioner
-
-    prov = VMProvisioner()
-    prov._template_text = _load_chart_vm_template(ORCHESTRATOR_CHART)
-    return prov._render_template({**BASE_JOB_CONFIG, "description": description})
 
 
 def _install_controller_import_stubs() -> None:
@@ -198,8 +189,7 @@ def _controller_render(description: str) -> dict:
 
 
 RENDER_SITES = [
-    pytest.param(_orchestrator_render, id="orchestrator-direct-k8s"),
-    pytest.param(_controller_render, id="vm-controller"),
+    pytest.param(_controller_render, id="external-vm-controller"),
 ]
 
 
