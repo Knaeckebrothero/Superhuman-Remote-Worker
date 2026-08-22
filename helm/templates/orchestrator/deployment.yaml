@@ -30,17 +30,17 @@ spec:
         {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
         - name: wait-for-postgres
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.postgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
         - name: wait-for-pgvector
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-pgvector 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.vectorPostgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
         - name: wait-for-auditdb
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-auditdb 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.auditPostgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.gitea.enabled .Values.gitea.internal }}
         - name: wait-for-gitea

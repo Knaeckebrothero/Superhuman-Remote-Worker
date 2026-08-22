@@ -252,3 +252,118 @@ def test_migrating_still_renders_the_legacy_statefulset():
     assert f"{FULLNAME}-postgres" in {
         d["metadata"]["name"] for d in _kinds(documents, "StatefulSet")
     }
+
+
+# --- the -rw flip ----------------------------------------------------------
+
+
+def test_hosts_are_unchanged_on_the_statefulset_engine():
+    assert _configmap()["POSTGRES_HOST"] == f"{FULLNAME}-postgres"
+
+
+@pytest.mark.parametrize(
+    "key,variable,component",
+    [
+        ("postgres", "POSTGRES_HOST", "postgres"),
+        ("vector", "VECTOR_POSTGRES_HOST", "pgvector"),
+        ("audit", "AUDIT_POSTGRES_HOST", "auditdb"),
+    ],
+)
+def test_hosts_still_point_at_the_legacy_service_while_migrating(
+    key, variable, component
+):
+    """The import runs against the legacy Service and consumers keep writing
+    to it. Repointing here would cut over before the data has arrived."""
+    assert (
+        _configmap(f"databases.{key}.engine=migrating")[variable]
+        == f"{FULLNAME}-{component}"
+    )
+
+
+@pytest.mark.parametrize(
+    "key,variable,component",
+    [
+        ("postgres", "POSTGRES_HOST", "postgres"),
+        ("vector", "VECTOR_POSTGRES_HOST", "pgvector"),
+        ("audit", "AUDIT_POSTGRES_HOST", "auditdb"),
+    ],
+)
+def test_cnpg_engine_points_at_the_read_write_service(key, variable, component):
+    assert (
+        _configmap(f"databases.{key}.engine=cnpg")[variable]
+        == f"{FULLNAME}-{component}-rw"
+    )
+
+
+def test_no_template_hardcodes_a_database_service_name():
+    """The -rw flip only reaches a consumer that goes through the helper. A
+    template that spells the Service name itself keeps pointing at the retired
+    StatefulSet after cutover, silently -- the canvas gateway and the Gitea
+    init container are exactly the kind of consumer that could.
+
+    Checked at the source, because enabling every consumer for a render test
+    means satisfying each one's unrelated schema prerequisites."""
+    helpers = {
+        "postgres": "srw.postgresHost",
+        "pgvector": "srw.vectorPostgresHost",
+        "auditdb": "srw.auditPostgresHost",
+        "giteadb": "srw.giteaDbHost",
+        "keycloakdb": "srw.keycloakDbJdbcUrl",
+    }
+    offenders = []
+    for template in (CHART / "templates").rglob("*.yaml"):
+        if template.name.startswith("cnpg-") or template.name.startswith("postgres"):
+            continue  # the database templates themselves legitimately name it
+        body = template.read_text()
+        for component in helpers:
+            for line in body.splitlines():
+                if f'"srw.fullname" . }}}}-{component}' not in line:
+                    continue
+                # `name:` is the resource's own name, which legitimately
+                # matches the Service. Anything else is a reference to it.
+                if line.strip().startswith("name:"):
+                    continue
+                offenders.append(f"{template.relative_to(CHART)} spells -{component}")
+    assert not offenders, "; ".join(offenders)
+
+
+def test_external_mode_is_untouched_by_the_engine():
+    """internal=false means someone else's database. The engine is irrelevant
+    and must not append anything to their hostname."""
+    config = _configmap(
+        "databases.postgres.internal=false",
+        "databases.postgres.externalHost=pg.example.com",
+        "databases.postgres.engine=cnpg",
+    )
+    assert config["POSTGRES_HOST"] == "pg.example.com"
+
+
+def test_gitea_host_flips_with_its_port():
+    documents = _render("databases.gitea.engine=cnpg")
+    gitea = [
+        d
+        for d in _kinds(documents, "StatefulSet")
+        if d["metadata"]["name"] == f"{FULLNAME}-gitea"
+    ][0]
+    env = {
+        e["name"]: e.get("value")
+        for e in gitea["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    # Gitea takes host:port as one string.
+    assert env["GITEA__database__HOST"] == f"{FULLNAME}-giteadb-rw:5432"
+
+
+def test_keycloak_jdbc_url_flips():
+    documents = _render("databases.keycloak.engine=cnpg")
+    keycloak = [
+        d
+        for d in _kinds(documents, "Deployment")  # Keycloak is a Deployment
+        if d["metadata"]["name"].endswith("-keycloak")
+    ][0]
+    env = {
+        e["name"]: e.get("value")
+        for e in keycloak["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert (
+        env["KC_DB_URL"] == f"jdbc:postgresql://{FULLNAME}-keycloakdb-rw:5432/keycloak"
+    )
