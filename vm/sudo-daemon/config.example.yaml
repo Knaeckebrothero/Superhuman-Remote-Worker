@@ -1,6 +1,7 @@
 # sudo-gated configuration
 # Copy to /etc/sudo-gate/config.yaml on the VM, or pass --config flag.
-# Environment variables NATS_URL, JOB_ID, VM_ID override file values.
+# Environment variables ORCHESTRATOR_URL, VM_AUTH_TOKEN, ENTITY_ID, NATS_URL,
+# JOB_ID, and VM_ID override file values.
 
 socket_path: /run/sudo-gated/sudo-gated.sock
 
@@ -10,6 +11,10 @@ nats:
   reconnect_wait: 2s
   subject_prefix: sudo.request
   # credentials_file: /etc/sudo-gate/nats.creds  # NKey/JWT auth (optional)
+
+orchestrator:
+  url: ""
+  token: ""
 
 rate_limit:
   requests_per_minute: 5
