@@ -7,7 +7,7 @@
 #   - User setup (agent-host for SSH + workspace)
 #   - SSH server config tuned for RemoteBackend
 #   - Management daemon (NATS bridge to orchestrator)
-#   - Sudo approval gate (plugin .so + Go daemon, optional)
+#   - Sudo approval gate (plugin .so + Go daemon)
 #   - tmux + git config
 #
 # Files (daemon binaries, sudo-gate artifacts, configs) are uploaded to /tmp/
@@ -173,8 +173,8 @@ EOF
 # 3b. code-server (Web IDE)
 #
 # The binary is installed in stage1. Here we place the loopback / auth-none
-# config and a DISABLED systemd unit. The management daemon runs
-# `systemctl start code-server` on IDE request (see knowledge-base/knowledge/features/
+# config and a DISABLED systemd unit. The orchestrator starts and stops it over
+# SSH for IDE sessions (see knowledge-base/knowledge/features/
 # vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent"); we deliberately
 # do NOT enable it, so it stays dormant during normal headless job runs.
 # -----------------------------------------------------------------------------
@@ -186,8 +186,7 @@ sudo install -o root -g root -m 0644 /tmp/code-server-config.yaml /etc/code-serv
 
 sudo install -o root -g root -m 0644 /tmp/code-server.service /etc/systemd/system/code-server.service
 sudo systemctl daemon-reload
-# Intentionally NOT `systemctl enable`d — the management daemon starts it
-# on demand and stops it when the IDE session ends.
+# Intentionally NOT `systemctl enable`d — the orchestrator manages it over SSH.
 
 # user-data-dir / extensions-dir live outside $HOME (see config). code-server
 # runs as agent-host, so agent-host must own this tree.
@@ -201,11 +200,11 @@ sudo chown -R agent-host:agent-host /var/lib/code-server
 # The sudo approval gate intercepts every sudo invocation and forwards it
 # to the orchestrator for human approval. Components:
 #   - sudo_gate.so    — C plugin loaded by sudo (compiled from vm/sudo-plugin/)
-#   - sudo-gated      — Go daemon bridging plugin to orchestrator via NATS (vm/sudo-daemon/)
+#   - sudo-gated      — Go daemon bridging plugin to orchestrator (vm/sudo-daemon/)
 #
 # Compiled binaries are expected at /tmp/ (placed by Packer file provisioner
 # from CI artifacts, or compiled during an earlier build step).
-# If the binaries aren't present, this section is skipped — the gate is optional.
+# Both binaries are required; an image without the gate must not be published.
 
 _section "Setting up sudo approval gate"
 
@@ -247,7 +246,8 @@ if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
     # every sudo invocation. Since the daemon isn't running during provisioning,
     # fail_mode=deny would break all subsequent sudo commands in this script
     # and in later Packer provisioners (tmux, git config, cleanup).
-    # We use fail_mode=open here; cloud-init switches to fail_mode=deny at boot.
+    # We use fail_mode=open here; cleanup.sh seals it to fail_mode=deny after
+    # every remaining provisioning command has completed.
     echo "Registering plugin in sudo.conf..."
     # Strip the immutable flag if a prior stage2 already set it (idempotent re-run)
     sudo chattr -i /etc/sudo.conf 2>/dev/null || true
@@ -258,7 +258,8 @@ if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
 
     echo "Sudo approval gate installed"
 else
-    echo "Sudo gate binaries not found at /tmp/ — skipping (gate is optional)"
+    echo "ERROR: sudo gate binaries are missing or empty" >&2
+    exit 1
 fi
 
 # Default env file for sudo-gated (always created, overwritten by cloud-init).

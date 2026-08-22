@@ -13,10 +13,10 @@ import (
 // Server is the Unix domain socket server that accepts connections from
 // the sudo approval plugin and dispatches them to the Handler.
 type Server struct {
-	socketPath       string
-	handler          *Handler
-	gracefulTimeout  time.Duration
-	log              *slog.Logger
+	socketPath      string
+	handler         *Handler
+	gracefulTimeout time.Duration
+	log             *slog.Logger
 
 	listener net.Listener
 	wg       sync.WaitGroup
@@ -103,9 +103,8 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			// Create a child context with the NATS timeout as an upper bound.
-			// The handler manages its own internal timeouts (read, NATS request).
-			reqCtx, cancel := context.WithTimeout(ctx, s.handler.natsTimeout+10*time.Second)
+			// Leave enough time for the plugin request read plus the approval budget.
+			reqCtx, cancel := context.WithTimeout(ctx, s.handler.ApprovalTimeout()+10*time.Second)
 			defer cancel()
 			s.handler.Handle(reqCtx, conn)
 		}()

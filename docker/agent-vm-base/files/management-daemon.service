@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/management-daemon
+EnvironmentFile=-/etc/default/srw-guest
 ExecStart=/usr/bin/python3 /opt/srw/management-daemon.py
 Restart=always
 RestartSec=5

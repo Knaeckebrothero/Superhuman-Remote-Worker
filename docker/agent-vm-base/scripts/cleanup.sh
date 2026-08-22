@@ -60,6 +60,20 @@ userdel -r packer 2>/dev/null || true
 # Verify critical files exist before shutdown
 ls -la /opt/srw/management-daemon.py /etc/systemd/system/management-daemon.service
 
+# Seal the sudo approval plugin fail-closed as the final image mutation. The
+# temporary fail-open setting is needed only while Packer runs sudo commands.
+chattr -i /etc/sudo.conf
+sed -i '/sudo_gate_approval/s/fail_mode=open/fail_mode=deny/' /etc/sudo.conf
+chattr +i /etc/sudo.conf
+
+# Final stage2 contract gate. Packer invokes cleanup from a private directory,
+# so run guest-facing checks as agent-host from / and use absolute paths.
+cd /
+/usr/bin/grep -Eq 'sudo_gate_approval.*fail_mode=deny$' /etc/sudo.conf
+/usr/sbin/runuser -u agent-host -- /usr/bin/env PYTHONPYCACHEPREFIX=/dev/shm/srw-stage2-pycache \
+    /usr/bin/python3 -m py_compile /opt/srw/management-daemon.py
+/usr/sbin/runuser -u agent-host -- /usr/local/bin/sudo-gated --version
+
 echo "=== Cleanup complete ==="
 sync
 shutdown -P now
