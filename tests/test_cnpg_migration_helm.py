@@ -36,7 +36,7 @@ DATABASES = {
 }
 
 CLUSTER = "templates/databases/cnpg-cluster.yaml"
-OPERAND = "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+OPERAND = "ghcr.io/cloudnative-pg/postgresql:16.15"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("helm") is None, reason="Helm is not installed"
@@ -106,6 +106,26 @@ def test_operand_tag_is_a_real_version_not_a_commit_sha():
 def test_operand_image_is_not_wired_into_the_per_commit_tag_job():
     workflow = (ROOT / ".github/workflows/develop.yml").read_text()
     assert "cnpgImage" not in workflow
+
+
+def test_operand_is_upstream_not_a_custom_build():
+    """CloudNativePG's operand already bundles pgvector, uuid-ossp and
+    btree_gist. Building our own would mean owning a PostgreSQL image forever
+    to gain nothing -- the versions are identical."""
+    values = yaml.safe_load((CHART / "values.yaml").read_text())["databases"]
+    for key in DATABASES:
+        assert values[key]["cnpgImage"].startswith("ghcr.io/cloudnative-pg/postgresql:")
+
+
+def test_operand_tag_is_pinned_not_floating():
+    """A moving tag would roll every Postgres cluster whenever upstream
+    publishes, because imageName is part of the Cluster spec."""
+    values = yaml.safe_load((CHART / "values.yaml").read_text())["databases"]
+    for key in DATABASES:
+        tag = values[key]["cnpgImage"].rsplit(":", 1)[1]
+        assert re.fullmatch(r"\d+\.\d+", tag), (
+            f"{key}: {tag!r} is not a pinned patch version"
+        )
 
 
 # --- postgresql.parameters -------------------------------------------------
