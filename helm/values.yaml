@@ -1624,6 +1624,22 @@ gitea:
   # When internal=true, defaults to https://git.{global.domain}.
   externalUrl: ""
   image: gitea/gitea:1.22-rootless
+  ssh:
+    # -- Repository-scoped deploy keys use Gitea's SSH server. The bundled
+    # service is enabled by default; disabling it makes managed workspace
+    # dispatch fail closed rather than falling back to administrator HTTP auth.
+    enabled: true
+    internalHost: ""
+    internalPort: 2222
+    # VM guests cannot generally resolve ClusterIP DNS. Set an exact routed
+    # host/port (and optionally expose the SSH-only Service below) before VM
+    # managed-repository dispatch is enabled.
+    externalHost: ""
+    externalPort: 22
+    externalService:
+      enabled: false
+      type: LoadBalancer
+      nodePort: null
   # -- Metadata database backing the bundled Gitea: users, orgs, repo
   # metadata, issues, PRs, and the OIDC login source. Git object data always
   # lives on the Gitea PVC and is NOT affected by this setting.

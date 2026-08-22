@@ -1548,6 +1548,7 @@ __SRW_PROCESS_ZERO_PY__
         timeout: int,
         *,
         retain_tail: bool = False,
+        sensitive: bool = False,
     ) -> tuple[str, int]:
         """Drain stdout/stderr until exit under a wall-clock deadline."""
         out_chunks: list[bytes] = []
@@ -1564,7 +1565,9 @@ __SRW_PROCESS_ZERO_PY__
             # BOTH buffers went momentarily empty.
             while chan.recv_ready() and time.monotonic() <= deadline:
                 chunk = chan.recv(65536)
-                if retain_tail:
+                if sensitive:
+                    pass
+                elif retain_tail:
                     out_chunks.append(chunk)
                     retained = sum(len(part) for part in out_chunks)
                     while retained > _EXEC_MAX_OUTPUT_BYTES and out_chunks:
@@ -1586,7 +1589,7 @@ __SRW_PROCESS_ZERO_PY__
                 out_size += len(chunk)
             while chan.recv_stderr_ready() and time.monotonic() <= deadline:
                 chunk = chan.recv_stderr(65536)
-                if err_size < _EXEC_MAX_OUTPUT_BYTES:
+                if not sensitive and err_size < _EXEC_MAX_OUTPUT_BYTES:
                     err_chunks.append(chunk)
                 err_size += len(chunk)
             if (
@@ -1602,11 +1605,13 @@ __SRW_PROCESS_ZERO_PY__
                 )
             time.sleep(_EXEC_POLL_SECONDS)
         exit_code = chan.recv_exit_status()  # ready — returns immediately
-        output = b"".join(out_chunks).decode("utf-8", errors="replace")
+        output = (
+            "" if sensitive else b"".join(out_chunks).decode("utf-8", errors="replace")
+        )
         if truncated:
             notice = "[output truncated at 5 MiB]"
             output = f"{notice}\n{output}" if retain_tail else f"{output}\n{notice}"
-        if exit_code != 0:
+        if exit_code != 0 and not sensitive:
             err = b"".join(err_chunks).decode("utf-8", errors="replace")
             # Some commands (grep with no match, tmux has-session) use non-zero
             # exit codes for normal conditions — callers check output.
@@ -1775,6 +1780,57 @@ __SRW_PROCESS_ZERO_PY__
 
     def resolve_home_path(self, relative_path: str) -> str:
         return self._resolve_home_path(relative_path)
+
+    def execute_with_secret_stdin(
+        self, command: str, secret: str | bytes | bytearray, *, timeout: int = 30
+    ) -> bool:
+        """Run trusted bootstrap code with secret bytes sent over SSH stdin.
+
+        Unlike ``shell_run`` this bypasses tmux entirely, so neither command
+        history nor scrollback can contain the input. Output is drained and
+        discarded. The caller must supply only a server-authored command and
+        must never interpolate the secret into it.
+        """
+
+        self._ensure_connected()
+        if isinstance(secret, bytearray):
+            payload = secret
+        elif isinstance(secret, bytes):
+            payload = bytearray(secret)
+        else:
+            payload = bytearray(secret.encode("utf-8"))
+        stdout = None
+        with self._channel_slots:
+            ssh = self._ssh
+            if ssh is None or self._retired:
+                raise WorkspaceUnavailableError(
+                    "Remote workspace transport retired before secret bootstrap"
+                )
+            try:
+                stdin, stdout, _stderr = ssh.exec_command(command, timeout=timeout)
+                stdin.write(payload)
+                stdin.flush()
+                stdin.channel.shutdown_write()
+                payload[:] = b"\x00" * len(payload)
+                _output, returncode = self._drain_exec_channel(
+                    stdout.channel,
+                    command,
+                    timeout,
+                    retain_tail=False,
+                    sensitive=True,
+                )
+                return returncode == 0
+            except (paramiko.SSHException, socket.error, EOFError, OSError) as exc:
+                raise WorkspaceUnavailableError(
+                    "Remote secret bootstrap transport failed"
+                ) from exc
+            finally:
+                payload[:] = b"\x00" * len(payload)
+                if stdout is not None:
+                    try:
+                        stdout.channel.close()
+                    except (AttributeError, OSError):
+                        pass
 
     def append_file(self, path: str, content: str) -> None:
         self._ensure_connected()

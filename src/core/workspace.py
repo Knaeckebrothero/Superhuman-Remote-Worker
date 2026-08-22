@@ -108,6 +108,59 @@ def _normalize_repo_url(url: str) -> str:
         return raw
 
 
+def _managed_repository_path(url: str) -> Optional[str]:
+    """Return the exact owner/repository path of a managed SSH transport.
+
+    Only the new server-owned alias is accepted as the expected side of this
+    comparison. This lets an existing workspace migrate from the previous
+    release's credentialed HTTP origin to scoped SSH without treating the
+    transport change as a foreign repository. Arbitrary SSH/HTTP URLs retain
+    the strict full-origin comparison.
+    """
+
+    raw = (url or "").strip()
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    hostname = parts.hostname or ""
+    authority_suffix = hostname.removeprefix("srw-repo-")
+    if (
+        parts.scheme != "ssh"
+        or not hostname.startswith("srw-repo-")
+        or len(authority_suffix) != 32
+        or any(character not in "0123456789abcdef" for character in authority_suffix)
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        return None
+    path = parts.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) != 2:
+        return None
+    return "/".join(segments)
+
+
+def _repository_path(url: str) -> Optional[str]:
+    """Extract an exact URL repository path without treating it as authority."""
+
+    try:
+        parts = urlsplit((url or "").strip())
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    path = parts.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) != 2:
+        return None
+    return "/".join(segments)
+
+
 @dataclass
 class WorkspaceManagerConfig:
     """Configuration for WorkspaceManager.
@@ -706,7 +759,16 @@ class WorkspaceManager:
 
         git_mgr = GitManager(self._workspace_path, backend=self._backend)
         origin = git_mgr.remote_url("origin")
-        if origin and _normalize_repo_url(origin) != _normalize_repo_url(expected_url):
+        same_origin = bool(
+            origin and _normalize_repo_url(origin) == _normalize_repo_url(expected_url)
+        )
+        managed_path = _managed_repository_path(expected_url)
+        legacy_managed_origin = bool(
+            origin
+            and managed_path is not None
+            and _repository_path(origin) == managed_path
+        )
+        if origin and not same_origin and not legacy_managed_origin:
             # A PRESENT-but-different origin is a genuine identity conflict:
             # pushing would land this job's work in a foreign repo. Fail loud.
             raise RuntimeError(
@@ -715,7 +777,13 @@ class WorkspaceManager:
                 f"expected job repo '{repo_name}' — refusing to clone over "
                 "it or push into it."
             )
-        if not origin:
+        if legacy_managed_origin and not same_origin:
+            logger.info(
+                "Replacing a legacy managed HTTP origin with scoped SSH "
+                "authority for job repo '%s'",
+                repo_name,
+            )
+        elif not origin:
             # Unset/unreadable origin is NOT a conflict: `git remote get-url`
             # can fail transiently on a fresh session, and killing the job
             # here would lose the pre-seeded work (the exact failure F29
@@ -770,12 +838,43 @@ class WorkspaceManager:
             repo_name = repo["name"]
             target = repos_dir / repo_name
             remote_cwd = f"repos/{repo_name}"
+            repo_url = repo.get("repo_url")
 
             if self._backend.exists(remote_cwd):
+                if repo.get("is_managed"):
+                    # A workspace created by the previous release can already
+                    # contain this auxiliary clone with the shared administrator
+                    # URL in its .git/config.  Merely skipping the clone would
+                    # preserve that bearer forever across resume.  Accept only
+                    # the same exact owner/repository path, then replace origin
+                    # with the newly proven scoped SSH alias before any tool can
+                    # inspect or use it.
+                    managed_path = _managed_repository_path(str(repo_url or ""))
+                    git_mgr = GitManager(
+                        target,
+                        backend=self._backend,
+                        remote_cwd=remote_cwd,
+                    )
+                    if managed_path is None or not git_mgr.is_active:
+                        raise RuntimeError(
+                            f"Managed auxiliary repository '{repo_name}' has no "
+                            "usable scoped Git authority"
+                        )
+                    origin = git_mgr.remote_url("origin")
+                    if origin and _repository_path(origin) != managed_path:
+                        raise RuntimeError(
+                            f"Managed auxiliary repository '{repo_name}' has a "
+                            "foreign origin; refusing to replace it"
+                        )
+                    if not git_mgr.add_remote("origin", str(repo_url)):
+                        raise RuntimeError(
+                            f"Managed auxiliary repository '{repo_name}' origin "
+                            "could not be refreshed"
+                        )
+                    self._source_repos[repo_name] = git_mgr
                 logger.debug(f"Repo {repo_name} already cloned, skipping")
                 continue
 
-            repo_url = repo.get("repo_url")
             if not repo_url:
                 logger.warning(f"Repo {repo_name} has no URL, skipping")
                 continue
@@ -794,8 +893,17 @@ class WorkspaceManager:
                     self._source_repos[repo_name] = git_mgr
                     logger.info(f"Cloned {repo['role']} repo: {repo_name}")
                 else:
+                    if repo.get("is_managed"):
+                        raise RuntimeError(
+                            f"Managed auxiliary repository '{repo_name}' could "
+                            "not be cloned with scoped authority"
+                        )
                     logger.warning(f"Failed to clone repo: {repo_name}")
             except Exception as e:
+                if repo.get("is_managed"):
+                    raise RuntimeError(
+                        f"Managed auxiliary repository '{repo_name}' setup failed"
+                    ) from e
                 logger.warning(f"Error cloning repo {repo_name}: {e}")
 
         # Update .gitignore to exclude repos/ directory

@@ -137,6 +137,97 @@ class TestWorkspaceGitInitialization:
         assert mgr is sentinel
         assert calls["n"] == 3
 
+    def test_existing_managed_auxiliary_origin_is_replaced_with_scoped_ssh(
+        self, temp_base
+    ):
+        repo_name = "project-source"
+        repo_path = temp_base / "repos" / repo_name
+        repo_path.mkdir(parents=True)
+        subprocess.run(["git", "init", str(repo_path)], check=True, capture_output=True)
+        legacy = f"http://shared-admin:shared-secret@gitea:3000/srw/{repo_name}.git"
+        subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "add", "origin", legacy],
+            check=True,
+            capture_output=True,
+        )
+        scoped = f"ssh://srw-repo-{'a' * 32}/srw/{repo_name}.git"
+        manager = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+                repositories=[
+                    {
+                        "role": "source",
+                        "name": repo_name,
+                        "repo_url": scoped,
+                        "is_managed": True,
+                    }
+                ],
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+
+        manager._clone_auxiliary_repos()
+
+        refreshed = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert refreshed == scoped
+        assert "shared-admin" not in refreshed
+        assert "shared-secret" not in refreshed
+
+    def test_existing_managed_auxiliary_foreign_origin_fails_closed(self, temp_base):
+        repo_name = "project-source"
+        repo_path = temp_base / "repos" / repo_name
+        repo_path.mkdir(parents=True)
+        subprocess.run(["git", "init", str(repo_path)], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "remote",
+                "add",
+                "origin",
+                "http://shared-admin:shared-secret@gitea:3000/srw/foreign.git",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        manager = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+                repositories=[
+                    {
+                        "role": "source",
+                        "name": repo_name,
+                        "repo_url": (f"ssh://srw-repo-{'b' * 32}/srw/{repo_name}.git"),
+                        "is_managed": True,
+                    }
+                ],
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+
+        with pytest.raises(RuntimeError, match="foreign origin"):
+            manager._clone_auxiliary_repos()
+
+        unchanged = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert "foreign.git" in unchanged
+
     def test_git_directory_created(self, temp_base):
         """Test that .git directory is created."""
         ws = WorkspaceManager(
@@ -380,6 +471,9 @@ class TestWorkspaceGitGracefulDegradation:
 
 JOBS_URL = "http://srw:token-a@srw-gitea:3000/srw/proj-jobs.git"
 JOBS_URL_ROTATED = "http://srw:token-b@srw-gitea:3000/srw/proj-jobs.git"
+JOBS_SCOPED_SSH_URL = (
+    "ssh://srw-repo-2fd83ae5f72c41dbae1802e69d598aef/srw/proj-jobs.git"
+)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -449,6 +543,29 @@ class TestProjectWorkspacePrepopulatedRoot:
         with pytest.raises(RuntimeError, match="does not match expected job repo"):
             ws.initialize_project_workspace()
         assert ws._initialized is False
+
+    def test_legacy_admin_origin_migrates_to_clean_scoped_ssh(
+        self, temp_base, no_clone
+    ):
+        _seed_repo(temp_base, origin_url=JOBS_URL_ROTATED)
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+                git_remote_url=JOBS_SCOPED_SSH_URL,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+
+        ws.initialize_project_workspace()
+
+        assert ws.git_manager is not None
+        assert ws.git_manager.remote_url("origin") == JOBS_SCOPED_SSH_URL
+        config = (temp_base / ".git" / "config").read_text()
+        assert "token-b" not in config
+        assert "://srw:" not in config
 
     def test_missing_origin_attaches_and_sets_origin(self, temp_base, no_clone):
         """An unset/unreadable origin is not an identity conflict — `git remote

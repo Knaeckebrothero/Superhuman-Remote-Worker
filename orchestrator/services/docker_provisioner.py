@@ -781,8 +781,15 @@ class DockerProvisioner:
         # symlink. The final assertions make a partial cleanup fail closed.
         command = (
             "set -eu; "
+            "if test -d /home/agent-host/.ssh/srw-managed/sockets; then "
+            "for socket in /home/agent-host/.ssh/srw-managed/sockets/*.sock; do "
+            'if test -S "$socket"; then '
+            'SSH_AUTH_SOCK="$socket" ssh-add -D >/dev/null 2>&1 || true; '
+            "fi; done; fi; "
+            "rm -rf -- /home/agent-host/.ssh/srw-managed; "
             "rm -rf -- /home/agent-host/workspace; "
             "install -d -m 700 /home/agent-host/workspace; "
+            "test ! -e /home/agent-host/.ssh/srw-managed; "
             "test -d /home/agent-host/workspace; "
             "test ! -L /home/agent-host/workspace; "
             'test -z "$(find /home/agent-host/workspace -mindepth 1 '

@@ -12355,6 +12355,10 @@ async def _poll_workspace_ready(
                     "workspace_path": "/home/agent-host/workspace",
                 },
                 "git_remote_url": ws.get("git_remote_url"),
+                "managed_repository_credentials": ws.get(
+                    "managed_repository_credentials"
+                ),
+                "repositories": ws.get("repositories"),
                 "config_override": ws.get("config_override"),
                 "project_ids": ws.get("project_ids") or [],
                 "datasources": ws.get("datasources"),
@@ -12444,6 +12448,10 @@ async def _poll_workspace_ready(
                     "workspace_path": "/home/agent-host/workspace",
                 },
                 "git_remote_url": ws.get("git_remote_url"),
+                "managed_repository_credentials": ws.get(
+                    "managed_repository_credentials"
+                ),
+                "repositories": ws.get("repositories"),
                 "config_override": ws.get("config_override"),
                 "project_ids": ws.get("project_ids") or [],
                 "datasources": ws.get("datasources"),
@@ -12455,7 +12463,19 @@ async def _poll_workspace_ready(
                 "protected_cloud": ws.get("protected_cloud"),
             }
         if status == "failed" and (not vm_status or vm_status == "failed"):
-            logger.warning(f"Workspace provisioning failed: {ws}")
+            # The internal readiness response can carry the one-shot managed
+            # repository authority bundle once a runtime is ready.  Never log
+            # the response object on a terminal/error branch: a mixed-version
+            # or racing response could otherwise put encrypted-handoff
+            # plaintext in pod logs.  Status fields are sufficient to diagnose
+            # the provisioning failure.
+            logger.warning(
+                "Workspace provisioning failed for thread %s "
+                "(container_status=%s, vm_status=%s)",
+                thread_id,
+                status,
+                vm_status or "none",
+            )
             return None
         if status == "none" and not vm_status:
             # No workspace provisioned for this thread (no K8s)

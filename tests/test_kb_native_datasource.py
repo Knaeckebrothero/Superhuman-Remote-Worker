@@ -110,14 +110,56 @@ class TestProjectCreationProvisioning:
             return_value={"id": DATASOURCE_ID, "name": "Better Resavio Knowledge"}
         )
         db.link_datasource_to_project = AsyncMock(return_value=True)
+        creation_intent_id = uuid.uuid4()
+        creation_marker = uuid.uuid4()
+        db.reserve_managed_repository_creation_intent = AsyncMock(
+            return_value={
+                "id": creation_intent_id,
+                "intent_marker": creation_marker,
+                "status": "pending",
+            }
+        )
+        db.mark_managed_repository_created = AsyncMock(
+            return_value={
+                "id": creation_intent_id,
+                "intent_marker": creation_marker,
+                "status": "created",
+            }
+        )
+        db.fail_managed_repository_creation_intent = AsyncMock(return_value=True)
+        db.conflict_managed_repository_creation_intent = AsyncMock(return_value=True)
+
+        async def _reserve_authority(**kwargs):
+            return {
+                "id": uuid.uuid4(),
+                "repository_owner": kwargs["repository_owner"],
+                "repo_name": kwargs["repo_name"],
+                "authority_kind": kwargs["authority_kind"],
+                "authority_id": uuid.UUID(kwargs["authority_id"]),
+                "project_id": uuid.UUID(kwargs["project_id"]),
+                "generation": 1,
+                "clean_repo_url": kwargs["clean_repo_url"],
+                "private_key": kwargs["private_key"],
+                "status": "active",
+            }
+
+        db.reserve_managed_repository_authority = AsyncMock(
+            side_effect=_reserve_authority
+        )
+        db.managed_repository_scope_is_unambiguous = AsyncMock(return_value=True)
         return db
 
     def _gitea(self, **kwargs) -> MagicMock:
         gitea = MagicMock()
         gitea.is_initialized = True
+        gitea.repository_owner = "srw"
         gitea.create_repo = AsyncMock(
-            side_effect=lambda name: f"http://user:pw@gitea/srw/{name}.git",
+            side_effect=lambda name, **_kwargs: f"http://gitea/srw/{name}.git",
             **kwargs,
+        )
+        gitea.repository_creation_intent_status = AsyncMock(return_value="missing")
+        gitea.clean_repo_url = MagicMock(
+            side_effect=lambda name: f"http://gitea/srw/{name}.git"
         )
         gitea.grant_user_repo_access = AsyncMock()
         gitea.delete_repo = AsyncMock()

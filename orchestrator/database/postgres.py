@@ -114,6 +114,53 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
     }
 )
 
+# Repository transport and credential authority are minted only after Gitea
+# and the durable owner row have been resolved.  Creation funnels strip these
+# names even though current production code never persists the credential
+# bundle: this is the last-line defense for direct service/database callers.
+_SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS = frozenset(
+    {
+        "git_remote_url",
+        "repo_name",
+        "managed_repository_credentials",
+        "managed_repository_authority",
+        "repository_auth",
+        "repository_credentials",
+        "_managed_repository_authority_pending",
+    }
+)
+
+
+def _strip_managed_repository_authority(
+    value: Any, *, preserve_clean_url: bool = False
+) -> Any:
+    """Recursively remove repository authority from caller-authored JSON.
+
+    The runtime payload currently lives only at a top-level internal request
+    field. Recursive stripping is intentional defense in depth for direct DB
+    callers and future metadata reshaping: moving a credential object under an
+    arbitrary wrapper must not make it durable or model-selectable.
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _strip_managed_repository_authority(
+                item, preserve_clean_url=preserve_clean_url
+            )
+            for key, item in value.items()
+            if key not in _SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS
+            or (preserve_clean_url and key == "git_remote_url")
+        }
+    if isinstance(value, list):
+        return [
+            _strip_managed_repository_authority(
+                item, preserve_clean_url=preserve_clean_url
+            )
+            for item in value
+        ]
+    return value
+
+
 # These Post-state keys are lifecycle/authorization authority, not runtime
 # authored Officer state.  They must never be harvested from a thread,
 # restored into a successor thread, or replaced through the generic shallow
@@ -2048,7 +2095,9 @@ class PostgresDB:
             branch_name: Optional git branch name for this job
             parent_job_id: Optional parent job UUID (for verification/follow-up jobs)
             priority: Job priority (0=low, 5=normal, 10=high). Default: 5
-            repo_name: Optional Gitea repo name (e.g. "job-ec38de5d")
+            repo_name: Deprecated compatibility argument. Repository identity
+                is stripped here and may be added only through the exact
+                managed-repository binding seam after authority proof.
             creation_order: Optional 0-based index for delegation subagent merge ordering
             worktree_path: Optional git worktree path for delegation subagents
             delegation_context: Optional shared context string from parent delegation
@@ -2142,7 +2191,13 @@ class PostgresDB:
         # cascade. Delivery compares it with the live junction so a deleted
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
-        context = dict(context or {})
+        context = _strip_managed_repository_authority(dict(context or {}))
+        config_override = _strip_managed_repository_authority(config_override)
+        # Repository identity is server-owned. Every legitimate root/subjob
+        # path now binds it through ``bind_job_managed_repository`` only after
+        # exact active deploy-key proof. Retain the historical argument for
+        # rolling collaborators, but never trust it at this common ingress.
+        repo_name = None
         # Evidence manifests are minted only by completion finalization after
         # the repository and exact revision have been resolved. Every create
         # path (REST, session/tool, automation, loop, direct service call)
@@ -4545,6 +4600,7 @@ class PostgresDB:
         except ValueError:
             return False
 
+        resolved_config = _strip_managed_repository_authority(resolved_config)
         query = (
             "UPDATE jobs SET resolved_config = $1, updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2 AND resolved_config IS NULL"
@@ -4579,6 +4635,7 @@ class PostgresDB:
         except ValueError:
             return False
 
+        updates = _strip_managed_repository_authority(updates)
         query = (
             "UPDATE jobs "
             "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
@@ -6744,6 +6801,7 @@ class PostgresDB:
         except ValueError:
             return False
 
+        container_updates = _strip_managed_repository_authority(container_updates)
         query = (
             "UPDATE threads "
             "SET metadata = jsonb_set("
@@ -7513,6 +7571,7 @@ class PostgresDB:
         """
         import json as json_module
 
+        config_updates = _strip_managed_repository_authority(config_updates)
         try:
             uuid_val = UUID(thread_id)
         except ValueError:
@@ -16485,6 +16544,12 @@ class PostgresDB:
                 raise ValueError("initial thread metadata is not JSON-safe") from exc
             if not isinstance(metadata, dict):
                 raise ValueError("initial thread metadata must be an object")
+        metadata = _strip_managed_repository_authority(metadata)
+        initial_workspace = metadata.get("workspace_container")
+        if isinstance(initial_workspace, dict):
+            initial_workspace = dict(initial_workspace)
+            initial_workspace.pop("repo_name", None)
+            metadata["workspace_container"] = initial_workspace
         if "datasource_ids" in metadata or "datasource_selection" in metadata:
             raise ValueError("initial thread metadata contains reserved fields")
         metadata["datasource_ids"] = selected_ids
@@ -25609,11 +25674,979 @@ class PostgresDB:
 
     # -- Project Repositories --
 
+    @staticmethod
+    def _managed_repository_authority_row(
+        row: Any, *, include_private_key: bool = False
+    ) -> Dict[str, Any] | None:
+        """Normalize one repository authority without accidental secret spread.
+
+        Ordinary callers receive only audit/provenance fields.  The private
+        key is decrypted only for the exact runtime-delivery service that asks
+        for it explicitly; ciphertext is never returned.
+        """
+        if row is None:
+            return None
+        result = dict(row)
+        ciphertext = result.pop("private_key_ciphertext", None)
+        if include_private_key:
+            if not isinstance(ciphertext, str) or not is_encrypted(ciphertext):
+                raise RuntimeError("Managed repository authority is not decryptable")
+            try:
+                result["private_key"] = decrypt(ciphertext)
+            except DecryptionError as exc:
+                raise RuntimeError(
+                    "Managed repository authority is not decryptable"
+                ) from exc
+        return result
+
+    async def managed_repository_scope_is_unambiguous(
+        self,
+        *,
+        repo_name: str,
+        authority_kind: str,
+        authority_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Fail closed when historical durable owners disagree on a repo name.
+
+        Migration 0176 intentionally does not guess between pre-authority rows.
+        A project jobs repository may be referenced by multiple root jobs in
+        that same project; every other cross-kind/project duplicate is an
+        ambiguous legacy ownership claim and must be reconciled by an operator
+        before any deploy key is minted.
+        """
+
+        try:
+            expected_id = UUID(str(authority_id))
+            expected_project = UUID(str(project_id)) if project_id else None
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            if authority_kind == "job":
+                owner = await conn.fetchrow(
+                    "SELECT project_id, repo_name FROM jobs WHERE id = $1",
+                    expected_id,
+                )
+            elif authority_kind == "thread":
+                owner = await conn.fetchrow(
+                    "SELECT project_id, "
+                    "metadata->'workspace_container'->>'repo_name' AS repo_name "
+                    "FROM threads WHERE id = $1",
+                    expected_id,
+                )
+            elif authority_kind == "project_repository":
+                owner = await conn.fetchrow(
+                    "SELECT project_id, name AS repo_name "
+                    "FROM project_repositories WHERE id = $1",
+                    expected_id,
+                )
+            else:
+                return False
+            if owner is None or owner["project_id"] != expected_project:
+                return False
+            durable_repo_name = str(owner["repo_name"] or "").strip()
+            if durable_repo_name:
+                if durable_repo_name != str(repo_name):
+                    return False
+            elif authority_kind == "job":
+                if str(repo_name) != f"job-{str(expected_id)[:8]}":
+                    return False
+            elif authority_kind == "thread":
+                if str(repo_name) != f"thread-{str(expected_id)[:8]}":
+                    return False
+            else:
+                return False
+            rows = await conn.fetch(
+                """
+                SELECT 'project_repository'::text AS kind, id AS scope_id,
+                       project_id, role
+                  FROM project_repositories
+                 WHERE is_managed AND name = $1
+                UNION ALL
+                SELECT 'job', id, project_id, NULL::text
+                  FROM jobs
+                 WHERE parent_job_id IS NULL AND repo_name = $1
+                UNION ALL
+                SELECT 'thread', id, project_id, NULL::text
+                  FROM threads
+                 WHERE metadata->'workspace_container'->>'repo_name' = $1
+                """,
+                str(repo_name),
+            )
+        project_rows = [row for row in rows if row["kind"] == "project_repository"]
+        job_rows = [row for row in rows if row["kind"] == "job"]
+        thread_rows = [row for row in rows if row["kind"] == "thread"]
+        if authority_kind == "job":
+            return (
+                not project_rows
+                and not thread_rows
+                and all(row["scope_id"] == expected_id for row in job_rows)
+            )
+        if authority_kind == "thread":
+            return (
+                not project_rows
+                and not job_rows
+                and all(row["scope_id"] == expected_id for row in thread_rows)
+            )
+        if authority_kind == "project_repository":
+            return (
+                len(project_rows) == 1
+                and project_rows[0]["scope_id"] == expected_id
+                and project_rows[0]["project_id"] == expected_project
+                and not thread_rows
+                and (not job_rows or project_rows[0]["role"] == "jobs")
+                and all(row["project_id"] == expected_project for row in job_rows)
+            )
+        return False
+
+    async def reserve_managed_repository_creation_intent(
+        self,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_id: str,
+        project_id: str | None,
+        access_mode: str,
+    ) -> Dict[str, Any]:
+        """Persist the exact creation identity before mutating Gitea.
+
+        The random marker survives response loss and orchestrator restarts.
+        A name collision is adoptable only when Gitea reports this same marker
+        and the durable scope below is identical.
+        """
+
+        owner = str(repository_owner or "").strip()
+        name = str(repo_name or "").strip()
+        if authority_kind not in {"job", "thread", "project_repository"}:
+            raise ValueError("Unsupported managed repository authority kind")
+        if access_mode not in {"none", "read", "write"}:
+            raise ValueError("Unsupported managed repository access mode")
+        authority_uuid = UUID(str(authority_id))
+        project_uuid = UUID(str(project_id)) if project_id else None
+        lock_name = f"managed-repository-creation:{owner}/{name}"
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    lock_name,
+                )
+                existing = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_creation_intents
+                     WHERE repository_owner = $1
+                       AND repo_name = $2
+                       AND status IN ('pending', 'created', 'deleting')
+                     ORDER BY generation DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """,
+                    owner,
+                    name,
+                )
+                if existing is not None:
+                    if (
+                        existing["authority_kind"] != authority_kind
+                        or existing["authority_id"] != authority_uuid
+                        or existing["project_id"] != project_uuid
+                        or existing["access_mode"] != access_mode
+                    ):
+                        raise RuntimeError(
+                            "Managed repository creation intent belongs to another scope"
+                        )
+                    if existing["status"] == "deleting":
+                        raise RuntimeError(
+                            "Managed repository creation intent is deleting"
+                        )
+                    return dict(existing)
+
+                # A verified name-only/foreign collision owns no repository
+                # and therefore must not wedge deletion of its job/thread
+                # owner. Reuse its exact marker if the same durable owner is
+                # retried: returning it to pending before the forge call keeps
+                # response-loss semantics intact without growing one terminal
+                # audit row per retry. A different scope gets a new generation
+                # and still has to prove its own unguessable marker.
+                conflicted = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_creation_intents
+                     WHERE repository_owner = $1
+                       AND repo_name = $2
+                       AND status = 'conflicted'
+                     ORDER BY generation DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """,
+                    owner,
+                    name,
+                )
+                if conflicted is not None and (
+                    conflicted["authority_kind"] == authority_kind
+                    and conflicted["authority_id"] == authority_uuid
+                    and conflicted["project_id"] == project_uuid
+                    and conflicted["access_mode"] == access_mode
+                ):
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE managed_repository_creation_intents
+                           SET status = 'pending', failure_class = NULL,
+                               updated_at = now()
+                         WHERE id = $1 AND status = 'conflicted'
+                        RETURNING *
+                        """,
+                        conflicted["id"],
+                    )
+                    return dict(row)
+
+                generation = await conn.fetchval(
+                    """
+                    SELECT COALESCE(max(generation), 0) + 1
+                      FROM managed_repository_creation_intents
+                     WHERE repository_owner = $1 AND repo_name = $2
+                    """,
+                    owner,
+                    name,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO managed_repository_creation_intents (
+                        repository_owner, repo_name, authority_kind,
+                        authority_id, project_id, access_mode, generation
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING *
+                    """,
+                    owner,
+                    name,
+                    authority_kind,
+                    authority_uuid,
+                    project_uuid,
+                    access_mode,
+                    generation,
+                )
+        return dict(row)
+
+    async def mark_managed_repository_created(
+        self, intent_id: str, *, intent_marker: str
+    ) -> Dict[str, Any] | None:
+        """CAS a marker-verified repository intent to created."""
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE managed_repository_creation_intents
+                   SET status = 'created',
+                       repository_created_at = COALESCE(
+                           repository_created_at, now()
+                       ),
+                       failure_class = NULL,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND intent_marker = $2
+                   AND status IN ('pending', 'created')
+                RETURNING *
+                """,
+                UUID(str(intent_id)),
+                UUID(str(intent_marker)),
+            )
+        return dict(row) if row else None
+
+    async def fail_managed_repository_creation_intent(
+        self, intent_id: str, *, failure_class: str
+    ) -> bool:
+        """Record a secret-free retryable creation failure."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_creation_intents
+                   SET failure_class = $2, updated_at = now()
+                 WHERE id = $1 AND status = 'pending'
+                """,
+                UUID(str(intent_id)),
+                str(failure_class)[:100],
+            )
+        return result == "UPDATE 1"
+
+    async def conflict_managed_repository_creation_intent(self, intent_id: str) -> bool:
+        """Close a marker-mismatched create intent without claiming the repo.
+
+        The exact Gitea owner/name exists but does not carry this intent's
+        unguessable marker. No mutation or credential was created for this
+        scope, so the terminal audit row must not block deletion of its durable
+        job/thread owner and cleanup must never touch the foreign repository.
+        """
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_creation_intents
+                   SET status = 'conflicted',
+                       failure_class = 'foreign_collision',
+                       updated_at = now()
+                 WHERE id = $1 AND status = 'pending'
+                """,
+                UUID(str(intent_id)),
+            )
+        return result == "UPDATE 1"
+
+    async def get_managed_repository_creation_intent(
+        self,
+        repo_name: str,
+        *,
+        repository_owner: str,
+        include_deleting: bool = False,
+    ) -> Dict[str, Any] | None:
+        statuses = (
+            "('pending', 'created', 'deleting')"
+            if include_deleting
+            else "('pending', 'created')"
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT *
+                  FROM managed_repository_creation_intents
+                 WHERE repository_owner = $1 AND repo_name = $2
+                   AND status IN {statuses}
+                 ORDER BY generation DESC LIMIT 1
+                """,
+                str(repository_owner),
+                str(repo_name),
+            )
+        return dict(row) if row else None
+
+    async def claim_managed_repository_creation_cleanup(
+        self, repo_name: str, *, repository_owner: str
+    ) -> Dict[str, Any] | None:
+        """Claim marker-bound repository cleanup without losing retry state."""
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_creation_intents
+                     WHERE repository_owner = $1 AND repo_name = $2
+                     ORDER BY generation DESC LIMIT 1
+                     FOR UPDATE
+                    """,
+                    str(repository_owner),
+                    str(repo_name),
+                )
+                if row is None:
+                    return None
+                if row["status"] in ("pending", "created"):
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE managed_repository_creation_intents
+                           SET status = 'deleting', updated_at = now()
+                         WHERE id = $1
+                           AND status IN ('pending', 'created')
+                        RETURNING *
+                        """,
+                        row["id"],
+                    )
+        return dict(row)
+
+    async def finish_managed_repository_creation_cleanup(self, intent_id: str) -> bool:
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_creation_intents
+                   SET status = 'deleted',
+                       deleted_at = COALESCE(deleted_at, now()),
+                       updated_at = now()
+                 WHERE id = $1 AND status IN ('deleting', 'deleted')
+                """,
+                UUID(str(intent_id)),
+            )
+        return result == "UPDATE 1"
+
+    async def reserve_managed_repository_authority(
+        self,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_id: str,
+        project_id: str | None,
+        access_mode: str,
+        creation_intent_id: str | None,
+        clean_repo_url: str,
+        public_key: str,
+        public_key_fingerprint: str,
+        private_key: str,
+    ) -> Dict[str, Any]:
+        """Return the one live authority reservation for a managed repo.
+
+        The advisory transaction lock serializes replicas before the partial
+        unique indexes are consulted.  Existing live scope is immutable: a
+        caller may not adopt a repository already owned by another job/thread.
+        Revoked generations remain audit history and a later legitimate
+        recreation starts at ``max(generation)+1`` with fresh key material.
+        """
+        owner = str(repository_owner or "").strip()
+        name = str(repo_name or "").strip()
+        if authority_kind not in {"job", "thread", "project_repository"}:
+            raise ValueError("Unsupported managed repository authority kind")
+        if access_mode not in {"read", "write"}:
+            raise ValueError("Unsupported managed repository access mode")
+        authority_uuid = UUID(str(authority_id))
+        project_uuid = UUID(str(project_id)) if project_id else None
+        creation_intent_uuid = (
+            UUID(str(creation_intent_id)) if creation_intent_id else None
+        )
+        ciphertext = encrypt(private_key)
+        lock_name = f"managed-repository:{owner}/{name}"
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    lock_name,
+                )
+                if creation_intent_uuid is not None:
+                    creation = await conn.fetchrow(
+                        """
+                        SELECT *
+                          FROM managed_repository_creation_intents
+                         WHERE id = $1
+                         FOR UPDATE
+                        """,
+                        creation_intent_uuid,
+                    )
+                    if (
+                        creation is None
+                        or creation["repository_owner"] != owner
+                        or creation["repo_name"] != name
+                        or creation["authority_kind"] != authority_kind
+                        or creation["authority_id"] != authority_uuid
+                        or creation["project_id"] != project_uuid
+                        or creation["access_mode"] != access_mode
+                        or creation["status"] not in ("pending", "created")
+                    ):
+                        raise RuntimeError(
+                            "Managed repository creation intent does not match authority"
+                        )
+                existing = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_authorities
+                     WHERE repository_owner = $1
+                       AND repo_name = $2
+                       AND status IN ('provisioning', 'active', 'revoking')
+                     ORDER BY generation DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """,
+                    owner,
+                    name,
+                )
+                if existing is not None:
+                    if (
+                        existing["authority_kind"] != authority_kind
+                        or existing["authority_id"] != authority_uuid
+                        or existing["project_id"] != project_uuid
+                        or existing["access_mode"] != access_mode
+                        or (
+                            creation_intent_uuid is not None
+                            and existing["creation_intent_id"] != creation_intent_uuid
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Managed repository is already bound to another authority"
+                        )
+                    if existing["status"] == "revoking":
+                        raise RuntimeError("Managed repository authority is revoking")
+                    # A browser/internal host change is not an authority change.
+                    # Keep the canonical URL current without replacing key or scope.
+                    if existing["clean_repo_url"] != clean_repo_url:
+                        existing = await conn.fetchrow(
+                            """
+                            UPDATE managed_repository_authorities
+                               SET clean_repo_url = $2, updated_at = now()
+                             WHERE id = $1
+                            RETURNING *
+                            """,
+                            existing["id"],
+                            clean_repo_url,
+                        )
+                    normalized = self._managed_repository_authority_row(
+                        existing, include_private_key=True
+                    )
+                    assert normalized is not None
+                    return normalized
+
+                generation = await conn.fetchval(
+                    """
+                    SELECT COALESCE(max(generation), 0) + 1
+                      FROM managed_repository_authorities
+                     WHERE repository_owner = $1 AND repo_name = $2
+                    """,
+                    owner,
+                    name,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO managed_repository_authorities (
+                        repository_owner, repo_name, authority_kind,
+                        authority_id, project_id, generation, clean_repo_url,
+                        access_mode, creation_intent_id,
+                        public_key, public_key_fingerprint,
+                        private_key_ciphertext
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    RETURNING *
+                    """,
+                    owner,
+                    name,
+                    authority_kind,
+                    authority_uuid,
+                    project_uuid,
+                    generation,
+                    clean_repo_url,
+                    access_mode,
+                    creation_intent_uuid,
+                    public_key,
+                    public_key_fingerprint,
+                    ciphertext,
+                )
+        normalized = self._managed_repository_authority_row(
+            row, include_private_key=True
+        )
+        assert normalized is not None
+        return normalized
+
+    async def get_managed_repository_authority(
+        self,
+        repo_name: str,
+        *,
+        repository_owner: str | None = None,
+        include_private_key: bool = False,
+        active_only: bool = True,
+    ) -> Dict[str, Any] | None:
+        """Fetch the newest authority for one repository name."""
+        clauses = ["repo_name = $1"]
+        args: list[Any] = [repo_name]
+        if repository_owner is not None:
+            args.append(repository_owner)
+            clauses.append(f"repository_owner = ${len(args)}")
+        if active_only:
+            clauses.append("status = 'active'")
+        query = f"""
+            SELECT *
+              FROM managed_repository_authorities
+             WHERE {" AND ".join(clauses)}
+             ORDER BY generation DESC
+             LIMIT 1
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+        return self._managed_repository_authority_row(
+            row, include_private_key=include_private_key
+        )
+
+    async def managed_repository_authorities_are_current(
+        self, expected: Sequence[Mapping[str, Any]] | None
+    ) -> bool:
+        """Revalidate an internal runtime bundle without touching ciphertext."""
+
+        identities: list[tuple[UUID, int, str, str]] = []
+        try:
+            for item in expected or []:
+                identities.append(
+                    (
+                        UUID(str(item["authority_id"])),
+                        int(item["generation"]),
+                        str(item["repo_name"]),
+                        str(item["access_mode"]),
+                    )
+                )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not identities:
+            return True
+        if len({identity[0] for identity in identities}) != len(identities):
+            return False
+        async with self.acquire() as conn:
+            matched = await conn.fetchval(
+                """
+                WITH expected(id, generation, repo_name, access_mode) AS (
+                    SELECT * FROM unnest(
+                        $1::uuid[], $2::bigint[], $3::text[], $4::text[]
+                    )
+                )
+                SELECT count(*)
+                  FROM expected
+                  JOIN managed_repository_authorities AS authority
+                    ON authority.id = expected.id
+                   AND authority.generation = expected.generation
+                   AND authority.repo_name = expected.repo_name
+                   AND authority.access_mode = expected.access_mode
+                   AND authority.status = 'active'
+                """,
+                [identity[0] for identity in identities],
+                [identity[1] for identity in identities],
+                [identity[2] for identity in identities],
+                [identity[3] for identity in identities],
+            )
+        return int(matched or 0) == len(identities)
+
+    async def activate_managed_repository_authority(
+        self, authority_id: str, *, forge_key_id: int, access_mode: str
+    ) -> Dict[str, Any] | None:
+        """CAS one proven deploy key to active; replay returns the same row."""
+        authority_uuid = UUID(str(authority_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT * FROM managed_repository_authorities
+                     WHERE id = $1 FOR UPDATE
+                    """,
+                    authority_uuid,
+                )
+                if (
+                    row is None
+                    or row["status"] not in ("provisioning", "active")
+                    or row["access_mode"] != access_mode
+                ):
+                    return None
+                if row["status"] == "active":
+                    if row["forge_key_id"] != int(forge_key_id):
+                        raise RuntimeError(
+                            "Managed repository deploy-key identity changed"
+                        )
+                    return self._managed_repository_authority_row(row)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE managed_repository_authorities
+                       SET status = 'active', forge_key_id = $2,
+                           activated_at = COALESCE(activated_at, now()),
+                           failure_class = NULL, updated_at = now()
+                     WHERE id = $1 AND status = 'provisioning'
+                    RETURNING *
+                    """,
+                    authority_uuid,
+                    int(forge_key_id),
+                )
+        return self._managed_repository_authority_row(row)
+
+    async def fail_managed_repository_authority(
+        self, authority_id: str, *, failure_class: str
+    ) -> bool:
+        """Record a bounded provisioning failure without storing its detail."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_authorities
+                   SET failure_class = $2, updated_at = now()
+                 WHERE id = $1
+                   AND status = 'provisioning'
+                """,
+                UUID(str(authority_id)),
+                str(failure_class)[:100],
+            )
+        return result == "UPDATE 1"
+
+    async def claim_managed_repository_authority_revoke(
+        self, repo_name: str, *, repository_owner: str | None = None
+    ) -> Dict[str, Any] | None:
+        """Claim revocation once and return only the forge key identifier."""
+        args: list[Any] = [repo_name]
+        owner_sql = ""
+        if repository_owner is not None:
+            args.append(repository_owner)
+            owner_sql = f" AND repository_owner = ${len(args)}"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT * FROM managed_repository_authorities
+                     WHERE repo_name = $1{owner_sql}
+                       AND status IN ('provisioning', 'active', 'revoking')
+                     ORDER BY generation DESC LIMIT 1
+                     FOR UPDATE
+                    """,
+                    *args,
+                )
+                if row is None:
+                    return None
+                if row["status"] != "revoking":
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE managed_repository_authorities
+                           SET status = 'revoking', updated_at = now()
+                         WHERE id = $1
+                        RETURNING *
+                        """,
+                        row["id"],
+                    )
+        return self._managed_repository_authority_row(row)
+
+    async def finish_managed_repository_authority_revoke(
+        self, authority_id: str
+    ) -> bool:
+        """Set the terminal audit state after the Gitea key/repo is unusable."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_authorities
+                   SET status = 'revoked', revoked_at = COALESCE(revoked_at, now()),
+                       updated_at = now()
+                 WHERE id = $1 AND status IN ('revoking', 'revoked')
+                """,
+                UUID(str(authority_id)),
+            )
+        return result == "UPDATE 1"
+
+    async def scrub_job_managed_repository_url(
+        self,
+        job_id: str,
+        *,
+        repo_name: str,
+        observed_url: str | None,
+        clean_url: str,
+    ) -> bool:
+        """CAS one proven legacy job remote to its credential-free URL."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                   SET context = jsonb_set(
+                           COALESCE(context, '{}'::jsonb),
+                           '{git_remote_url}',
+                           to_jsonb($4::text),
+                           true
+                       ) - '_managed_repository_authority_pending',
+                       updated_at = now()
+                 WHERE id = $1
+                   AND repo_name = $2
+                   AND context->>'git_remote_url' IS NOT DISTINCT FROM $3
+                """,
+                UUID(str(job_id)),
+                repo_name,
+                observed_url,
+                clean_url,
+            )
+        return result == "UPDATE 1"
+
+    async def bind_job_managed_repository(
+        self,
+        job_id: str,
+        *,
+        repo_name: str,
+        clean_url: str,
+    ) -> bool:
+        """Atomically bind one job to an already-active repository authority.
+
+        This is the only general-purpose database seam that may introduce a
+        managed ``repo_name``/``git_remote_url`` pair.  Ordinary context merges
+        strip both keys.  The recursive lineage check permits a subjob to share
+        its root job's key and permits a legacy project jobs repository only
+        when the exact managed project-repository row belongs to this project.
+        """
+
+        try:
+            job_uuid = UUID(str(job_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                WITH RECURSIVE lineage AS (
+                    SELECT id, parent_job_id
+                      FROM jobs
+                     WHERE id = $1
+                    UNION ALL
+                    SELECT parent.id, parent.parent_job_id
+                      FROM jobs AS parent
+                      JOIN lineage ON parent.id = lineage.parent_job_id
+                ), root AS (
+                    SELECT id FROM lineage WHERE parent_job_id IS NULL LIMIT 1
+                )
+                UPDATE jobs AS target
+                   SET repo_name = $2,
+                       context = jsonb_set(
+                           COALESCE(target.context, '{}'::jsonb),
+                           '{git_remote_url}',
+                           to_jsonb($3::text),
+                           true
+                       ) - '_managed_repository_authority_pending',
+                       updated_at = now()
+                 WHERE target.id = $1
+                   AND NOT public.managed_repository_url_has_userinfo($3)
+                   AND EXISTS (
+                       SELECT 1
+                         FROM managed_repository_authorities AS authority
+                        WHERE authority.repo_name = $2
+                          AND authority.clean_repo_url = $3
+                          AND authority.status = 'active'
+                          AND authority.access_mode = 'write'
+                          AND (
+                              (
+                                  authority.authority_kind = 'job'
+                                  AND authority.authority_id = (
+                                      SELECT id FROM root
+                                  )
+                              )
+                              OR (
+                                  authority.authority_kind =
+                                      'project_repository'
+                                  AND EXISTS (
+                                      SELECT 1
+                                        FROM project_repositories AS repository
+                                       WHERE repository.id =
+                                             authority.authority_id
+                                         AND repository.project_id =
+                                             target.project_id
+                                         AND repository.name = $2
+                                         AND repository.is_managed
+                                         AND repository.role = 'jobs'
+                                         AND NOT repository.read_only
+                                  )
+                              )
+                          )
+                   )
+                """,
+                job_uuid,
+                str(repo_name),
+                str(clean_url),
+            )
+        return result == "UPDATE 1"
+
+    async def scrub_thread_managed_repository_url(
+        self,
+        thread_id: str,
+        *,
+        repo_name: str,
+        observed_url: str | None,
+        clean_url: str,
+    ) -> bool:
+        """CAS one proven legacy thread remote without replacing metadata."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads
+                   SET metadata = jsonb_set(
+                           COALESCE(metadata, '{}'::jsonb),
+                           '{workspace_container}',
+                           (
+                               COALESCE(
+                                   metadata->'workspace_container',
+                                   '{}'::jsonb
+                               ) - '_managed_repository_authority_pending'
+                           ) || jsonb_build_object(
+                               'git_remote_url', $4::text
+                           ),
+                           true
+                       ),
+                       last_activity = now()
+                 WHERE id = $1
+                   AND metadata->'workspace_container'->>'repo_name' = $2
+                   AND metadata->'workspace_container'->>'git_remote_url'
+                       IS NOT DISTINCT FROM $3
+                """,
+                UUID(str(thread_id)),
+                repo_name,
+                observed_url,
+                clean_url,
+            )
+        return result == "UPDATE 1"
+
+    async def bind_thread_managed_repository(
+        self,
+        thread_id: str,
+        *,
+        repo_name: str,
+        clean_url: str,
+    ) -> bool:
+        """Bind one thread workspace to its exact active scoped authority."""
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads AS target
+                   SET metadata = jsonb_set(
+                           COALESCE(target.metadata, '{}'::jsonb),
+                           '{workspace_container}',
+                           (
+                               COALESCE(
+                               target.metadata->'workspace_container',
+                               '{}'::jsonb
+                               ) - '_managed_repository_authority_pending'
+                           ) || jsonb_build_object(
+                               'repo_name', $2::text,
+                               'git_remote_url', $3::text
+                           ),
+                           true
+                       ),
+                       last_activity = now()
+                 WHERE target.id = $1
+                   AND NOT public.managed_repository_url_has_userinfo($3)
+                   AND EXISTS (
+                       SELECT 1
+                         FROM managed_repository_authorities AS authority
+                        WHERE authority.authority_kind = 'thread'
+                          AND authority.authority_id = target.id
+                          AND authority.repo_name = $2
+                          AND authority.clean_repo_url = $3
+                          AND authority.status = 'active'
+                          AND authority.access_mode = 'write'
+                   )
+                """,
+                thread_uuid,
+                str(repo_name),
+                str(clean_url),
+            )
+        return result == "UPDATE 1"
+
+    async def scrub_project_managed_repository_url(
+        self,
+        repository_id: str,
+        *,
+        repo_name: str,
+        project_id: str,
+        observed_url: str,
+        clean_url: str,
+    ) -> bool:
+        """CAS a proven managed project-repository row to a clean URL."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE project_repositories
+                   SET repo_url = $5, updated_at = now()
+                 WHERE id = $1
+                   AND project_id = $2
+                   AND name = $3
+                   AND is_managed
+                   AND repo_url = $4
+                """,
+                UUID(str(repository_id)),
+                UUID(str(project_id)),
+                repo_name,
+                observed_url,
+                clean_url,
+            )
+        return result == "UPDATE 1"
+
     async def add_project_repository(
         self,
         project_id: str,
         name: str,
         repo_url: str,
+        repository_id: str | None = None,
         role: str = "source",
         description: str | None = None,
         credentials: Dict[str, Any] | None = None,
@@ -25640,18 +26673,22 @@ class PostgresDB:
             Created repository dict
         """
         project_uuid = UUID(project_id)
+        repository_uuid = UUID(str(repository_id)) if repository_id else uuid4()
+        if is_managed:
+            credentials = None
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO project_repositories
-                    (project_id, name, repo_url, role, description, credentials,
+                    (id, project_id, name, repo_url, role, description, credentials,
                      read_only, is_managed, branch, clone_path)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING id, project_id, name, description, repo_url, credentials,
                           role, read_only, is_managed, branch, clone_path,
                           created_at, updated_at
                 """,
+                repository_uuid,
                 project_uuid,
                 name,
                 repo_url,

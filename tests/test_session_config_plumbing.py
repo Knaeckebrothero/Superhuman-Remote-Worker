@@ -40,6 +40,7 @@ class _FakeAsyncClient:
 
     calls: list = []
     response_status: int = 200
+    response_text: str = ""
     raise_on_post: Exception | None = None
 
     def __init__(self, **kwargs):
@@ -55,13 +56,16 @@ class _FakeAsyncClient:
         if _FakeAsyncClient.raise_on_post is not None:
             raise _FakeAsyncClient.raise_on_post
         _FakeAsyncClient.calls.append({"url": url, "json": json})
-        return _FakeResponse(_FakeAsyncClient.response_status)
+        response = _FakeResponse(_FakeAsyncClient.response_status)
+        response.text = _FakeAsyncClient.response_text
+        return response
 
 
 @pytest.fixture(autouse=True)
 def _reset_fake_client():
     _FakeAsyncClient.calls = []
     _FakeAsyncClient.response_status = 200
+    _FakeAsyncClient.response_text = ""
     _FakeAsyncClient.raise_on_post = None
     yield
 
@@ -714,6 +718,39 @@ class TestSendSessionAttachPayload:
             )
 
         assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_attach_log_does_not_echo_secret_response(self, caplog):
+        private_material = "-----BEGIN OPENSSH PRIVATE KEY-----hidden"
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        _FakeAsyncClient.response_status = 422
+        _FakeAsyncClient.response_text = private_material
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is True
+        assert private_material not in caplog.text
+        assert "ambiguous attach response 422" in caplog.text
 
     @pytest.mark.asyncio
     async def test_transport_failure_retains_reservation(self):

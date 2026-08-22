@@ -2527,7 +2527,14 @@ class UniversalAgent:
                     },
                 }
             if status == "failed":
-                logger.warning(f"[{job_id}] Workspace provisioning failed: {ws}")
+                # Keep internal readiness payloads out of logs.  They can gain
+                # server-owned transport material as provisioning evolves;
+                # the stable status is all this poller needs to report.
+                logger.warning(
+                    "[%s] Workspace provisioning failed (status=%s)",
+                    job_id,
+                    status,
+                )
                 return None
             if status == "none":
                 # No workspace_container recorded — nothing is provisioning.
@@ -2726,49 +2733,27 @@ class UniversalAgent:
         return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
-        """Append repository (workspace git) context to datasources.md after clone.
+        """Append safe workspace Git guidance to datasources.md after clone.
 
-        This gives the agent a persistent reference for the git remote URL,
-        branch, and Gitea API endpoint so it can push and create PRs. The
-        system prompts point the agent at datasources.md for connection details.
+        Repository transport is server-owned. The model needs the branch and
+        ordinary ``origin`` workflow, not endpoint/authentication coordinates.
         """
-        from urllib.parse import urlparse
-
-        parsed = urlparse(git_url)
-        # Gitea API base: scheme://host/api/v1
-        gitea_api_base = f"{parsed.scheme}://{parsed.hostname}"
-        if parsed.port:
-            gitea_api_base += f":{parsed.port}"
-        gitea_api_base += "/api/v1"
-
-        # Repo path: strip .git suffix and leading slash
-        repo_path = parsed.path.rstrip("/")
-        if repo_path.endswith(".git"):
-            repo_path = repo_path[:-4]
-        repo_path = repo_path.lstrip("/")
-        # owner/repo
-        owner_repo = repo_path  # e.g. "user/my-repo"
+        del git_url
 
         section = f"""
 
 ## Repository Context
 
-- **Remote URL**: `{git_url}` (credentials embedded — use for push)
 - **Branch**: `{git_branch}`
-- **Gitea API**: `{gitea_api_base}`
-- **Repo path**: `{owner_repo}`
+- **Remote**: `origin` (preconfigured with repository-scoped write authority)
 
-### Push & PR Workflow
+### Push Workflow
 
 ```bash
-# Push (credentials are in the remote URL)
 git push origin {git_branch}
-
-# Create PR via Gitea API
-curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"title": "PR_TITLE", "head": "{git_branch}", "base": "main", "body": "PR_DESCRIPTION"}}'
 ```
+
+Do not replace `origin`; its authority is selected and installed by the server.
 """
         try:
             try:
@@ -2942,6 +2927,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             Updated metadata with workspace-relative paths
         """
         metadata = metadata or {}
+        # This internal bearer must not survive into graph/checkpoint metadata.
+        # Pop it before config resolution, logging, or any early-return branch.
+        managed_repository_credentials = metadata.pop(
+            "managed_repository_credentials", None
+        )
         # Fresh capture per job: files we write on top of the pod's git clone,
         # re-asserted if a pod re-provision drops them (see the reconnect hook).
         self._agent_seed_files = {}
@@ -3353,6 +3343,65 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.error(f"Failed to create remote backend: {e}")
                 raise
+
+        from .core.managed_repository import (
+            ManagedRepositoryMaterializationError,
+            materialize_managed_repository_credentials,
+            repository_url_has_credentials,
+        )
+        from urllib.parse import urlparse
+
+        runtime_repository_urls = materialize_managed_repository_credentials(
+            managed_repository_credentials, workspace_backend
+        )
+        del managed_repository_credentials
+        primary_url = metadata.get("git_remote_url")
+        if repository_url_has_credentials(primary_url):
+            raise ManagedRepositoryMaterializationError(
+                "credentialed_managed_repository_url_refused"
+            )
+        if primary_url:
+            primary_name = (
+                urlparse(str(primary_url))
+                .path.rstrip("/")
+                .rsplit("/", 1)[-1]
+                .removesuffix(".git")
+            )
+            if str(primary_url).startswith("ssh://srw-repo-"):
+                if primary_name not in runtime_repository_urls:
+                    raise ManagedRepositoryMaterializationError(
+                        "managed_repository_transport_mismatch"
+                    )
+                metadata["git_remote_url"] = runtime_repository_urls[primary_name]
+        rendered_repositories: list[dict[str, Any]] = []
+        for raw_repository in metadata.get("repositories") or []:
+            repository = dict(raw_repository)
+            repo_url = repository.get("repo_url")
+            if repository.get("is_managed") and repository_url_has_credentials(
+                repo_url
+            ):
+                raise ManagedRepositoryMaterializationError(
+                    "credentialed_managed_repository_url_refused"
+                )
+            if repository.get("is_managed"):
+                repo_name = str(repository.get("name") or "")
+                role = str(repository.get("role") or "")
+                runtime_url = runtime_repository_urls.get(repo_name)
+                if runtime_url is not None:
+                    repository["repo_url"] = runtime_url
+                elif role not in {"knowledge", "jobs"}:
+                    # Source/reference repositories are cloned into the agent
+                    # workspace, so a managed row without its exact scoped
+                    # runtime authority must fail closed. Knowledge and the
+                    # project jobs ledger are server-side planes that
+                    # WorkspaceManager deliberately does not clone.
+                    raise ManagedRepositoryMaterializationError(
+                        "managed_repository_transport_mismatch"
+                    )
+                repository["credentials"] = None
+            rendered_repositories.append(repository)
+        if rendered_repositories:
+            metadata["repositories"] = rendered_repositories
 
         # Worktree creation: subjobs on shared VM/container get a git worktree
         # instead of a full clone. The worktree is created on the remote machine.

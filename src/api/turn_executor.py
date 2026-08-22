@@ -1565,6 +1565,10 @@ class StatelessTurnExecutor:
             ("git_remote_url", "git_remote_url"),
             ("datasources", "datasources"),
             ("repositories", "repositories"),
+            (
+                "managed_repository_credentials",
+                "managed_repository_credentials",
+            ),
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
             ("runtime_actor", "runtime_actor"),

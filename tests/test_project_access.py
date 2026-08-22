@@ -543,6 +543,57 @@ class TestProjectMutationRoles:
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_managed_repository_read_only_patch_rotates_before_row_update(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        from main import ProjectRepositoryUpdate, update_project_repository
+
+        repository = {
+            "id": "repo-id",
+            "project_id": project_a["id"],
+            "name": "project-source",
+            "role": "source",
+            "read_only": False,
+            "is_managed": True,
+        }
+        fake_db.get_project_repository = AsyncMock(return_value=repository)
+        fake_db.update_project_repository = AsyncMock(return_value=True)
+        events: list[str] = []
+
+        async def rotate(*_args, **kwargs):
+            events.append("rotate")
+            assert "force" not in kwargs
+            assert _args[2]["read_only"] is True
+            return {"access_mode": "read"}
+
+        async def update(*_args, **_kwargs):
+            assert events == ["rotate"]
+            events.append("update")
+            return True
+
+        fake_db.update_project_repository.side_effect = update
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch(
+                "main.rotate_project_repository_authority",
+                AsyncMock(side_effect=rotate),
+            ) as rotation,
+        ):
+            result = await update_project_repository(
+                fake_request,
+                str(project_a["id"]),
+                "repo-id",
+                ProjectRepositoryUpdate(read_only=True),
+            )
+
+        assert result == {"status": "updated"}
+        assert events == ["rotate", "update"]
+        rotation.assert_awaited_once()
+        fake_db.update_project_repository.assert_awaited_once_with(
+            "repo-id", read_only=True
+        )
+
+    @pytest.mark.asyncio
     async def test_remove_repository_editor_403(
         self, user_b, project_a, fake_db, fake_request
     ):
@@ -566,7 +617,13 @@ class TestProjectMutationRoles:
         from main import remove_project_repository
 
         fake_db.get_project_repository = AsyncMock(
-            return_value={"id": "r", "role": "doc", "is_managed": False, "name": "r"}
+            return_value={
+                "id": "r",
+                "project_id": project_a["id"],
+                "role": "doc",
+                "is_managed": False,
+                "name": "r",
+            }
         )
         fake_db.remove_project_repository = AsyncMock(
             return_value={"is_managed": False, "name": "r"}
@@ -1007,7 +1064,13 @@ class TestArchivedProjectStaysReadableAndTearableDown:
         from main import remove_project_repository
 
         fake_db.get_project_repository = AsyncMock(
-            return_value={"id": "r", "role": "doc", "is_managed": False, "name": "r"}
+            return_value={
+                "id": "r",
+                "project_id": archived_project["id"],
+                "role": "doc",
+                "is_managed": False,
+                "name": "r",
+            }
         )
         fake_db.remove_project_repository = AsyncMock(
             return_value={"is_managed": False, "name": "r"}

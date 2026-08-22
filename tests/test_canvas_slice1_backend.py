@@ -2296,6 +2296,10 @@ class _DockerLeaseConnection:
                 elif "inventory_trust_invalid" in query:
                     row["quarantine_reason"] = "inventory_trust_invalid"
             return "UPDATE 1"
+        if query.lstrip().startswith("UPDATE threads AS target"):
+            current = self.threads.setdefault(str(args[0]), {})
+            current.update({"repo_name": args[1], "git_remote_url": args[2]})
+            return "UPDATE 1"
         if "COALESCE(metadata->'workspace_container'" in query:
             current = self.threads.setdefault(str(args[1]), {})
             current.update(json.loads(args[0]))
@@ -2515,12 +2519,10 @@ async def test_repository_merge_after_docker_allocation_preserves_lease_identity
     assert lease is not None
     lease_id = lease["_docker_workspace_lease_id"]
 
-    assert await db.merge_thread_workspace_context(
+    assert await db.bind_thread_managed_repository(
         thread_id,
-        {
-            "git_remote_url": "http://gitea/thread.git",
-            "repo_name": "thread-d6666666",
-        },
+        clean_url="http://gitea/thread.git",
+        repo_name="thread-d6666666",
     )
     merged = connection.threads[thread_id]
     assert merged["git_remote_url"] == "http://gitea/thread.git"
@@ -3125,6 +3127,9 @@ async def test_trusted_dev_cleanup_requires_and_pins_inventory_identity(
         validator.validate_host_public_key("workspace-1", "127.0.0.1", 30022, wrong_key)
         is False
     )
+    assert "ssh-add -D" in connection.command
+    assert "rm -rf -- /home/agent-host/.ssh/srw-managed" in connection.command
+    assert "test ! -e /home/agent-host/.ssh/srw-managed" in connection.command
     assert "rm -rf -- /home/agent-host/workspace" in connection.command
     assert "install -d -m 700 /home/agent-host/workspace" in connection.command
     assert "test ! -L /home/agent-host/workspace" in connection.command
