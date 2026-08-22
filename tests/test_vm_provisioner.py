@@ -126,6 +126,16 @@ class TestBackendSelection:
             assert provisioner.mode == "off"
         assert caplog.text.count("VM_MODE is unset") == 1
 
+    def test_invalid_mode_is_off_and_warns_once(self, caplog):
+        import orchestrator.services.vm_provisioner as vm_module
+
+        vm_module._warned_invalid_vm_mode = False
+        with patch.dict(os.environ, {"VM_MODE": "bogus"}, clear=True):
+            provisioner = vm_module.VMProvisioner()
+            assert provisioner.mode == "off"
+            assert provisioner.mode == "off"
+        assert caplog.text.count("Invalid VM_MODE") == 1
+
     def test_same_cluster_requires_controller_url(self):
         with patch.dict(os.environ, {"VM_MODE": "same-cluster"}, clear=True):
             from orchestrator.services.vm_provisioner import VMProvisioner
@@ -224,6 +234,10 @@ class TestCreateVm:
             "active_pod_uid": "launcher-uid-1",
         }
         provisioner_disabled._set_thread_vm_context = AsyncMock()
+        provisioner_disabled._db = MagicMock()
+        provisioner_disabled._db.get_workspace_network_tier = AsyncMock(
+            return_value="home-allowed"
+        )
         provisioner_disabled._http_client = MagicMock()
         provisioner_disabled._http_client.post = AsyncMock(return_value=response)
 
@@ -244,6 +258,7 @@ class TestCreateVm:
         payload = provisioner_disabled._http_client.post.await_args.kwargs["json"]
         assert payload["job_id"] == "thread-1"
         assert payload["entity_type"] == "thread"
+        assert payload["network_tier"] == "home-allowed"
         # An unsigned legacy controller response remains operational telemetry,
         # but its reusable names/UID strings are not authoritative identity.
         created_updates = provisioner_disabled._set_thread_vm_context.await_args_list[

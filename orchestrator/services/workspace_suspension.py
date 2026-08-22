@@ -571,12 +571,22 @@ class WorkspaceSuspensionService:
                         {"status": "failed", "error": "VM creation failed on restore"},
                     )
                     return False
-                logger.info(
-                    "VM restore for job %s created asynchronously; readiness and "
-                    "restore continuation are owned by the VM prober",
-                    job_id,
+                if vm_ctx.get("rootdisk") == "kept":
+                    logger.info(
+                        "VM restore for job %s is reusing its kept rootdisk; "
+                        "readiness is owned by the VM prober",
+                        job_id,
+                    )
+                    return True
+                error_msg = (
+                    "VM restore without a kept rootdisk requires a post-readiness "
+                    "snapshot extract (unsupported in same-cluster mode v1)"
                 )
-                return True
+                logger.error("%s (job %s)", error_msg, job_id)
+                await self._db.merge_vm_context(
+                    job_id, {"status": "failed", "error": error_msg}
+                )
+                return False
 
             else:
                 # K8s container (default): create a fresh pod
@@ -601,34 +611,24 @@ class WorkspaceSuspensionService:
             if not ssh_host:
                 error_msg = "no SSH host after provisioning for restore"
                 logger.error("%s (job %s)", error_msg, job_id)
-                if ws_ctx:
-                    await self._db.merge_workspace_container_context(
-                        job_id, {"status": "failed", "error": error_msg}
-                    )
-                elif vm_ctx:
-                    await self._db.merge_vm_context(
-                        job_id, {"status": "failed", "error": error_msg}
-                    )
+                await self._db.merge_workspace_container_context(
+                    job_id, {"status": "failed", "error": error_msg}
+                )
                 return False
 
             # Extract snapshot into the workspace. A failed extract is a failed
             # restore: the workspace is empty or half-populated, and stamping
             # 'ready' over it hands the dispatcher a blank tree that looks
             # healthy. Fail visibly instead and let the caller decide.
-            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
+            ssh_port = _resolve_ssh_port(ws_ctx, {})
             if not await self._extract_snapshot(
-                job_id, ssh_host, ssh_port=ssh_port, scoped_home=not restoring_vm
+                job_id, ssh_host, ssh_port=ssh_port, scoped_home=True
             ):
                 error_msg = "snapshot extraction failed on restore"
                 logger.error("%s (job %s)", error_msg, job_id)
-                if ws_ctx:
-                    await self._db.merge_workspace_container_context(
-                        job_id, {"status": "failed", "error": error_msg}
-                    )
-                elif vm_ctx:
-                    await self._db.merge_vm_context(
-                        job_id, {"status": "failed", "error": error_msg}
-                    )
+                await self._db.merge_workspace_container_context(
+                    job_id, {"status": "failed", "error": error_msg}
+                )
                 return False
 
             # Mark as ready
@@ -636,10 +636,7 @@ class WorkspaceSuspensionService:
                 "status": "ready",
                 "restored_at": datetime.now(timezone.utc).isoformat(),
             }
-            if ws_ctx:
-                await self._db.merge_workspace_container_context(job_id, restored_ctx)
-            elif vm_ctx:
-                await self._db.merge_vm_context(job_id, restored_ctx)
+            await self._db.merge_workspace_container_context(job_id, restored_ctx)
 
             logger.info(
                 "Workspace restored from S3 for job %s (ssh_host=%s)",

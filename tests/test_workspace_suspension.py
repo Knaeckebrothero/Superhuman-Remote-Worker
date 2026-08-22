@@ -369,6 +369,49 @@ class TestRestoreWorkspace:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_vm_restore_with_kept_rootdisk_defers_to_readiness_prober(self):
+        svc, vm_prov = make_vm_service()
+        vm_prov.create_vm = AsyncMock(return_value=True)
+        svc._db.get_job.return_value = {
+            "id": "job-vm",
+            "context": {"vm": {"status": "suspended", "rootdisk": "kept"}},
+        }
+        svc._extract_snapshot = AsyncMock()
+
+        result = await svc.restore_workspace("job-vm")
+
+        assert result is True
+        vm_prov.create_vm.assert_awaited_once_with("job-vm")
+        svc._extract_snapshot.assert_not_awaited()
+        assert not any(
+            call.args[1].get("status") == "failed"
+            for call in svc._db.merge_vm_context.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_vm_restore_without_kept_rootdisk_fails_visibly(self):
+        svc, vm_prov = make_vm_service()
+        vm_prov.create_vm = AsyncMock(return_value=True)
+        svc._db.get_job.return_value = {
+            "id": "job-vm",
+            "context": {"vm": {"status": "suspended", "rootdisk": "purged"}},
+        }
+        svc._extract_snapshot = AsyncMock()
+
+        result = await svc.restore_workspace("job-vm")
+
+        assert result is False
+        svc._extract_snapshot.assert_not_awaited()
+        failure = svc._db.merge_vm_context.await_args_list[-1].args[1]
+        assert failure == {
+            "status": "failed",
+            "error": (
+                "VM restore without a kept rootdisk requires a post-readiness "
+                "snapshot extract (unsupported in same-cluster mode v1)"
+            ),
+        }
+
 
 # =============================================================================
 # Test: _extract_snapshot command selection (pod home-only vs VM full)

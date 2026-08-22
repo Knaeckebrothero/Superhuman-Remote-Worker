@@ -13,6 +13,7 @@ import httpx
 
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 
+from .container_provisioner import DEFAULT_NETWORK_TIER
 from .nats_bridge import nats_bridge
 from .vm_lifecycle_auth import (
     AUTH_FIELD,
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _VALID_VM_MODES = frozenset({"off", "same-cluster", "external"})
 _warned_unset_vm_mode = False
+_warned_invalid_vm_mode = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +179,7 @@ class VMProvisioner:
     @property
     def mode(self) -> str:
         """Return ``off``, ``same-cluster``, or ``external`` from ``VM_MODE``."""
-        global _warned_unset_vm_mode
+        global _warned_invalid_vm_mode, _warned_unset_vm_mode
 
         raw_mode = os.environ.get("VM_MODE")
         if raw_mode is None:
@@ -187,7 +189,11 @@ class VMProvisioner:
             return "off"
         mode = raw_mode.strip().lower()
         if mode not in _VALID_VM_MODES:
-            logger.warning("Invalid VM_MODE=%r; VM provisioning is disabled", raw_mode)
+            if not _warned_invalid_vm_mode:
+                logger.warning(
+                    "Invalid VM_MODE=%r; VM provisioning is disabled", raw_mode
+                )
+                _warned_invalid_vm_mode = True
             return "off"
         return mode
 
@@ -1039,6 +1045,20 @@ class VMProvisioner:
         if self._http_client is None:
             return False
 
+        network_tier = DEFAULT_NETWORK_TIER
+        if self._db is not None:
+            try:
+                network_tier = (
+                    await self._db.get_workspace_network_tier(job_id, entity_type)
+                    or DEFAULT_NETWORK_TIER
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to resolve network_tier for %s=%s; using default",
+                    entity_type,
+                    job_id,
+                )
+
         payload: dict[str, Any] = {
             "job_id": job_id,
             "entity_type": entity_type,
@@ -1047,7 +1067,10 @@ class VMProvisioner:
             "memory": memory,
             "description": description,
             "nats_url": "",  # No NATS in same-cluster mode
+            "network_tier": network_tier,
         }
+        if orchestrator_url := os.getenv("ORCHESTRATOR_URL"):
+            payload["orchestrator_url"] = orchestrator_url
         generation = _provision_generation(provision_generation)
         if self._lifecycle_hmac_secret is not None and generation is None:
             logger.error(
