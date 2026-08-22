@@ -493,12 +493,41 @@ databases:
   # Without the sweep fix this refills, exactly as postgres did in ~4 days.
   vector:
     storageSize: "32Gi"
-    # Rehearsal 2026-08-22 reverted. `migrating` here is not inert: any Fleet
-    # apply recreates the Cluster and restarts a ~2.5h import that is currently
-    # KNOWN TO FAIL -- PostgreSQL 16 refuses to build idx_sources_content_fts
-    # over this data (source PG15 holds a 1,344,716-byte tsvector; the PG16
-    # limit is 1,048,575). Do not set it again until that is resolved.
-    # See knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
+    # -- MIGRATION IN PROGRESS, 2026-08-22.
+    #
+    #    `migrating` renders BOTH workloads: the legacy StatefulSet keeps
+    #    serving on its own Service while a CNPG Cluster imports from it over
+    #    the network. Nothing is written to the source.
+    #
+    #    This key is NOT inert. Any Fleet apply recreates a Cluster deleted by
+    #    hand and restarts the ~2.5h import from zero. Revert to a bare
+    #    `storageSize` once the Cluster is cut over, or if the import is
+    #    abandoned -- do not leave it set.
+    #
+    #    The earlier attempt failed because the target initdb'd under locale
+    #    `C` while the source is en_US.utf8; fixed chart-side in
+    #    `databases.locale`. Root cause and proof:
+    #    knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
+    engine: "migrating"
+    # -- Peak disk measured at 38 GB in the rehearsal: the 17 GB dump and the
+    #    restored data occupy this volume simultaneously. The inherited 32Gi
+    #    runs out ~2h in, after the dump has already completed. Separate key
+    #    because `storageSize` also sizes the LIVE StatefulSet's PVC, and a PVC
+    #    cannot shrink.
+    cnpgStorageSize: "64Gi"
+    cnpgResources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        # -- 8Gi peaked at 6502Mi on an index build that never finished, so the
+        #    true requirement was never measured. pg_restore --jobs=4 can run
+        #    four index builds at once, each entitled to maintenance_work_mem
+        #    (2GB) -- 8Gi exactly, with nothing left for anything else. An OOM
+        #    two hours in costs the whole run; the headroom costs nothing on a
+        #    node with 115Gi free.
+        cpu: "4"
+        memory: "12Gi"
 # Other DBs stay internal (chart defaults). Externalize here if needed.
 # NOTE: `vector:` is a REAL key above — add externalUrl to that block rather
 # than uncommenting a second one here, or it silently shadows the storageSize
