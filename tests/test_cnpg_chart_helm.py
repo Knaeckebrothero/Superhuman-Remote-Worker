@@ -386,19 +386,37 @@ def _sources(policy: dict, kind: str) -> list[dict]:
 
 
 @pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
+def test_cnpg_pods_are_allowed_in_by_their_own_label(key, component):
+    """The policy must select CNPG pods by `cnpg.io/cluster`, not by the
+    chart's component labels. During `migrating` those chart labels are
+    deliberately absent -- otherwise the legacy Service captures the pods --
+    so a component-label rule denies the IMPORT its read of the source
+    database. Verified live on dev 2026-08-22: Calico rejected pg_dump with
+    'connection refused' and the import failed in 25 seconds.
+
+    It is also tighter: only pods of that one cluster, rather than anything
+    wearing the component label."""
+    policy = _policies(f"databases.{key}.engine=migrating")[f"{FULLNAME}-{component}"]
+    selectors = _sources(policy, "podSelector")
+    assert any(
+        s["matchLabels"].get("cnpg.io/cluster") == f"{FULLNAME}-{component}"
+        for s in selectors
+    ), f"nothing admits the {component} cluster's own pods: {selectors}"
+
+
+@pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
 def test_replication_between_instances_is_allowed(key, component):
-    """Multi-instance CNPG streams WAL between its own pods on 5432. The
-    current from-list names orchestrator/agent/etc but not the DB itself."""
+    """Multi-instance CNPG streams WAL between its own pods on 5432, and the
+    same cnpg.io/cluster rule carries it -- the from-list otherwise names only
+    orchestrator/agent/etc, so replication would be silently blocked."""
     policy = _policies(f"databases.{key}.engine=cnpg", f"databases.{key}.instances=2")[
         f"{FULLNAME}-{component}"
     ]
     selectors = _sources(policy, "podSelector")
     assert any(
-        s["matchLabels"].get("app.kubernetes.io/component") == component
+        s["matchLabels"].get("cnpg.io/cluster") == f"{FULLNAME}-{component}"
         for s in selectors
-    ), (
-        "the database must accept connections from its own pods, or streaming replication is silently blocked"
-    )
+    ), "the database must accept connections from its own cluster's pods"
 
 
 @pytest.mark.parametrize("key,component", sorted(POLICY_COMPONENTS.items()))
