@@ -106,3 +106,75 @@ def test_operand_tag_is_a_real_version_not_a_commit_sha():
 def test_operand_image_is_not_wired_into_the_per_commit_tag_job():
     workflow = (ROOT / ".github/workflows/develop.yml").read_text()
     assert "cnpgImage" not in workflow
+
+
+# --- postgresql.parameters -------------------------------------------------
+
+
+def test_parameters_passthrough_merges_with_max_connections():
+    cluster = _clusters(
+        "databases.postgres.engine=cnpg",
+        "databases.postgres.parameters.maintenance_work_mem=2GB",
+    )[f"{FULLNAME}-postgres"]
+    parameters = cluster["spec"]["postgresql"]["parameters"]
+    assert parameters["max_connections"] == "100"
+    assert parameters["maintenance_work_mem"] == "2GB"
+
+
+def test_all_parameters_render_as_strings():
+    """CNPG's parameters map is map[string]string. An unquoted integer makes
+    the whole Cluster fail admission, which reads as a template bug."""
+    cluster = _clusters(
+        "databases.vector.engine=cnpg",
+        "databases.vector.parameters.max_parallel_maintenance_workers=4",
+    )[f"{FULLNAME}-pgvector"]
+    for value in cluster["spec"]["postgresql"]["parameters"].values():
+        assert isinstance(value, str)
+
+
+def test_vector_ships_index_build_parameters():
+    """A logical restore rebuilds all 3.9 GB of this database's HNSW indexes
+    from scratch. The legacy server did that at maintenance_work_mem 64MB."""
+    parameters = _clusters("databases.vector.engine=cnpg")[f"{FULLNAME}-pgvector"][
+        "spec"
+    ]["postgresql"]["parameters"]
+    assert parameters["maintenance_work_mem"] == "2GB"
+    assert parameters["max_parallel_maintenance_workers"] == "4"
+
+
+def test_vector_has_headroom_for_the_index_build():
+    """maintenance_work_mem above the pod's memory limit is an OOM kill, not a
+    slow build. The legacy limit was 1Gi against ~169Mi steady-state."""
+    resources = _clusters("databases.vector.engine=cnpg")[f"{FULLNAME}-pgvector"][
+        "spec"
+    ]["resources"]
+    assert resources["limits"]["memory"] == "8Gi"
+
+
+def test_other_databases_ship_no_extra_parameters():
+    for key in ("postgres", "audit", "gitea", "keycloak"):
+        component = DATABASES[key]
+        parameters = _clusters(f"databases.{key}.engine=cnpg")[
+            f"{FULLNAME}-{component}"
+        ]["spec"]["postgresql"]["parameters"]
+        assert set(parameters) == {"max_connections"}, key
+
+
+def test_legacy_statefulset_resources_are_untouched():
+    """`resources` sizes the legacy pod too. Raising it there restarts a live
+    database to reserve memory it never uses -- hence the separate key."""
+    statefulsets = {d["metadata"]["name"]: d for d in _kinds(_render(), "StatefulSet")}
+    container = statefulsets[f"{FULLNAME}-pgvector"]["spec"]["template"]["spec"][
+        "containers"
+    ][0]
+    assert container["resources"]["limits"]["memory"] == "1Gi"
+
+
+def test_no_imagevolume_extension_against_a_mismatched_operand():
+    """The only official pgvector extension images are PostgreSQL 18. The
+    operand is 16 and already carries pgvector, so mounting one would be a
+    major-version mismatch."""
+    for cluster in _clusters(*_all_cnpg()).values():
+        assert "extensions" not in cluster["spec"]["postgresql"], cluster["metadata"][
+            "name"
+        ]

@@ -184,18 +184,29 @@ def test_topology_key_is_overridable_for_zonal_hyperscaler_volumes():
     assert cluster["spec"]["affinity"]["topologyKey"] == "topology.kubernetes.io/zone"
 
 
-def test_only_the_vector_cluster_declares_pgvector():
-    clusters = _cluster(*_all_cnpg())
-    with_ext = {
-        c["metadata"]["name"]: [
-            e["name"] for e in c["spec"]["postgresql"].get("extensions", [])
+def test_pgvector_comes_from_the_operand_image_not_an_image_volume():
+    """Phase 2 declared pgvector as a CNPG ImageVolume extension. Phase 4
+    replaced that with an operand image carrying pgvector, because the only
+    official extension images are PostgreSQL 18 while the operand is 16 --
+    mounting one would be a major-version mismatch. Still only the vector
+    database needs it at all: the app DB creates btree_gist and uuid-ossp."""
+    for cluster in _cluster(*_all_cnpg()):
+        assert "extensions" not in cluster["spec"]["postgresql"], cluster["metadata"][
+            "name"
         ]
-        for c in clusters
-    }
-    assert with_ext[f"{FULLNAME}-pgvector"] == ["pgvector"]
-    for name, extensions in with_ext.items():
-        if name != f"{FULLNAME}-pgvector":
-            assert extensions == [], f"{name} should declare no extensions"
+
+
+def test_operand_image_never_inherits_the_statefulset_tag():
+    """CNPG parses imageName's tag as a PostgreSQL version and rejects
+    `pgvector/pgvector:pg15` with "invalid version tag" -- verified against the
+    live CRD. Phase 2 omitted the field; Phase 4 pins a purpose-built operand.
+    Either way it must never be the StatefulSet's own image."""
+    values = yaml.safe_load((CHART / "values.yaml").read_text())["databases"]
+    legacy = {values[key]["image"] for key in DATABASES}
+    for cluster in _cluster(*_all_cnpg()):
+        assert cluster["spec"].get("imageName") not in legacy, cluster["metadata"][
+            "name"
+        ]
 
 
 def test_storage_and_connection_defaults():
@@ -216,14 +227,6 @@ def test_invalid_engine_is_rejected():
     )
     assert result.returncode != 0
     assert "engine" in result.stderr or "bogus" in result.stderr
-
-
-def test_operand_image_is_omitted_rather_than_inheriting_the_statefulset_tag():
-    """CNPG parses imageName's tag as a PostgreSQL version and rejects
-    `pgvector/pgvector:pg15` with "invalid version tag" -- verified against
-    the live CRD. An omitted imageName lets the operator pick a valid one."""
-    for cluster in _cluster(*_all_cnpg()):
-        assert "imageName" not in cluster["spec"], cluster["metadata"]["name"]
 
 
 def test_operand_image_is_used_when_pinned():

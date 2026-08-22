@@ -1097,6 +1097,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
     # -- Include this database in backups when databases.backup.method is set.
     backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
@@ -1168,6 +1172,19 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    #
+    #    These two exist for the migration. A logical restore rebuilds all
+    #    3.9 GB of this database's HNSW indexes from scratch, and the legacy
+    #    server did that at maintenance_work_mem 64MB, where pgvector falls
+    #    back to building the graph on disk with repeated merges. Keep
+    #    maintenance_work_mem WELL under resources.limits.memory below -- above
+    #    it, the build is OOM-killed rather than slow.
+    parameters:
+      maintenance_work_mem: "2GB"
+      max_parallel_maintenance_workers: "4"
     # -- Include this database in backups when databases.backup.method is set.
     backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
@@ -1188,12 +1205,16 @@ databases:
     #    >= 2.1.0. The image tag encodes the PostgreSQL major ("-18-"), so it
     #    must match `image` below. Declaring an extension only makes it
     #    AVAILABLE; the migrations still run CREATE EXTENSION.
-    #    Alternative for older clusters: leave this empty and point `image` at
-    #    an operand image with pgvector already built in.
-    extensions:
-      - name: pgvector
-        image:
-          reference: ghcr.io/cloudnative-pg/pgvector:0.8.6-18-trixie
+    #    EMPTY ON PURPOSE. The operand image (`cnpgImage`) already carries
+    #    pgvector, which is the "alternative for older clusters" this comment
+    #    describes -- and it is not optional here: the only official extension
+    #    images are PostgreSQL 18, so mounting one into the PostgreSQL 16
+    #    operand would be a major-version mismatch. Revisit when the cluster
+    #    reaches Kubernetes 1.35 and the custom image can be retired:
+    #      - name: pgvector
+    #        image:
+    #          reference: ghcr.io/cloudnative-pg/pgvector:0.8.6-18-trixie
+    extensions: []
     internal: true
     # -- External mode connection parts. See ``databases.postgres`` above for
     # the rationale (credentials live in the Secret, not a bundled URL).
@@ -1216,6 +1237,21 @@ databases:
     image: pgvector/pgvector:pg15
     storageClass: ""
     storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Separate from `resources` above because that one
+    #    also sizes the legacy StatefulSet, and raising it there restarts a
+    #    live database to reserve memory it never uses. Empty = inherit.
+    cnpgResources:
+      requests:
+        # Sized for the index REBUILD a logical import performs, not for steady
+        # state: this database carries 3.9 GB of HNSW across ~850k rows, and
+        # the legacy pod ran it in ~169Mi. maintenance_work_mem above this
+        # limit is an OOM kill, not a slow build.
+        memory: "2Gi"
+        cpu: "100m"
+      limits:
+        memory: "8Gi"
+        cpu: "500m"
     resources:
       requests:
         memory: "256Mi"
@@ -1243,6 +1279,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
     # -- Audit is append-heavy, so it dominates WAL volume, and it is non-fatal
     #    by contract and already retention-bounded. Off by default; turn it on
     #    if the audit trail is a compliance artefact for you.
@@ -1311,6 +1351,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
     # -- Include this database in backups when databases.backup.method is set.
     backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
@@ -1365,6 +1409,10 @@ databases:
     #    checkpointer connections — is documented above under `orchestrator`.
     #    Leave headroom for the instance manager's own connections.
     maxConnections: 100
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
     # -- Include this database in backups when databases.backup.method is set.
     backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not

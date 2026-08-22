@@ -53,6 +53,9 @@ spec:
     # inherit the image default of 100.
     parameters:
       max_connections: {{ $db.maxConnections | default 100 | quote }}
+      {{- range $key, $value := $db.parameters }}
+      {{ $key }}: {{ $value | quote }}
+      {{- end }}
     {{- with $db.extensions }}
     extensions:
       {{- toYaml . | nindent 6 }}
@@ -72,8 +75,11 @@ spec:
       owner: {{ .owner | quote }}
       secret:
         name: {{ include "srw.fullname" $ctx }}-{{ .component }}-app
+  # cnpgResources when set: the shared `resources` also sizes the legacy
+  # StatefulSet, and a Cluster rebuilding indexes needs a ceiling that pod
+  # never does.
   resources:
-    {{- toYaml $db.resources | nindent 4 }}
+    {{- toYaml ($db.cnpgResources | default $db.resources) | nindent 4 }}
 {{- end }}
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
