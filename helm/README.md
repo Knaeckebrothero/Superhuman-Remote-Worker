@@ -52,6 +52,73 @@ Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
 - **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
+- **CloudNativePG** + the **Barman Cloud plugin**, only if you run the bundled
+  databases on `databases.<name>.engine: cnpg` and want backups — see
+  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg) below.
+  Neither is needed for the default StatefulSet engine.
+
+---
+
+## Bundled databases on CloudNativePG
+
+Each bundled database carries its own `databases.<name>.engine`:
+
+| value | renders | host helper points at |
+|---|---|---|
+| `statefulset` | the bundled single-replica StatefulSet | that Service |
+| `migrating` | **both** — the Cluster imports from the legacy Service | the legacy Service |
+| `cnpg` | the CloudNativePG `Cluster` only | `<name>-rw` |
+
+`statefulset` is the default and needs nothing installed. The rest of this
+section applies only if you change it.
+
+### The operator
+
+`databases.operator.install` ships **false**, because one operator serving many
+namespaces is the normal deployment and a second install fights the first over
+cluster-scoped CRDs — which Helm neither upgrades on `helm upgrade` nor removes
+on `helm uninstall`. Set it to `true` only on a cluster that has no
+CloudNativePG operator yet.
+
+### The Barman Cloud plugin — the chart cannot install this
+
+Backups (`databases.backup.method: objectstore`) additionally require the
+[Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud).
+`barmanObjectStore` on the `Cluster` resource was deprecated in CloudNativePG
+1.26 and is slated for removal in 1.30, so the plugin is the supported path.
+
+**This chart cannot install it, and will not try.** The plugin ships as a raw
+manifest with no Helm chart, and every namespaced object in it hardcodes the
+operator's namespace (`cnpg-system`) — a release deployed into its own
+namespace does not own that one. Install it yourself:
+
+```bash
+kubectl apply -f https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.14.0/manifest.yaml
+kubectl -n cnpg-system rollout status deployment barman-cloud
+kubectl -n cnpg-system logs deploy/cnpg-cloudnative-pg | grep "Registered plugin"
+```
+
+That last line is the one that matters. A running plugin pod does not mean the
+operator found it — discovery goes through the plugin's Service and its
+cert-manager-issued mTLS secrets, and a plugin the operator has not registered
+is invisible to every `Cluster`.
+
+It in turn requires **cert-manager** (for that mTLS) and **CloudNativePG
+>= 1.26**. If your operator is not in `cnpg-system`, re-namespace the manifest
+before applying it.
+
+`ObjectStore` itself is namespaced, so the chart does render that one alongside
+your clusters — only the plugin Deployment is confined to the operator's
+namespace.
+
+### Backups are off by default, deliberately
+
+`databases.backup.method` defaults to `none`. Pointing it at the chart's own
+bundled Garage would be **worse than having no backups**, because it would look
+like having them: Garage here is a single node on a single PVC in the same
+cluster as the databases it would be backing up, so one node loss takes both.
+`NOTES.txt` warns on install in both cases — no backups at all, and backups
+aimed at this release's own object store.
 
 ---
 
