@@ -1156,6 +1156,11 @@ databases:
     sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
     storageSize: "16Gi"
     resources:
       requests:
@@ -1256,6 +1261,11 @@ databases:
     sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
     storageSize: "16Gi"
     # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
     #    not `statefulset`. Separate from `resources` above because that one
@@ -1350,6 +1360,11 @@ databases:
     # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
     image: postgres:16
     storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
     storageSize: "16Gi"
     resources:
       requests:
@@ -1419,6 +1434,11 @@ databases:
     sslMode: "disable"
     image: postgres:16
     storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
     storageSize: "8Gi"
     resources:
       requests:
@@ -1483,6 +1503,11 @@ databases:
     externalUrl: ""
     image: postgres:15
     storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
     storageSize: "8Gi"
     resources:
       requests:

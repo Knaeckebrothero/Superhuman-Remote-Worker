@@ -36,7 +36,11 @@ spec:
     labels:
       {{- include "srw.componentSelectorLabels" (dict "context" $ctx "component" .component) | nindent 6 }}
   storage:
-    size: {{ $db.storageSize }}
+    # cnpgStorageSize when set. A logical import needs room for the data, the
+    # indexes it rebuilds AND the WAL it generates, all on this one volume --
+    # more than the legacy pod ever needed. Raising the shared `storageSize`
+    # instead would resize the LEGACY PVC too, and a PVC cannot shrink.
+    size: {{ $db.cnpgStorageSize | default $db.storageSize }}
     {{- if $db.storageClass }}
     storageClass: {{ $db.storageClass }}
     {{- end }}
