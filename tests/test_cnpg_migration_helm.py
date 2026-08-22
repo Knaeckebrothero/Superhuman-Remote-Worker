@@ -178,3 +178,77 @@ def test_no_imagevolume_extension_against_a_mismatched_operand():
         assert "extensions" not in cluster["spec"]["postgresql"], cluster["metadata"][
             "name"
         ]
+
+
+# --- the import ------------------------------------------------------------
+
+IMPORT_SOURCES = {
+    "postgres": ("srw", "srw", "POSTGRES_PASSWORD"),
+    "vector": ("srw_vector", "srw", "VECTOR_POSTGRES_PASSWORD"),
+    "audit": ("srw_audit", "srw", "AUDIT_POSTGRES_PASSWORD"),
+    "gitea": ("gitea", "gitea", "GITEA_DB_PASSWORD"),
+    "keycloak": ("keycloak", "keycloak", "KC_DB_PASSWORD"),
+}
+
+
+def test_cnpg_engine_bootstraps_empty():
+    """A fresh install has nothing to import from. Going straight to cnpg on
+    an EXISTING database is how you get an empty one -- pass through
+    migrating."""
+    cluster = _clusters("databases.postgres.engine=cnpg")[f"{FULLNAME}-postgres"]
+    assert "import" not in cluster["spec"]["bootstrap"]["initdb"]
+    assert "externalClusters" not in cluster["spec"]
+
+
+@pytest.mark.parametrize("key", sorted(IMPORT_SOURCES))
+def test_migrating_imports_each_database_from_its_own_legacy_service(key):
+    database, owner, password_key = IMPORT_SOURCES[key]
+    component = DATABASES[key]
+    cluster = _clusters(f"databases.{key}.engine=migrating")[f"{FULLNAME}-{component}"]
+
+    import_spec = cluster["spec"]["bootstrap"]["initdb"]["import"]
+    assert import_spec["type"] == "microservice"
+    assert import_spec["databases"] == [database]
+
+    source = [
+        c
+        for c in cluster["spec"]["externalClusters"]
+        if c["name"] == import_spec["source"]["externalCluster"]
+    ][0]
+    assert source["connectionParameters"]["host"] == f"{FULLNAME}-{component}"
+    assert source["connectionParameters"]["dbname"] == database
+    assert source["connectionParameters"]["user"] == owner
+    assert source["password"] == {"name": FULLNAME, "key": password_key}
+
+
+def test_import_source_is_the_legacy_service_not_the_cluster_itself():
+    """The Cluster and the legacy Service share a name. Pointing the import at
+    `-rw` would have it bootstrap from itself."""
+    cluster = _clusters("databases.postgres.engine=migrating")[f"{FULLNAME}-postgres"]
+    host = cluster["spec"]["externalClusters"][0]["connectionParameters"]["host"]
+    assert not host.endswith("-rw")
+
+
+def test_import_parallelises_the_index_rebuild_for_vector():
+    """Index creation happens in pg_restore's post-data section."""
+    cluster = _clusters("databases.vector.engine=migrating")[f"{FULLNAME}-pgvector"]
+    options = cluster["spec"]["bootstrap"]["initdb"]["import"][
+        "pgRestorePostdataOptions"
+    ]
+    assert "--jobs=4" in options
+
+
+def test_other_databases_do_not_parallelise_by_default():
+    cluster = _clusters("databases.gitea.engine=migrating")[f"{FULLNAME}-giteadb"]
+    assert (
+        "pgRestorePostdataOptions"
+        not in cluster["spec"]["bootstrap"]["initdb"]["import"]
+    )
+
+
+def test_migrating_still_renders_the_legacy_statefulset():
+    """The import reads from the legacy Service, so it must still exist."""
+    documents = _render("databases.postgres.engine=migrating")
+    assert f"{FULLNAME}-postgres" in {
+        d["metadata"]["name"] for d in _kinds(documents, "StatefulSet")
+    }
