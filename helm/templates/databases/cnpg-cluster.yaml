@@ -30,11 +30,24 @@ spec:
   # ("pg15") fails CNPG's version parse.
   imageName: {{ . }}
   {{- end }}
+  {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "cnpg" }}
   # Carries the chart's component labels onto every pod CNPG creates, so the
-  # existing NetworkPolicy and Service selectors keep matching unmodified.
+  # existing NetworkPolicy selectors keep matching unmodified.
+  #
+  # ONLY at engine `cnpg`, never while `migrating`. The legacy Service selects
+  # on these exact labels, and during `migrating` it still exists and still
+  # carries live traffic -- so labelling the new pods would make that Service
+  # load-balance across the real database and a half-imported copy. Reads would
+  # be intermittently wrong and any write landing on the new cluster would be
+  # lost when the import is discarded.
+  #
+  # The cost is that no NetworkPolicy selects the importing cluster during the
+  # window, so it is reachable in-namespace. That window is short and holds a
+  # copy, where the alternative corrupts the original.
   inheritedMetadata:
     labels:
       {{- include "srw.componentSelectorLabels" (dict "context" $ctx "component" .component) | nindent 6 }}
+  {{- end }}
   storage:
     # cnpgStorageSize when set. A logical import needs room for the data, the
     # indexes it rebuilds AND the WAL it generates, all on this one volume --
