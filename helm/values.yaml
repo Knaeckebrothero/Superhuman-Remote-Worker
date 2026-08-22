@@ -2620,52 +2620,59 @@ nats:
       memory: "512Mi"
 
 # =============================================================================
-# VM Controller (optional, same-cluster KubeVirt)
+# VM workspaces
 # =============================================================================
-# Co-locates the VM Controller in the orchestrator's cluster so VMs can be
-# created without standing up a second Kubernetes cluster + NATS.
+vm:
+  # -- VM topology: off | same-cluster | external.
+  mode: "off"
+  # -- Shared lifecycle HMAC Secret read by the orchestrator and, in
+  # same-cluster mode, by the VM controller.
+  lifecycleAuthSecretName: ""
+  lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  preflight:
+    # -- Fail install/upgrade from a hook Job when KubeVirt/CDI CRDs are absent.
+    enabled: true
+    # -- Also require CRD API versions while rendering. Keep false for Fleet
+    # controller and plain `helm template` compatibility.
+    renderTime: false
+
+# =============================================================================
+# VM Controller (same-cluster KubeVirt)
+# =============================================================================
 #
 # Prerequisites the chart does NOT install (operator must do this first):
 #   - KubeVirt operator + KubeVirt CR (cluster-scoped)
 #   - CDI operator (DataVolume support — used by the VM template)
 #   - Nodes with hardware virtualization (vmx/svm) and KubeVirt feature gates
 #
-# Trade-offs vs. the cross-cluster (NATS) path:
-#   - Blast radius is namespace-scoped instead of cluster-scoped (weaker isolation)
-#   - HTTP transport carries lifecycle (create/delete/query) only. In-VM daemon
-#     events (register, heartbeat, freeze, resume) still need NATS — set
-#     vmController.transport=both and configure nats.url if you need them.
 vmController:
-  # -- Deploy the VM controller into the same cluster as the orchestrator.
+  # -- DEPRECATED one-release alias. true resolves vm.mode=off to same-cluster.
   enabled: false
-  # -- Transport: "http" (no NATS, lifecycle only) | "nats" (cross-cluster,
-  # full feature set) | "both" (HTTP for lifecycle + NATS for daemon events).
+  # -- DEPRECATED one-release alias. Same-cluster transport is always HTTP.
   transport: http
-  # -- Namespace for the controller and VMs. Defaults to the release namespace
-  # when empty. A dedicated namespace is recommended so the controller's RBAC
-  # (kubevirt.io verbs) stays scoped away from the orchestrator's namespace.
-  namespace: agent-vms
+  # -- Must be empty in same-cluster mode; controller and VMs use the release namespace.
+  namespace: ""
   image:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
     tag: latest
     pullPolicy: Always
   service:
     port: 8080
-  # -- Dedicated shared HMAC credential for lifecycle commands and identity
-  # responses. The Secret must exist in the controller namespace and contain
-  # the same value as infrastructureMetering.vmLifecycleAuthSecretName in the
-  # orchestrator namespace. It must never be an application/collector Secret.
-  # Empty preserves legacy provisioning but VM compute/storage is unattributed.
-  lifecycleAuthSecretName: ""
-  lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
   # -- Default VM image — override per-job via the orchestrator API.
   # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
   # so the VM base tracks the chart release. Set explicitly to pin a specific tag.
   defaultVmImage: ""
-  # -- Per-VM size: 8 cores / 16Gi (bumped from 2c/4Gi 2026-06-21). Workspace
+  # -- Per-VM size. Workspace
   # *containers* (sandbox tier) are sized separately and are NOT affected.
-  defaultCpu: 8
-  defaultMemory: 16Gi
+  defaultCpu: 4
+  defaultMemory: 8Gi
+  # -- Zero disables the controller-side live-VM capacity gate.
+  maxConcurrentVms: 4
+  # -- Placement copied into each VMI template.
+  nodeSelector: {}
+  tolerations: []
+  # -- NetworkPolicy tier stamped on each VMI/launcher pod.
+  defaultNetworkTier: internet-only
   # -- CDI DataVolume storage class + size for the VM root disk.
   vmStorageClass: local-path
   vmDiskSize: 20Gi
@@ -2682,7 +2689,8 @@ vmController:
       enabled: true
       keep: 3            # keep the N newest image digests
       minAgeMinutes: 30  # don't GC a golden younger than this
-  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
+  # -- Persistent VM rootdisks, shared by same-cluster and external modes
+  # (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # Create each VM's root disk as a standalone DataVolume instead of via
   # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
   # recreate reattaches it by name: files survive a crash or a suspend, and the
@@ -2695,23 +2703,6 @@ vmController:
     gc:
       enabled: false
       orphanHours: 72
-  # -- SSH public key injected into the VM's authorized_keys (cloud-init).
-  # The matching private key lives in the chart's vm-ssh-key secret and is
-  # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode
-  # since there's no external Headscale to dial — agents SSH directly to the
-  # VM's pod IP.
-  vmSshPublicKey: ""
-  headscale:
-    # -- Existing Secret with a Headscale API key. Empty disables the mesh.
-    apiKeySecretName: ""
-    apiKeySecretKey: api-key
-    user: srw
-    # -- Pre-auth key registration deadline (minutes). The VM must join the mesh
-    # within this window of key mint (at VM-create); it must exceed worst-case
-    # create→join, which includes the cold per-VM image import — not just boot.
-    # 10 (old default) expired mid-import for tier upgrades. See
-    # knowledge-base/knowledge/features/workspace_tier_upgrade.md Q7.
-    keyExpiryMinutes: 30
   resources:
     requests:
       memory: "64Mi"

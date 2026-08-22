@@ -1188,6 +1188,12 @@ spec:
                   key: NTFY_TOKEN
                   optional: true
             # VM lifecycle (optional)
+            - name: VM_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_MODE
+            {{- if eq (include "srw.vmMode" .) "external" }}
             - name: NATS_URL
               valueFrom:
                 configMapKeyRef:
@@ -1200,19 +1206,21 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: ORCHESTRATOR_ID
                   optional: true
-            {{- if .Values.infrastructureMetering.vmLifecycleAuthSecretName }}
+            {{- end }}
+            {{- if and (include "srw.vmSameCluster" .) (include "srw.vmLifecycleAuthSecretName" .) }}
             - name: VM_LIFECYCLE_HMAC_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.infrastructureMetering.vmLifecycleAuthSecretName | quote }}
-                  key: {{ .Values.infrastructureMetering.vmLifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET" | quote }}
-            {{- end }}
-            - name: VM_TEMPLATE_PATH
+                  name: {{ include "srw.vmLifecycleAuthSecretName" . | quote }}
+                  key: {{ .Values.vm.lifecycleAuthSecretKey | quote }}
+            {{- else if and (eq (include "srw.vmMode" .) "external") (include "srw.vmLifecycleAuthSecretName" .) }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
               valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: VM_TEMPLATE_PATH
-                  optional: true
+                secretKeyRef:
+                  name: {{ include "srw.vmLifecycleAuthSecretName" . | quote }}
+                  key: {{ ternary .Values.vm.lifecycleAuthSecretKey (.Values.infrastructureMetering.vmLifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") (not (empty .Values.vm.lifecycleAuthSecretName)) | quote }}
+            {{- end }}
+            {{- if include "srw.vmSameCluster" . }}
             - name: VM_NAMESPACE
               valueFrom:
                 configMapKeyRef:
@@ -1225,6 +1233,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_CONTROLLER_URL
                   optional: true
+            {{- end }}
             - name: VM_PERSISTENT_ROOTDISK
               valueFrom:
                 configMapKeyRef:
@@ -1314,6 +1323,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: OFFICER_RUNTIME_VERIFICATION_ENABLED
+            {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED
               valueFrom:
@@ -1333,6 +1343,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: HEADSCALE_URL
                   optional: true
+            {{- end }}
             # Codex OAuth Proxy
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"

@@ -147,7 +147,31 @@ exposes an HTTP API on Service `srw.vmControllerServiceName` port
 {{- end }}
 
 {{- define "srw.vmControllerNamespace" -}}
-{{- default .Release.Namespace .Values.vmController.namespace }}
+{{- .Release.Namespace }}
+{{- end }}
+
+{{/* Resolve the one-release vmController.enabled alias. */}}
+{{- define "srw.vmMode" -}}
+{{- $mode := .Values.vm.mode | default "off" -}}
+{{- if and .Values.vmController.enabled (eq $mode "off") -}}
+same-cluster
+{{- else -}}
+{{- $mode -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.vmSameCluster" -}}
+{{- if eq (include "srw.vmMode" .) "same-cluster" -}}true{{- end -}}
+{{- end }}
+
+{{- define "srw.orchestratorClusterUrl" -}}
+{{- printf "http://%s-orchestrator.%s.svc.cluster.local:8085" (include "srw.fullname" .) .Release.Namespace -}}
+{{- end }}
+
+{{- define "srw.vmLifecycleAuthSecretName" -}}
+{{- $legacy := .Values.infrastructureMetering.vmLifecycleAuthSecretName | default "" -}}
+{{- $name := .Values.vm.lifecycleAuthSecretName | default $legacy -}}
+{{- $name -}}
 {{- end }}
 
 {{/*
@@ -158,7 +182,7 @@ exported so the orchestrator's HTTP transport is available even though
 NATS takes priority.
 */}}
 {{- define "srw.vmControllerUrl" -}}
-{{- if and .Values.vmController.enabled (ne .Values.vmController.transport "nats") }}
+{{- if eq (include "srw.vmMode" .) "same-cluster" }}
 {{- printf "http://%s.%s.svc.cluster.local:%d"
     (include "srw.vmControllerServiceName" .)
     (include "srw.vmControllerNamespace" .)

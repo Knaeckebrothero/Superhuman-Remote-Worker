@@ -1,4 +1,4 @@
-{{- if and .Values.vmController.enabled (ne .Values.vmController.transport "nats") }}
+{{- if include "srw.vmSameCluster" . }}
 apiVersion: v1
 kind: Service
 metadata:
