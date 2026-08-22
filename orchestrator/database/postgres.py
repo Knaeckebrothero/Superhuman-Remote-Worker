@@ -5508,6 +5508,8 @@ class PostgresDB:
         job_id: str,
         expected_generation: str,
         vm_updates: Dict[str, Any],
+        *,
+        require_status_not_ready: bool = False,
     ) -> bool:
         """Atomically merge only into the still-current VM provision.
 
@@ -5531,7 +5533,9 @@ class PostgresDB:
             "), "
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2 "
-            "  AND context->'vm'->>'provision_generation' = $3"
+            "  AND context->'vm'->>'provision_generation' = $3 "
+            "  AND ($4::boolean = FALSE "
+            "       OR context->'vm'->>'status' IS DISTINCT FROM 'ready')"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -5539,9 +5543,47 @@ class PostgresDB:
                 json_module.dumps(vm_updates),
                 uuid_val,
                 expected_generation,
+                require_status_not_ready,
             )
 
         return result == "UPDATE 1"
+
+    async def list_job_vm_readiness_candidates(self, *, ready: bool = False) -> list:
+        status_clause = (
+            'context @> \'{"vm":{"status":"ready"}}\'::jsonb'
+            if ready
+            else " OR ".join(
+                f'context @> \'{{"vm":{{"status":"{status}"}}}}\'::jsonb'
+                for status in (
+                    "created",
+                    "provisioning",
+                    "starting",
+                    "restoring",
+                    "ssh_pending",
+                )
+            )
+        )
+        query = (
+            "SELECT id::text AS entity_id, user_id::text AS user_id, "
+            "context->'vm' AS vm FROM jobs WHERE (" + status_clause + ")"
+        )
+        async with self.acquire() as conn:
+            return [dict(row) for row in await conn.fetch(query)]
+
+    async def get_vm_provision_generation(
+        self, entity_id: str, *, is_thread: bool
+    ) -> str | None:
+        try:
+            uuid_val = UUID(entity_id)
+        except ValueError:
+            return None
+        table = "threads" if is_thread else "jobs"
+        column = "metadata" if is_thread else "context"
+        query = (
+            f"SELECT {column}->'vm'->>'provision_generation' FROM {table} WHERE id = $1"
+        )
+        async with self.acquire() as conn:
+            return await conn.fetchval(query, uuid_val)
 
     async def merge_snapshot_context(
         self, job_id: str, snapshot_updates: Dict[str, Any]
@@ -7481,6 +7523,8 @@ class PostgresDB:
         thread_id: str,
         expected_generation: str,
         vm_updates: Dict[str, Any],
+        *,
+        require_status_not_ready: bool = False,
     ) -> bool:
         """Atomically merge only into the current thread VM provision."""
         import json as json_module
@@ -7499,7 +7543,9 @@ class PostgresDB:
             "), "
             "    last_activity = CURRENT_TIMESTAMP "
             "WHERE id = $2 "
-            "  AND metadata->'vm'->>'provision_generation' = $3"
+            "  AND metadata->'vm'->>'provision_generation' = $3 "
+            "  AND ($4::boolean = FALSE "
+            "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready')"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -7507,9 +7553,32 @@ class PostgresDB:
                 json_module.dumps(vm_updates),
                 uuid_val,
                 expected_generation,
+                require_status_not_ready,
             )
 
         return result == "UPDATE 1"
+
+    async def list_thread_vm_readiness_candidates(self, *, ready: bool = False) -> list:
+        status_clause = (
+            'metadata @> \'{"vm":{"status":"ready"}}\'::jsonb'
+            if ready
+            else " OR ".join(
+                f'metadata @> \'{{"vm":{{"status":"{status}"}}}}\'::jsonb'
+                for status in (
+                    "created",
+                    "provisioning",
+                    "starting",
+                    "restoring",
+                    "ssh_pending",
+                )
+            )
+        )
+        query = (
+            "SELECT id::text AS entity_id, user_id::text AS user_id, "
+            "metadata->'vm' AS vm FROM threads WHERE (" + status_clause + ")"
+        )
+        async with self.acquire() as conn:
+            return [dict(row) for row in await conn.fetch(query)]
 
     async def merge_thread_snapshot_context(
         self, thread_id: str, snapshot_updates: Dict[str, Any]

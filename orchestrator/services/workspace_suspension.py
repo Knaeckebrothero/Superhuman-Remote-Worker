@@ -571,11 +571,12 @@ class WorkspaceSuspensionService:
                         {"status": "failed", "error": "VM creation failed on restore"},
                     )
                     return False
-
-                # Re-read context to get SSH coordinates
-                job = await self._db.get_job(job_id)
-                vm_ctx = (job.get("context") or {}).get("vm", {})
-                ssh_host = vm_ctx.get("ssh_host")
+                logger.info(
+                    "VM restore for job %s created asynchronously; readiness and "
+                    "restore continuation are owned by the VM prober",
+                    job_id,
+                )
+                return True
 
             else:
                 # K8s container (default): create a fresh pod

@@ -9,8 +9,10 @@ knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md
 from __future__ import annotations
 
 from orchestrator.services.dispatch_guards import (
+    VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
     VM_HEADSCALE_POLL,
+    VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
     VM_PARK_HEADSCALE,
@@ -205,6 +207,30 @@ class TestVmGoldenWaitDecision:
         ctx = {"status": "waiting_golden", "golden_wait_started_at": 100.0}
         assert self._decide(ctx, now=2800.0, golden_timeout_s=2700.0) == VM_GOLDEN_POLL
         assert self._decide(ctx, now=2800.1, golden_timeout_s=2700.0) == VM_PARK_GOLDEN
+
+
+class TestVmCapacityWaitDecision:
+    def _decide(self, vm_ctx, *, now=1000.0, capacity_timeout_s=2700.0):
+        return vm_provisioning_decision(
+            vm_ctx,
+            provision_attempts=3,
+            max_provision_attempts=3,
+            now=now,
+            timeout_s=600.0,
+            capacity_timeout_s=capacity_timeout_s,
+        )
+
+    def test_waiting_capacity_polls_without_consuming_attempts(self):
+        ctx = {"status": "waiting_capacity", "capacity_wait_started_at": 900.0}
+        assert self._decide(ctx) == VM_CAPACITY_POLL
+
+    def test_waiting_capacity_polls_before_anchor(self):
+        assert self._decide({"status": "waiting_capacity"}) == VM_CAPACITY_POLL
+
+    def test_waiting_capacity_parks_past_budget(self):
+        ctx = {"status": "waiting_capacity", "capacity_wait_started_at": 100.0}
+        assert self._decide(ctx, now=2800.0) == VM_CAPACITY_POLL
+        assert self._decide(ctx, now=2800.1) == VM_PARK_CAPACITY
 
 
 class TestVmHeadscaleWaitDecision:

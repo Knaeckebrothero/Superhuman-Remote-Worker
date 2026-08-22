@@ -421,14 +421,10 @@ async def test_flag_off_cascade_pause_preserves_unusable_agent_early_return(assi
         return_value={"id": assigned, "status": "offline", "pod_ip": None}
     )
     db.pause_job = AsyncMock()
-    provisioner = MagicMock()
-    provisioner.send_control = AsyncMock()
     with (
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
         patch.object(main, "postgres_db", db),
-        patch.object(main, "vm_provisioner", provisioner),
     ):
         await main._cascade_pause_to_children(str(uuid4()))
 
     db.pause_job.assert_not_awaited()
-    provisioner.send_control.assert_not_awaited()

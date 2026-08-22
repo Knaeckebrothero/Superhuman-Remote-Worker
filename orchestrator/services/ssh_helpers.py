@@ -155,6 +155,8 @@ def orchestrator_can_reach(host: Optional[str]) -> bool:
     Escape hatch: set ORCHESTRATOR_HAS_TAILNET_ROUTE=true on deployments that
     give the orchestrator tailnet membership (e.g. a future tailscale sidecar).
     """
+    if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster":
+        return True
     if not is_tailnet_addr(host):
         return True
     return os.getenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", "").lower() == "true"
