@@ -19,6 +19,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "srw.fullname" $ }}-workspace-policy-{{ $tier.name }}
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- include "srw.labels" $ | nindent 4 }}
     srw.io/network-tier: {{ $tier.name }}
@@ -51,6 +52,10 @@ spec:
               app: srw-agent-stateless
         {{- end }}
       ports:
+        {{- if include "srw.vmSameCluster" $ }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
         - protocol: TCP
           port: 30022
         - protocol: TCP
@@ -61,6 +66,10 @@ spec:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
       ports:
+        {{- if include "srw.vmSameCluster" $ }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
         - protocol: TCP
           port: 30022
     {{- if $.Values.canvas.livePreview.viewer.enabled }}
@@ -97,6 +106,16 @@ spec:
         - protocol: TCP
           port: 38080
   egress:
+    {{- if include "srw.vmSameCluster" $ }}
+    # Guest daemons call the co-located orchestrator directly over HTTP.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+    {{- end }}
     # DNS resolution
     - ports:
         - protocol: UDP
@@ -214,6 +233,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "srw.fullname" . }}-workspace-fallback-deny
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "srw.labels" . | nindent 4 }}
 spec:

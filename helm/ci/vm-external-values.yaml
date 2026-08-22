@@ -1,0 +1,21 @@
+# External VM controller scenario. The controller itself is installed from
+# helm-vm-cluster; this chart renders only the orchestrator-facing contract.
+license:
+  acceptTerms: true
+
+global:
+  domain: "vm-external.example.com"
+
+vm:
+  mode: external
+
+orchestratorId: vm-external-ci
+
+nats:
+  url: "nats://nats.vm-system.svc.cluster.local:4222"
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false

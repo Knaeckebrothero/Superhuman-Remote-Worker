@@ -10,7 +10,15 @@
 {{- $remoteInventory := or (.Values.infrastructureMetering.vmInventoryEnabled | default false) $vmPvcInventory $vmPvInventory -}}
 {{- $remoteStorageInventory := or $vmPvcInventory $vmPvInventory -}}
 {{- $primaryIngestionSecretName := .Values.infrastructureMetering.ingestionSecretName | default (printf "%s-infra-ingestion" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
-{{- $vmLifecycleAuthSecretName := .Values.infrastructureMetering.vmLifecycleAuthSecretName | default "" -}}
+{{- $vmLifecycleAuthSecretName := include "srw.vmLifecycleAuthSecretName" . -}}
+{{- /* Same-cluster VMs are inventoried by this cluster's own identity; external mode
+     must name the remote VM cluster explicitly, so the defaults apply only here. */ -}}
+{{- $vmMeteringStableClusterId := .Values.infrastructureMetering.vmStableClusterId -}}
+{{- $vmMeteringNamespace := .Values.infrastructureMetering.vmNamespace -}}
+{{- if include "srw.vmSameCluster" . -}}
+{{- $vmMeteringStableClusterId = $vmMeteringStableClusterId | default .Values.infrastructureMetering.stableClusterId -}}
+{{- $vmMeteringNamespace = $vmMeteringNamespace | default .Release.Namespace -}}
+{{- end -}}
 {{- $volumeIdentitySecretName := .Values.infrastructureMetering.volumeIdentitySecretName | default (printf "%s-infra-volume-identity" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
 {{- if $vmLifecycleAuthSecretName }}
 {{- if eq $vmLifecycleAuthSecretName (include "srw.secretName" .) }}
@@ -27,36 +35,6 @@
 {{- end }}
 {{- if eq $vmLifecycleAuthSecretName $volumeIdentitySecretName }}
 {{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from volumeIdentitySecretName" }}
-{{- end }}
-{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq .Values.vmController.lifecycleAuthSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
-{{- fail "vmController.lifecycleAuthSecretName must be separate from vmIngestionSecretName" }}
-{{- end }}
-{{- if and .Values.infrastructureMetering.vmStorageIngestionSecretName (eq .Values.vmController.lifecycleAuthSecretName .Values.infrastructureMetering.vmStorageIngestionSecretName) }}
-{{- fail "vmController.lifecycleAuthSecretName must be separate from vmStorageIngestionSecretName" }}
-{{- end }}
-{{- if eq .Values.vmController.lifecycleAuthSecretName $volumeIdentitySecretName }}
-{{- fail "vmController.lifecycleAuthSecretName must be separate from volumeIdentitySecretName" }}
-{{- end }}
-{{- end }}
-{{- if .Values.vmController.lifecycleAuthSecretName }}
-{{- if eq .Values.vmController.lifecycleAuthSecretName (include "srw.secretName" .) }}
-{{- fail "vmController.lifecycleAuthSecretName must be separate from the application Secret" }}
-{{- end }}
-{{- if eq .Values.vmController.lifecycleAuthSecretName $primaryIngestionSecretName }}
-{{- fail "vmController.lifecycleAuthSecretName must be separate from infrastructure metering ingestion Secrets" }}
-{{- end }}
-{{- end }}
-{{- if .Values.vmController.enabled }}
-{{- if ne (empty $vmLifecycleAuthSecretName) (empty .Values.vmController.lifecycleAuthSecretName) }}
-{{- fail "vmController.enabled requires infrastructureMetering.vmLifecycleAuthSecretName and vmController.lifecycleAuthSecretName to be both set or both empty" }}
-{{- end }}
-{{- if and $vmLifecycleAuthSecretName .Values.vmController.lifecycleAuthSecretName }}
-{{- if ne $vmLifecycleAuthSecretName .Values.vmController.lifecycleAuthSecretName }}
-{{- fail "co-located vmController lifecycle authentication must use the same Secret name as infrastructureMetering.vmLifecycleAuthSecretName" }}
-{{- end }}
-{{- if ne (.Values.infrastructureMetering.vmLifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") (.Values.vmController.lifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") }}
-{{- fail "co-located vmController lifecycle authentication must use the same Secret key as infrastructureMetering.vmLifecycleAuthSecretKey" }}
-{{- end }}
 {{- end }}
 {{- end }}
 {{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
@@ -143,10 +121,10 @@
 {{- if not .Values.infrastructureMetering.collectorEnabled }}
 {{- fail "infrastructureMetering.vmInventoryEnabled requires collectorEnabled" }}
 {{- end }}
-{{- if not .Values.infrastructureMetering.vmStableClusterId }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmStableClusterId) }}
 {{- fail "infrastructureMetering.vmInventoryEnabled requires vmStableClusterId" }}
 {{- end }}
-{{- if not .Values.infrastructureMetering.vmNamespace }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmNamespace) }}
 {{- fail "infrastructureMetering.vmInventoryEnabled requires vmNamespace" }}
 {{- end }}
 {{- if not .Values.infrastructureMetering.vmIngestionSecretName }}
@@ -182,10 +160,10 @@
 {{- if not .Values.infrastructureMetering.collectorEnabled }}
 {{- fail "infrastructureMetering remote storage inventory requires collectorEnabled" }}
 {{- end }}
-{{- if not .Values.infrastructureMetering.vmStableClusterId }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmStableClusterId) }}
 {{- fail "infrastructureMetering remote storage inventory requires vmStableClusterId" }}
 {{- end }}
-{{- if not .Values.infrastructureMetering.vmNamespace }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmNamespace) }}
 {{- fail "infrastructureMetering remote storage inventory requires vmNamespace" }}
 {{- end }}
 {{- if not .Values.infrastructureMetering.vmStorageIngestionSecretName }}
@@ -614,8 +592,8 @@ data:
   INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvcPublicationEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvPublicationEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED: {{ .Values.infrastructureMetering.vmPvClusterWideRbacAcknowledged | default false | quote }}
-  INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.vmStableClusterId | default "" | quote }}
-  INFRASTRUCTURE_METERING_VM_NAMESPACE: {{ .Values.infrastructureMetering.vmNamespace | default "" | quote }}
+  INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID: {{ $vmMeteringStableClusterId | quote }}
+  INFRASTRUCTURE_METERING_VM_NAMESPACE: {{ $vmMeteringNamespace | quote }}
   INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION: {{ .Values.infrastructureMetering.volumeIdentityKeyVersion | default "" | quote }}
   INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON: {{ .Values.infrastructureMetering.volumeResourceMappings | default list | toJson | quote }}
   INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
@@ -750,15 +728,18 @@ data:
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
+  VM_MODE: {{ include "srw.vmMode" . | quote }}
+  {{- if eq (include "srw.vmMode" .) "external" }}
   # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
   # the paired VM controller chart's orchestratorId.
   ORCHESTRATOR_ID: {{ include "srw.orchestratorId" . | quote }}
+  {{- end }}
 
-  # VM Controller (HTTP transport, same-cluster mode). Empty when
-  # vmController.enabled=false or transport=nats — orchestrator falls back
-  # to NATS / direct K8s in those cases.
+  {{- if include "srw.vmSameCluster" . }}
+  # VM Controller (HTTP transport, same-cluster mode).
   VM_CONTROLLER_URL: {{ include "srw.vmControllerUrl" . | quote }}
-  VM_NAMESPACE: {{ include "srw.vmControllerNamespace" . | quote }}
+  VM_NAMESPACE: {{ .Release.Namespace | quote }}
+  {{- end }}
 
   # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
@@ -769,7 +750,8 @@ data:
   # cascade-deletes disks would suspend sessions into nothing.
   VM_PERSISTENT_ROOTDISK: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
 
-  # Headscale (mesh VPN coordination server)
+  {{- if eq (include "srw.vmMode" .) "external" }}
+  # Headscale and agent mesh are external-VM topology settings.
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
 
   # Agent tailscale sidecar gate (read by AgentProvisioner). When "false",
@@ -777,6 +759,7 @@ data:
   AGENT_TAILSCALE_ENABLED: {{ .Values.agent.tailscale.enabled | quote }}
   # Sustained-dark window (seconds) for the agent tailscale sidecar liveness probe.
   AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS: {{ .Values.agent.tailscale.darkTimeoutSeconds | default 600 | quote }}
+  {{- end }}
 
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.workspace) | quote }}

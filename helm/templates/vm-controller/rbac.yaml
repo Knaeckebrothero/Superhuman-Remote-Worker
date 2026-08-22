@@ -1,4 +1,4 @@
-{{- if .Values.vmController.enabled }}
+{{- if include "srw.vmSameCluster" . }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -21,6 +21,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete", "patch"]
   # Golden-image cloning: the controller creates a shared golden DataVolume per
   # image digest and GCs stale ones. PVC get/list only (CDI owns their
   # lifecycle; deletion cascades from the DataVolume). Same-namespace clone → no
@@ -31,12 +34,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list"]
-  {{ if .Values.vmController.lifecycleAuthSecretName }}
   # Durable replay claims for authenticated create/delete request UUIDs.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "create", "delete"]
-  {{ end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

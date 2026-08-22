@@ -81,4 +81,29 @@ durable Canvas presentations, workspace snapshots, and the virtual tier.
 Inspect the one-time bootstrap (layout + buckets + keys):
   kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-garage-bootstrap
 {{- end }}
+
+{{- if include "srw.vmSameCluster" . }}
+{{- $legacyVmAliasWithoutSecret := and .Values.vmController.enabled (eq (.Values.vm.mode | default "off") "off") (empty (include "srw.vmLifecycleAuthSecretName" .)) }}
+
+VM workspaces on this cluster
+=============================
+KubeVirt and CDI must already be installed. The preflight hook verifies their
+CRDs before install/upgrade. Confirm the VM node selector and storage class,
+then watch the controller and its first VMI:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "srw.vmControllerName" . }}
+  kubectl -n {{ .Release.Namespace }} get vm,vmi,pod -l srw.io/component=agent-workspace
+
+{{- if $legacyVmAliasWithoutSecret }}
+
+WARNING: vmController.enabled selected legacy unauthenticated provisioning.
+Guest tokens cannot be minted. Set vm.lifecycleAuthSecretName before enabling
+authenticated VM lifecycle requests.
+{{- else }}
+
+The lifecycle Secret is `{{ include "srw.vmLifecycleAuthSecretName" . }}`.
+{{- end }}
+The SSH key Secret is `{{ include "srw.vmSshKeySecretName" . }}`. See
+helm/README.md#vm-workspaces-on-your-cluster for prerequisites and checks.
+{{- end }}
 {{ include "srw.backupNotes" . }}
