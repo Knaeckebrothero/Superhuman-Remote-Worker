@@ -403,3 +403,32 @@ logLevel: "DEBUG"
 # Local k3d keeps human-readable logs ("json" once Loki lands — see
 # knowledge-base/knowledge/features/centralized_logging.md).
 logFormat: "text"
+
+# --- VM workspaces on the local k3d cluster (optional) -----------------------
+# Run `scripts/local-kubevirt-up.sh` first (KubeVirt + CDI on k3d, KVM passthrough,
+# smoke test), create the two Secrets below, then uncomment. Tilt applies values
+# on the next image rebuild, not on save (see tilt_inner_loop_dev.md).
+#
+#   kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
+#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+#   # srw-vm-ssh-key is minted by scripts/local-dev-up.sh
+#
+# vm:
+#   mode: same-cluster
+#   lifecycleAuthSecretName: srw-vm-lifecycle-hmac
+#   preflight:
+#     enabled: true
+# vmController:
+#   # Tilt builds srw-vm-controller from vm/controller and injects image.* itself.
+#   # The VM image is only built by CI — pin a published sha tag:
+#   defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-XXXXXXX
+#   defaultCpu: 4
+#   defaultMemory: 8Gi
+#   maxConcurrentVms: 2
+#   vmStorageClass: local-path
+#   vmDiskSize: 20Gi
+#   goldenImage:
+#     enabled: true
+# agent:
+#   tailscale:
+#     enabled: false
