@@ -21,6 +21,13 @@ fullnameOverride: srw
 # Without this, the helper falls back to fullnameOverride ("srw") which doesn't
 # match the controller's "srw-dev" → publishes drop silently.
 orchestratorId: srw-dev
+# VM topology: dev's VMs still live on the separate vm cluster (NATS leaf + Headscale).
+# Declared explicitly — with vm.mode unset the chart renders `off`, which would strip the
+# NATS/Headscale/tailscale wiring below (the chart's validator refuses that combination).
+# Same-cluster on dev lands with the R630 cutover
+# (knowledge-base/knowledge/features/single_cluster_vm_deployment.md §7).
+vm:
+  mode: external
 # Connect to the shared homelab NATS hub (Fleet-managed in the HomeLab repo at
 # deployments_managed/nats/). The hub bridges to leaf NATS instances on the
 # vm cluster so VM lifecycle commands can flow cross-cluster.
