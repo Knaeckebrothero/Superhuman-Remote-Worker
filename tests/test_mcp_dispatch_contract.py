@@ -27,6 +27,24 @@ def test_created_job_response_describes_automatic_dispatch():
     assert "Next step: Use assign_job" not in rendered
 
 
+def test_created_job_response_reports_workspace_assignment() -> None:
+    rendered = format_created_job(
+        {
+            "id": "job-1",
+            "status": "created",
+            "workspace_contract": {
+                "requested_backend": "vm",
+                "assigned_backend": "vm",
+                "effective_backend": None,
+                "state": "waiting",
+            },
+        },
+        "developer",
+    )
+
+    assert "Workspace: requested=vm, assigned=vm, effective=pending" in rendered
+
+
 def test_mcp_creation_signatures_expose_deliverable_contract():
     tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
 

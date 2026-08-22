@@ -215,16 +215,15 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
             async def audit_fingerprint(job_ids):
                 return {str(item): audit_count for item in job_ids}
 
-            async def rearm(agent_id):
+            async def rearm(target_job_id, agent_id):
+                assert await db.claim_job_for_agent(str(target_job_id), str(agent_id))
                 await conn.execute(
                     """
                     UPDATE jobs
-                    SET status='processing', assigned_agent_id=$2,
-                        lease_expires_at=now()-interval '1 second'
+                    SET lease_expires_at=now()-interval '1 second'
                     WHERE id=$1
                     """,
-                    job_id,
-                    agent_id,
+                    target_job_id,
                 )
 
             first = await db.recover_expired_lease_jobs(
@@ -235,7 +234,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
                     RecoveredJob(job_id=str(job_id), project_id=str(project_id)),
                 )
             )
-            await rearm(agent_ids[1]["id"])
+            await rearm(job_id, agent_ids[1]["id"])
             second = await db.recover_expired_lease_jobs(
                 audit_fingerprint_provider=audit_fingerprint
             )
@@ -248,7 +247,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
             # Both replicas discover the same expired row. Post/thread/job
             # locks plus the processing-state CAS permit one trip and no
             # double increment, outbox insert, or redispatch result.
-            await rearm(agent_ids[2]["id"])
+            await rearm(job_id, agent_ids[2]["id"])
             contenders = await asyncio.gather(
                 db.recover_expired_lease_jobs(
                     audit_fingerprint_provider=audit_fingerprint
@@ -347,12 +346,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
                     )
                 ).recovered_job_ids
             )
-            await conn.execute(
-                "UPDATE jobs SET status='processing', assigned_agent_id=$2, "
-                "lease_expires_at=now()-interval '1 second' WHERE id=$1",
-                reset_job_id,
-                agent_ids[1]["id"],
-            )
+            await rearm(reset_job_id, agent_ids[1]["id"])
 
             async def unavailable_audit(_job_ids):
                 raise RuntimeError("audit unavailable")
@@ -367,12 +361,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
                 )
             )
             assert unavailable_context["_lease_recovery"]["unchanged_recoveries"] == 2
-            await conn.execute(
-                "UPDATE jobs SET status='processing', assigned_agent_id=$2, "
-                "lease_expires_at=now()-interval '1 second' WHERE id=$1",
-                reset_job_id,
-                agent_ids[2]["id"],
-            )
+            await rearm(reset_job_id, agent_ids[2]["id"])
             audit_count = 31
             reset = await db.recover_expired_lease_jobs(
                 audit_fingerprint_provider=audit_fingerprint
@@ -405,12 +394,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
                 audit_fingerprint_provider=unavailable_audit
             )
             assert str(unknown_job_id) in first_unknown.recovered_job_ids
-            await conn.execute(
-                "UPDATE jobs SET status='processing', assigned_agent_id=$2, "
-                "lease_expires_at=now()-interval '1 second' WHERE id=$1",
-                unknown_job_id,
-                agent_ids[1]["id"],
-            )
+            await rearm(unknown_job_id, agent_ids[1]["id"])
             restored = await db.recover_expired_lease_jobs(
                 audit_fingerprint_provider=audit_fingerprint
             )
@@ -439,13 +423,7 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
             )
             for cycle in range(3):
                 if cycle:
-                    await conn.execute(
-                        "UPDATE jobs SET status='processing', "
-                        "assigned_agent_id=$2, "
-                        "lease_expires_at=now()-interval '1 second' WHERE id=$1",
-                        vacant_job_id,
-                        agent_ids[cycle]["id"],
-                    )
+                    await rearm(vacant_job_id, agent_ids[cycle]["id"])
                 vacant_result = await db.recover_expired_lease_jobs()
             assert len(vacant_result.circuit_trips) == 1
             assert vacant_result.circuit_trips[0].officer_destination == (

@@ -230,8 +230,10 @@ describe('JobReviewComponent delivery section', () => {
       },
     }),
     liveStatus: PullRequestStatus | null = OPEN_STATUS,
+    workspaceContract: Job['workspace_contract'] | undefined = undefined,
   ): Promise<HTMLElement> {
     const job = reviewJob(context);
+    job.workspace_contract = workspaceContract;
     api = {
       getJob: vi.fn().mockReturnValue(of(job)),
       getFrozenJobData: vi.fn().mockReturnValue(of({ summary: 'Theme delivered' })),
@@ -334,5 +336,24 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).toContain('Job workspace');
     expect(text).not.toContain('Branch main');
     expect(text).not.toContain('Pull request #');
+  });
+
+  it('shows only the safe server-owned workspace tier projection', async () => {
+    const root = await render(undefined, OPEN_STATUS, {
+      requested_backend: 'vm',
+      assigned_backend: 'vm',
+      effective_backend: 'vm',
+      state: 'ready',
+      failure: null,
+      stale_backend: 'sandbox',
+    });
+    const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
+
+    expect(text).toContain('Workspace: requested vm · assigned vm · effective vm');
+    expect(fixture.componentInstance.workspaceContractTitle()).toContain(
+      'Workspace state: ready · detail: none',
+    );
+    expect(text).not.toContain('ssh_host');
+    expect(text).not.toContain('private.svc');
   });
 });

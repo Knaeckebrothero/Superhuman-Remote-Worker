@@ -280,6 +280,28 @@ def _reason_lines(rows: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _workspace_line(job: dict[str, Any]) -> str:
+    """Coordinate-free workspace contract for Officer supervision text."""
+
+    workspace = job.get("workspace_contract")
+    if not isinstance(workspace, dict):
+        return ""
+    requested = workspace.get("requested_backend") or "default"
+    assigned = workspace.get("assigned_backend") or "unknown"
+    effective = workspace.get("effective_backend") or "unavailable"
+    state = workspace.get("state") or "unknown"
+    failure = f", failure={workspace['failure']}" if workspace.get("failure") else ""
+    residue = (
+        f", stale={workspace['stale_backend']}"
+        if workspace.get("stale_backend")
+        else ""
+    )
+    return (
+        f" [workspace requested={requested}, assigned={assigned}, "
+        f"effective={effective}, state={state}{failure}{residue}]"
+    )
+
+
 async def _jobs_section(
     db: Any,
     audit_reader: Any,
@@ -326,7 +348,7 @@ async def _jobs_section(
             desc = _truncate(job.get("description") or "", _DESC_CHARS)
             prev_entry = _as_dict(prev_prints.get(jid))
             if jid not in prev_prints:
-                new.append(f"- NEW {jid[:8]} {status} — {desc}")
+                new.append(f"- NEW {jid[:8]} {status}{_workspace_line(job)} — {desc}")
             elif prev_entry.get("status") != status:
                 line = f"- {jid[:8]} {prev_entry.get('status')} → {status} — {desc}"
                 error = (job.get("error_message") or "").strip()
@@ -360,6 +382,7 @@ async def _jobs_section(
             liveness = liveness_by_id.get(jid)
             if liveness:
                 detail += f" [{liveness.get('state')}]"
+            detail += _workspace_line(job)
             if steps is not None:
                 if isinstance(prev_steps, int):
                     detail += f" — steps {prev_steps}→{steps}"

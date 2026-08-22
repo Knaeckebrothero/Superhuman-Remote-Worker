@@ -250,6 +250,10 @@ from services.dispatch_guards import (  # noqa: E402
     resume_lane_applies,
     vm_provisioning_decision,
 )
+from services.job_workspace_adoption import (  # noqa: E402
+    ensure_legacy_k8s_job_runtime_authority,
+    verify_adopted_k8s_runtime_before_delivery,
+)
 from services.config_drift import (  # noqa: E402
     DriftItem,
     acknowledged_drift_ids,
@@ -428,6 +432,17 @@ from src.core.product_capabilities import (  # noqa: E402
 # (no_workspace_agent_mode.md §4) — importing the frozenset is cheap; the heavy
 # backend modules are lazy-imported inside the factory's functions.
 from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
+from src.shared.workspace_contract import (  # noqa: E402
+    WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    WORKSPACE_RUNTIME_CONTEXT_KEY,
+    WorkspaceContractError,
+    configured_workspace_backend,
+    resolve_workspace_contract,
+    resolve_workspace_runtime,
+    workspace_contract_projection,
+    workspace_runtime_authority_digest,
+)
 
 # Datasource type → tool-category map, shared with the agent's session attach
 # path so the two boundaries can't drift (live_session_settings.md P0.2).
@@ -4157,12 +4172,31 @@ async def _build_job_start_request(
                 resolved_ds, config_override
             )
 
-        # Inject VM workspace config if job has a ready VM
-        vm_ctx = _get_vm_context(job)
-        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
-            config_override = config_override or {}
-            ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "vm"
+        # Resolve exactly one runtime from the persisted assignment. Runtime
+        # context order is never authority: a ready opposite-tier residue is
+        # reported but cannot overwrite the selected backend.
+        config_override, workspace_decision = _inject_matching_workspace_config(
+            job, config_override, replace_endpoint=True
+        )
+        workspace_runtime_projection = workspace_decision.safe_projection()
+        remaining_context[WORKSPACE_RUNTIME_CONTEXT_KEY] = workspace_runtime_projection
+        if not workspace_decision.ready:
+            msg = (
+                "Workspace contract refused dispatch: "
+                f"{workspace_decision.reason or workspace_decision.state}"
+            )
+            logger.error("Dispatch: job %s refused — %s", job_id, msg)
+            if persist_dispatch_state and workspace_decision.state in {
+                "invalid",
+                "failed",
+                "mismatch",
+            }:
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=msg
+                )
+            return None
+
+        if workspace_decision.effective_backend == "vm":
             # F29: VMs are tailnet nodes and can't resolve the cluster-internal
             # Gitea host (GITEA_INTERNAL_URL, e.g. srw-gitea:3000). Left as-is,
             # GitManager.clone fails and silently falls back to `git init`
@@ -4175,43 +4209,17 @@ async def _build_job_start_request(
             for _repo in repositories_payload or []:
                 if _repo.get("repo_url"):
                     _repo["repo_url"] = externalize_gitea_url(_repo["repo_url"])
-            remote = ws.setdefault("remote", {})
-            remote.setdefault("host", vm_ctx["ssh_host"])
-            remote.setdefault("port", vm_ctx.get("ssh_port", 22))
-            remote.setdefault("username", "agent-host")
-            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-            remote.setdefault("workspace_path", "/home/agent-host/workspace")
-            remote.setdefault(
-                "connect_timeout",
-                int(os.environ.get("VM_REMOTE_CONNECT_TIMEOUT_S", "10")),
-            )
-            remote.setdefault(
-                "max_retries",
-                int(os.environ.get("VM_REMOTE_CONNECT_MAX_RETRIES", "6")),
-            )
-            remote.setdefault("retry_timeouts_as_booting", True)
-            # VM has its own sudo gate — allow sudo through
-            config_override.setdefault("shell", {})["sudo_action"] = "allow"
             logger.info(
-                f"Dispatch: injected VM workspace config for job {job_id} "
-                f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
+                "Dispatch: injected attested VM workspace config for job %s",
+                job_id,
             )
-
-        # Inject workspace container config if job has a ready container.
-        # Keep this in one helper shared with resume: the resume path used to
-        # restore only host + port and silently drop username/key_path/path,
-        # producing Paramiko's "No authentication methods available" before
-        # the graph could start.
-        container_ctx = _get_container_context(job)
-        container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
-        if container_ctx.get("status") == "ready" and container_host:
-            config_override = _inject_container_workspace_config(
-                config_override, container_ctx
-            )
+        elif workspace_decision.effective_backend == "sandbox":
+            container_ctx = _get_container_context(job)
             logger.info(
-                f"Dispatch: injected workspace container config for job {job_id} "
-                f"(host={container_host}:{container_ctx.get('port', 22)}, "
-                f"provisioner={container_ctx.get('provisioner', 'k8s')})"
+                "Dispatch: injected attested sandbox workspace config for job %s "
+                "(provisioner=%s)",
+                job_id,
+                container_ctx.get("provisioner", "k8s"),
             )
 
         # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
@@ -4465,6 +4473,7 @@ async def _build_job_start_request(
             branch_name=job.get("branch_name"),
             project_id=str(job["project_id"]) if job.get("project_id") else None,
             runtime_actor=runtime_actor.to_payload(),
+            workspace_runtime=workspace_runtime_projection,
         )
 
         return job_start
@@ -4521,6 +4530,15 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         logger.warning("Agent %s has no pod IP — skipping dispatch", agent_id)
         return False
 
+    workspace_action, job, workspace_reason = await _prepare_job_workspace_runtime(job)
+    if workspace_action != "proceed":
+        logger.warning(
+            "Dispatch: job %s waiting for workspace authority recovery (%s)",
+            job_id,
+            workspace_reason or workspace_action,
+        )
+        return False
+
     _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
     try:
         job_start = await _build_job_start_request(
@@ -4528,6 +4546,13 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             persist_dispatch_state=not COMPLETION_COMMANDS_ENABLED,
         )
         if job_start is None:
+            return False
+
+        if not await _workspace_runtime_unchanged_before_delivery(job):
+            logger.warning(
+                "Dispatch: workspace authority changed while assembling job %s",
+                job_id,
+            )
             return False
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
@@ -4610,6 +4635,15 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
     if not agent.get("pod_ip"):
         logger.warning(f"Agent {agent_id} has no pod IP — skipping resume dispatch")
+        return False
+
+    workspace_action, job, workspace_reason = await _prepare_job_workspace_runtime(job)
+    if workspace_action != "proceed":
+        logger.warning(
+            "Resume dispatch: job %s waiting for workspace authority recovery (%s)",
+            job_id,
+            workspace_reason or workspace_action,
+        )
         return False
 
     # Never ship a workspace-backed job with no workspace to dial: the VM and
@@ -4740,44 +4774,30 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             sorted((config_override.get("env_keys") or {}).keys()),
         )
 
-        # Inject VM workspace config if job has a ready VM
-        vm_ctx = _get_vm_context(job)
-        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
-            config_override = config_override or {}
-            ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "vm"
-            remote = ws.setdefault("remote", {})
-            remote.setdefault("host", vm_ctx["ssh_host"])
-            remote.setdefault("port", vm_ctx.get("ssh_port", 22))
-            remote.setdefault("username", "agent-host")
-            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-            remote.setdefault("workspace_path", "/home/agent-host/workspace")
-            # VM has its own sudo gate — allow sudo through
-            config_override.setdefault("shell", {})["sudo_action"] = "allow"
+        config_override, workspace_decision = _inject_matching_workspace_config(
+            job, config_override, replace_endpoint=True
+        )
+        if not workspace_decision.ready:
+            logger.warning(
+                "Resume dispatch: job %s refused by workspace contract (%s)",
+                job_id,
+                workspace_decision.reason or workspace_decision.state,
+            )
+            return False
+        if workspace_decision.effective_backend == "vm":
             logger.info(
-                f"Resume dispatch: injected VM workspace config for job {job_id} "
-                f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
+                "Resume dispatch: injected attested VM workspace config for job %s",
+                job_id,
             )
-
-        # Rebuild the complete managed-sandbox connection on resume. Endpoint
-        # replacement handles pod recreation, while the shared helper also
-        # restores the in-flight username/key/path values that are intentionally
-        # not persisted in jobs.config_override.
-        container_ctx = _get_container_context(job)
-        container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
-        if container_ctx.get("status") == "ready" and container_host:
-            config_override = _inject_container_workspace_config(
-                config_override, container_ctx, replace_endpoint=True
-            )
+        elif workspace_decision.effective_backend == "sandbox":
+            container_ctx = _get_container_context(job)
             worktree_path = job.get("worktree_path")
             if worktree_path:
                 config_override["workspace"]["remote"]["workspace_path"] = worktree_path
             logger.info(
-                "Resume dispatch: injected complete container config for job %s "
-                "(host=%s:%s, provisioner=%s)",
+                "Resume dispatch: injected attested sandbox workspace config for "
+                "job %s (provisioner=%s)",
                 job_id,
-                container_host,
-                container_ctx.get("port", 22),
                 container_ctx.get("provisioner", "k8s"),
             )
 
@@ -4838,11 +4858,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # workspaces cannot resolve the cluster-internal Gitea host, so
         # mirror the fresh path's VM-scoped rewrite (F29).
         git_remote_url = job_context.get("git_remote_url")
-        if (
-            git_remote_url
-            and vm_ctx.get("status") == "ready"
-            and vm_ctx.get("ssh_host")
-        ):
+        if git_remote_url and workspace_decision.effective_backend == "vm":
             git_remote_url = externalize_gitea_url(git_remote_url)
 
         runtime_actor = await mint_worker_runtime_actor(
@@ -4862,6 +4878,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "previous_status": job.get("status"),
             "git_remote_url": git_remote_url,
             "runtime_actor": runtime_actor.to_payload(),
+            WORKSPACE_RUNTIME_CONTEXT_KEY: workspace_decision.safe_projection(),
         }
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
@@ -4869,6 +4886,13 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 resume_payload["feedback_reason"] = queued_feedback_reason
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
+
+        if not await _workspace_runtime_unchanged_before_delivery(job):
+            logger.warning(
+                "Resume dispatch: workspace authority changed while assembling job %s",
+                job_id,
+            )
+            return False
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -5517,18 +5541,10 @@ def _backend_from_override(config_override: Any) -> Optional[str]:
     Mirrors the parsing the dispatch path already does for ``config_override``
     so every caller reads the backend the same way.
     """
-    co = config_override
-    if isinstance(co, str):
-        try:
-            co = json.loads(co)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(co, dict):
+    try:
+        return configured_workspace_backend(config_override)
+    except WorkspaceContractError:
         return None
-    ws = co.get("workspace")
-    if not isinstance(ws, dict):
-        return None
-    return ws.get("backend")
 
 
 def _thread_workspace_backend(thread: Any) -> Optional[str]:
@@ -6308,26 +6324,14 @@ async def _revalidate_job_datasource_ids(job: dict[str, Any]) -> list[str]:
 
 
 def _job_needs_vm(job: dict) -> bool:
-    """Check if a job requires a VM workspace (from config_override or context)."""
-    # Explicit VM request in context
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    vm_ctx = ctx.get("vm", {})
-    if vm_ctx.get("requested"):
-        return True
-    # Config override specifies VM workspace
-    co = job.get("config_override") or {}
-    if isinstance(co, str):
-        try:
-            co = json.loads(co)
-        except (json.JSONDecodeError, TypeError):
-            co = {}
-    backend = co.get("workspace", {}).get("backend")
-    return backend in ("vm", "remote")  # "remote" is legacy for VM
+    """Whether the authoritative contract assigns the VM tier."""
+
+    try:
+        return resolve_workspace_contract(job).assigned_backend == "vm"
+    except WorkspaceContractError:
+        # Malformed/ambiguous jobs are refused by the bundle resolver. Never
+        # guess a tier here merely because one runtime happens to be ready.
+        return False
 
 
 def _get_vm_context(job: dict) -> dict:
@@ -6389,36 +6393,15 @@ def _job_needs_sandbox(job: dict) -> bool:
     Returns False if the job already has a ready VM or container inherited
     from a parent job (worktree sharing — no new container needed).
     """
-    # If job inherits a ready workspace backend from parent, skip provisioning
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    if ctx.get("vm", {}).get("status") == "ready":
+    try:
+        contract = resolve_workspace_contract(job)
+    except WorkspaceContractError:
         return False
-    if ctx.get("workspace_container", {}).get("status") == "ready":
+    if contract.assigned_backend != "sandbox":
         return False
-
-    co = job.get("config_override") or {}
-    if isinstance(co, str):
-        try:
-            co = json.loads(co)
-        except (json.JSONDecodeError, TypeError):
-            co = {}
-    backend = co.get("workspace", {}).get("backend")
-    if backend in ("sandbox", "container"):  # "container" is legacy
-        return True
-    if backend in ("vm", "remote"):  # "remote" is legacy for VM
-        return False
-    if backend in LITE_BACKENDS:
-        # virtual/none run with no workspace pod at all (no_workspace_agent_mode.md
-        # §4). Without this the next line would provision a sandbox whenever a
-        # provisioner is available — defeating the whole tier.
-        return False
-    # No explicit backend — default to sandbox if any provisioner is available
-    return container_provisioner.is_available or docker_provisioner.is_available
+    decision = resolve_workspace_runtime(job)
+    # An opposite-tier VM must never suppress sandbox provisioning.
+    return decision.effective_backend != "sandbox"
 
 
 def _resolve_requested_job_execution_lane(
@@ -6568,6 +6551,98 @@ def _inject_container_workspace_config(
     return config_override
 
 
+def _inject_vm_workspace_config(
+    config_override: dict | None,
+    vm_ctx: dict,
+    *,
+    replace_endpoint: bool = False,
+) -> dict:
+    """Inject only the authoritative VM endpoint into a worker config."""
+
+    if vm_ctx.get("status") != "ready" or not vm_ctx.get("ssh_host"):
+        return config_override or {}
+    config_override = config_override or {}
+    workspace = config_override.setdefault("workspace", {})
+    workspace["backend"] = "vm"
+    remote = workspace.setdefault("remote", {})
+    if replace_endpoint or not remote.get("host"):
+        remote["host"] = vm_ctx["ssh_host"]
+    if replace_endpoint or not remote.get("port"):
+        remote["port"] = vm_ctx.get("ssh_port", 22)
+    remote.setdefault("username", "agent-host")
+    remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
+    remote.setdefault("workspace_path", "/home/agent-host/workspace")
+    remote.setdefault(
+        "connect_timeout", int(os.environ.get("VM_REMOTE_CONNECT_TIMEOUT_S", "10"))
+    )
+    remote.setdefault(
+        "max_retries", int(os.environ.get("VM_REMOTE_CONNECT_MAX_RETRIES", "6"))
+    )
+    remote.setdefault("retry_timeouts_as_booting", True)
+    config_override.setdefault("shell", {})["sudo_action"] = "allow"
+    return config_override
+
+
+def _inject_matching_workspace_config(
+    job: Mapping[str, Any],
+    config_override: dict | None,
+    *,
+    replace_endpoint: bool = False,
+) -> tuple[dict, Any]:
+    """Apply exactly one runtime selected by the server-owned tier contract."""
+
+    decision = resolve_workspace_runtime(job)
+    config = copy.deepcopy(config_override or {})
+    if not decision.ready:
+        return config, decision
+    if decision.effective_backend == "vm":
+        config = _inject_vm_workspace_config(
+            config,
+            _get_vm_context(dict(job)),
+            replace_endpoint=replace_endpoint,
+        )
+    elif decision.effective_backend == "sandbox":
+        config = _inject_container_workspace_config(
+            config,
+            _get_container_context(dict(job)),
+            replace_endpoint=replace_endpoint,
+        )
+    return config, decision
+
+
+async def _workspace_runtime_unchanged_before_delivery(job: dict[str, Any]) -> bool:
+    """Recheck the selected runtime after slow bundle assembly.
+
+    Provisioner callbacks can race config/model/credential resolution.  Refetch
+    the durable job at the last network boundary and require the exact selected
+    runtime authority to match what the bundle was built from.  Opposite-tier
+    residue is deliberately excluded from the digest, so it is observable but
+    can neither block nor replace the assigned runtime.
+    """
+
+    expected = workspace_runtime_authority_digest(job)
+    if expected is None:
+        return False
+    fresh = await postgres_db.get_job(str(job["id"]))
+    if fresh is None:
+        return False
+    context = fresh.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if isinstance(context, dict) and context.get("inherits_parent_workspace"):
+        action, _reason = await _resolve_subjob_inherited_workspace(fresh)
+        if action != "proceed":
+            return False
+    if workspace_runtime_authority_digest(fresh) != expected:
+        return False
+    return await verify_adopted_k8s_runtime_before_delivery(
+        postgres_db, container_provisioner, fresh
+    )
+
+
 # Job context key holding each remote tier's live workspace, by tier name.
 _WORKSPACE_CONTEXT_KEYS = {"vm": "vm", "sandbox": "workspace_container"}
 
@@ -6598,37 +6673,16 @@ def _resume_missing_workspace(job: dict) -> Optional[str]:
     injection blocks in ``_resume_job_on_agent``.
     """
 
-    def _vm_is_live() -> bool:
-        vm_ctx = _get_vm_context(job)
-        return bool(vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"))
-
-    def _container_is_live() -> bool:
-        ctx = _get_container_context(job)
-        return bool(
-            ctx.get("status") == "ready" and (ctx.get("host") or ctx.get("pod_ip"))
-        )
-
-    # An explicitly configured backend is decided on its own context, ahead of
-    # the needs-predicates below: _job_needs_sandbox() short-circuits to False
-    # the moment a container claims 'ready', which would mask a ready-but-
-    # address-less container — the very state that strands the agent.
-    backend = _backend_from_override(job.get("config_override"))
-    if backend in LITE_BACKENDS:
-        # virtual/none run with no workspace pod at all and legitimately have
-        # no remote — same exemption as the dispatch backstop.
+    try:
+        contract = resolve_workspace_contract(job)
+    except WorkspaceContractError:
+        # No tier can be shed safely when authority itself is ambiguous. The
+        # shared bundle resolver will refuse it rather than choosing one.
         return None
-    if backend in ("vm", "remote"):  # "remote" is legacy for VM
-        return None if _vm_is_live() else "vm"
-    if backend in ("sandbox", "container"):  # "container" is legacy
-        return None if _container_is_live() else "sandbox"
-
-    # No explicit backend — defer to the same predicates the dispatcher uses to
-    # decide what it would provision, so resume and dispatch stay in agreement.
-    if _job_needs_vm(job):
-        return None if _vm_is_live() else "vm"
-    if _job_needs_sandbox(job):
-        return None if _container_is_live() else "sandbox"
-    return None
+    if contract.assigned_backend in LITE_BACKENDS:
+        return None
+    decision = resolve_workspace_runtime(job)
+    return None if decision.ready else contract.assigned_backend
 
 
 def _scholar_provision_parent_id(job: dict) -> str | None:
@@ -6729,11 +6783,26 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     if not ctx.get("inherits_parent_workspace"):
         return ("proceed", None)
 
-    own_container = ctx.get("workspace_container") or {}
-    own_vm = ctx.get("vm") or {}
+    adoption = await ensure_legacy_k8s_job_runtime_authority(
+        postgres_db, container_provisioner, job
+    )
+    if adoption.retryable:
+        logger.warning(
+            "Dispatcher: subjob %s parent workspace needs live Kubernetes "
+            "adoption (%s); waiting without dispatch",
+            job.get("id"),
+            adoption.reason,
+        )
+        return ("wait", None)
+    if adoption.reason == "authority_ambiguous":
+        return ("fail", "Inherited workspace authority is ambiguous.")
 
     try:
-        parent = await postgres_db.get_job(str(parent_id))
+        parent = (
+            adoption.authority_job
+            if adoption.owner is not None and adoption.owner.id == str(parent_id)
+            else await postgres_db.get_job(str(parent_id))
+        )
     except Exception as e:
         logger.warning(
             "Dispatcher: subjob %s — failed to read parent %s for workspace "
@@ -6758,38 +6827,59 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             parent_ctx = {}
     parent_container = parent_ctx.get("workspace_container") or {}
     parent_vm = parent_ctx.get("vm") or {}
-    # The inherit flag is authoritative even if an explicit reprovision resume
-    # shed the child's stale copied snapshot. Infer the inherited backend from
-    # the parent's current live context in that case; never let a flag-only
-    # child fall through to self-provisioning or a bundle with no remote.
-    inherit_container = bool(own_container) or (not own_vm and bool(parent_container))
-    inherit_vm = bool(own_vm) or (
-        not own_container and not parent_container and bool(parent_vm)
-    )
+    try:
+        parent_contract = resolve_workspace_contract(parent)
+    except WorkspaceContractError as exc:
+        return ("fail", f"Parent workspace contract is invalid ({exc.code}).")
+    # Resolve against a temporary overlay only. A waiting child keeps its
+    # original durable-looking snapshot untouched; a genuine pre-0175 child
+    # can still inherit the newly adopted parent UID without teaching the pure
+    # resolver to trust its old endpoint.
+    resolved_child_ctx = dict(ctx)
+    if parent_contract.assigned_backend == "sandbox":
+        resolved_child_ctx["workspace_container"] = parent_container
+        resolved_child_ctx.pop("vm", None)
+    elif parent_contract.assigned_backend == "vm":
+        resolved_child_ctx["vm"] = parent_vm
+        resolved_child_ctx.pop("workspace_container", None)
+    try:
+        child_contract = resolve_workspace_contract(
+            {**job, "context": resolved_child_ctx}
+        )
+    except WorkspaceContractError as exc:
+        return ("fail", f"Child workspace contract is invalid ({exc.code}).")
+    if parent_contract.assigned_backend != child_contract.assigned_backend:
+        return (
+            "fail",
+            "Parent and child workspace assignments differ; refusing cross-tier "
+            f"inheritance ({parent_contract.assigned_backend} -> "
+            f"{child_contract.assigned_backend}).",
+        )
+    inherited_backend = child_contract.assigned_backend
 
     # Parent's workspace is ready → overlay the live context and dispatch. All
     # downstream machinery (_job_needs_sandbox/_job_needs_vm, the dispatch-time
     # injectors) then keys off the ready context and injects workspace.remote.
-    if inherit_container and parent_container.get("status") == "ready":
+    if inherited_backend == "sandbox" and parent_container.get("status") == "ready":
         ctx["workspace_container"] = parent_container
+        ctx.pop("vm", None)
         job["context"] = ctx
         logger.info(
-            "Dispatcher: subjob %s inheriting parent %s workspace container "
-            "(host=%s) — resolved live at dispatch",
+            "Dispatcher: subjob %s inheriting parent %s sandbox runtime — "
+            "resolved live at dispatch",
             job.get("id"),
             parent_id,
-            parent_container.get("host") or parent_container.get("pod_ip"),
         )
         return ("proceed", None)
-    if inherit_vm and parent_vm.get("status") == "ready":
+    if inherited_backend == "vm" and parent_vm.get("status") == "ready":
         ctx["vm"] = parent_vm
+        ctx.pop("workspace_container", None)
         job["context"] = ctx
         logger.info(
-            "Dispatcher: subjob %s inheriting parent %s VM (host=%s) — resolved "
+            "Dispatcher: subjob %s inheriting parent %s VM runtime — resolved "
             "live at dispatch",
             job.get("id"),
             parent_id,
-            parent_vm.get("ssh_host"),
         )
         return ("proceed", None)
 
@@ -6798,8 +6888,11 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     dead_states = ("failed", "deleted")
     parent_status = parent.get("status")
     if (
-        parent_container.get("status") in dead_states
-        or parent_vm.get("status") in dead_states
+        (
+            inherited_backend == "sandbox"
+            and parent_container.get("status") in dead_states
+        )
+        or (inherited_backend == "vm" and parent_vm.get("status") in dead_states)
         or parent_status in ("failed", "cancelled", "completed")
     ):
         return (
@@ -6848,6 +6941,40 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             ),
         )
     return ("wait", None)
+
+
+async def _prepare_job_workspace_runtime(
+    job: dict[str, Any],
+) -> tuple[str, dict[str, Any], str | None]:
+    """Converge historical K8s authority before any dispatch decision.
+
+    Automatic dispatch, direct/manual start, resume and stateless claim bundles
+    all enter here. Inherited jobs delegate adoption to their exact parent
+    owner through ``_resolve_subjob_inherited_workspace``.
+    """
+
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            context = {}
+    if isinstance(context, dict) and context.get("inherits_parent_workspace"):
+        action, reason = await _resolve_subjob_inherited_workspace(job)
+        return action, job, reason
+
+    adoption = await ensure_legacy_k8s_job_runtime_authority(
+        postgres_db, container_provisioner, job
+    )
+    if adoption.retryable:
+        return "wait", job, adoption.reason
+    if (
+        adoption.owner is not None
+        and adoption.owner.id == str(job.get("id"))
+        and adoption.authority_job is not None
+    ):
+        job = dict(adoption.authority_job)
+    return "proceed", job, adoption.reason
 
 
 async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
@@ -7164,7 +7291,13 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
     "provisioning_preflight",
 }
 _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
-    "evidence_manifest"
+    "evidence_manifest",
+    WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    WORKSPACE_RUNTIME_CONTEXT_KEY,
+    "workspace_backend",
+    "vm",
+    "workspace_container",
 }
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
     "lifecycle_marker",
@@ -8395,6 +8528,47 @@ async def _try_dispatch_pending_jobs() -> None:
             for job in pending_jobs:
                 job_id = str(job["id"])
                 stateless_worker = job.get("execution_lane") == "stateless"
+                (
+                    workspace_action,
+                    job,
+                    workspace_recovery_reason,
+                ) = await _prepare_job_workspace_runtime(job)
+                if workspace_action == "wait":
+                    logger.warning(
+                        "Dispatcher: job %s waiting for live workspace authority "
+                        "recovery (%s)",
+                        job_id,
+                        workspace_recovery_reason or "retryable",
+                    )
+                    continue
+                if workspace_action == "fail":
+                    await _fail_subjob_and_unblock_parent(
+                        job,
+                        workspace_recovery_reason
+                        or "Inherited workspace authority is unavailable.",
+                    )
+                    continue
+                workspace_decision = resolve_workspace_runtime(job)
+                if (
+                    workspace_decision.contract is None
+                    or workspace_decision.state == "invalid"
+                ):
+                    logger.error(
+                        "Dispatcher: refusing job %s with invalid workspace "
+                        "authority (%s)",
+                        job_id,
+                        workspace_decision.reason or workspace_decision.state,
+                    )
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=(
+                            "Workspace contract is ambiguous or invalid; "
+                            "refusing dispatch"
+                        ),
+                        expected_status=str(job.get("status")),
+                    )
+                    continue
 
                 # Defense for inherited/operator-created rows. An explicit VM
                 # request is the one supported plane transition: pin it before
@@ -8478,33 +8652,6 @@ async def _try_dispatch_pending_jobs() -> None:
                         "Kubernetes workspace provisioner",
                         job_id,
                     )
-                    continue
-
-                # Subjobs (scholar / critic) share their parent's workspace but
-                # copy its context by value at spawn time — stale when the parent
-                # pod wasn't ready yet. Re-resolve from the parent's live row so
-                # the subjob rides the parent pod instead of stranding at
-                # init_workspace with no SSH host. See knowledge-base/knowledge/issues/
-                # subjob_inherits_stale_workspace_container_snapshot.md.
-                inherit_action, inherit_msg = await _resolve_subjob_inherited_workspace(
-                    job
-                )
-                if inherit_action == "wait":
-                    logger.debug(
-                        "Dispatcher: subjob %s waiting for parent %s workspace "
-                        "to become ready",
-                        job_id,
-                        job.get("parent_job_id"),
-                    )
-                    continue
-                if inherit_action == "fail":
-                    logger.error(
-                        "Dispatcher: subjob %s cannot inherit parent workspace "
-                        "— failing: %s",
-                        job_id,
-                        inherit_msg,
-                    )
-                    await _fail_subjob_and_unblock_parent(job, inherit_msg)
                     continue
 
                 if _job_needs_vm(job):
@@ -8986,9 +9133,8 @@ async def _try_dispatch_pending_jobs() -> None:
                     existing_ctx = _get_container_context(job)
                     if existing_ctx.get("status") == "ready":
                         logger.info(
-                            "Dispatcher: job %s using pre-assigned workspace (%s)",
+                            "Dispatcher: job %s using pre-assigned workspace",
                             job_id,
-                            existing_ctx.get("host", "unknown"),
                         )
                     else:
                         logger.debug(
@@ -9646,14 +9792,14 @@ class JobCreate(BaseModel):
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
         # Earliest ingress fence for both public and internally authenticated
-        # HTTP bodies. Completion finalization alone may mint this object after
-        # resolving the job's actual repository and pinned revision. The route
-        # helper and Postgres funnel repeat the strip as independent defenses.
-        if isinstance(self.context, dict) and "evidence_manifest" in self.context:
+        # HTTP bodies. Completion/provisioning code may mint these namespaces
+        # only after resolving server authority. The route helper and Postgres
+        # funnel repeat the strip as independent defenses.
+        if isinstance(self.context, dict):
             self.context = {
                 key: value
                 for key, value in self.context.items()
-                if key != "evidence_manifest"
+                if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
             }
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
             raise ValueError("datasource_ids may be omitted or an array, not null")
@@ -12784,7 +12930,38 @@ async def list_jobs(
 def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
     """Strip credentials and private workspace lease identity from a job."""
 
+    job = dict(job)
+    if (
+        not isinstance(job.get("workspace_contract"), dict)
+        or "state" not in job["workspace_contract"]
+    ):
+        job["workspace_contract"] = workspace_contract_projection(job)
     job = _redact_nested_workspace_state(job, field="context")
+    context = job.get("context")
+    context_was_str = isinstance(context, str)
+    if context_was_str:
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            context = None
+    if isinstance(context, dict):
+        # The coordinate-free workspace_contract projection above is the
+        # public contract. Provisioner branches contain SSH hosts, pod/service
+        # coordinates and generation authority needed only by server and
+        # worker paths; never return them from the user-facing job API.
+        public_context = dict(context)
+        for key in (
+            "vm",
+            "workspace_container",
+            WORKSPACE_CONTRACT_CONTEXT_KEY,
+            WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+            WORKSPACE_RUNTIME_CONTEXT_KEY,
+            "workspace_backend",
+        ):
+            public_context.pop(key, None)
+        job["context"] = (
+            json.dumps(public_context) if context_was_str else public_context
+        )
     co = job.get("config_override")
     if co is None:
         return job
@@ -12799,6 +12976,10 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
             return job
     job = dict(job)
     cleaned = redact_config_override(co)
+    if isinstance(cleaned, dict) and isinstance(cleaned.get("workspace"), dict):
+        workspace = dict(cleaned["workspace"])
+        workspace.pop("remote", None)
+        cleaned = {**cleaned, "workspace": workspace}
     job["config_override"] = json.dumps(cleaned) if was_str else cleaned
     return job
 
@@ -13283,6 +13464,15 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 ),
             )
         request_config_override = job.config_override
+        try:
+            requested_workspace_backend = configured_workspace_backend(
+                request_config_override
+            )
+        except WorkspaceContractError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": exc.code, "message": exc.detail},
+            ) from exc
         project_default_override: dict[str, Any] | None = None
         if project_id:
             project = await postgres_db.get_project(project_id)
@@ -13431,8 +13621,18 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                         project_id=project_id,
                         thread_id=_officer_admit_thread_id,
                         requested_slot=str(requested_slot) if requested_slot else None,
+                        requested_config_override=request_config_override,
                     )
-                except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
+                except OfficerAdmissionConflict as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": exc.code,
+                            "message": exc.detail,
+                            **exc.fields,
+                        },
+                    ) from exc
+                except SlotAdmissionError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 officer_slot_name = officer_admission_preparation.slot_name
                 if officer_slot_name:
@@ -13525,13 +13725,12 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     )
 
                 # Precedence law (§6): the SLOT's category decides the contract
-                # this worker is held to; the officer's explicit arguments win
-                # over the roster default. A cross-category dispatch — sending
-                # a slot into work its category does not describe — is NOT
-                # refused, because warn-not-forbid is the whole posture. It is
-                # named in the kickoff and logged instead, so the one thing
-                # that cannot happen is a silent contradiction between the
-                # contract the worker reads and the slot it occupies.
+                # this worker is held to. Explicit model/backend choices must
+                # match the slot (validated above and again under the Post
+                # lock); they are never silently replaced. A cross-category
+                # dispatch — sending a slot into work its category does not
+                # describe — remains warn-not-forbid and is named in the
+                # kickoff instead.
                 _slot_category = officer_admission_preparation.category
                 if _slot_category:
                     context.setdefault("work_category", _slot_category)
@@ -13792,6 +13991,12 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 parent_job_id=job.parent_job_id,
                 thread_id=creating_thread_id,
             ),
+            "requested_workspace_backend": requested_workspace_backend,
+            "workspace_assignment_source": (
+                "request"
+                if requested_workspace_backend is not None
+                else "resolved_config"
+            ),
         }
         if officer_admission_preparation is not None:
             from services.officer_admission import (
@@ -13810,7 +14015,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     ticket_claim_source="manual",
                     strict_provisioning=True,
                 )
-            except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
+            except OfficerAdmissionConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": exc.code,
+                        "message": exc.detail,
+                        **exc.fields,
+                    },
+                ) from exc
+            except SlotAdmissionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         else:
             result = await postgres_db.create_job(**create_kwargs)
@@ -13866,7 +14080,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         if officer_admission_preparation is None:
             _trigger_dispatch()
 
-        return result
+        return _redact_job_config_override(result)
     except DatasourceMaterializationAuthorizationError as exc:
         raise HTTPException(
             status_code=403,
@@ -17312,7 +17526,23 @@ async def create_vm(request: Request, body: VMCreateRequest) -> dict[str, Any]:
     Uses NATS (cross-cluster) or direct Kubernetes API (same-cluster).
     Returns 503 if no VM provisioning backend is available.
     """
-    await require_job_access(request, postgres_db, body.job_id)
+    _caller, job = await require_job_access(request, postgres_db, body.job_id)
+    try:
+        assigned_backend = resolve_workspace_contract(job).assigned_backend
+    except WorkspaceContractError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    if assigned_backend != "vm":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_backend_conflict",
+                "message": "Job is not assigned to the VM workspace tier",
+                "assigned_backend": assigned_backend,
+            },
+        )
     if not vm_provisioner.is_available:
         raise HTTPException(
             status_code=503, detail="VM provisioning not available (no NATS or K8s)"
@@ -18148,6 +18378,7 @@ async def resume_job(
             workspace_preflight_required: bool = False,
             workspace_context_key: str | None = None,
             control_claim: Any | None = None,
+            expected_status_override: str | None = None,
         ) -> dict[str, str]:
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
@@ -18166,7 +18397,7 @@ async def resume_job(
                 if feedback
                 else None
             )
-            expected_status = str(job["status"])
+            expected_status = expected_status_override or str(job["status"])
             if (
                 job.get("execution_lane") == "stateless"
                 and workspace_preflight_required
@@ -18301,6 +18532,23 @@ async def resume_job(
             _trigger_dispatch()
             return {"status": "queued", "message": message, "job_id": job_id}
 
+        workspace_action, job, workspace_reason = await _prepare_job_workspace_runtime(
+            job
+        )
+        if workspace_action == "wait":
+            return await _queue_for_dispatch(
+                "Workspace authority recovery is pending live Kubernetes attestation"
+            )
+        if workspace_action == "fail":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_authority_unavailable",
+                    "message": workspace_reason
+                    or "Inherited workspace authority is unavailable",
+                },
+            )
+
         # A workspace-backed job with no live workspace cannot be resumed onto an
         # agent — nothing in this path provisions. Shed the stale context and hand
         # it to the dispatcher, the only thing that rebuilds a workspace. This is
@@ -18336,8 +18584,9 @@ async def resume_job(
         if COMPLETION_COMMANDS_ENABLED:
             # The command-aware path linearizes the resume in the guarded jobs
             # mutation before any pod POST.  The dispatcher then performs the
-            # external delivery from that durable state; flag-off preserves
-            # the historical direct-resume fast path exactly.
+            # external delivery from that durable state. Flag-off retains the
+            # direct-resume optimization, but it now takes the same atomic
+            # workspace-contract claim before any pod POST.
             return await _queue_for_dispatch(
                 "Completion-safe resume queued for auto-dispatch"
             )
@@ -18425,6 +18674,19 @@ async def resume_job(
                         f"Snapshot restore failed for job {job_id} resume (non-blocking): {e}"
                     )
 
+        # Claim before the external POST. This is the same atomic workspace-
+        # authority/agent/lease boundary used by the normal dispatcher. Rows
+        # outside the claimable created/paused/failed set (or rows won by a
+        # concurrent actor) return through the durable queue path below.
+        if not await postgres_db.claim_job_for_agent(
+            job_id,
+            str(agent_id),
+            allow_failed=True,
+        ):
+            return await _queue_for_dispatch(
+                "Job queued for authoritative resume dispatch"
+            )
+
         # Delegate payload build + delivery to the dispatcher's resume path so
         # a user-triggered resume ships exactly what an auto re-dispatch ships:
         # dispatch-time credentials (llm api_key/base_url, env_keys incl.
@@ -18435,7 +18697,8 @@ async def resume_job(
         # knowledge-base/knowledge/issues/job_resume_direct_path_skips_credential_injection.md
         if not await _resume_job_on_agent(job, agent):
             return await _queue_for_dispatch(
-                "Agent did not accept the direct resume; job queued for auto-dispatch"
+                "Agent did not accept the direct resume; job queued for auto-dispatch",
+                expected_status_override="processing",
             )
 
         # Parent resumed — trigger dispatch so paused children become dispatchable
@@ -18925,6 +19188,12 @@ async def _upgrade_job_to_vm_internal(
             "upgrade_from": "container",
             "upgrade_command": frozen_data.get("command", ""),
         }
+        upgraded_workspace_contract = {
+            "version": 1,
+            "requested_backend": "vm",
+            "assigned_backend": "vm",
+            "assignment_source": "operator_vm_upgrade",
+        }
 
         # 5. Update DB in ONE statement: merge the VM keys into context.vm, clear
         #    freeze, set status to paused (dispatchable), unassign agent. Fused so
@@ -18961,7 +19230,7 @@ async def _upgrade_job_to_vm_internal(
                 )
                 control_guard = (
                     " AND ("
-                    + _completion_control_owned_active_sql("context", "$5")
+                    + _completion_control_owned_active_sql("context", "$6")
                     + ")"
                     if control_claim is not None
                     else ""
@@ -18971,14 +19240,19 @@ async def _upgrade_job_to_vm_internal(
                     job_id,
                     str(job["status"]),
                     str(job.get("execution_lane") or "pinned"),
+                    json.dumps(upgraded_workspace_contract),
                 )
                 if control_claim is not None:
                     update_args += (str(control_claim.claim_id),)
                 updated = await conn.fetchrow(
-                    f"UPDATE jobs SET context = jsonb_set("
+                    f"UPDATE jobs SET context = jsonb_set(jsonb_set("
                     f"        COALESCE(context, '{{}}'::jsonb){control_drop}, '{{vm}}', "
                     "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
-                    "    ), "
+                    "    ), '{_workspace_contract}', $5::jsonb), "
+                    "    config_override = jsonb_set("
+                    "        COALESCE(config_override, '{}'::jsonb), '{workspace}', "
+                    "        COALESCE(config_override->'workspace', '{}'::jsonb) "
+                    '            || \'{"backend":"vm"}\'::jsonb), '
                     "    status = 'paused', freeze_data = NULL, "
                     "    assigned_agent_id = NULL, execution_lane = 'pinned', "
                     "    updated_at = CURRENT_TIMESTAMP "
@@ -19582,10 +19856,13 @@ async def _spawn_scholar_subjob(
     # are mutually exclusive: the flag routes into the inherit/wait path, the
     # marker into the provision-under-parent path. See
     # knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
-    if parent_ctx.get("vm"):
+    parent_workspace_backend = resolve_workspace_contract(job).assigned_backend
+    if parent_workspace_backend == "vm" and parent_ctx.get("vm"):
         scholar_context["vm"] = parent_ctx["vm"]
         scholar_context["inherits_parent_workspace"] = True
-    elif parent_ctx.get("workspace_container"):
+    elif parent_workspace_backend == "sandbox" and parent_ctx.get(
+        "workspace_container"
+    ):
         scholar_context["workspace_container"] = parent_ctx["workspace_container"]
         scholar_context["inherits_parent_workspace"] = True
     elif _scholar_should_provision_parent_container(config_override):
@@ -19600,6 +19877,9 @@ async def _spawn_scholar_subjob(
         "verification": {"enabled": False},
         "curator": {"enabled": False},
         "autonomy": "full",
+        "workspace": {
+            "backend": parent_workspace_backend,
+        },
     }
 
     # Propagate parent's LLM override so the scholar uses the same model
@@ -19655,6 +19935,9 @@ async def _spawn_scholar_subjob(
             authority_project_ids=(
                 [project_id] if scholar_owner_id and project_id else []
             ),
+            requested_workspace_backend=None,
+            workspace_assignment_source="parent_inheritance",
+            authoritative_workspace_context=True,
         )
     except Exception:
         logger.exception(
@@ -19710,7 +19993,7 @@ async def _spawn_scholar_subjob(
 
             # Set worktree_path if subjob inherits a workspace backend
             worktree_path = None
-            if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
+            if scholar_context.get("inherits_parent_workspace"):
                 worktree_path = f"/home/agent-host/workspace/worktrees/{short_id}-{scholar_config_name}"
 
             async with postgres_db.acquire() as conn:
@@ -21076,8 +21359,16 @@ async def _setup_verification_critic_workspace(
                 f"Critic {critic_job_id} disappeared during context handoff"
             )
 
+        critic_context = critic_job.get("context") or {}
+        if isinstance(critic_context, str):
+            try:
+                critic_context = json.loads(critic_context)
+            except (json.JSONDecodeError, ValueError):
+                critic_context = {}
         worktree_path = None
-        if parent_context.get("vm") or parent_context.get("workspace_container"):
+        if isinstance(critic_context, dict) and critic_context.get(
+            "inherits_parent_workspace"
+        ):
             worktree_path = (
                 f"/home/agent-host/workspace/worktrees/{short_id}-{effective_config}"
             )
@@ -21315,10 +21606,13 @@ async def _trigger_verification_on_complete(
     # (same discriminator the scholar uses) so the dispatch-time resolver
     # overlays the parent's LIVE workspace instead of skipping it — the flag,
     # not key presence, now gates the inherit path.
-    if parent_ctx.get("vm"):
+    parent_workspace_backend = resolve_workspace_contract(job).assigned_backend
+    if parent_workspace_backend == "vm" and parent_ctx.get("vm"):
         context["vm"] = parent_ctx["vm"]
         context["inherits_parent_workspace"] = True
-    elif parent_ctx.get("workspace_container"):
+    elif parent_workspace_backend == "sandbox" and parent_ctx.get(
+        "workspace_container"
+    ):
         context["workspace_container"] = parent_ctx["workspace_container"]
         context["inherits_parent_workspace"] = True
 
@@ -21334,6 +21628,14 @@ async def _trigger_verification_on_complete(
         parent_llm = parent_override["llm"]
 
     config_override = _critic_config_override(parent_llm)
+    config_override = _deep_merge_dicts(
+        config_override,
+        {
+            "workspace": {
+                "backend": parent_workspace_backend,
+            }
+        },
+    )
 
     project_id = str(job["project_id"]) if job.get("project_id") else None
 
@@ -21391,6 +21693,9 @@ async def _trigger_verification_on_complete(
             authority_project_ids=(
                 [project_id] if critic_owner_id and project_id else []
             ),
+            requested_workspace_backend=None,
+            workspace_assignment_source="parent_inheritance",
+            authoritative_workspace_context=True,
         )
     except asyncpg.UniqueViolationError as exc:
         # The optimistic has_live_verification_critic read is intentionally
@@ -21672,10 +21977,13 @@ async def _materialize_verification_critic_transactional(
                 parent_context = json.loads(parent_context)
             except (TypeError, ValueError):
                 parent_context = {}
-        if parent_context.get("vm"):
+        parent_workspace_backend = resolve_workspace_contract(parent).assigned_backend
+        if parent_workspace_backend == "vm" and parent_context.get("vm"):
             critic_context["vm"] = parent_context["vm"]
             critic_context["inherits_parent_workspace"] = True
-        elif parent_context.get("workspace_container"):
+        elif parent_workspace_backend == "sandbox" and parent_context.get(
+            "workspace_container"
+        ):
             critic_context["workspace_container"] = parent_context[
                 "workspace_container"
             ]
@@ -21694,6 +22002,14 @@ async def _materialize_verification_critic_transactional(
             else None
         )
         critic_override = _critic_config_override(parent_llm)
+        critic_override = _deep_merge_dicts(
+            critic_override,
+            {
+                "workspace": {
+                    "backend": parent_workspace_backend,
+                }
+            },
+        )
         project_id = str(parent["project_id"]) if parent.get("project_id") else None
 
         try:
@@ -21749,6 +22065,9 @@ async def _materialize_verification_critic_transactional(
                     authority_project_ids=(
                         [project_id] if critic_owner_id and project_id else []
                     ),
+                    requested_workspace_backend=None,
+                    workspace_assignment_source="parent_inheritance",
+                    authoritative_workspace_context=True,
                 )
         except asyncpg.UniqueViolationError as exc:
             if getattr(exc, "constraint_name", None) != "jobs_verification_uniq":
@@ -30364,6 +30683,37 @@ async def assign_job_to_agent(
 
         await _guard_completion_control(job_id, source="manual_assign")
 
+        workspace_action, job, workspace_reason = await _prepare_job_workspace_runtime(
+            job
+        )
+        if workspace_action != "proceed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_runtime_adoption_pending",
+                    "message": (
+                        "Live Kubernetes workspace authority is not yet available; "
+                        "no agent was reserved"
+                    ),
+                    "retryable": workspace_action == "wait",
+                    "failure": workspace_reason,
+                },
+            )
+
+        workspace_decision = resolve_workspace_runtime(job)
+        if workspace_decision.contract is None or workspace_decision.state == "invalid":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_contract_invalid",
+                    "message": (
+                        "Job workspace authority is ambiguous; no agent was reserved"
+                    ),
+                    "state": workspace_decision.state,
+                    "failure": workspace_decision.reason,
+                },
+            )
+
         missing_workspace = _resume_missing_workspace(job)
         if missing_workspace:
             if COMPLETION_COMMANDS_ENABLED:
@@ -30426,10 +30776,10 @@ async def assign_job_to_agent(
                 detail="Agent has no pod IP configured",
             )
 
-        if COMPLETION_COMMANDS_ENABLED and not await postgres_db.claim_job_for_agent(
+        if not await postgres_db.claim_job_for_agent(
             job_id,
             agent_id,
-            completion_commands_enabled=True,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
             allow_failed=True,
         ):
             raise HTTPException(
@@ -39420,6 +39770,26 @@ async def provision_job_workspace(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    try:
+        workspace_contract = resolve_workspace_contract(job)
+    except WorkspaceContractError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    if workspace_contract.assigned_backend not in {"virtual", "none", "sandbox"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_backend_conflict",
+                "message": (
+                    "This job is assigned to the VM tier; an in-process "
+                    "sandbox upgrade would violate its workspace contract"
+                ),
+                "assigned_backend": workspace_contract.assigned_backend,
+            },
+        )
+
     # Sec-1 — authorize against the owner's grants BEFORE provisioning
     # (fail-closed), via the shared gate. sandbox passes by default; a
     # shell-restricted owner is refused 403.
@@ -39431,7 +39801,8 @@ async def provision_job_workspace(
             detail="Workspace container provisioning not available (no in-cluster K8s)",
         )
 
-    # Idempotency: short-circuit if a container is already in flight or ready.
+    # Idempotency: short-circuit only after this route has durably changed the
+    # assignment. Opposite-tier readiness is never authority to select sandbox.
     context = job.get("context") or {}
     if isinstance(context, str):
         try:
@@ -39439,7 +39810,12 @@ async def provision_job_workspace(
         except (json.JSONDecodeError, TypeError):
             context = {}
     wc = context.get("workspace_container") or {}
-    if wc.get("status") in ("pending", "creating", "created", "ready"):
+    if workspace_contract.assigned_backend == "sandbox" and wc.get("status") in (
+        "pending",
+        "creating",
+        "created",
+        "ready",
+    ):
         return {
             "status": wc["status"],
             "job_id": job_id,
@@ -39447,13 +39823,70 @@ async def provision_job_workspace(
             "message": "Workspace container already provisioned or in progress",
         }
 
-    # Mark pending, then provision in the background: create_workspace blocks up
+    if workspace_contract.assigned_backend == "sandbox":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_runtime_unavailable",
+                "message": (
+                    "The sandbox assignment exists without a current "
+                    "provisioning generation; use normal workspace recovery"
+                ),
+            },
+        )
+
+    # Change the assignment and mark pending atomically, then provision in the
+    # background: create_workspace blocks up
     # to ~120s waiting for the pod IP and updates context.workspace_container to
     # ready/failed itself. The agent polls /workspace-status
     # (-> _poll_job_workspace_ready) for the ready connection block, then swaps
     # in place. No status change, no _trigger_dispatch — the running agent owns
     # the swap (the whole point of the in-process design, §4.3 W1).
-    await postgres_db.merge_workspace_container_context(job_id, {"status": "pending"})
+    transitioned = await postgres_db.begin_job_workspace_tier_transition(
+        job_id,
+        expected_backend=workspace_contract.assigned_backend,
+        target_backend="sandbox",
+        requested_backend=workspace_contract.requested_backend,
+        assignment_source="runtime_workspace_upgrade",
+        expected_status=str(job.get("status") or ""),
+    )
+    if not transitioned:
+        refreshed = await postgres_db.get_job(job_id)
+        if refreshed:
+            try:
+                refreshed_contract = resolve_workspace_contract(refreshed)
+            except WorkspaceContractError:
+                refreshed_contract = None
+            refreshed_context = refreshed.get("context") or {}
+            if isinstance(refreshed_context, str):
+                try:
+                    refreshed_context = json.loads(refreshed_context)
+                except (json.JSONDecodeError, TypeError):
+                    refreshed_context = {}
+            refreshed_workspace = (
+                refreshed_context.get("workspace_container")
+                if isinstance(refreshed_context, dict)
+                else None
+            ) or {}
+            if (
+                refreshed_contract is not None
+                and refreshed_contract.assigned_backend == "sandbox"
+                and refreshed_workspace.get("status")
+                in ("pending", "creating", "created", "ready")
+            ):
+                return {
+                    "status": refreshed_workspace["status"],
+                    "job_id": job_id,
+                    "target_tier": "sandbox",
+                    "message": "Workspace transition already accepted",
+                }
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_contract_changed",
+                "message": "Job workspace assignment changed before provisioning",
+            },
+        )
     asyncio.create_task(
         container_provisioner.create_workspace(WorkspaceOwner.job(job_id))
     )
@@ -39480,6 +39913,26 @@ async def get_job_workspace_status(request: Request, job_id: str) -> dict[str, A
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    try:
+        contract = resolve_workspace_contract(job)
+    except WorkspaceContractError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    if contract.assigned_backend != "sandbox":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_backend_conflict",
+                "message": (
+                    "Sandbox workspace status is unavailable for this job's "
+                    "assigned workspace tier"
+                ),
+                "assigned_backend": contract.assigned_backend,
+            },
+        )
 
     context = job.get("context") or {}
     if isinstance(context, str):
@@ -45607,6 +46060,29 @@ async def internal_unit_claim_bundle(
             raise HTTPException(
                 status_code=409, detail="Job is not on the stateless lane"
             )
+        workspace_action, job, _workspace_reason = await _prepare_job_workspace_runtime(
+            job
+        )
+        if workspace_action != "proceed":
+            raise HTTPException(
+                status_code=409,
+                detail="Job workspace authority is not ready",
+            )
+        workspace_decision = resolve_workspace_runtime(job)
+        if (
+            workspace_decision.contract is None
+            or workspace_decision.contract.assigned_backend != "sandbox"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job workspace contract is not stateless-compatible",
+            )
+        initial_runtime_digest = workspace_runtime_authority_digest(job)
+        if initial_runtime_digest is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Job workspace authority is not ready",
+            )
 
         # Inheriting scholar/critic/delegation jobs deliberately keep only a
         # snapshot of their parent's workspace in their own row. Resolve the
@@ -45654,6 +46130,7 @@ async def internal_unit_claim_bundle(
                 "host": initial_attestation.host,
                 "pod_ip": initial_attestation.pod_ip,
                 "port": initial_attestation.port,
+                "_runtime_incarnation": (initial_attestation.runtime_incarnation),
             }
         )
         attested_context["workspace_container"] = exact_container_ctx
@@ -45707,6 +46184,38 @@ async def internal_unit_claim_bundle(
             raise HTTPException(
                 status_code=409,
                 detail="Stateless worker workspace authority unavailable",
+            )
+
+        # The Kubernetes objects are only half of the authority. Re-read the
+        # job's assigned tier after slow credential/config assembly so a
+        # concurrent control-plane transition cannot ship a sandbox bundle
+        # under an obsolete contract. Opposite-tier diagnostic residue is not
+        # part of this comparison and cannot perturb a valid sandbox claim.
+        final_job = await postgres_db.get_job(unit_id)
+        final_action = "fail"
+        if final_job is not None:
+            (
+                final_action,
+                final_job,
+                _final_reason,
+            ) = await _prepare_job_workspace_runtime(final_job)
+        try:
+            final_contract = (
+                resolve_workspace_contract(final_job) if final_job else None
+            )
+        except WorkspaceContractError:
+            final_contract = None
+        if (
+            final_job is None
+            or final_action != "proceed"
+            or final_job.get("execution_lane") != LANE_STATELESS
+            or final_contract != workspace_decision.contract
+            or final_contract.assigned_backend != "sandbox"
+            or workspace_runtime_authority_digest(final_job) != initial_runtime_digest
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job workspace contract changed during bundle assembly",
             )
 
         # Recheck the exact lease after both slow operations so a stolen zombie

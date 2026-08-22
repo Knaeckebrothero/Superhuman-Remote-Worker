@@ -1,7 +1,7 @@
 import {signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, Router} from '@angular/router';
-import {TranslocoTestingModule} from '@jsverse/transloco';
+import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
 import {BehaviorSubject, of} from 'rxjs';
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ApiService} from '../../core/services/api.service';
@@ -63,6 +63,9 @@ function mountLogic(overrides: {
     ],
   });
   TestBed.overrideComponent(JobListComponent, {set: {template: '', imports: []}});
+  const transloco = TestBed.inject(TranslocoService);
+  transloco.setTranslation(en, 'en');
+  transloco.setActiveLang('en');
   const fixture = TestBed.createComponent(JobListComponent);
   return {fixture, component: fixture.componentInstance, api, navigate};
 }
@@ -170,6 +173,31 @@ describe('JobListComponent — server-resolved tree', () => {
     });
     fixture.detectChanges();
     expect(component.displayRows().map((row) => row.job.id)).toEqual(['a']);
+  });
+
+  it('formats the safe requested, assigned, effective and mismatch projection', async () => {
+    const workspaceJob = job('vm-job', {
+      workspace_contract: {
+        requested_backend: 'vm',
+        assigned_backend: 'vm',
+        effective_backend: null,
+        state: 'mismatch',
+        failure: 'sandbox_ready_for_vm_assignment',
+        stale_backend: 'sandbox',
+      },
+    }) as JobSummary;
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(component.workspaceContractSummary(workspaceJob)).toContain(
+      'requested vm · assigned vm · effective unavailable',
+    );
+    expect(component.workspaceContractTitle(workspaceJob)).toContain(
+      'mismatch · detail: sandbox_ready_for_vm_assignment',
+    );
+    expect(component.workspaceContractSummary(workspaceJob)).not.toContain('ssh');
   });
 });
 

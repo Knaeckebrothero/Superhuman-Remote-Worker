@@ -35,6 +35,10 @@ from uuid import UUID, uuid4
 
 from services.officer_slots import SlotAdmissionError
 from services.officer_slots import admit as admit_slot
+from src.shared.workspace_contract import (
+    WorkspaceContractError,
+    configured_workspace_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +71,11 @@ OFFICER_HELD_MESSAGE = (
 class OfficerAdmissionConflict(RuntimeError):
     """A normal, retryable/refused Officer Post admission outcome."""
 
-    def __init__(self, code: str, detail: str):
+    def __init__(self, code: str, detail: str, **fields: Any):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+        self.fields = dict(fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,8 @@ class OfficerAdmissionPreparation:
     incarnation: int
     owner_user_id: str | None
     require_auto_pull: bool
+    requested_model: str | None = None
+    requested_backend: str | None = None
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -194,8 +201,58 @@ def apply_prepared_slot_config(
     return _deep_merge(base_config_override, preparation.slot_patch)
 
 
-def _conflict(code: str, detail: str) -> OfficerAdmissionConflict:
-    return OfficerAdmissionConflict(code, detail)
+def _conflict(code: str, detail: str, **fields: Any) -> OfficerAdmissionConflict:
+    return OfficerAdmissionConflict(code, detail, **fields)
+
+
+def _requested_model(config_override: Any) -> str | None:
+    config = _as_dict(config_override)
+    llm = _as_dict(config.get("llm"))
+    model = llm.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
+def _validate_slot_pins(
+    *,
+    slot_name: str | None,
+    slot_patch: Mapping[str, Any],
+    requested_model: str | None,
+    requested_backend: str | None,
+) -> None:
+    """Refuse a caller choice that a typed slot would otherwise overwrite."""
+
+    if slot_name is None:
+        return
+    pinned_backend = configured_workspace_backend(slot_patch)
+    if (
+        requested_backend is not None
+        and pinned_backend is not None
+        and requested_backend != pinned_backend
+    ):
+        raise _conflict(
+            "slot_backend_conflict",
+            f"Slot '{slot_name}' pins workspace backend '{pinned_backend}', "
+            f"which conflicts with requested backend '{requested_backend}'. "
+            "Select a compatible Officer slot instead of retrying the same override.",
+            slot=slot_name,
+            pinned_backend=pinned_backend,
+            requested_backend=requested_backend,
+        )
+    pinned_model = _as_dict(slot_patch.get("llm")).get("model")
+    if (
+        requested_model is not None
+        and isinstance(pinned_model, str)
+        and requested_model != pinned_model
+    ):
+        raise _conflict(
+            "slot_model_conflict",
+            f"Slot '{slot_name}' pins model '{pinned_model}', which conflicts "
+            f"with requested model '{requested_model}'. Select a compatible "
+            "Officer slot instead of retrying the same override.",
+            slot=slot_name,
+            pinned_model=pinned_model,
+            requested_model=requested_model,
+        )
 
 
 def _validate_live_incarnation(
@@ -244,6 +301,8 @@ def _preparation_from_rows(
     requested_slot: str | None,
     require_auto_pull: bool,
     expected_category: str | None,
+    requested_model: str | None = None,
+    requested_backend: str | None = None,
 ) -> OfficerAdmissionPreparation:
     officer_meta = _validate_live_incarnation(
         post,
@@ -252,6 +311,12 @@ def _preparation_from_rows(
         require_auto_pull=require_auto_pull,
     )
     slot_name, slot_patch = admit_slot(officer_meta, requested_slot, {})
+    _validate_slot_pins(
+        slot_name=slot_name,
+        slot_patch=slot_patch,
+        requested_model=requested_model,
+        requested_backend=requested_backend,
+    )
     category = _slot_category(officer_meta, slot_name)
     if expected_category is not None and category != expected_category:
         raise _conflict(
@@ -271,6 +336,8 @@ def _preparation_from_rows(
         incarnation=len(incarnations),
         owner_user_id=str(owner) if owner else None,
         require_auto_pull=require_auto_pull,
+        requested_model=requested_model,
+        requested_backend=requested_backend,
     )
 
 
@@ -282,6 +349,7 @@ async def prepare_officer_admission(
     requested_slot: str | None,
     require_auto_pull: bool = False,
     expected_category: str | None = None,
+    requested_config_override: Mapping[str, Any] | None = None,
 ) -> OfficerAdmissionPreparation:
     """Read a coherent preflight snapshot without holding a long transaction."""
 
@@ -326,6 +394,10 @@ async def prepare_officer_admission(
             "user_id": row["thread_user_id"],
             "created_at": row["thread_created_at"],
         }
+    try:
+        requested_backend = configured_workspace_backend(requested_config_override)
+    except WorkspaceContractError as exc:
+        raise _conflict(exc.code, exc.detail) from exc
     return _preparation_from_rows(
         post,
         thread,
@@ -333,6 +405,8 @@ async def prepare_officer_admission(
         requested_slot=requested_slot,
         require_auto_pull=require_auto_pull,
         expected_category=expected_category,
+        requested_model=_requested_model(requested_config_override),
+        requested_backend=requested_backend,
     )
 
 
@@ -487,6 +561,8 @@ async def admit_and_create_job_in_transaction(
         requested_slot=preparation.requested_slot,
         require_auto_pull=preparation.require_auto_pull,
         expected_category=preparation.category,
+        requested_model=preparation.requested_model,
+        requested_backend=preparation.requested_backend,
     )
     if current.config_fingerprint != preparation.config_fingerprint:
         raise _conflict(
@@ -512,6 +588,12 @@ async def admit_and_create_job_in_transaction(
     officer_meta = _officer_meta(thread.get("metadata"))
     slot_name, slot_patch = admit_slot(
         officer_meta, preparation.requested_slot, in_flight
+    )
+    _validate_slot_pins(
+        slot_name=slot_name,
+        slot_patch=slot_patch,
+        requested_model=preparation.requested_model,
+        requested_backend=preparation.requested_backend,
     )
     if slot_name != preparation.slot_name or slot_patch != preparation.slot_patch:
         raise _conflict(
@@ -602,6 +684,12 @@ async def admit_and_create_job_in_transaction(
         )
         final_kwargs["job_id"] = admitted_job_id
     final_kwargs["authoritative_officer_admission"] = True
+    # The slot's configured tier is the assignment, not a caller request. This
+    # stays ``None`` for auto-pull/defaulted jobs and preserves the explicit
+    # request only for manual Officer calls that were checked for collision.
+    final_kwargs["requested_workspace_backend"] = preparation.requested_backend
+    if configured_workspace_backend(slot_patch) is not None:
+        final_kwargs["workspace_assignment_source"] = f"officer_slot:{slot_name}"
     final_kwargs["conn"] = conn
     # Stamped at the last common funnel rather than in each caller: both the
     # backlog tick and the manual "pull this ticket" click land here, and both

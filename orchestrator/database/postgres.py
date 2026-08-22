@@ -51,8 +51,17 @@ from security.crypto import (
 from utils.db_url import build_postgres_url
 from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
+from src.shared.workspace_contract import (
+    WORKSPACE_CONTRACT_CONTEXT_KEY,
+    WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
+    configured_workspace_backend,
+    strip_and_stamp_workspace_creation,
+    workspace_contract_projection,
+)
 
 logger = logging.getLogger(__name__)
+
+_WORKSPACE_REQUEST_UNSET = object()
 
 # Non-lifecycle workspace metadata which may be written independently while a
 # static Docker lease is allocated. Allocation replaces every authority-bearing
@@ -1864,6 +1873,8 @@ class PostgresDB:
                        j.diff_status, j.exported_at, j.exported_folder_handle,
                        j.error_message,
                        j.created_at, j.created_by_thread_id,
+                       j.config_override AS _workspace_config_override,
+                       j.context AS _workspace_context,
                        j.context->'snapshot'->>'status' AS snapshot_status,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
@@ -1914,6 +1925,13 @@ class PostgresDB:
                     total_is_capped = True
 
         rows = [dict(row) for row in fetched]
+        for row in rows:
+            row["workspace_contract"] = workspace_contract_projection(
+                {
+                    "config_override": row.pop("_workspace_config_override", None),
+                    "context": row.pop("_workspace_context", None),
+                }
+            )
 
         # has_more is measured in display roots, because that is what the page
         # size counts. Fetching limit+1 roots and dropping the surplus root
@@ -2009,6 +2027,9 @@ class PostgresDB:
         execution_lane: str | None = None,
         job_id: str | UUID | None = None,
         authoritative_officer_admission: bool = False,
+        requested_workspace_backend: Any = _WORKSPACE_REQUEST_UNSET,
+        workspace_assignment_source: str | None = None,
+        authoritative_workspace_context: bool = False,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -2066,6 +2087,16 @@ class PostgresDB:
                 claim/admission context stamped by the final admission helper.
                 Valid only with a caller-owned transaction; every ordinary
                 caller is stripped at this last common funnel.
+            requested_workspace_backend: Caller-requested tier resolved by the
+                API before project/expert/Officer-slot layering. ``None`` means
+                the caller accepted a default; omission lets trusted direct
+                service callers describe their final explicit override.
+            workspace_assignment_source: Safe server-owned description of the
+                layer that selected the assigned tier.
+            authoritative_workspace_context: Preserve a server-built parent's
+                runtime context for an inheriting child. Raw REST/session/tool
+                callers must never set this; the default strips both runtime
+                context branches before stamping the contract.
             conn: Optional caller-owned connection ALREADY inside a transaction.
                 Officer admission needs its stable post lock, ticket-claim
                 check, lineage capacity count and this INSERT to be one atomic
@@ -2130,6 +2161,17 @@ class PostgresDB:
         else:
             for key in _SERVER_OWNED_OFFICER_CONTEXT_KEYS:
                 context.pop(key, None)
+        if requested_workspace_backend is _WORKSPACE_REQUEST_UNSET:
+            requested_workspace_backend = configured_workspace_backend(config_override)
+        context, config_override, _workspace_contract = (
+            strip_and_stamp_workspace_creation(
+                context,
+                config_override,
+                requested_backend=requested_workspace_backend,
+                assignment_source=workspace_assignment_source,
+                preserve_runtime_context=authoritative_workspace_context,
+            )
+        )
         safe_provenance = dict(datasource_selection_provenance or {})
         safe_provenance["datasource_ids"] = [
             str(datasource_id) for datasource_id in datasource_uuids
@@ -2224,7 +2266,11 @@ class PostgresDB:
                 ):
                     row = await _write(owned_conn)
 
-        return dict(row)
+        result = dict(row)
+        result["workspace_contract"] = workspace_contract_projection(
+            {"context": context, "config_override": config_override}
+        )
+        return result
 
     async def delete_job(
         self,
@@ -5577,6 +5623,190 @@ class PostgresDB:
             result = await conn.execute(query, *values)
 
         return result == "UPDATE 1"
+
+    async def begin_job_workspace_tier_transition(
+        self,
+        job_id: str,
+        *,
+        expected_backend: str,
+        target_backend: str,
+        requested_backend: str | None,
+        assignment_source: str,
+        expected_status: str,
+    ) -> bool:
+        """Atomically authorize an intentional in-process workspace upgrade.
+
+        Runtime readiness is never allowed to select a tier.  The running
+        lite worker first changes its durable assignment and writes the
+        sandbox ``pending`` marker in this one CAS; only then may the
+        provisioner start.  A late callback for an opposite tier can still be
+        retained as diagnostics, but it cannot change this contract.
+
+        This is deliberately narrower than a general JSONB patch.  Today the
+        only supported in-process job transition is ``virtual|none`` to
+        ``sandbox``.  VM approval has its own status/control transaction.
+        """
+
+        import json as json_module
+
+        try:
+            job_uuid = UUID(job_id)
+        except (TypeError, ValueError):
+            return False
+        if expected_backend not in {"virtual", "none"} or target_backend != "sandbox":
+            raise ValueError("unsupported job workspace tier transition")
+        if not assignment_source:
+            raise ValueError("workspace assignment source is required")
+
+        contract = {
+            "version": 1,
+            "requested_backend": requested_backend,
+            "assigned_backend": target_backend,
+            "assignment_source": assignment_source,
+        }
+        normalized_config_backend = (
+            "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
+            "'sandbox')) WHEN 'container' THEN 'sandbox' "
+            "WHEN 'remote' THEN 'vm' ELSE lower(COALESCE("
+            "config_override->'workspace'->>'backend', 'sandbox')) END"
+        )
+        query = f"""
+            UPDATE jobs
+               SET context = jsonb_set(
+                       jsonb_set(
+                           COALESCE(context, '{{}}'::jsonb),
+                           '{{_workspace_contract}}',
+                           $2::jsonb
+                       ),
+                       '{{workspace_container}}',
+                       COALESCE(context->'workspace_container', '{{}}'::jsonb)
+                           || '{{"status":"pending"}}'::jsonb
+                   ),
+                   config_override = jsonb_set(
+                       COALESCE(config_override, '{{}}'::jsonb),
+                       '{{workspace}}',
+                       COALESCE(config_override->'workspace', '{{}}'::jsonb)
+                           || jsonb_build_object('backend', $3::text)
+                   ),
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+               AND status::text = $4::text
+               AND {normalized_config_backend} = $5::text
+               AND (
+                   NOT (COALESCE(context, '{{}}'::jsonb)
+                       ? '_workspace_contract')
+                   OR (
+                       jsonb_typeof(context->'_workspace_contract') = 'object'
+                       AND context->'_workspace_contract'->>'version' = '1'
+                       AND context->'_workspace_contract'
+                               ->>'assigned_backend' = $5::text
+                   )
+               )
+            RETURNING id
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                job_uuid,
+                json_module.dumps(contract),
+                target_backend,
+                expected_status,
+                expected_backend,
+            )
+        return row is not None
+
+    async def adopt_legacy_k8s_job_workspace_runtime(
+        self,
+        job_id: str,
+        *,
+        expected_status: str,
+        expected_execution_lane: str | None,
+        expected_parent_job_id: str | None,
+        expected_contract: Any,
+        expected_legacy_backend: Any,
+        expected_workspace_config: Any,
+        expected_workspace: Mapping[str, Any],
+        adopted_workspace: Mapping[str, Any],
+    ) -> bool:
+        """CAS one live-attested pre-0175 Kubernetes job runtime.
+
+        Kubernetes supplies the provenance; PostgreSQL only proves that the
+        status, tier evidence, lineage/lane and exact UID-less workspace
+        snapshot did not change while that external attestation ran. No name,
+        endpoint or database value is promoted into a Pod UID here.
+        """
+
+        import json as json_module
+
+        try:
+            job_uuid = UUID(job_id)
+            parent_uuid = (
+                UUID(expected_parent_job_id) if expected_parent_job_id else None
+            )
+        except (TypeError, ValueError):
+            return False
+
+        def _json(value: Any) -> str | None:
+            return None if value is None else json_module.dumps(value)
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET context = jsonb_set(
+                           COALESCE(context, '{}'::jsonb),
+                           '{workspace_container}',
+                           $9::jsonb,
+                           true
+                       ),
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1::uuid
+                   AND status::text = $2::text
+                   AND execution_lane::text IS NOT DISTINCT FROM $3::text
+                   AND parent_job_id IS NOT DISTINCT FROM $4::uuid
+                   AND context->'_workspace_contract'
+                       IS NOT DISTINCT FROM $5::jsonb
+                   AND context->'workspace_backend'
+                       IS NOT DISTINCT FROM $6::jsonb
+                   AND config_override->'workspace'
+                       IS NOT DISTINCT FROM $7::jsonb
+                   AND context->'workspace_container' = $8::jsonb
+                RETURNING id
+                """,
+                job_uuid,
+                expected_status,
+                expected_execution_lane,
+                parent_uuid,
+                _json(expected_contract),
+                _json(expected_legacy_backend),
+                _json(expected_workspace_config),
+                json_module.dumps(dict(expected_workspace)),
+                json_module.dumps(dict(adopted_workspace)),
+            )
+        return row is not None
+
+    async def list_uidless_k8s_job_workspace_rows(self) -> list[dict[str, Any]]:
+        """Read-only rollout inventory for genuine pre-0175 job contexts."""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status::text AS status, execution_lane,
+                       parent_job_id, config_override, context, created_at
+                  FROM jobs
+                 WHERE status::text IN (
+                       'created', 'processing', 'failed', 'pending_review',
+                       'paused', 'reviewing', 'waiting', 'waiting_for_reply'
+                   )
+                   AND context->'workspace_container'->>'status' = 'ready'
+                   AND context->'workspace_container'->>'provisioner' = 'k8s'
+                   AND NOT (
+                       context->'workspace_container' ? '_runtime_incarnation'
+                   )
+                 ORDER BY created_at, id
+                """
+            )
+        return [dict(row) for row in rows]
 
     async def acquire_docker_workspace_lease(
         self,
@@ -9622,13 +9852,42 @@ class PostgresDB:
             if allow_failed
             else "AND status IN ('created', 'paused')"
         )
+        normalized_backend_sql = (
+            "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
+            "'sandbox')) WHEN 'container' THEN 'sandbox' WHEN 'remote' THEN "
+            "'vm' ELSE lower(COALESCE(config_override->'workspace'->>'backend', "
+            "'sandbox')) END"
+        )
         async with self.acquire() as conn:
             query = f"""
                     UPDATE jobs
                        SET status = 'processing',
-                           assigned_agent_id = $2,
+                           assigned_agent_id = $2::uuid,
                            lease_expires_at = NOW() + make_interval(
                                secs => $3::int
+                           ),
+                           context = jsonb_set(
+                               COALESCE(context, '{{}}'::jsonb),
+                               '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
+                               jsonb_build_object(
+                                   'version', 1,
+                                   'dispatch_kind', 'pinned',
+                                   'contract_version', CASE
+                                       WHEN context
+                                           ? '{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                                       THEN 1 ELSE 0
+                                   END,
+                                   'assigned_backend', COALESCE(
+                                       context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                                           ->>'assigned_backend',
+                                       {normalized_backend_sql}
+                                   ),
+                                   'agent_id', ($2::uuid)::text,
+                                   'lease_expires_at', to_jsonb(
+                                       NOW() + make_interval(secs => $3::int)
+                                   )
+                               ),
+                               true
                            ),
                            error_message = NULL,
                            error_details = NULL,
@@ -9642,6 +9901,42 @@ class PostgresDB:
                        AND COALESCE(
                            context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', ''
                        ) <> 'tripped'
+                       AND (
+                           (
+                               jsonb_typeof(
+                                   context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                               ) = 'object'
+                               AND context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                                       ->>'version' = '1'
+                               AND context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                                       ->>'assigned_backend'
+                                   IN ('sandbox', 'vm', 'virtual', 'none')
+                               AND {normalized_backend_sql}
+                                   = context->'{WORKSPACE_CONTRACT_CONTEXT_KEY}'
+                                       ->>'assigned_backend'
+                           )
+                           OR (
+                               NOT (COALESCE(context, '{{}}'::jsonb)
+                                   ? '{WORKSPACE_CONTRACT_CONTEXT_KEY}')
+                               AND {normalized_backend_sql}
+                                   IN ('sandbox', 'vm', 'virtual', 'none')
+                               AND (
+                                   NOT (COALESCE(context, '{{}}'::jsonb)
+                                       ? 'workspace_backend')
+                                   OR CASE lower(context->>'workspace_backend')
+                                       WHEN 'container' THEN 'sandbox'
+                                       WHEN 'remote' THEN 'vm'
+                                       ELSE lower(context->>'workspace_backend')
+                                   END = {normalized_backend_sql}
+                               )
+                               AND (
+                                   COALESCE(
+                                       context->'vm'->>'requested', 'false'
+                                   ) <> 'true'
+                                   OR {normalized_backend_sql} = 'vm'
+                               )
+                           )
+                       )
                        {status_guard}
                        {control_guard}
                     RETURNING id
@@ -15983,6 +16278,52 @@ class PostgresDB:
                            AND status IN ('created', 'paused')
                            AND assigned_agent_id IS NULL
                            AND freeze_data IS NULL
+                           AND (
+                               (
+                                   jsonb_typeof(
+                                       context->'_workspace_contract'
+                                   ) = 'object'
+                                   AND context->'_workspace_contract'
+                                           ->>'version' = '1'
+                                   AND context->'_workspace_contract'
+                                           ->>'assigned_backend' = 'sandbox'
+                                   AND CASE lower(COALESCE(
+                                       config_override->'workspace'->>'backend',
+                                       'sandbox'
+                                   ))
+                                       WHEN 'container' THEN 'sandbox'
+                                       WHEN 'remote' THEN 'vm'
+                                       ELSE lower(COALESCE(
+                                           config_override->'workspace'->>'backend',
+                                           'sandbox'
+                                       ))
+                                   END = 'sandbox'
+                               )
+                               OR (
+                                   NOT (COALESCE(context, '{{}}'::jsonb)
+                                       ? '_workspace_contract')
+                                   AND CASE lower(COALESCE(
+                                       config_override->'workspace'->>'backend',
+                                       'sandbox'
+                                   ))
+                                       WHEN 'container' THEN 'sandbox'
+                                       WHEN 'remote' THEN 'vm'
+                                       ELSE lower(COALESCE(
+                                           config_override->'workspace'->>'backend',
+                                           'sandbox'
+                                       ))
+                                   END = 'sandbox'
+                                   AND (
+                                       NOT (COALESCE(context, '{{}}'::jsonb)
+                                           ? 'workspace_backend')
+                                       OR lower(context->>'workspace_backend')
+                                           IN ('sandbox', 'container')
+                                   )
+                                   AND COALESCE(
+                                       context->'vm'->>'requested', 'false'
+                                   ) <> 'true'
+                               )
+                           )
                            {completion_exclusion}
                            {control_guard}
                            AND CASE

@@ -726,6 +726,10 @@ async def test_admission_rechecks_exact_k8s_ready_evidence_after_enqueue():
             assert "->>'status' = 'ready'" in normalized
             assert "->>'provisioner' = 'k8s'" in normalized
             assert "->>'pod_ip'" in normalized
+            assert "_workspace_contract" in normalized
+            assert "assigned_backend' = 'sandbox'" in normalized
+            assert "workspace_backend" in normalized
+            assert "context->'vm'->>'requested'" in normalized
             assert "inherits_parent_workspace" in normalized
             assert "parent.id = jobs.parent_job_id" in normalized
             return {"id": UUID(JOB_ID)}
@@ -832,6 +836,51 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
         error_message="Workspace container failed: image pull failed",
         expected_status="created",
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypatch):
+    from orchestrator import main
+
+    job = {
+        "id": JOB_ID,
+        "status": "created",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "context": {
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+                "port": 30022,
+            }
+        },
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "priority": 0,
+        "user_id": None,
+        "parent_job_id": None,
+    }
+    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_admittable_stateless_jobs",
+        AsyncMock(return_value=[job]),
+    )
+    prepare = AsyncMock(
+        return_value=("wait", job, "kubernetes_attestation_unavailable")
+    )
+    monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+    update = AsyncMock()
+    monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+    provision = AsyncMock(side_effect=AssertionError("provisioning attempted"))
+    monkeypatch.setattr(main, "ensure_workspace", provision)
+
+    await main._try_dispatch_pending_jobs()
+
+    prepare.assert_awaited_once_with(job)
+    update.assert_not_awaited()
+    provision.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -42,19 +42,53 @@ READY_CONTAINER = {
     "pod_ip": "10.42.3.218",
     "port": 30022,
     "pod_name": "workspace-parent",
+    "_runtime_incarnation": "11111111-1111-4111-8111-111111111111",
 }
 STALE_CONTAINER = {"status": "created", "pod_name": "workspace-parent"}
-READY_VM = {"status": "ready", "ssh_host": "100.64.0.1", "pod_ip": "10.0.2.1"}
+READY_VM = {
+    "status": "ready",
+    "ssh_host": "100.64.0.1",
+    "pod_ip": "10.0.2.1",
+    "provision_generation": "22222222-2222-4222-8222-222222222222",
+}
+
+
+def _stamp_workspace(row):
+    if row is None:
+        return None
+    row = dict(row)
+    context = row.get("context") or {}
+    context_was_json = isinstance(context, str)
+    if context_was_json:
+        import json
+
+        context = json.loads(context)
+    context = dict(context)
+    backend = "vm" if "vm" in context else "sandbox"
+    context.setdefault(
+        "_workspace_contract",
+        {
+            "version": 1,
+            "requested_backend": backend,
+            "assigned_backend": backend,
+            "assignment_source": "test",
+        },
+    )
+    row["context"] = context
+    row.setdefault("config_override", {"workspace": {"backend": backend}})
+    return row
 
 
 def _subjob(context, *, parent_id="parent-uuid", age_s=5.0):
     """Build a subjob row like get_dispatchable_jobs returns."""
-    return {
-        "id": "subjob-uuid",
-        "parent_job_id": parent_id,
-        "context": context,
-        "created_at": datetime.now(timezone.utc) - timedelta(seconds=age_s),
-    }
+    return _stamp_workspace(
+        {
+            "id": "subjob-uuid",
+            "parent_job_id": parent_id,
+            "context": context,
+            "created_at": datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        }
+    )
 
 
 def _inherited(container=None, vm=None):
@@ -79,7 +113,7 @@ def patch_get_job(monkeypatch):
     """Patch main.postgres_db.get_job with an AsyncMock; return the mock."""
 
     def _apply(parent_row):
-        mock = AsyncMock(return_value=parent_row)
+        mock = AsyncMock(return_value=_stamp_workspace(parent_row))
         monkeypatch.setattr(main.postgres_db, "get_job", mock)
         return mock
 
@@ -165,6 +199,79 @@ class TestSelfProvisionedDiscrimination:
 
 
 class TestContainerInheritance:
+    @pytest.mark.asyncio
+    async def test_exact_legacy_parent_runtime_is_adopted_under_parent_owner(
+        self, monkeypatch
+    ):
+        from services.container_provisioner import WorkspaceRuntimeAttestation
+
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        old_runtime = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.3.218",
+            "port": 30022,
+            "host": "workspace-parent.ns.svc.cluster.local",
+        }
+        parent = {
+            "id": parent_id,
+            "status": "waiting",
+            "execution_lane": "pinned",
+            "config_override": {"workspace": {"backend": "container"}},
+            # Exact prior-release row: no contract and no runtime UID.
+            "context": {"workspace_container": dict(old_runtime)},
+        }
+        attestation = WorkspaceRuntimeAttestation(
+            backing_id="k8s-pvc:test:22222222-2222-4222-8222-222222222222",
+            workspace_generation="22222222-2222-4222-8222-222222222222",
+            runtime_incarnation="33333333-3333-4333-8333-333333333333",
+            ssh_host_key_fingerprint="SHA256:" + ("a" * 43),
+            host=old_runtime["host"],
+            pod_ip=old_runtime["pod_ip"],
+            port=old_runtime["port"],
+        )
+        adopted = {
+            **parent,
+            "context": {
+                "workspace_container": {
+                    **old_runtime,
+                    "_runtime_incarnation": attestation.runtime_incarnation,
+                    "_legacy_k8s_runtime_adoption": {
+                        "version": 1,
+                        "runtime_incarnation": attestation.runtime_incarnation,
+                        "workspace_generation": attestation.workspace_generation,
+                        "ssh_host_key_fingerprint": (
+                            attestation.ssh_host_key_fingerprint
+                        ),
+                    },
+                }
+            },
+        }
+        get_job = AsyncMock(side_effect=[parent, parent, adopted])
+        monkeypatch.setattr(main.postgres_db, "get_job", get_job)
+        cas = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            main.postgres_db, "adopt_legacy_k8s_job_workspace_runtime", cas
+        )
+        attest = AsyncMock(return_value=attestation)
+        monkeypatch.setattr(
+            main.container_provisioner, "attest_workspace_runtime", attest
+        )
+        child = _subjob(_inherited(container=dict(old_runtime)), parent_id=parent_id)
+
+        assert await main._resolve_subjob_inherited_workspace(child) == (
+            "proceed",
+            None,
+        )
+
+        assert (
+            child["context"]["workspace_container"]["_runtime_incarnation"]
+            == attestation.runtime_incarnation
+        )
+        assert attest.await_count == 3
+        assert all(call.args[0].id == parent_id for call in attest.await_args_list)
+        cas.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_flag_only_child_overlays_parent_ready_container(self, patch_get_job):
         get_parent = patch_get_job(
@@ -456,9 +563,11 @@ class TestScholarMaterializationFailure:
             "user_id": owner_id,
             "description": "Research this",
             "context": {"workspace_container": dict(READY_CONTAINER)},
+            "config_override": {"workspace": {"backend": "sandbox"}},
             "project_id": None,
             "parent_job_id": None,
         }
+        job = _stamp_workspace(job)
 
         monkeypatch.setattr(
             completion,

@@ -1868,6 +1868,17 @@ export interface JobReviewSessionResult {
 /**
  * Job from the orchestrator.
  */
+export interface WorkspaceContractProjection {
+  requested_backend?: 'sandbox' | 'vm' | 'virtual' | 'none' | null;
+  assigned_backend?: 'sandbox' | 'vm' | 'virtual' | 'none' | null;
+  effective_backend?: 'sandbox' | 'vm' | 'virtual' | 'none' | null;
+  assignment_source?: string | null;
+  state: 'ready' | 'waiting' | 'failed' | 'mismatch' | 'invalid' | string;
+  failure?: string | null;
+  stale_backend?: 'sandbox' | 'vm' | null;
+  compatibility_derived?: boolean;
+}
+
 export interface Job {
   id: string;
   description: string;
@@ -1940,6 +1951,8 @@ export interface Job {
   created_by_thread_id?: string | null;
   /** Whether this job's terminal state owes its creating session a wake. */
   wake_on_complete?: boolean;
+  /** Safe, server-owned workspace tier decision; contains no endpoints. */
+  workspace_contract?: WorkspaceContractProjection;
 }
 
 /**

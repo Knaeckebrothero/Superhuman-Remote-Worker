@@ -176,3 +176,25 @@ class TestJobErrorFormatters:
             ]
         )
         assert "Error: clone failed" in out
+
+    def test_workspace_contract_is_prominent_without_transport_details(self):
+        job = {
+            "id": "job1",
+            "status": "created",
+            "workspace_contract": {
+                "requested_backend": "vm",
+                "assigned_backend": "vm",
+                "effective_backend": None,
+                "state": "mismatch",
+                "failure": "sandbox_ready_for_vm_assignment",
+                "stale_backend": "sandbox",
+            },
+        }
+        detail = format_job_detail(job)
+        listed = format_jobs([job])
+        for rendered in (detail, listed):
+            assert "requested=vm" in rendered
+            assert "assigned=vm" in rendered
+            assert "effective=unavailable" in rendered
+            assert "stale sandbox" in rendered
+            assert "host" not in rendered

@@ -25,6 +25,7 @@ import pytest
 
 from services.workspace_lifecycle import WorkspaceOwner
 from src.core.capability_grants import CATALOG, evaluate
+from src.shared.workspace_contract import resolve_workspace_contract
 
 DEFAULTS = {k: v["default"] for k, v in CATALOG.items()}
 
@@ -58,6 +59,10 @@ async def provision_job_workspace(
     if not job:
         return {"error": 404, "detail": "Job not found"}
 
+    contract = resolve_workspace_contract(job)
+    if contract.assigned_backend not in {"virtual", "none", "sandbox"}:
+        return {"error": 409, "detail": "workspace_backend_conflict"}
+
     if grant_gate is not None:
         try:
             await grant_gate(job, target_tier)
@@ -77,7 +82,12 @@ async def provision_job_workspace(
         except (json.JSONDecodeError, TypeError):
             context = {}
     wc = context.get("workspace_container") or {}
-    if wc.get("status") in ("pending", "creating", "created", "ready"):
+    if contract.assigned_backend == "sandbox" and wc.get("status") in (
+        "pending",
+        "creating",
+        "created",
+        "ready",
+    ):
         return {
             "status": wc["status"],
             "job_id": job_id,
@@ -85,7 +95,19 @@ async def provision_job_workspace(
             "message": "Workspace container already provisioned or in progress",
         }
 
-    await db.merge_workspace_container_context(job_id, {"status": "pending"})
+    if contract.assigned_backend == "sandbox":
+        return {"error": 409, "detail": "workspace_runtime_unavailable"}
+
+    transitioned = await db.begin_job_workspace_tier_transition(
+        job_id,
+        expected_backend=contract.assigned_backend,
+        target_backend="sandbox",
+        requested_backend=contract.requested_backend,
+        assignment_source="runtime_workspace_upgrade",
+        expected_status=str(job.get("status") or ""),
+    )
+    if not transitioned:
+        return {"error": 409, "detail": "workspace_contract_changed"}
     await provisioner.create_workspace(WorkspaceOwner.job(job_id))
 
     return {"status": "provisioning", "job_id": job_id, "target_tier": "sandbox"}
@@ -100,6 +122,9 @@ async def get_job_workspace_status(db, job_id, ssh_key_path=None):
     job = await db.get_job(job_id)
     if not job:
         return {"error": 404, "detail": "Job not found"}
+    contract = resolve_workspace_contract(job)
+    if contract.assigned_backend != "sandbox":
+        return {"error": 409, "detail": "workspace_backend_conflict"}
     context = job.get("context") or {}
     if isinstance(context, str):
         try:
@@ -153,7 +178,7 @@ def _mock_provisioner(available=True, in_cluster=True):
 def _mock_db(job=None):
     db = MagicMock()
     db.get_job = AsyncMock(return_value=job)
-    db.merge_workspace_container_context = AsyncMock(return_value=True)
+    db.begin_job_workspace_tier_transition = AsyncMock(return_value=True)
     return db
 
 
@@ -163,13 +188,31 @@ def _make_job(
     config_override=None,
     context=None,
     status="processing",
+    backend="virtual",
 ):
+    config_was_json = isinstance(config_override, str)
+    config = (
+        json.loads(config_override) if config_was_json else dict(config_override or {})
+    )
+    workspace = dict(config.get("workspace") or {})
+    workspace.setdefault("backend", backend)
+    config["workspace"] = workspace
+    job_context = dict(context or {})
+    job_context.setdefault(
+        "_workspace_contract",
+        {
+            "version": 1,
+            "requested_backend": backend,
+            "assigned_backend": backend,
+            "assignment_source": "test",
+        },
+    )
     return {
         "id": job_id,
         "user_id": user_id,
         "status": status,
-        "config_override": config_override,
-        "context": context or {},
+        "config_override": json.dumps(config) if config_was_json else config,
+        "context": job_context,
     }
 
 
@@ -214,7 +257,7 @@ class TestProvisionJobWorkspace:
         assert r["error"] == 403
         # Fail-closed: no pending mark, no provisioning.
         prov.create_workspace.assert_not_called()
-        db.merge_workspace_container_context.assert_not_called()
+        db.begin_job_workspace_tier_transition.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unavailable_provisioner_returns_503(self):
@@ -225,13 +268,16 @@ class TestProvisionJobWorkspace:
 
     @pytest.mark.asyncio
     async def test_idempotent_when_already_in_flight(self):
-        job = _make_job(context={"workspace_container": {"status": "ready"}})
+        job = _make_job(
+            backend="sandbox",
+            context={"workspace_container": {"status": "ready"}},
+        )
         db = _mock_db(job)
         prov = _mock_provisioner()
         r = await provision_job_workspace(db, prov, "job-1")
         assert r["status"] == "ready"
         prov.create_workspace.assert_not_called()
-        db.merge_workspace_container_context.assert_not_called()
+        db.begin_job_workspace_tier_transition.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sandbox_provisions_in_place(self):
@@ -241,8 +287,13 @@ class TestProvisionJobWorkspace:
         assert r["status"] == "provisioning"
         assert r["target_tier"] == "sandbox"
         # Marks pending, then provisions for the JOB owner kind (not session).
-        db.merge_workspace_container_context.assert_awaited_once_with(
-            "job-1", {"status": "pending"}
+        db.begin_job_workspace_tier_transition.assert_awaited_once_with(
+            "job-1",
+            expected_backend="virtual",
+            target_backend="sandbox",
+            requested_backend="virtual",
+            assignment_source="runtime_workspace_upgrade",
+            expected_status="processing",
         )
         prov.create_workspace.assert_awaited_once()
         owner = prov.create_workspace.call_args.args[0]
@@ -260,6 +311,7 @@ class TestGetJobWorkspaceStatus:
     async def test_ready_maps_port_to_pod_port(self):
         # Provisioner writes {pod_ip, port}; the endpoint exposes pod_port.
         job = _make_job(
+            backend="sandbox",
             context={
                 "workspace_container": {
                     "status": "ready",
@@ -268,7 +320,7 @@ class TestGetJobWorkspaceStatus:
                     "pod_name": "workspace-job-1",
                     "namespace": "srw",
                 }
-            }
+            },
         )
         db = _mock_db(job)
         r = await get_job_workspace_status(db, "job-1", ssh_key_path="/k/key")
@@ -279,10 +331,26 @@ class TestGetJobWorkspaceStatus:
 
     @pytest.mark.asyncio
     async def test_none_when_no_container(self):
-        db = _mock_db(_make_job())
+        db = _mock_db(_make_job(backend="sandbox"))
         r = await get_job_workspace_status(db, "job-1")
         assert r["status"] == "none"
         assert r["pod_ip"] is None
+
+    @pytest.mark.asyncio
+    async def test_vm_assignment_never_returns_stale_container(self):
+        db = _mock_db(
+            _make_job(
+                backend="vm",
+                context={
+                    "workspace_container": {
+                        "status": "ready",
+                        "pod_ip": "10.1.2.3",
+                    }
+                },
+            )
+        )
+        r = await get_job_workspace_status(db, "job-1")
+        assert r == {"error": 409, "detail": "workspace_backend_conflict"}
 
     @pytest.mark.asyncio
     async def test_missing_job_returns_404(self):

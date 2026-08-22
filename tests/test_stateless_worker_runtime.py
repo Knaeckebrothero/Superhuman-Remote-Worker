@@ -143,7 +143,19 @@ def _bundle(claim: WorkerClaim) -> dict:
             "job_id": job_id,
             "description": "continue the task",
             "config_name": "worker_base",
+            "config_override": {
+                "workspace": {
+                    "backend": "sandbox",
+                    "remote": {"host": "workspace.internal"},
+                }
+            },
             "context": {},
+            "workspace_runtime": {
+                "requested_backend": "sandbox",
+                "assigned_backend": "sandbox",
+                "effective_backend": "sandbox",
+                "state": "ready",
+            },
             "workspace_generation": WORKSPACE_GENERATION,
             "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
             "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
@@ -171,6 +183,12 @@ def test_worker_bundle_preserves_exact_workspace_authority_in_metadata():
     assert metadata["workspace_ssh_host_key_fingerprint"] == WORKSPACE_FINGERPRINT
     assert metadata["workspace_owner_kind"] == "job"
     assert metadata["workspace_owner_id"] == str(claim.unit.unit_id)
+    assert metadata["workspace_runtime"] == {
+        "requested_backend": "sandbox",
+        "assigned_backend": "sandbox",
+        "effective_backend": "sandbox",
+        "state": "ready",
+    }
 
 
 @pytest.mark.parametrize(

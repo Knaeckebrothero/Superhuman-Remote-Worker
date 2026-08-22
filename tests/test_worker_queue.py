@@ -81,6 +81,13 @@ async def test_claim_cas_accepts_processing_reclaim(monkeypatch):
     cas_sql = conn.fetchrow.await_args_list[1].args[0]
     assert "status = 'processing'" in cas_sql
     assert "assigned_agent_id IS NULL" in cas_sql
+    assert "_workspace_dispatch_authority" in cas_sql
+    assert "'dispatch_kind', 'stateless'" in cas_sql
+    assert conn.fetchrow.await_args_list[1].args[3:] == (
+        "pod-b",
+        unit.lease_token,
+        unit.leased_until,
+    )
 
 
 @pytest.mark.asyncio

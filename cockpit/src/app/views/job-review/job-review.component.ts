@@ -229,6 +229,13 @@ export function selectDeliveryRepository(
             <div class="job-meta">
               <app-copy-field class="meta-item" [label]="'jobReview.meta.jobId' | transloco" [value]="job()!.id" />
               <span class="meta-item">{{ 'jobReview.meta.created' | transloco: {date: formatDate(job()!.created_at)} }}</span>
+              @if (job()!.workspace_contract) {
+                <span
+                  class="meta-item workspace-contract"
+                  [class.warning]="job()!.workspace_contract!.state !== 'ready'"
+                  [title]="workspaceContractTitle()"
+                >{{ workspaceContractSummary() }}</span>
+              }
             </div>
           </div>
 
@@ -612,6 +619,10 @@ export function selectDeliveryRepository(
         color: var(--text-muted);
       }
 
+      .workspace-contract.warning {
+        color: var(--warning);
+      }
+
       .summary-text {
         font-size: 12px;
         color: var(--text-primary, var(--text-primary));
@@ -828,6 +839,28 @@ export class JobReviewComponent {
       this.deliveryForge(),
     ),
   );
+
+  workspaceContractSummary(): string {
+    const workspace = this.job()?.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.summary', {
+      requested:
+        workspace.requested_backend ?? this.transloco.translate('jobs.workspace.default'),
+      assigned:
+        workspace.assigned_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+      effective:
+        workspace.effective_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+    });
+  }
+
+  workspaceContractTitle(): string {
+    const workspace = this.job()?.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.state', {
+      state: workspace.state,
+      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
+    });
+  }
   readonly frozenData = signal<FrozenJobData | null>(null);
   readonly isLoading = signal(false);
   readonly isApproving = signal(false);

@@ -40,6 +40,7 @@ async def db(pg_dsn):
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 assigned_agent_id uuid,
                 lease_expires_at timestamptz,
+                config_override jsonb,
                 -- A tripped lease-recovery circuit fences the claim: the job
                 -- stays parked until the trip is acknowledged.
                 context jsonb,

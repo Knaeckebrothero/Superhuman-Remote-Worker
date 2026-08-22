@@ -286,6 +286,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         <span class="config-badge">{{ row.job.config_name }}</span>
                       }
                     </div>
+                    @if (row.job.workspace_contract) {
+                      <div
+                        class="workspace-contract"
+                        [class.warning]="row.job.workspace_contract.state !== 'ready'"
+                        [style.padding-left.px]="row.isChild ? 16 : 0"
+                        [title]="workspaceContractTitle(row.job)"
+                      >
+                        {{ workspaceContractSummary(row.job) }}
+                      </div>
+                    }
                     @if (row.job.status === 'failed' && row.job.error_message) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
@@ -965,6 +975,19 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         text-overflow: ellipsis;
       }
 
+      .workspace-contract {
+        margin-top: 2px;
+        color: var(--text-muted);
+        font-size: 10px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .workspace-contract.warning {
+        color: var(--warning);
+      }
+
       /* Project Cell */
       .project-cell {
         max-width: 180px;
@@ -1567,6 +1590,28 @@ export class JobListComponent implements OnInit, OnDestroy {
    *  components before the job tool card became the third consumer. */
   jobStatusTone(status: string): BadgeTone {
     return sharedJobStatusTone(status);
+  }
+
+  workspaceContractSummary(job: JobSummary): string {
+    const workspace = job.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.summary', {
+      requested:
+        workspace.requested_backend ?? this.transloco.translate('jobs.workspace.default'),
+      assigned:
+        workspace.assigned_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+      effective:
+        workspace.effective_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+    });
+  }
+
+  workspaceContractTitle(job: JobSummary): string {
+    const workspace = job.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.state', {
+      state: workspace.state,
+      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
+    });
   }
 
   selectJob(jobId: string): void {

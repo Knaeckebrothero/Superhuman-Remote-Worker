@@ -45,6 +45,7 @@ from src.shared.runtime_actor import RuntimeActorContext  # noqa: E402
 JOB_ID = "00000000-0000-0000-0000-000000000001"
 AGENT_ID = "00000000-0000-0000-0000-0000000000a1"
 PROJECT_ID = "00000000-0000-0000-0000-0000000000bb"
+WORKSPACE_RUNTIME = "11111111-1111-4111-8111-111111111111"
 
 INJECTED_ENV = {
     "EMBEDDING_MODEL": "qwen3-embedding-8b",
@@ -59,13 +60,45 @@ def _job(**overrides) -> dict:
         "user_id": None,
         "project_id": None,
         "config_name": "default",
-        "config_override": {"llm": {"model": "gpt-5.6-terra"}},
-        "context": {},
+        "config_override": {
+            "llm": {"model": "gpt-5.6-terra"},
+            "workspace": {"backend": "sandbox"},
+        },
+        "context": {
+            "_workspace_contract": {
+                "version": 1,
+                "requested_backend": "sandbox",
+                "assigned_backend": "sandbox",
+                "assignment_source": "test",
+            },
+            "workspace_container": {
+                "status": "ready",
+                "host": "workspace-job.svc.cluster.local",
+                "port": 30022,
+                "provisioner": "k8s",
+                "_runtime_incarnation": WORKSPACE_RUNTIME,
+            },
+        },
         "status": "paused",
         "assigned_agent_id": None,
         "priority": 1,
     }
+    context_override = overrides.pop("context", None)
+    config_override = overrides.pop("config_override", None)
     job.update(overrides)
+    if config_override is not None:
+        job["config_override"] = {
+            **job["config_override"],
+            **config_override,
+        }
+    if context_override is not None:
+        context = {**job["context"], **context_override}
+        if isinstance(context_override.get("workspace_container"), dict):
+            context["workspace_container"] = {
+                **job["context"]["workspace_container"],
+                **context_override["workspace_container"],
+            }
+        job["context"] = context
     return job
 
 
@@ -155,6 +188,11 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     monkeypatch.setattr(main.postgres_db, "delete_job_context_keys", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "update_job_status", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "heartbeat", AsyncMock())
+    monkeypatch.setattr(
+        main,
+        "_workspace_runtime_unchanged_before_delivery",
+        AsyncMock(return_value=True),
+    )
 
     async def _mint_worker(_db, *, project_id, user_id):
         return RuntimeActorContext(
@@ -227,6 +265,10 @@ class TestResumeJobOnAgentInjection:
                     "pod_ip": "172.20.0.8",
                     "port": 22,
                     "provisioner": "docker",
+                    "_docker_workspace_lease_id": (
+                        "22222222-2222-4222-8222-222222222222"
+                    ),
+                    "_docker_workspace_attested": True,
                 }
             },
         )
@@ -360,6 +402,8 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock(return_value=agent))
     monkeypatch.setattr(main.postgres_db, "merge_job_context", AsyncMock())
+    claim_job = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "claim_job_for_agent", claim_job)
     queue_for_resume = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", queue_for_resume)
     acknowledge_circuit = AsyncMock(return_value=True)
@@ -388,6 +432,7 @@ def endpoint_collaborators(monkeypatch, fake_conn):
         delegate=delegate,
         conn=fake_conn,
         queue_for_resume=queue_for_resume,
+        claim_job=claim_job,
         acknowledge_circuit=acknowledge_circuit,
         queue_stateless=queue_stateless,
         prepare_stateless=prepare_stateless,
@@ -396,8 +441,34 @@ def endpoint_collaborators(monkeypatch, fake_conn):
 
 class TestResumeEndpointDelegation:
     @pytest.mark.asyncio
+    async def test_uidless_k8s_runtime_queues_for_live_adoption_without_shedding(
+        self, endpoint_collaborators, monkeypatch
+    ):
+        job = endpoint_collaborators.job
+        job["context"]["workspace_container"].update(
+            {"provisioner": "k8s", "pod_ip": "10.42.0.17"}
+        )
+        job["context"]["workspace_container"].pop("_runtime_incarnation")
+        prepare = AsyncMock(
+            return_value=("wait", job, "kubernetes_attestation_unavailable")
+        )
+        monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+        shed = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "shed_workspace_context", shed)
+
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result["status"] == "queued"
+        endpoint_collaborators.queue_for_resume.assert_awaited_once_with(
+            JOB_ID, None, expected_status="paused"
+        )
+        endpoint_collaborators.delegate.assert_not_awaited()
+        main.postgres_db.get_agent.assert_not_awaited()
+        shed.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_stateless_resume_reenqueues_without_registered_agent(
-        self, endpoint_collaborators
+        self, endpoint_collaborators, monkeypatch
     ):
         endpoint_collaborators.job.update(
             {
@@ -411,6 +482,19 @@ class TestResumeEndpointDelegation:
                     }
                 },
             }
+        )
+        # This test owns the stateless queue transition, not the historical
+        # Kubernetes adoption collaborator exercised in the dedicated cases.
+        monkeypatch.setattr(
+            main,
+            "_prepare_job_workspace_runtime",
+            AsyncMock(
+                return_value=(
+                    "proceed",
+                    endpoint_collaborators.job,
+                    None,
+                )
+            ),
         )
 
         result = await main.resume_job(
@@ -450,6 +534,11 @@ class TestResumeEndpointDelegation:
         args = endpoint_collaborators.delegate.await_args.args
         assert args[0]["id"] == JOB_ID
         assert args[1] is endpoint_collaborators.agent
+        endpoint_collaborators.claim_job.assert_awaited_once_with(
+            JOB_ID,
+            AGENT_ID,
+            allow_failed=True,
+        )
         main.postgres_db.merge_job_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -490,7 +579,7 @@ class TestResumeEndpointDelegation:
         endpoint_collaborators.queue_for_resume.assert_awaited_once_with(
             JOB_ID,
             None,
-            expected_status="paused",
+            expected_status="processing",
         )
 
 
@@ -728,7 +817,18 @@ class TestResumeEndpointWorkspacelessJob:
     async def test_healthy_vm_job_still_resumes_directly(self, workspaceless):
         """Regression: the guard must not divert jobs that have a live VM."""
         workspaceless.job["context"] = {
-            "vm": {"status": "ready", "ssh_host": "100.64.0.7", "ssh_port": 22}
+            "_workspace_contract": {
+                "version": 1,
+                "requested_backend": "vm",
+                "assigned_backend": "vm",
+                "assignment_source": "request",
+            },
+            "vm": {
+                "status": "ready",
+                "ssh_host": "100.64.0.7",
+                "ssh_port": 22,
+                "provision_generation": WORKSPACE_RUNTIME,
+            },
         }
 
         result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
