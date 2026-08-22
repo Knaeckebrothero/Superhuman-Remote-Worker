@@ -1033,6 +1033,30 @@ databases:
     #    across nodes inside one zone buys nothing.
     topologyKey: "kubernetes.io/hostname"
 
+  # -- initdb locale for CNPG Clusters. MUST match the databases being migrated.
+  #
+  #    CNPG defaults --lc-collate and --lc-ctype to `C` (see the Cluster CRD's
+  #    own field docs), because the operand image sets no LANG. The legacy
+  #    StatefulSet runs docker.io/library/postgres, which ships LANG=en_US.utf8,
+  #    so every existing SRW database is en_US.utf8. Migrating without pinning
+  #    this re-initialises the target under `C` and silently changes:
+  #      * text sort order      -- 'Banana' < 'apple' under C, the reverse under en_US
+  #      * upper()/lower()      -- upper('abaco') keeps the accented char uncased under C
+  #      * FTS tokenisation     -- non-ASCII stops being alphabetic, so one long
+  #                                token becomes thousands of short ones
+  #    That last one is not merely cosmetic: it made pgvector's restore FAIL,
+  #    `string is too long for tsvector (1237068 bytes, max 1048575 bytes)`,
+  #    because the 1MB tsvector cap is reached only under `C`. Same PG16.15
+  #    binary, same rows, en_US.utf8 builds the index in 37MB.
+  #
+  #    These are initdb arguments: they apply ONLY at Cluster creation and
+  #    cannot be changed afterwards without a re-import. The operand image must
+  #    carry the locale -- verify with `locale -a` before changing this.
+  locale:
+    encoding: "UTF8"
+    collate: "en_US.utf8"
+    ctype: "en_US.utf8"
+
   # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
   #    CNPG-I plugin. Applies only to databases on the `cnpg` engine.
   #
