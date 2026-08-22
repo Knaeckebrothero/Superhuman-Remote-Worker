@@ -1611,6 +1611,12 @@ STATELESS_WORKER_ENABLED = os.environ.get(
     "STATELESS_WORKER_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
+# Worker-lane defaulting is subordinate to admission. If this is enabled while
+# worker admission remains disabled, omitted root jobs silently stay pinned.
+STATELESS_WORKER_DEFAULT_ENABLED = os.environ.get(
+    "STATELESS_WORKER_DEFAULT_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
 # Gate-3 completion commands ship dark.  Helm wires this value explicitly in
 # M4; local/tests may opt in before then without changing the legacy path.
 COMPLETION_COMMANDS_ENABLED = os.environ.get(
@@ -6407,18 +6413,28 @@ def _job_needs_sandbox(job: dict) -> bool:
 def _resolve_requested_job_execution_lane(
     requested_lane: Literal["pinned", "stateless"] | None,
     *,
+    default_stateless: bool,
     needs_vm: bool,
     needs_sandbox: bool,
 ) -> Literal["pinned", "stateless"] | None:
     """Apply the default-off, k8s-sandbox-only worker admission gate.
 
-    ``None`` is preserved so Postgres can distinguish an omitted root (pinned)
-    from an omitted child (authoritative parent-lane inheritance).
+    ``None`` is preserved unless a capable omitted root opts into defaulting,
+    so Postgres can still distinguish authoritative child-lane inheritance.
     """
     if needs_vm:
         # This is a capability decision, not a silent arbitrary lane flip: the
         # first stateless worker pool intentionally has no VM mesh sidecar.
         return "pinned"
+    if requested_lane is None and default_stateless:
+        if (
+            STATELESS_WORKER_ENABLED
+            and container_provisioner.is_available
+            and container_provisioner.in_cluster
+            and needs_sandbox
+        ):
+            return "stateless"
+        return None
     if requested_lane != "stateless":
         return requested_lane
     if not STATELESS_WORKER_ENABLED:
@@ -13767,19 +13783,49 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
 
-        # Stateless worker admission is an explicit, independently gated
-        # opt-in. The first slice can reach only Kubernetes workspace pods;
-        # VM jobs keep their established pinned lane because the stateless
-        # worker Deployment has no mesh sidecar. Omitted children are resolved
-        # from the authoritative parent lane inside PostgresDB.create_job, so a
-        # stateless parent cannot silently revive the registered-agent plane.
+        # Stateless worker admission is independently gated. Explicit requests
+        # keep their fail-closed admission errors; an omitted root lane may try
+        # the stateless default and silently fall back to pinned when any
+        # capability is absent. Omitted children do not enter that default:
+        # PostgresDB.create_job resolves them from the authoritative parent.
+        needs_sandbox = _job_needs_sandbox(
+            {"context": context, "config_override": config_override}
+        )
         execution_lane = _resolve_requested_job_execution_lane(
             job.execution_lane,
+            default_stateless=STATELESS_WORKER_DEFAULT_ENABLED and root_creation,
             needs_vm=needs_vm,
-            needs_sandbox=_job_needs_sandbox(
-                {"context": context, "config_override": config_override}
-            ),
+            needs_sandbox=needs_sandbox,
         )
+        if (
+            job.execution_lane is None
+            and STATELESS_WORKER_DEFAULT_ENABLED
+            and root_creation
+        ):
+            if execution_lane == "stateless":
+                logger.info(
+                    "Job create: worker execution lane defaulted to stateless "
+                    "for a capable root job"
+                )
+            else:
+                if needs_vm:
+                    fallback_reason = "VM jobs require pinned workers"
+                elif not STATELESS_WORKER_ENABLED:
+                    fallback_reason = "stateless worker admission is disabled"
+                elif not container_provisioner.is_available:
+                    fallback_reason = (
+                        "the Kubernetes workspace provisioner is unavailable"
+                    )
+                elif not container_provisioner.in_cluster:
+                    fallback_reason = "the workspace provisioner is not in-cluster"
+                elif not needs_sandbox:
+                    fallback_reason = "the job does not require a Kubernetes sandbox"
+                else:
+                    fallback_reason = "the worker capability check declined stateless"
+                logger.debug(
+                    "Job create: stateless worker lane default fell back to pinned (%s)",
+                    fallback_reason,
+                )
         if job.execution_lane == "stateless" and execution_lane == "pinned":
             logger.info(
                 "Job create: VM request keeps job on pinned lane "

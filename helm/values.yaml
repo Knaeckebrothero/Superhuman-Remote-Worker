@@ -546,6 +546,10 @@ agent:
     worker:
       # -- DEFAULT OFF. A fresh install preserves the pinned worker path.
       enabled: false
+      # -- DEFAULT OFF. When enabled, omitted root jobs try the stateless lane
+      # only when admission is open and an in-cluster Kubernetes sandbox is
+      # available. Other workspaces fall back to pinned; VM jobs always pin.
+      defaultEnabled: false
       # -- Minimum wall-clock budget for one worker batch. Production keeps a
       # five-minute floor; local acceptance may explicitly lower it.
       batchMinWallSeconds: 300

@@ -56,6 +56,7 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
 
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
+    assert config_map["data"]["STATELESS_WORKER_DEFAULT_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_STATUS_REORDER_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "0"
@@ -255,6 +256,7 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     settings = (
         "agent.stateless.enabled=true",
         "agent.stateless.worker.enabled=true",
+        "agent.stateless.worker.defaultEnabled=true",
         "agent.stateless.worker.batchMinWallSeconds=60",
     )
     documents = _render(*settings)
@@ -267,6 +269,7 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     config_map_name = config_map["metadata"]["name"]
 
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "true"
+    assert config_map["data"]["STATELESS_WORKER_DEFAULT_ENABLED"] == "true"
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "true"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "60"
 
@@ -288,6 +291,7 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     for key in (
         "STATELESS_SESSION_ENABLED",
         "STATELESS_WORKER_ENABLED",
+        "STATELESS_WORKER_DEFAULT_ENABLED",
         "WORKER_BATCH_MIN_WALL_SECONDS",
     ):
         assert env_by_name[key]["valueFrom"]["configMapKeyRef"] == {
@@ -380,4 +384,8 @@ def test_tilt_overlay_explicitly_enables_short_worker_batches() -> None:
 
     assert values["agent"]["stateless"]["enabled"] is True
     worker = values["agent"]["stateless"]["worker"]
-    assert worker == {"enabled": True, "batchMinWallSeconds": 60}
+    assert worker == {
+        "enabled": True,
+        "defaultEnabled": False,
+        "batchMinWallSeconds": 60,
+    }

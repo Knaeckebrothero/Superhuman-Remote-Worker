@@ -42,60 +42,223 @@ def _db_with_conn(conn):
     return db
 
 
-def test_requested_lane_gate_is_default_off_k8s_only(monkeypatch):
+def test_omitted_lane_defaults_stateless_when_fully_capable(monkeypatch):
     from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
 
     assert (
         main._resolve_requested_job_execution_lane(
-            None, needs_vm=False, needs_sandbox=True
+            None,
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=True,
         )
-        is None
+        == "stateless"
     )
-    assert (
-        main._resolve_requested_job_execution_lane(
-            "pinned", needs_vm=False, needs_sandbox=False
-        )
-        == "pinned"
-    )
-    # VM capability always stays on the established pinned plane, even while
-    # worker admission itself is closed.
-    assert (
-        main._resolve_requested_job_execution_lane(
-            "stateless", needs_vm=True, needs_sandbox=False
-        )
-        == "pinned"
-    )
+
+
+def test_omitted_lane_default_keeps_vm_jobs_pinned(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+
     # Omitted child lanes normally inherit their parent's lane in create_job,
     # but an explicit VM requirement must override a stateless parent before
     # persistence because this worker pool has no mesh sidecar.
     assert (
         main._resolve_requested_job_execution_lane(
-            None, needs_vm=True, needs_sandbox=False
+            None,
+            default_stateless=True,
+            needs_vm=True,
+            needs_sandbox=False,
         )
         == "pinned"
     )
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
-    with pytest.raises(HTTPException) as disabled:
+    # The explicit stateless VM behavior is unchanged by defaulting.
+    assert (
         main._resolve_requested_job_execution_lane(
-            "stateless", needs_vm=False, needs_sandbox=True
+            "stateless",
+            default_stateless=True,
+            needs_vm=True,
+            needs_sandbox=False,
         )
-    assert disabled.value.status_code == 409
+        == "pinned"
+    )
+
+
+def test_omitted_lane_default_falls_back_without_sandbox(monkeypatch):
+    from orchestrator import main
 
     monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
     monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
     monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+
     assert (
         main._resolve_requested_job_execution_lane(
-            "stateless", needs_vm=False, needs_sandbox=True
+            None,
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("available", "in_cluster"),
+    [(False, True), (True, False)],
+)
+def test_omitted_lane_default_falls_back_without_in_cluster_provisioner(
+    monkeypatch,
+    available,
+    in_cluster,
+):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", available)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", in_cluster)
+
+    assert (
+        main._resolve_requested_job_execution_lane(
+            None,
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=True,
+        )
+        is None
+    )
+
+
+def test_omitted_lane_default_is_subordinate_to_worker_admission(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+
+    assert (
+        main._resolve_requested_job_execution_lane(
+            None,
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=True,
+        )
+        is None
+    )
+
+
+def test_omitted_lane_stays_unchanged_when_default_is_off(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+
+    assert (
+        main._resolve_requested_job_execution_lane(
+            None,
+            default_stateless=False,
+            needs_vm=False,
+            needs_sandbox=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "admission_enabled",
+        "available",
+        "in_cluster",
+        "needs_sandbox",
+        "status_code",
+        "detail",
+    ),
+    [
+        (
+            False,
+            True,
+            True,
+            True,
+            409,
+            "Stateless worker admission is disabled",
+        ),
+        (
+            True,
+            False,
+            True,
+            True,
+            503,
+            "Stateless workers require an in-cluster Kubernetes workspace provisioner",
+        ),
+        (
+            True,
+            True,
+            True,
+            False,
+            422,
+            "Stateless workers currently require a Kubernetes sandbox workspace",
+        ),
+    ],
+)
+def test_explicit_stateless_infeasibility_still_raises(
+    monkeypatch,
+    admission_enabled,
+    available,
+    in_cluster,
+    needs_sandbox,
+    status_code,
+    detail,
+):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", admission_enabled)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", available)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", in_cluster)
+
+    with pytest.raises(HTTPException) as exc:
+        main._resolve_requested_job_execution_lane(
+            "stateless",
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=needs_sandbox,
+        )
+    assert exc.value.status_code == status_code
+    assert exc.value.detail == detail
+
+
+def test_explicit_lanes_are_unchanged_when_default_is_on(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+
+    assert (
+        main._resolve_requested_job_execution_lane(
+            "pinned",
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=False,
+        )
+        == "pinned"
+    )
+    assert (
+        main._resolve_requested_job_execution_lane(
+            "stateless",
+            default_stateless=True,
+            needs_vm=False,
+            needs_sandbox=True,
         )
         == "stateless"
     )
-    with pytest.raises(HTTPException) as lite:
-        main._resolve_requested_job_execution_lane(
-            "stateless", needs_vm=False, needs_sandbox=False
-        )
-    assert lite.value.status_code == 422
 
 
 @pytest.mark.asyncio

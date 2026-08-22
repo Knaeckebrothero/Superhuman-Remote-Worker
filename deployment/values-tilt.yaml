@@ -39,6 +39,8 @@ agent:
     enabled: true
     worker:
       enabled: true
+      # Preserve explicit-lane S3 acceptance runs unless the default is the test.
+      defaultEnabled: false
       batchMinWallSeconds: 60
 
 # Pre-warm DaemonSet pulls with `Always` and would crash on Tilt-built tags.
