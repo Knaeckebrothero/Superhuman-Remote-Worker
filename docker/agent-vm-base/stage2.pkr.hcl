@@ -126,8 +126,7 @@ build {
   }
 
   # sudo-gated-bin needs a rename to /tmp/sudo-gated, so it stays separate.
-  # CI creates an empty placeholder if the binary isn't available;
-  # provision-stage2.sh skips installation when the placeholder is empty.
+  # CI requires this file and the plugin artifact to be non-empty.
   provisioner "file" {
     source      = "files/sudo-gated-bin"
     destination = "/tmp/sudo-gated"
