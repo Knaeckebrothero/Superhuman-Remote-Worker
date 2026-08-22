@@ -1113,12 +1113,17 @@ databases:
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
     #    tag", verified against the live CRD 2026-08-21).
     #
-    #    Built from docker/Dockerfile.postgres and published by its own
-    #    workflow, NOT the per-commit one: imageName is part of the Cluster
-    #    spec, so changing it rolls every Postgres cluster. The tag is the real
-    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
-    #    CNPG refuses downgrades based on it, so it must not lie.
-    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- Deploy StatefulSet within chart (false = external database — set
     # externalHost/externalPort/externalDb below)
     internal: true
@@ -1203,12 +1208,17 @@ databases:
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
     #    tag", verified against the live CRD 2026-08-21).
     #
-    #    Built from docker/Dockerfile.postgres and published by its own
-    #    workflow, NOT the per-commit one: imageName is part of the Cluster
-    #    spec, so changing it rolls every Postgres cluster. The tag is the real
-    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
-    #    CNPG refuses downgrades based on it, so it must not lie.
-    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- PostgreSQL extensions mounted as image volumes (CloudNativePG >= 1.29).
     #    REQUIRES Kubernetes >= 1.35, or 1.33/1.34 with the ImageVolume feature
     #    gate enabled on the API server and every kubelet, plus containerd
@@ -1307,12 +1317,17 @@ databases:
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
     #    tag", verified against the live CRD 2026-08-21).
     #
-    #    Built from docker/Dockerfile.postgres and published by its own
-    #    workflow, NOT the per-commit one: imageName is part of the Cluster
-    #    spec, so changing it rolls every Postgres cluster. The tag is the real
-    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
-    #    CNPG refuses downgrades based on it, so it must not lie.
-    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     internal: true
     # -- External mode connection parts (credentials live in the Secret).
     externalHost: ""
@@ -1381,12 +1396,17 @@ databases:
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
     #    tag", verified against the live CRD 2026-08-21).
     #
-    #    Built from docker/Dockerfile.postgres and published by its own
-    #    workflow, NOT the per-commit one: imageName is part of the Cluster
-    #    spec, so changing it rolls every Postgres cluster. The tag is the real
-    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
-    #    CNPG refuses downgrades based on it, so it must not lie.
-    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- When false, the bundled Gitea points at externalHost/Port/Db below
     #    (managed Postgres — RDS, Cloud SQL, CloudNativePG). Credentials still
     #    come from the Secret (GITEA_DB_USER / GITEA_DB_PASSWORD).
@@ -1443,12 +1463,17 @@ databases:
     #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
     #    tag", verified against the live CRD 2026-08-21).
     #
-    #    Built from docker/Dockerfile.postgres and published by its own
-    #    workflow, NOT the per-commit one: imageName is part of the Cluster
-    #    spec, so changing it rolls every Postgres cluster. The tag is the real
-    #    PostgreSQL version inside the image (16.15, with pgvector 0.8.6) --
-    #    CNPG refuses downgrades based on it, so it must not lie.
-    cnpgImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-postgres:16.15"
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- When false, KC_DB_URL on the Keycloak pod uses externalUrl below.
     #    Lets the bundled Keycloak point at a managed Postgres (RDS, Cloud SQL).
     internal: true
