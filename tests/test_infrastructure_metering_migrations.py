@@ -213,10 +213,15 @@ APP_JOB_COMPLETION_ACCEPT_STATUS = (
 APP_JOB_COMPLETION_STATUS_REORDER = (
     ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = (
+APP_MANAGED_REPOSITORY_AUTHORITIES = (
     ROOT
     / "orchestrator/database/migrations/app/0176_managed_repository_authorities.sql"
 )
+APP_MANAGED_REPOSITORY_THREAD_DETACH = (
+    ROOT
+    / "orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_THREAD_DETACH
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -771,6 +776,154 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     assert "schema_current" not in APP_DATASOURCE_TOMBSTONES_MIGRATION.read_text()
     assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
+    raw = APP_MANAGED_REPOSITORY_THREAD_DETACH.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0177_managed_repository_thread_detach.sql" in raw
+    assert "-- depends-on:    0176_managed_repository_authorities.sql" in raw
+    assert "-- expected:" in raw
+    assert "-- locks:" in raw
+    assert "-- transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    assert "SET LOCAL statement_timeout = '15min'" in sql
+    assert "SET LOCAL idle_in_transaction_session_timeout = '5min'" in sql
+    assert "SET LOCAL timezone = 'UTC'" in sql
+    assert "AND OLD.agent_id IS DISTINCT FROM NEW.agent_id" in sql
+    assert "AND NEW.agent_id IS NOT NULL" in sql
+    assert "DROP TRIGGER trg_managed_thread_repository_url_authority" in sql
+    assert "ON public.threads" in sql
+    assert "ON public.jobs" not in sql
+    assert "ON public.project_repositories" not in sql
+    assert hashlib.sha256(
+        APP_MANAGED_REPOSITORY_AUTHORITIES.read_bytes()
+    ).hexdigest() == (
+        "4f74a15db19b9234100b2c3cc93b756bda179b93db5c7d691080d0c7fb1d726e"
+    )
+
+
+@pytest.mark.asyncio
+async def test_0177_repairs_deployed_legacy_thread_detach_without_opening_attach(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Exercise the exact 0175 history -> 0176 failure -> 0177 repair."""
+
+    dbname = f"managed_thread_detach_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    through_0175 = tmp_path / "through-0175"
+    through_0176 = tmp_path / "through-0176"
+    through_0175.mkdir()
+    through_0176.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name < APP_MANAGED_REPOSITORY_AUTHORITIES.name:
+                (through_0175 / path.name).write_bytes(path.read_bytes())
+            if path.name <= APP_MANAGED_REPOSITORY_AUTHORITIES.name:
+                (through_0176 / path.name).write_bytes(path.read_bytes())
+
+        await run_migrations(pool, through_0175)
+        thread_id = uuid4()
+        old_agent_id = uuid4()
+        replacement_agent_id = uuid4()
+        repo_name = f"thread-{str(thread_id)[:8]}"
+        legacy_url = f"http://admin:shared-secret@gitea:3000/srw/{repo_name}.git"
+        async with pool.acquire() as conn:
+            # Exact prior-release shape: already-bound thread, ordinary
+            # workspace_container coordinates, no 0176 authority state.
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id, status, execution_lane, config_name, metadata) "
+                "VALUES ($1, 'active', 'pinned', 'centurion', "
+                "jsonb_build_object('workspace_container', "
+                "jsonb_build_object('repo_name', $2::text, "
+                "'git_remote_url', $3::text)))",
+                thread_id,
+                repo_name,
+                legacy_url,
+            )
+            await conn.execute(
+                "INSERT INTO agents "
+                "(id, config_name, hostname, status, agent_mode, thread_id) "
+                "VALUES ($1, 'centurion', 'legacy-officer-pod', 'session', "
+                "'persistent', $2)",
+                old_agent_id,
+                thread_id,
+            )
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                thread_id,
+                old_agent_id,
+            )
+
+        await run_migrations(pool, through_0176)
+        async with pool.acquire() as conn:
+            with pytest.raises(asyncpg.exceptions.CheckViolationError) as deployed:
+                await conn.execute(
+                    "UPDATE threads SET agent_id=NULL WHERE id=$1",
+                    thread_id,
+                )
+            assert (
+                deployed.value.constraint_name
+                == "managed_repository_url_must_be_credential_free"
+            )
+
+        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        async with pool.acquire() as conn:
+            assert (
+                await conn.execute(
+                    "UPDATE threads SET agent_id=NULL WHERE id=$1 AND agent_id=$2",
+                    thread_id,
+                    old_agent_id,
+                )
+                == "UPDATE 1"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT metadata->'workspace_container'->>'git_remote_url' "
+                    "FROM threads WHERE id=$1",
+                    thread_id,
+                )
+                == legacy_url
+            )
+            await conn.execute(
+                "INSERT INTO agents "
+                "(id, config_name, hostname, status, agent_mode, thread_id) "
+                "VALUES ($1, 'centurion', 'replacement-officer-pod', "
+                "'session', 'persistent', $2)",
+                replacement_agent_id,
+                thread_id,
+            )
+            with pytest.raises(asyncpg.exceptions.CheckViolationError) as attach:
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                    thread_id,
+                    replacement_agent_id,
+                )
+            assert (
+                attach.value.constraint_name
+                == "managed_repository_url_must_be_credential_free"
+            )
+            assert await conn.fetchval(
+                "SELECT success FROM schema_migrations WHERE filename=$1",
+                APP_MANAGED_REPOSITORY_THREAD_DETACH.name,
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+        finally:
+            await admin.close()
 
 
 def test_control_inbox_migration_preserves_and_constrains_narration_receipts() -> None:

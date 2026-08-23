@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -31,6 +32,7 @@ from src.shared.persistent_input_delivery import (
     persist_input_delivery,
     transition_input_delivery,
 )
+from src.shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -38,6 +40,10 @@ SCHEMA_FILE = (
     / "database"
     / "schema_current.sql"
 )
+
+
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
 
 
 @pytest.fixture(scope="module")
@@ -99,6 +105,7 @@ class FakeProvisioner:
         self.create_calls = 0
         self.created_targets: list[str | None] = []
         self.deleted_uids: list[str] = []
+        self.pvc_identities: dict[str, tuple[str, str]] = {}
         self.fail_creates = False
 
     async def get_pod_status(self, thread_id: str):
@@ -120,6 +127,13 @@ class FakeProvisioner:
     ):
         self.create_calls += 1
         self.created_targets.append(target_image_ref)
+        # Production provisioning uses create-or-reuse for this deterministic
+        # PVC and never deletes it during pod recycle. Keep an external UID in
+        # the fake so lifecycle tests can prove object identity, not just name.
+        self.pvc_identities.setdefault(
+            thread_id,
+            (f"pvc-persistent-{thread_id[:12]}", f"pvc-{uuid4()}"),
+        )
         if self.fail_creates:
             return PersistentPodCreateResult(
                 PersistentPodCreateStatus.FAILED,
@@ -240,6 +254,18 @@ async def _recycle_state(db: PostgresDB, thread_id: str):
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     return metadata["agent_pod"]["recycle"], metadata
+
+
+def _managed_gitea(*, probe: bool = True) -> MagicMock:
+    client = MagicMock()
+    client.repository_owner = "srw"
+    client.is_initialized = True
+    client.clean_repo_url = MagicMock(
+        side_effect=lambda name: f"http://gitea:3000/srw/{name}.git"
+    )
+    client.ensure_repo_deploy_key = AsyncMock(return_value=91)
+    client.probe_repo_deploy_key = AsyncMock(return_value=probe)
+    return client
 
 
 async def _bind_replacement_agent(
@@ -378,6 +404,342 @@ async def test_turn_boundary_recycle_preserves_thread_and_replaces_authority(db)
     assert live_grants == 1
     assert str(post_thread) == ids["thread"]
     assert pending_wakes == 1
+
+
+@pytest.mark.asyncio
+async def test_recycler_legacy_thread_recovers_through_registration_route(db, caplog):
+    """0177 recovery uses the same adoption/bind/grant path as a real pod."""
+
+    import main as orch_main
+
+    ids = await _seed(db)
+    message_id = await db.save_thread_message(
+        ids["thread"], "human", "continuity marker", turn_number=7
+    )
+    assert await db.enqueue_session_wake_event(
+        ids["thread"],
+        source="test",
+        dedup_key="managed-authority-recycle",
+        payload={"kind": "continuity"},
+        project_id=ids["project"],
+    )
+    repo_name = f"thread-{ids['thread'][:8]}"
+    legacy_url = f"http://admin:shared-secret@gitea:3000/srw/{repo_name}.git"
+    async with db.acquire() as conn:
+        # Reproduce only state the immediately previous release emitted: the
+        # already-bound commissioned thread carried its deterministic primary
+        # remote in ordinary workspace metadata and had no 0176 authority row.
+        await conn.execute(
+            "ALTER TABLE threads DISABLE TRIGGER "
+            "trg_managed_thread_repository_url_authority"
+        )
+        try:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata, "
+                "'{workspace_container}', jsonb_build_object("
+                "'repo_name', $2::text, 'git_remote_url', $3::text), true) "
+                "WHERE id=$1",
+                UUID(ids["thread"]),
+                repo_name,
+                legacy_url,
+            )
+        finally:
+            await conn.execute(
+                "ALTER TABLE threads ENABLE TRIGGER "
+                "trg_managed_thread_repository_url_authority"
+            )
+        post_before = dict(
+            await conn.fetchrow(
+                "SELECT project_id, thread_id, config_override, "
+                "communication_policy, state, incarnations, created_at "
+                "FROM project_officers WHERE project_id=$1",
+                UUID(ids["project"]),
+            )
+        )
+        thread_before = dict(
+            await conn.fetchrow(
+                "SELECT id, user_id, project_id, execution_lane, config_name, "
+                "created_at FROM threads WHERE id=$1",
+                UUID(ids["thread"]),
+            )
+        )
+        old_incarnation = await conn.fetchval(
+            "SELECT officer_incarnation FROM runtime_actor_grants "
+            "WHERE thread_id=$1 AND revoked_at IS NULL",
+            UUID(ids["thread"]),
+        )
+        wake_before = dict(
+            await conn.fetchrow(
+                "SELECT id, thread_id, project_id, source, dedup_key, payload, "
+                "state, created_at FROM session_wake_events "
+                "WHERE thread_id=$1 AND dedup_key='managed-authority-recycle'",
+                UUID(ids["thread"]),
+            )
+        )
+
+    provisioner = FakeProvisioner()
+    pvc_identity = (
+        f"pvc-persistent-{ids['thread'][:12]}",
+        f"pvc-fixture-{uuid4()}",
+    )
+    provisioner.pvc_identities[ids["thread"]] = pvc_identity
+    provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    observation = PersistentPodObservation.from_status(
+        ids["thread"], provisioner.current
+    )
+
+    requested = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        observation=observation,
+        expected_project_id=ids["project"],
+    )
+    assert requested.phase == "awaiting_old_pod_exit"
+    acknowledged = await recycler.acknowledge_parked_boundary(
+        thread_id=ids["thread"], agent_id=None
+    )
+    assert acknowledged.acknowledged is True
+
+    provisioner.current = None
+    advanced = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert advanced.phase == "awaiting_replacement"
+    assert provisioner.create_calls == 1
+    assert provisioner.pvc_identities[ids["thread"]] == pvc_identity
+    detached = await db.get_thread(ids["thread"])
+    assert detached["agent_id"] is None
+    detached_metadata = _json(detached["metadata"])
+    assert detached_metadata["workspace_container"]["git_remote_url"] == legacy_url
+    assert detached_metadata["config_override"]["officer"]["hold"] is not None
+    state, _ = await _recycle_state(db, ids["thread"])
+    assert state["phase"] == "awaiting_replacement"
+    assert state["generation"] == advanced.generation
+
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE id=$1", UUID(ids["agent"])
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM runtime_actor_grants "
+                "WHERE thread_id=$1 AND revoked_at IS NULL",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+        # A direct replacement bind remains database-fenced before proof.
+        unauthorized_agent = uuid4()
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id, config_name, hostname, status, agent_mode, thread_id) "
+            "VALUES ($1, 'centurion', 'unproven-replacement', 'booting', "
+            "'persistent', $2)",
+            unauthorized_agent,
+            UUID(ids["thread"]),
+        )
+        with pytest.raises(asyncpg.exceptions.CheckViolationError) as unproven:
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                UUID(ids["thread"]),
+                unauthorized_agent,
+            )
+        assert (
+            unproven.value.constraint_name
+            == "managed_repository_url_must_be_credential_free"
+        )
+        await conn.execute("DELETE FROM agents WHERE id=$1", unauthorized_agent)
+
+    replacement_uid = provisioner.current["pod_uid"]
+    bootstrap = await runtime_actor.issue_runtime_actor_bootstrap(db, ids["thread"])
+    request = MagicMock()
+    request.headers = {RUNTIME_ACTOR_BOOTSTRAP_HEADER: bootstrap}
+    registration = orch_main.AgentRegistration(
+        config_name="centurion",
+        pod_ip="127.0.0.2",
+        hostname=provisioner.current["pod_name"],
+        agent_mode="persistent",
+        thread_id=ids["thread"],
+        build_sha="new-build",
+        pod_uid=replacement_uid,
+    )
+    gitea = _managed_gitea(probe=False)
+    with (
+        patch.object(orch_main, "require_internal", AsyncMock()),
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "gitea_client", gitea),
+        pytest.raises(orch_main.HTTPException) as unavailable,
+    ):
+        await orch_main.register_agent(request, registration)
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.detail == "Workspace repository authority is unavailable"
+    assert "shared-secret" not in str(unavailable.value.detail)
+    assert "shared-secret" not in caplog.text
+
+    failed = await db.get_thread(ids["thread"])
+    failed_metadata = _json(failed["metadata"])
+    assert failed["agent_id"] is None
+    assert failed_metadata["workspace_container"]["git_remote_url"] == legacy_url
+    assert failed_metadata["config_override"]["officer"]["hold"] is not None
+    failed_state, _ = await _recycle_state(db, ids["thread"])
+    assert failed_state["generation"] == state["generation"]
+    assert failed_state["phase"] == "awaiting_replacement"
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE thread_id=$1",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM runtime_actor_grants "
+                "WHERE thread_id=$1 AND revoked_at IS NULL",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+        failed_authority = dict(
+            await conn.fetchrow(
+                "SELECT id, generation, status, access_mode, authority_kind, "
+                "authority_id, project_id, failure_class "
+                "FROM managed_repository_authorities WHERE repo_name=$1",
+                repo_name,
+            )
+        )
+    assert failed_authority["status"] == "provisioning"
+    assert failed_authority["failure_class"] == "deploy_key_probe"
+
+    # Retry the exact same production registration. The existing reservation
+    # is proven and activated, the observed URL is CAS-scrubbed, and only then
+    # may the route insert/bind the agent and mint its Officer runtime actor.
+    gitea.probe_repo_deploy_key.return_value = True
+    with (
+        patch.object(orch_main, "require_internal", AsyncMock()),
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "gitea_client", gitea),
+    ):
+        response = await orch_main.register_agent(request, registration)
+    assert response.runtime_actor is not None
+    successor = response.agent_id
+
+    bound = await db.get_thread(ids["thread"])
+    bound_metadata = _json(bound["metadata"])
+    clean_url = bound_metadata["workspace_container"]["git_remote_url"]
+    assert str(bound["agent_id"]) == successor
+    assert clean_url == f"http://gitea:3000/srw/{repo_name}.git"
+    assert "shared-secret" not in clean_url
+    # Registration alone is not readiness and must not release the hold.
+    assert bound_metadata["config_override"]["officer"]["hold"] is not None
+    async with db.acquire() as conn:
+        authority = dict(
+            await conn.fetchrow(
+                "SELECT id, generation, status, access_mode, authority_kind, "
+                "authority_id, project_id, "
+                "private_key_ciphertext IS NOT NULL AS encrypted "
+                "FROM managed_repository_authorities WHERE repo_name=$1",
+                repo_name,
+            )
+        )
+        grant = dict(
+            await conn.fetchrow(
+                "SELECT id, caller_kind, project_id, thread_id, agent_id, "
+                "officer_incarnation, revoked_at, refresh_expires_at > now() "
+                "AS refresh_valid FROM runtime_actor_grants "
+                "WHERE thread_id=$1 AND agent_id=$2 AND revoked_at IS NULL",
+                UUID(ids["thread"]),
+                UUID(successor),
+            )
+        )
+    assert authority == {
+        "id": failed_authority["id"],
+        "generation": 1,
+        "status": "active",
+        "access_mode": "write",
+        "authority_kind": "thread",
+        "authority_id": UUID(ids["thread"]),
+        "project_id": UUID(ids["project"]),
+        "encrypted": True,
+    }
+    assert grant["caller_kind"] == "officer"
+    assert str(grant["project_id"]) == ids["project"]
+    assert str(grant["thread_id"]) == ids["thread"]
+    assert str(grant["agent_id"]) == successor
+    assert grant["officer_incarnation"] == old_incarnation
+    assert grant["revoked_at"] is None
+    assert grant["refresh_valid"] is True
+
+    await db.heartbeat(successor, status="session")
+    provisioner.current = _pod_status(
+        ids["thread"],
+        uid=replacement_uid,
+        build="new-build",
+        generation=state["generation"],
+        ready=True,
+    )
+    completed = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert completed.phase == "complete"
+
+    final_thread = await db.get_thread(ids["thread"])
+    final_metadata = _json(final_thread["metadata"])
+    assert str(final_thread["agent_id"]) == successor
+    assert final_metadata["config_override"]["officer"]["hold"] is None
+    assert final_metadata["agent_pod"]["recycle"]["phase"] == "complete"
+    assert provisioner.pvc_identities[ids["thread"]] == pvc_identity
+    async with db.acquire() as conn:
+        post_after = dict(
+            await conn.fetchrow(
+                "SELECT project_id, thread_id, config_override, "
+                "communication_policy, state, incarnations, created_at "
+                "FROM project_officers WHERE project_id=$1",
+                UUID(ids["project"]),
+            )
+        )
+        thread_after = dict(
+            await conn.fetchrow(
+                "SELECT id, user_id, project_id, execution_lane, config_name, "
+                "created_at FROM threads WHERE id=$1",
+                UUID(ids["thread"]),
+            )
+        )
+        messages = await conn.fetch(
+            "SELECT id, content, turn_number FROM thread_messages WHERE thread_id=$1",
+            UUID(ids["thread"]),
+        )
+        wake_after = dict(
+            await conn.fetchrow(
+                "SELECT id, thread_id, project_id, source, dedup_key, payload, "
+                "state, created_at FROM session_wake_events "
+                "WHERE thread_id=$1 AND dedup_key='managed-authority-recycle'",
+                UUID(ids["thread"]),
+            )
+        )
+        live_grants = await conn.fetchval(
+            "SELECT count(*) FROM runtime_actor_grants "
+            "WHERE thread_id=$1 AND revoked_at IS NULL",
+            UUID(ids["thread"]),
+        )
+    assert post_after == post_before
+    assert thread_after == thread_before
+    assert [
+        (str(row["id"]), row["content"], row["turn_number"]) for row in messages
+    ] == [(message_id, "continuity marker", 7)]
+    assert wake_after == wake_before
+    assert live_grants == 1
 
 
 @pytest.mark.asyncio

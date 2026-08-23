@@ -250,6 +250,111 @@ async def test_genuine_legacy_thread_url_scrubs_only_after_key_is_proven(db):
 
 
 @pytest.mark.asyncio
+async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
+    """0177 removes runtime authority without weakening the attach fence."""
+
+    thread_id = await db.create_thread()
+    repo_name = f"thread-{thread_id[:8]}"
+    legacy_url = f"http://admin:shared-secret@gitea:3000/srw/{repo_name}.git"
+    old_agent_id = uuid4()
+    replacement_agent_id = uuid4()
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id, config_name, hostname, status, agent_mode, thread_id) "
+            "VALUES ($1, 'session_base', 'legacy-thread-pod', 'session', "
+            "'persistent', $2)",
+            old_agent_id,
+            UUID(thread_id),
+        )
+        await conn.execute(
+            "UPDATE threads SET agent_id=$2 WHERE id=$1",
+            UUID(thread_id),
+            old_agent_id,
+        )
+        # Exact pre-0176 durable shape: an already-attached persistent thread
+        # held the administrator-bearing clone URL in workspace_container.
+        await conn.execute(
+            "ALTER TABLE threads DISABLE TRIGGER "
+            "trg_managed_thread_repository_url_authority"
+        )
+        try:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_build_object("
+                "'workspace_container', jsonb_build_object("
+                "'repo_name', $2::text, 'git_remote_url', $3::text)) "
+                "WHERE id=$1",
+                UUID(thread_id),
+                repo_name,
+                legacy_url,
+            )
+        finally:
+            await conn.execute(
+                "ALTER TABLE threads ENABLE TRIGGER "
+                "trg_managed_thread_repository_url_authority"
+            )
+
+        # Detach is a reduction of authority and must stay available even
+        # before Gitea/key adoption can run.
+        assert (
+            await conn.execute(
+                "UPDATE threads SET agent_id=NULL WHERE id=$1 AND agent_id=$2",
+                UUID(thread_id),
+                old_agent_id,
+            )
+            == "UPDATE 1"
+        )
+        stored = await conn.fetchrow(
+            "SELECT agent_id, metadata FROM threads WHERE id=$1", UUID(thread_id)
+        )
+        assert stored["agent_id"] is None
+        assert (
+            _json(stored["metadata"])["workspace_container"]["git_remote_url"]
+            == legacy_url
+        )
+
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id, config_name, hostname, status, agent_mode, thread_id) "
+            "VALUES ($1, 'session_base', 'replacement-thread-pod', 'session', "
+            "'persistent', $2)",
+            replacement_agent_id,
+            UUID(thread_id),
+        )
+        with pytest.raises(asyncpg.exceptions.CheckViolationError) as attach:
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                UUID(thread_id),
+                replacement_agent_id,
+            )
+        assert (
+            attach.value.constraint_name
+            == "managed_repository_url_must_be_credential_free"
+        )
+
+    await prepare_thread_repository_authority(
+        db, _gitea(probe=True), await db.get_thread(thread_id)
+    )
+    async with db.acquire() as conn:
+        assert (
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                UUID(thread_id),
+                replacement_agent_id,
+            )
+            == "UPDATE 1"
+        )
+        clean_url = await conn.fetchval(
+            "SELECT metadata->'workspace_container'->>'git_remote_url' "
+            "FROM threads WHERE id=$1",
+            UUID(thread_id),
+        )
+    assert clean_url == f"http://gitea:3000/srw/{repo_name}.git"
+    assert "shared-secret" not in clean_url
+
+
+@pytest.mark.asyncio
 async def test_genuine_legacy_project_repository_scrubs_after_proof(db, monkeypatch):
     monkeypatch.setenv("GITEA_SSH_INTERNAL_HOST", "gitea")
     monkeypatch.setenv("GITEA_SSH_INTERNAL_PORT", "2222")
