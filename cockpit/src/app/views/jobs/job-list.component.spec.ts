@@ -274,6 +274,65 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(state.loadingSubtree).toBe(false);
   });
 
+  it('refreshes an open panel — cost must not stay frozen at first-open', () => {
+    // The cache lives for the whole view, so before this an explicit Refresh
+    // reloaded the rows underneath an open panel while its tokens and cost
+    // stayed at whatever they were when it was first expanded.
+    const getJob = vi.fn().mockReturnValue(of(null));
+    const getJobUsage = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJob,
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    expect(getJobUsage).toHaveBeenCalledTimes(1);
+
+    component.refresh();
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+    expect(getJob).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the subtree scope loaded across a refresh', () => {
+    // Dropping the reader back to own-spend on refresh would be its own lie —
+    // the two figures differ by more than 10x on a real tree.
+    const getJobUsage = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    component.loadSubtreeUsage('root-1');
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+
+    component.refresh();
+    // own + subtree again, not own alone.
+    expect(getJobUsage).toHaveBeenCalledTimes(4);
+    expect(getJobUsage).toHaveBeenLastCalledWith('root-1', true);
+  });
+
+  it('refreshes nothing when no panel is open', () => {
+    const getJob = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJob,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.refresh();
+    expect(getJob).not.toHaveBeenCalled();
+  });
+
   it('expands a row that has no children at all', () => {
     // The chevron used to appear only on parents. Details are worth reading on
     // a leaf job too, so every row now carries the gesture.
