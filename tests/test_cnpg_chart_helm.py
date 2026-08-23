@@ -611,3 +611,62 @@ class TestInitdbLocale:
         assert "localeCollate" not in initdb
         assert "localeCType" not in initdb
         assert "encoding" not in initdb
+
+
+class TestOperatorStatusPort:
+    """The operator polls instance health on 8000, not 5432.
+
+    A policy that admits `cnpg-system` but only opens 5432 leaves the Cluster
+    reporting `Ready=False` -- "unable to receive the status from all the ready
+    instances" -- while the database serves normally. CNPG makes failover and
+    switchover decisions from that status, so beyond one instance it is not
+    cosmetic. Observed live on srw-postgres and srw-keycloakdb, 2026-08-23,
+    immediately after cutover.
+
+    It cannot be caught by a rehearsal: while `migrating`, CNPG pods do not
+    carry the chart's component labels, so the policy does not select them.
+    """
+
+    OPERATOR_NS = "cnpg-system"
+
+    @staticmethod
+    def _operator_rules(policy: dict) -> list[dict]:
+        rules = []
+        for rule in policy["spec"].get("ingress", []):
+            for source in rule.get("from", []):
+                labels = source.get("namespaceSelector", {}).get("matchLabels", {})
+                if labels.get("kubernetes.io/metadata.name") == "cnpg-system":
+                    rules.append(rule)
+                    break
+        return rules
+
+    def test_operator_can_reach_the_status_port(self):
+        for key, (component, _, _) in DATABASES.items():
+            if component == "giteadb":
+                continue  # deliberately has no policy
+            policies = _policies(f"databases.{key}.engine=cnpg")
+            policy = policies.get(f"{FULLNAME}-{component}")
+            assert policy is not None, f"no policy for {component}"
+            rules = self._operator_rules(policy)
+            assert rules, f"{component}: operator namespace not admitted at all"
+            ports = {p.get("port") for rule in rules for p in rule.get("ports", [])}
+            assert 8000 in ports, f"{component}: status port missing, got {ports}"
+            assert 5432 in ports, f"{component}: postgres port missing, got {ports}"
+
+    def test_status_port_is_not_open_to_application_workloads(self):
+        """8000 is the instance manager's API. Only the operator gets it."""
+        policy = _policies("databases.postgres.engine=cnpg")[f"{FULLNAME}-postgres"]
+        for rule in policy["spec"]["ingress"]:
+            ports = {p.get("port") for p in rule.get("ports", [])}
+            if 8000 not in ports:
+                continue
+            for source in rule.get("from", []):
+                labels = source.get("namespaceSelector", {}).get("matchLabels", {})
+                assert labels.get("kubernetes.io/metadata.name") == self.OPERATOR_NS, (
+                    f"port 8000 exposed to a non-operator source: {source}"
+                )
+
+    def test_no_operator_rule_while_on_the_statefulset_engine(self):
+        """Negative control: nothing CNPG-shaped leaks into a pre-migration render."""
+        policy = _policies()[f"{FULLNAME}-postgres"]
+        assert not self._operator_rules(policy)

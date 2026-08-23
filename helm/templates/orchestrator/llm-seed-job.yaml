@@ -1,4 +1,3 @@
-{{- if .Values.llm.seed.enabled }}
 {{- /*
 Short-lived Job that seeds system_api_keys and llm_endpoints from the
 helm-rendered payload. Insert-only: `helm upgrade` re-runs this against an
@@ -8,7 +7,25 @@ API keys are injected via env vars (never written into the ConfigMap) — each
 `llm.seed.systemApiKeys[provider]` entry becomes a `SEED_<PROVIDER>_API_KEY`
 env var sourced from the referenced Secret, and each endpoint's apiKeyRef
 becomes `SEED_ENDPOINT_<index>_API_KEY`.
+
+Rendered only when the orchestrator is actually scheduled to run. The health
+gate below cannot pass at `orchestrator.replicas: 0`, and Helm blocks on a
+post-upgrade hook until it finishes — so a quiesced orchestrator wedged the
+release in `pending-upgrade`, which blocks every later apply *including the one
+that scales the orchestrator back up*. That is a deadlock, and it cost two
+manual recoveries during the 2026-08-23 CNPG cutover window. A database cutover
+has to quiesce its writers (knowledge-base/knowledge/operations/
+cnpg_migration_runbook.md §B2a), so that apply must carry no hook at all.
+
+`gt (int ...) 0`, NOT `default` — Helm's `default` treats 0 as empty, so
+`.Values.orchestrator.replicas | default 1` would render the hook straight
+through the quiesce. Same trap as gitea.replicas, same day.
+
+The payload ConfigMap (hook-weight 0) still renders while quiesced. It is
+applied without a wait and is inert on its own, so it costs nothing and is back
+in step with this Job the moment the replicas return.
 */ -}}
+{{- if and .Values.llm.seed.enabled (gt (int .Values.orchestrator.replicas) 0) }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -25,6 +42,12 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 2
+  # Hard ceiling on the hook, end to end. The bounded wait below caps one pod
+  # at 300s, but backoffLimit retries it twice more, so the init container
+  # alone would still let a failing apply hang for ~15 minutes. Seeding itself
+  # is a handful of INSERTs (seconds), so 600s can only ever be hit by
+  # something stuck — and Helm is released either way.
+  activeDeadlineSeconds: 600
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -45,13 +68,33 @@ spec:
         - name: wait-for-orchestrator
           # The orchestrator runs ensure_schema() on startup — delay the seed
           # until its health endpoint is responsive so the tables exist.
+          #
+          # Bounded at 100 tries × 3s. This loop had no ceiling until
+          # 2026-08-23, and an orchestrator that never answers is not a
+          # hypothetical: a rollout can fail, an image can be unpullable, and a
+          # cutover deliberately scales it to zero. Helm waits on the hook, so
+          # "forever" meant the release never left `pending-upgrade`.
+          #
+          # Exhausting the budget exits 1 rather than 0, deliberately. Exit 1
+          # fails the hook and marks the release `failed` — noisy, but Fleet's
+          # next apply proceeds normally, because `failed` is re-appliable and
+          # `pending-upgrade` is not. Exit 0 would be worse than noisy: the
+          # seeder talks to Postgres directly and only works because the
+          # orchestrator has already applied the schema, so it would die on an
+          # undefined table (main() returns 1 on any exception) and report a DB
+          # error in place of the real cause — after possibly seeding part of a
+          # half-migrated schema.
           image: busybox:1.36
           command:
             - sh
             - -c
-            - >-
-              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/api/health >/dev/null;
-              do echo "waiting for orchestrator..."; sleep 3; done
+            - |
+              i=0
+              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/api/health >/dev/null; do
+                i=$((i+1))
+                [ "$i" -ge 100 ] && { echo "orchestrator not ready after 300s; failing the seed hook"; exit 1; }
+                echo "waiting for orchestrator ($i/100)"; sleep 3
+              done
       containers:
         - name: seed
           image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
