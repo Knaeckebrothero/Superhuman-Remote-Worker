@@ -282,7 +282,15 @@ canvas:
           existingSecret: ""
           vaultPath: "homelab/superhuman-remote-worker/canvas-gateway-db"
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
-        provisionRole: false
+        # -- TRUE since the 2026-08-23 CNPG cutover. The role used to exist only
+    #    because someone created it by hand on the legacy StatefulSet, so it
+    #    was never code -- and a microservice import carries no roles, which
+    #    left canvas-gateway unable to log in to the new cluster (its
+    #    wait-for-canvas-database init container looped and the pod never came
+    #    up). The job reconciles the role from the Vault-supplied password,
+    #    idempotently and under an advisory lock, so the next migration does
+    #    not repeat this.
+    provisionRole: true
         pool:
           min: 1
           max: 4
