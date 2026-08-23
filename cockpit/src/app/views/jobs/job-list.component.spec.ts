@@ -207,6 +207,73 @@ describe('JobListComponent — server-resolved tree', () => {
     }
   });
 
+  it('fetches the subtree figure only when asked, and only once', () => {
+    // Most jobs are leaves, so a subtree call made eagerly would usually return
+    // the number already on screen. It is worth an extra request only when
+    // someone actually reaches for it — a tree can be many times its root.
+    const getJobUsage = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    expect(getJobUsage).toHaveBeenCalledTimes(1);
+    expect(getJobUsage).toHaveBeenLastCalledWith('root-1');
+
+    component.loadSubtreeUsage('root-1');
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+    expect(getJobUsage).toHaveBeenLastCalledWith('root-1', true);
+
+    // A null result means the call failed; asking again on every click would
+    // hammer it, so the loaded flag has to stop that.
+    component.loadSubtreeUsage('root-1');
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not request a subtree for a job whose panel was never opened', () => {
+    const getJobUsage = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.loadSubtreeUsage('root-1');
+    expect(getJobUsage).not.toHaveBeenCalled();
+  });
+
+  it('keeps the own-scope figure when the subtree loads', () => {
+    // Two independent figures, not one that overwrites the other — switching
+    // scope back must not refetch or show the wrong number.
+    const own = {job_count: 1, state: 'measured'} as never;
+    const subtree = {job_count: 3, state: 'measured'} as never;
+    const getJobUsage = vi
+      .fn()
+      .mockReturnValueOnce(of(own))
+      .mockReturnValueOnce(of(subtree));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    component.loadSubtreeUsage('root-1');
+
+    const state = component.jobDetails()['root-1'];
+    expect(state.usage).toBe(own);
+    expect(state.usageSubtree).toBe(subtree);
+    expect(state.loadingSubtree).toBe(false);
+  });
+
   it('expands a row that has no children at all', () => {
     // The chevron used to appear only on parents. Details are worth reading on
     // a leaf job too, so every row now carries the gesture.

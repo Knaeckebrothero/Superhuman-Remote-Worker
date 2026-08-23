@@ -268,6 +268,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         [job]="row.job"
                         [data]="jobDetails()[row.job.id] ?? null"
                         [childCount]="getChildCount(row.job.id)"
+                        (subtreeRequested)="loadSubtreeUsage(row.job.id)"
                       />
                     </td>
                   </tr>
@@ -1731,7 +1732,16 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (this.jobDetails()[jobId]) return; // cached, including a failed attempt
     this.jobDetails.update((cache) => ({
       ...cache,
-      [jobId]: {loading: true, error: false, detail: null, usage: null, progress: null},
+      [jobId]: {
+        loading: true,
+        error: false,
+        detail: null,
+        usage: null,
+        progress: null,
+        usageSubtree: null,
+        loadingSubtree: false,
+        subtreeAttempted: false,
+      },
     }));
     forkJoin({
       detail: this.api.getJob(jobId),
@@ -1743,12 +1753,41 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.jobDetails.update((cache) => ({
           ...cache,
           [jobId]: {
+            ...cache[jobId],
             loading: false,
             error: !result.detail && !result.usage && !result.progress,
             detail: result.detail,
             usage: result.usage,
             progress: result.progress,
           },
+        }));
+      });
+  }
+
+  /**
+   * Fetch the subtree figure for one job, once, when the panel asks for it.
+   *
+   * Not fetched alongside the other three: most jobs are leaves, and a request
+   * whose answer equals the one already on screen is pure waste. A parent's tree
+   * can be many times its own spend, so the toggle is worth the extra call when
+   * someone actually reaches for it.
+   */
+  loadSubtreeUsage(jobId: string): void {
+    const state = this.jobDetails()[jobId];
+    // `subtreeAttempted`, not `usageSubtree`: a failed call leaves the data null
+    // and a data-keyed guard would then refetch on every click.
+    if (!state || state.subtreeAttempted) return;
+    this.jobDetails.update((cache) => ({
+      ...cache,
+      [jobId]: {...cache[jobId], loadingSubtree: true, subtreeAttempted: true},
+    }));
+    this.api
+      .getJobUsage(jobId, true)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((usageSubtree) => {
+        this.jobDetails.update((cache) => ({
+          ...cache,
+          [jobId]: {...cache[jobId], loadingSubtree: false, usageSubtree},
         }));
       });
   }

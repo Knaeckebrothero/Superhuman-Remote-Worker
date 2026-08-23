@@ -1,4 +1,11 @@
-import {ChangeDetectionStrategy, Component, computed, input} from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  input,
+  output,
+  signal,
+} from '@angular/core';
 import {TranslocoModule} from '@jsverse/transloco';
 import {
   Job,
@@ -10,12 +17,28 @@ import {JobSummary} from '../../core/models/audit.model';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
 
+/** Own spend, or the whole subtree beneath the job. */
+export type UsageScope = 'job' | 'subtree';
+
 /** Everything the panel loads lazily for one job, plus its load state. */
 export interface JobDetailState {
   loading: boolean;
   /** Set only when every lazy call failed — a partial load still renders. */
   error: boolean;
   detail: Job | null;
+  /**
+   * Subtree usage, fetched only if the reader asks for it. Kept separate from
+   * `usage` rather than replacing it so switching scope back and forth is free
+   * and the two figures stay independently inspectable.
+   */
+  usageSubtree: JobUsage | null;
+  loadingSubtree: boolean;
+  /**
+   * Whether the subtree call has been made at all. Separate from
+   * `usageSubtree != null` because a failed call leaves that null forever, and
+   * keying the guard off the data would refetch on every single click.
+   */
+  subtreeAttempted: boolean;
   usage: JobUsage | null;
   progress: JobProgress | null;
 }
@@ -163,7 +186,7 @@ export function formatUsd(amount: number): string {
         </div>
       </div>
 
-      @if (data()?.loading) {
+      @if (data()?.loading || (scope() === 'subtree' && data()?.loadingSubtree)) {
         <div class="detail-loading">
           <app-spinner size="sm" />
           <span>{{ 'jobs.detail.loading' | transloco }}</span>
@@ -172,14 +195,40 @@ export function formatUsd(amount: number): string {
         <div class="usage-block">
           <div class="usage-head">
             <span class="usage-title">{{ 'jobs.detail.usage' | transloco }}</span>
-            @if (usage()?.freshness?.live) {
+            <div class="scope-switch" role="group" [attr.aria-label]="'jobs.detail.scopeLabel' | transloco">
+              <button
+                type="button"
+                [class.active]="scope() === 'job'"
+                [attr.aria-pressed]="scope() === 'job'"
+                (click)="setScope('job')"
+              >
+                {{ 'jobs.detail.scopeJob' | transloco }}
+              </button>
+              <button
+                type="button"
+                [class.active]="scope() === 'subtree'"
+                [attr.aria-pressed]="scope() === 'subtree'"
+                (click)="setScope('subtree')"
+              >
+                {{ 'jobs.detail.scopeSubtree' | transloco }}
+              </button>
+            </div>
+            @if (activeUsage()?.freshness?.live) {
               <span class="usage-note">{{ 'jobs.detail.usageLive' | transloco }}</span>
             }
           </div>
 
+          @if (scope() === 'subtree' && subtreeJobCount() === 1) {
+            <p class="usage-reason">{{ 'jobs.detail.scopeNoSubjobs' | transloco }}</p>
+          } @else if (scope() === 'subtree' && subtreeJobCount() > 1) {
+            <p class="usage-reason">
+              {{ 'jobs.detail.scopeCovers' | transloco: {count: subtreeJobCount()} }}
+            </p>
+          }
+
           <div class="usage-figures">
             <div class="figure">
-              <span class="figure-value">{{ formatCount(usage()?.llm?.total_tokens) }}</span>
+              <span class="figure-value">{{ formatCount(activeUsage()?.llm?.total_tokens) }}</span>
               <span class="figure-label">{{ 'jobs.detail.tokens' | transloco }}</span>
             </div>
             <div class="figure">
@@ -205,7 +254,7 @@ export function formatUsd(amount: number): string {
             <p class="usage-reason">
               {{
                 'jobs.detail.costFloor'
-                  | transloco: {priced: usage()!.cost.priced_events, total: usage()!.cost.events}
+                  | transloco: {priced: activeUsage()!.cost.priced_events, total: activeUsage()!.cost.events}
               }}
             </p>
           }
@@ -305,6 +354,30 @@ export function formatUsd(amount: number): string {
         font-size: 11px;
         color: var(--text-muted);
       }
+      .scope-switch {
+        display: inline-flex;
+        gap: 2px;
+        padding: 2px;
+        border-radius: var(--radius-control);
+        background: var(--surface-0);
+      }
+      .scope-switch button {
+        border: none;
+        background: none;
+        font: inherit;
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: var(--radius-control);
+        color: var(--text-muted);
+        cursor: pointer;
+      }
+      .scope-switch button:hover {
+        color: var(--text-primary);
+      }
+      .scope-switch button.active {
+        background: var(--surface-2);
+        color: var(--text-primary);
+      }
       .usage-figures {
         display: flex;
         gap: 28px;
@@ -377,11 +450,45 @@ export class JobDetailPanelComponent {
    */
   readonly childCount = input(0);
 
+  /**
+   * Asked for when the reader first switches to the subtree scope. The parent
+   * owns the fetch and the cache; the panel only says when it is wanted, so a
+   * leaf job never pays for a request nobody looked at.
+   */
+  readonly subtreeRequested = output<void>();
+
+  /** Which figure is on screen. Resets with the panel, which is cheap and honest. */
+  readonly scope = signal<UsageScope>('job');
+
   protected readonly formatCount = formatCount;
   protected readonly formatUsd = formatUsd;
 
+  setScope(scope: UsageScope): void {
+    this.scope.set(scope);
+    if (scope !== 'subtree') return;
+    const state = this.data();
+    // Ask once. Keyed off `subtreeAttempted`, not off the data: a failed call
+    // leaves `usageSubtree` null, so a data-keyed guard would re-ask on every
+    // click of a scope the server has already refused.
+    if (state && !state.subtreeAttempted) {
+      this.subtreeRequested.emit();
+    }
+  }
+
   readonly usage = computed(() => this.data()?.usage ?? null);
-  readonly cost = computed<CostDisplay>(() => costDisplay(this.usage()));
+  /** Whichever scope the reader is looking at — everything below reads this. */
+  readonly activeUsage = computed(() =>
+    this.scope() === 'subtree' ? (this.data()?.usageSubtree ?? null) : this.usage(),
+  );
+  readonly cost = computed<CostDisplay>(() => costDisplay(this.activeUsage()));
+  /**
+   * How many jobs the subtree figure actually covers, straight from the server.
+   *
+   * Deliberately not `childCount`: that is the *filtered* count of children the
+   * list happens to be showing, while the subtree sum walks the real tree in the
+   * database. Conflating them would put a filter artifact into a spend figure.
+   */
+  readonly subtreeJobCount = computed(() => this.data()?.usageSubtree?.job_count ?? 0);
   readonly modelLabel = computed(() => jobModelLabel(this.data()?.detail ?? null));
 
   readonly durationLabel = computed(() =>
@@ -399,7 +506,7 @@ export class JobDetailPanelComponent {
 
   /** Token totals per model, biggest first — the per-resource split, folded. */
   readonly perModel = computed(() => {
-    const rows = this.usage()?.rows ?? [];
+    const rows = this.activeUsage()?.rows ?? [];
     const byResource = new Map<string, number>();
     for (const row of rows) {
       if (row.category !== 'llm') continue;
