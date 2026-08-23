@@ -125,7 +125,7 @@ orchestrator:
   #    would restore it (observed twice on 2026-08-23). Fixed in the chart: the
   #    seed Job no longer renders at replicas 0, and its wait is bounded. A
   #    quiesce is now an ordinary apply. See the migration runbook §B2a.
-  replicas: 2
+  replicas: 0
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
   # leader-elected finalizer; `lifespan` additionally starts the finalizer and
@@ -514,6 +514,20 @@ databases:
     #    rule is ~2.5x. Separate key because storageSize sizes the live
     #    StatefulSet's PVC, and a PVC cannot shrink.
     cnpgStorageSize: "64Gi"
+    # -- The shared `resources` sizes the legacy StatefulSet, which idles at 14m
+    #    CPU / 183Mi and is capped at 500m / 1Gi. That is fine for serving and
+    #    hopeless for importing 26 GB: pgvector needed 4 CPU to move 20 GB in
+    #    63 minutes, so half a core here would run for most of a day, and 1Gi
+    #    risks an OOM an hour in. Memory stays modest on purpose -- this
+    #    database is only 281 MB of indexes, so the restore is COPY-bound, not
+    #    index-bound, which is also why importRestoreJobs stays serial.
+    cnpgResources:
+      requests:
+        cpu: "1"
+        memory: "1Gi"
+      limits:
+        cpu: "4"
+        memory: "4Gi"
   # Gitea's database (srw-giteadb) — 50 MB. First real cutover, chosen first
   # because it is the smallest blast radius of the three: Gitea only, not auth
   # and not the orchestrator. Writer quiesced via gitea.replicas: 0 above; the
@@ -592,11 +606,6 @@ databases:
     #    `databases.locale`. Root cause and proof:
     #    knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
     engine: "migrating"
-    # -- The cluster on this engine is a REHEARSAL copy, superseded the moment
-    #    the real cutover re-imports with writers quiesced. Archiving 20 GB of
-    #    it would push a throwaway into the bucket and pay retention on it.
-    #    Set back to true (or delete this line) at the real cutover.
-    backupEnabled: false
     # -- Peak disk measured at 38 GB in the rehearsal: the 17 GB dump and the
     #    restored data occupy this volume simultaneously. The inherited 32Gi
     #    runs out ~2h in, after the dump has already completed. Separate key
@@ -645,6 +654,9 @@ agent:
   # tiers stay pinned/refused.
   stateless:
     enabled: true
+    # QUIESCED for the auditdb + pgvector cutovers, 2026-08-23. Writers to the
+    # srw database as the `srw` superuser. Remove once both are on `cnpg`.
+    replicas: 0
     # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. Admission
     # remains independently rollbackable from the default-selection flag.
     #
