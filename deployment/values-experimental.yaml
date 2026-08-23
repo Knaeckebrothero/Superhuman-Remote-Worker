@@ -452,6 +452,29 @@ databases:
       externalTrafficPolicy: Local
       allowedClientCIDRs:
         - "192.168.178.0/24"
+  # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
+  #    CNPG-I plugin. Applies ONLY to databases on the cnpg/migrating engines.
+  #
+  #    Prerequisites, all already satisfied on dev:
+  #      * plugin installed in cnpg-system (HomeLab/deployments_managed/cnpg-barman-plugin)
+  #      * bucket `srw-pgbackup` with a key scoped to it alone
+  #      * BACKUP_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY in the Vault bundle,
+  #        hence in the chart's own Secret -- so credentialsSecret stays empty
+  #
+  #    Target is the homelab MinIO, which is a DIFFERENT failure domain from
+  #    this cluster. Deliberately not the bundled Garage: same cluster, single
+  #    node, one PVC -- whatever kills the database plausibly kills the backup
+  #    while still looking like one.
+  backup:
+    method: "objectstore"
+    # Each cluster gets its own folder underneath, named after the cluster.
+    # Dev and prod use separate buckets, so no environment prefix is needed.
+    destinationPath: "s3://srw-pgbackup"
+    endpointURL: "http://minio.minio.svc.cluster.local:9000"
+    retentionPolicy: "30d"
+    # SIX-field cron, seconds first. 02:00:00 daily.
+    schedule: "0 0 2 * * *"
+    immediate: true
   # Audit store (srw-auditdb) — append-only observability tier. Bumped from the
   # chart default 10Gi to 32Gi after the 10Gi Longhorn volume filled 2026-07-07,
   # crashlooping auditdb ("No space left on device" on postmaster.pid) and
@@ -461,6 +484,12 @@ databases:
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
     storageSize: "32Gi"
+    # -- 26 GB of data. A logical import holds the dump and the restored data on
+    #    the SAME volume, measured at ~2.2x the source on pgvector, so 32Gi runs
+    #    out roughly two hours in -- after the dump has already completed. The
+    #    rule is ~2.5x. Separate key because storageSize sizes the live
+    #    StatefulSet's PVC, and a PVC cannot shrink.
+    cnpgStorageSize: "64Gi"
   # Main postgres (srw-postgres) — same story as audit above, one env narrower.
   # The chart default stays 16Gi (right for a fresh/self-hosted install); only
   # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
@@ -509,6 +538,11 @@ databases:
     #    `databases.locale`. Root cause and proof:
     #    knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
     engine: "migrating"
+    # -- The cluster on this engine is a REHEARSAL copy, superseded the moment
+    #    the real cutover re-imports with writers quiesced. Archiving 20 GB of
+    #    it would push a throwaway into the bucket and pay retention on it.
+    #    Set back to true (or delete this line) at the real cutover.
+    backupEnabled: false
     # -- Peak disk measured at 38 GB in the rehearsal: the 17 GB dump and the
     #    restored data occupy this volume simultaneously. The inherited 32Gi
     #    runs out ~2h in, after the dump has already completed. Separate key
