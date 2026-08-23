@@ -511,7 +511,10 @@ databases:
   # Holds sessions and Infinispan jdbc-ping rows as well as realm config;
   # expect to re-authenticate afterwards. Chart default storage is ample.
   keycloak:
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source: all 88 tables identical
+    # by exact COUNT(*), locale/extensions/index-validity identical, clean
+    # restore log, both realms (master, srw) present and enabled.
+    engine: "cnpg"
   # Main postgres (srw-postgres) — same story as audit above, one env narrower.
   # The chart default stays 16Gi (right for a fresh/self-hosted install); only
   # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
@@ -717,11 +720,11 @@ keycloak:
   # on both replicas at once against an empty database. This realm already
   # exists, so there is no import to race — the same reasoning that lets
   # orchestrator run replicas:2 here ahead of the chart default.
-  # QUIESCED (was 2) for the keycloakdb cutover, 2026-08-23. Both replicas, not
-  # one: this database also backs Infinispan's jdbc-ping peer discovery and
-  # session storage, so a surviving pod keeps writing to it. Restore to 2 once
-  # databases.keycloak.engine is `cnpg`.
-  replicas: 0
+  # Restored to 2 after the keycloakdb cutover, 2026-08-23. Both pods now
+  # discover each other through the CNPG cluster's -rw Service. Set to 0 to
+  # quiesce for a future cutover -- both replicas, since jdbc-ping and session
+  # storage mean any surviving pod keeps writing.
+  replicas: 2
   bridgeCert:
     enabled: true
     smtpHost: "protonmail-bridge.protonmail-bridge.svc"
