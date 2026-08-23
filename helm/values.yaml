@@ -2312,6 +2312,13 @@ llm:
   # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
   # to bring the stack up empty and configure providers via Admin → Providers.
+  #
+  # The Job is a post-upgrade hook that waits on the orchestrator's health
+  # endpoint, so it also renders only while `orchestrator.replicas` is above
+  # zero — a cutover that quiesces the orchestrator carries no hook and cannot
+  # wedge the release. Setting enabled:false is the explicit form of the same
+  # thing; the seeder is insert-only, so turning it off for a window and back
+  # on afterwards seeds nothing twice.
   # ---------------------------------------------------------------------------
   seed:
     # -- Enable the seed Job. Missing/false leaves system tables untouched.
