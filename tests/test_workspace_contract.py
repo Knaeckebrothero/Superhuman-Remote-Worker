@@ -952,6 +952,38 @@ def test_worker_recipient_accepts_exact_server_tier_projection() -> None:
     )
 
 
+def test_job_start_workspace_authority_survives_producer_consumer_round_trip() -> None:
+    from orchestrator.main import JobStartRequest as ProducerJobStartRequest
+    from src.api.models import JobStartRequest as ConsumerJobStartRequest
+
+    runtime = {
+        "requested_backend": None,
+        "assigned_backend": "sandbox",
+        "effective_backend": "sandbox",
+        "state": "ready",
+    }
+    producer = ProducerJobStartRequest(
+        job_id=str(uuid4()),
+        description="exercise the real dispatch wire contract",
+        config_override={
+            "workspace": {
+                "backend": "sandbox",
+                "remote": {"host": "workspace.internal"},
+            }
+        },
+        workspace_runtime=runtime,
+    )
+
+    payload = producer.model_dump(exclude_none=True)
+    assert payload["workspace_runtime"] == runtime
+    consumer = ConsumerJobStartRequest.model_validate(payload)
+    validate_worker_workspace_projection(
+        config_override=consumer.config_override,
+        resolved_config=consumer.resolved_config,
+        workspace_runtime=consumer.workspace_runtime,
+    )
+
+
 @pytest.mark.parametrize(
     ("runtime", "code"),
     [

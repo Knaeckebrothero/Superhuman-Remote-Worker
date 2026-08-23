@@ -10021,6 +10021,11 @@ class JobCreate(BaseModel):
 class JobStartRequest(BaseModel):
     """Request sent to agent to start a job."""
 
+    # This is an internal wire contract.  Silently ignoring an undeclared
+    # constructor kwarg can make the producer appear to populate a required
+    # field while model_dump() drops it before delivery.
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
     description: str
     upload_id: str | None = None
@@ -10062,6 +10067,10 @@ class JobStartRequest(BaseModel):
     runtime_actor: dict[str, Any] | None = Field(
         default=None,
         description="Hidden server-derived runtime actor context",
+    )
+    workspace_runtime: dict[str, Any] | None = Field(
+        default=None,
+        description="Safe server-owned workspace runtime authority projection",
     )
     delegation_context: str | None = Field(
         default=None,
