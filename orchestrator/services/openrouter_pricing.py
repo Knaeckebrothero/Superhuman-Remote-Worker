@@ -12,10 +12,12 @@ auth), which publishes per-model ``pricing.prompt`` / ``pricing.completion`` /
 Mapping: each catalog model resolves to an OpenRouter price by its admin-set
 ``params_json.pricing_id`` (Admin → Models) when present, else by the model id
 itself. Resolution (``_build_price_resolver``) tries an exact (case-insensitive)
-match on the full OpenRouter id first, then the provider-prefix-stripped suffix —
-so a bare ``gpt-5.6-terra`` auto-matches ``openai/gpt-5.6-terra`` with no admin
-mapping. A suffix shared by more than one provider is treated as ambiguous and
-left unpriced (fail closed) rather than mis-priced against the wrong provider.
+match on the full OpenRouter id, then the once-stripped remainder as a full id
+(the gateway case: ``openrouter/openai/gpt-oss-120b`` → ``openai/gpt-oss-120b``),
+then as a bare suffix — so a bare ``gpt-5.6-terra`` auto-matches
+``openai/gpt-5.6-terra`` with no admin mapping. A suffix shared by more than one
+provider is treated as ambiguous and left unpriced (fail closed) rather than
+mis-priced against the wrong provider.
 ``pricing_id = ""`` marks a model explicitly unpriced (self-hosted / free) → no
 rate → ``cost_usd`` stays NULL.
 
@@ -117,6 +119,11 @@ def _build_price_resolver(
       two providers is dropped, so an ambiguous bare name fails closed (unpriced)
       rather than being mis-priced against the wrong provider.
 
+    Lookup order is full id, then the stripped remainder against ``by_full``, then
+    against ``by_suffix``. The middle step handles GATEWAY-prefixed catalog ids —
+    ``openrouter/openai/gpt-oss-120b`` is a routing prefix in front of a complete
+    OpenRouter id, so one strip yields a full id rather than a bare suffix.
+
     This lets a bare catalog ``model_id`` (``gpt-5.6-terra``) auto-match
     ``openai/gpt-5.6-terra`` with no admin mapping, while every existing
     exact-match and force-unprice path is preserved unchanged.
@@ -137,7 +144,16 @@ def _build_price_resolver(
         if not candidate:
             return None
         c = candidate.strip().lower()
-        return by_full.get(c) or by_suffix.get(c.split("/", 1)[-1])
+        stripped = c.split("/", 1)[-1]
+        # ``by_full`` on the stripped remainder is the gateway case: a catalog id
+        # like ``openrouter/openai/gpt-oss-120b`` carries a ROUTING prefix in
+        # front of a complete OpenRouter id. Dropping one segment leaves
+        # ``openai/gpt-oss-120b``, which is a full id, not a bare suffix — so
+        # without this it fell through to ``by_suffix`` (bare names only) and
+        # missed, leaving OpenRouter's own models the ones auto-detection could
+        # not price. Fail-closed is unaffected: ambiguity is a property of the
+        # BARE suffix, and a full id is unambiguous by construction.
+        return by_full.get(c) or by_full.get(stripped) or by_suffix.get(stripped)
 
     return resolve
 

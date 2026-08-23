@@ -132,6 +132,29 @@ class TestBuildPriceResolver:
         assert resolve("openai/foo") is self._P
         assert resolve("bar/foo") is self._Q
 
+    def test_gateway_prefixed_id_resolves_to_the_inner_full_id(self):
+        """``openrouter/openai/gpt-oss-120b`` is a ROUTING prefix + a full id.
+
+        Stripping one segment leaves ``openai/gpt-oss-120b``, which lives in the
+        full-id index, not the bare-suffix one. Before this was handled, the
+        models routed *through OpenRouter* were the ones auto-detection could not
+        price — verified against the live catalog: both ``openrouter/…`` entries
+        missed while the bare ``MiniMax-M3`` matched.
+        """
+        resolve = _build_price_resolver({"openai/gpt-oss-120b": self._P})
+        assert resolve("openrouter/openai/gpt-oss-120b") is self._P
+
+    def test_gateway_prefix_does_not_reopen_the_ambiguous_bare_name(self):
+        """Fail-closed is a property of the BARE suffix and must survive the fix.
+
+        A gateway-prefixed *full* id stays resolvable (it is unambiguous by
+        construction), while the bare shared suffix stays unpriced.
+        """
+        resolve = _build_price_resolver({"openai/foo": self._P, "bar/foo": self._Q})
+        assert resolve("gateway/openai/foo") is self._P
+        assert resolve("gateway/foo") is None
+        assert resolve("foo") is None
+
     def test_none_empty_and_absent(self):
         resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
         assert resolve(None) is None
