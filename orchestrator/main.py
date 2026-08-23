@@ -26857,13 +26857,37 @@ async def _complete_job_legacy(
                             "recovering": True,
                             "previous_error": "workspace_unavailable",
                             "rootdisk": "kept",
+                            # Carried across the reset on purpose. delete_vm()
+                            # re-reads context.vm.provision_generation to fence
+                            # the request, so a wholesale wipe here made it send
+                            # a generation-less delete that never reached the
+                            # controller at all. The old VM survived, and with
+                            # it the per-VM cloud-init Secret it owns, so the
+                            # next create died on a 409 AlreadyExists and the
+                            # job failed permanently instead of recovering with
+                            # its kept rootdisk. Found by the live k3d VM gate.
+                            "provision_generation": (
+                                (vm_ctx or {}).get("provision_generation")
+                            ),
                         }
                     },
                 )
 
-                # Delete the old VM but retain the persistent root disk.
+                # Delete the old VM but retain the persistent root disk. The
+                # boolean matters: a refused delete leaves the cloud-init Secret
+                # behind, which is fatal to the recreate, so do not report a
+                # recovery we did not actually perform.
+                vm_deleted = True
                 if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                    await vm_provisioner.delete_vm(job_id, purge_disk=False)
+                    vm_deleted = await vm_provisioner.delete_vm(
+                        job_id, purge_disk=False
+                    )
+                    if not vm_deleted:
+                        logger.error(
+                            "VM recovery for job %s: delete was refused; the "
+                            "stale cloud-init Secret will fail the recreate",
+                            job_id,
+                        )
                 if not COMPLETION_COMMANDS_ENABLED:
                     await postgres_db.pause_job(job_id)
                 _trigger_dispatch()
@@ -26872,8 +26896,15 @@ async def _complete_job_legacy(
                     "job_id": job_id,
                     "new_status": "paused",
                     "actions": [
-                        "vm recovery: old VM deleted, new VM will be provisioned, "
-                        "job re-queued"
+                        (
+                            "vm recovery: old VM deleted, new VM will be "
+                            "provisioned, job re-queued"
+                        )
+                        if vm_deleted
+                        else (
+                            "vm recovery: old VM delete REFUSED — recreate will "
+                            "likely fail on the stale cloud-init Secret"
+                        )
                     ],
                 }
 
