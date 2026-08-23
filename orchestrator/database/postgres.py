@@ -2016,8 +2016,12 @@ class PostgresDB:
             Job dict or None if not found
         """
         try:
-            uuid_val = UUID(job_id)
-        except ValueError:
+            # str() so an asyncpg.pgproto.UUID from a row is accepted too;
+            # uuid.UUID() calls .replace() on its argument and would raise
+            # AttributeError, which this guard did not catch (it escaped as a
+            # 500 from every /api/sudo/requests route).
+            uuid_val = UUID(str(job_id))
+        except (ValueError, AttributeError, TypeError):
             return None
 
         async with self.acquire() as conn:
