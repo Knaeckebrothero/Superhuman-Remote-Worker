@@ -445,6 +445,15 @@ checkpointer:
 # Databases — all internal (chart defaults), override here if you externalize
 # -----------------------------------------------------------------------------
 databases:
+  # -- HA posture: 2 instances per cluster (2026-08-23). CNPG builds the new
+  #    replica with pg_basebackup from the primary and streams thereafter, so
+  #    this is a live change with no re-import -- but it does put real I/O on
+  #    each primary while it seeds.
+  #
+  #    Rolled out small-first: `vector` and `audit` hold at 1 below until the
+  #    three small clusters are proven at 2. Remove those two overrides to
+  #    finish the rollout.
+  profile: ha
   # Neo4j graph-DB browser UI. Exposed via the chart's Traefik ingress
   # (neo4j.superhuman-remote-worker.com -> srw-neo4j:7474, TLS via
   # cloudflare-dns-issuer) on the home-network Traefik LB (10.0.51.11) ONLY —
@@ -514,6 +523,9 @@ databases:
   # sync so a reconcile never tries to (illegally) shrink it back to 10Gi.
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
+    # Held at 1 until the small clusters are proven at 2 -- seeding a 26 GB
+    # replica is the expensive half of this flip. Delete this line to finish.
+    instances: 1
     storageSize: "32Gi"
     # Cut over 2026-08-23. Verified against the source before the flip: 29
     # tables identical by exact COUNT(*), 26 GB on both sides with the large
@@ -606,6 +618,9 @@ databases:
   # So 32Gi buys headroom to recover and to VACUUM FULL; it is not the fix.
   # Without the sweep fix this refills, exactly as postgres did in ~4 days.
   vector:
+    # Held at 1 until the small clusters are proven at 2 -- seeding a 20 GB
+    # replica is the expensive half of this flip. Delete this line to finish.
+    instances: 1
     storageSize: "32Gi"
     # -- MIGRATION IN PROGRESS, 2026-08-22.
     #
