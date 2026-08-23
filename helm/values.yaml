@@ -1640,6 +1640,15 @@ databases:
 # =============================================================================
 gitea:
   enabled: true
+  # -- Gitea is single-writer: it holds an exclusive lock on its data volume and
+  #    its StatefulSet has no leader election, so this is 0 or 1, never more.
+  #
+  #    It exists so a database cutover can quiesce the writer THROUGH GitOps.
+  #    `kubectl scale` is reverted within ~90s, mid-migration, and
+  #    `gitea.enabled: false` is not a substitute -- that guard also covers the
+  #    PersistentVolumeClaim, so disabling Gitea to quiet it would delete its
+  #    data volume.
+  replicas: 1
   # -- Deploy Gitea StatefulSet within the chart. Set false to use external git server.
   internal: true
   # -- Internal cluster URL (when internal=false, set to your existing git server's internal URL)
