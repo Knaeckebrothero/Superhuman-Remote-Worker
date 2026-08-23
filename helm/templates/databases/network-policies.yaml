@@ -69,14 +69,35 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "srw.fullname" . }}-postgres
-        # The operator polls instance health; without this, failover never fires.
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -123,14 +144,35 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "srw.fullname" . }}-pgvector
-        # The operator polls instance health; without this, failover never fires.
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -178,14 +220,35 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "srw.fullname" . }}-auditdb
-        # The operator polls instance health; without this, failover never fires.
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -285,12 +348,33 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "srw.fullname" . }}-keycloakdb
-        # The operator polls instance health; without this, failover never fires.
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
         {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 {{- end }}
