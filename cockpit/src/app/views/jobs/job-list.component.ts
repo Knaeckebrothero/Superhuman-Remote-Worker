@@ -275,7 +275,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                 <tr
                   [class.selected]="selectedJobId() === row.job.id"
                   [class.child-row]="row.isChild"
-                  (click)="selectJob(row.job.id)"
+                  (click)="onRowClick(row.job.id, $event)"
                 >
                   <td class="prompt-cell">
                     <div class="prompt-inner" [style.padding-left.px]="row.isChild ? 16 : 0">
@@ -1682,6 +1682,29 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   selectJob(jobId: string): void {
     this.selectedJobId.set(jobId);
+  }
+
+  /**
+   * Clicking anywhere on a row opens its detail panel.
+   *
+   * The chevron stays — it is the only keyboard-reachable way in (a `<tr>` with
+   * a click handler is not focusable) and it carries the expanded/collapsed
+   * state for screen readers. It stops propagation, so a click on it toggles
+   * once rather than twice.
+   *
+   * A drag that selected text is not a click: the job id sits in the row and
+   * people copy it constantly, so selecting it must not toggle the panel
+   * underneath their cursor.
+   */
+  onRowClick(jobId: string, event?: MouseEvent): void {
+    this.selectJob(jobId);
+    if (event && this.hasTextSelection()) return;
+    this.toggleExpand(jobId);
+  }
+
+  private hasTextSelection(): boolean {
+    const selection = typeof window === 'undefined' ? null : window.getSelection();
+    return !!selection && !selection.isCollapsed && selection.toString().trim().length > 0;
   }
 
   toggleExpand(jobId: string): void {
