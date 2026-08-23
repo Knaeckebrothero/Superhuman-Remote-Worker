@@ -336,7 +336,12 @@ codexProxy:
 # so the repos cannot be silently orphaned. Rollback is restoring this block.
 # Procedure: knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
 # -----------------------------------------------------------------------------
-gitea: {}
+gitea:
+  # -- QUIESCED for the giteadb cutover, 2026-08-23. A cutover imports from a
+  #    live source, and anything written between pg_dump's snapshot and the
+  #    traffic flip is silently absent from the target. Restore to 1 once
+  #    databases.gitea.engine is `cnpg`.
+  replicas: 0
 # -----------------------------------------------------------------------------
 # Cloud storage — migrated OpenCloud -> Nextcloud 2026-08-02.
 #
