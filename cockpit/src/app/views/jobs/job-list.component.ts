@@ -31,7 +31,10 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
-import {jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
+import {
+  isTerminalJobStatus,
+  jobStatusTone as sharedJobStatusTone,
+} from '../../core/util/job-status';
 import {JobListParams} from '../../core/models/audit.model';
 import {MultiSelectOption} from '../../ui/multi-select';
 import {JobFilterBarComponent} from './job-filter-bar.component';
@@ -1457,6 +1460,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.refreshInterval = setInterval(() => {
       if (this.canPoll()) {
         this.pollForChanges();
+        this.reloadOpenPanels({liveOnly: true});
       }
     }, 30000);
   }
@@ -1490,6 +1494,45 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.pendingNewCount.set(0);
     this.load();
     this.loadFacets();
+    // The panel cache is keyed per job id and otherwise lives for the whole
+    // view, so without this an explicit Refresh reloaded the rows underneath
+    // an open panel while its tokens and cost stayed frozen at whatever they
+    // were when it was first opened.
+    this.reloadOpenPanels({liveOnly: false});
+  }
+
+  /**
+   * Re-fetch the panels that are currently open.
+   *
+   * `liveOnly` is what separates the two callers. An explicit Refresh means
+   * "show me current numbers", so it reloads every open panel. The 30s poller
+   * reloads only non-terminal jobs: a finished job's figures cannot change, and
+   * refetching three endpoints per open panel every half minute to re-render
+   * identical numbers is a poor trade.
+   *
+   * A panel mid-load is skipped rather than restarted — its request is already
+   * newer than the data on screen.
+   */
+  private reloadOpenPanels(opts: {liveOnly: boolean}): void {
+    const expanded = this.expandedJobIds();
+    if (expanded.size === 0) return;
+    const cache = this.jobDetails();
+    const rows = new Map(this.jobs().map((job) => [job.id, job]));
+    for (const jobId of expanded) {
+      const state = cache[jobId];
+      if (!state || state.loading) continue;
+      if (opts.liveOnly && isTerminalJobStatus(rows.get(jobId)?.status)) continue;
+      // Whether the reader had asked for the subtree figure; a refresh that
+      // silently dropped them back to own-spend would be its own small lie.
+      const wantSubtree = state.subtreeAttempted;
+      this.jobDetails.update((current) => {
+        const next = {...current};
+        delete next[jobId];
+        return next;
+      });
+      this.loadJobDetail(jobId);
+      if (wantSubtree) this.loadSubtreeUsage(jobId);
+    }
   }
 
   /**
