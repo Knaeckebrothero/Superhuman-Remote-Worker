@@ -494,7 +494,9 @@ class TestWriterQuiesce:
 
     def test_keycloak_can_be_quiesced_to_zero(self):
         deployments = _kinds(
-            _render("keycloak.replicas=0", show_only="templates/services/keycloak.yaml"),
+            _render(
+                "keycloak.replicas=0", show_only="templates/services/keycloak.yaml"
+            ),
             "Deployment",
         )
         assert deployments, "keycloak Deployment did not render"
@@ -509,7 +511,9 @@ class TestWriterQuiesce:
         assert _kinds(enabled, "PersistentVolumeClaim"), "expected a PVC when enabled"
 
         disabled = subprocess.run(
-            _template_command("gitea.enabled=false", show_only="templates/services/gitea.yaml"),
+            _template_command(
+                "gitea.enabled=false", show_only="templates/services/gitea.yaml"
+            ),
             capture_output=True,
             text=True,
         )
