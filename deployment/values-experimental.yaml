@@ -114,12 +114,13 @@ mcp:
 # -----------------------------------------------------------------------------
 orchestrator:
   persistentAgentReconciliationEnabled: true
-  # QUIESCED (was 2) for the postgres cutover, 2026-08-23. Unlike giteadb and
-  # keycloakdb, this database has a LIVE write stream -- tuple counters moved
-  # every sample -- so the writers stop in their own apply and are verified
-  # stopped before the import starts. Restore to 2 once
-  # databases.postgres.engine is `cnpg`.
-  replicas: 0
+  # -- MUST come back in the SAME apply that flips the engine. The llm-seed
+  #    post-upgrade hook blocks on `until wget http://srw-orchestrator:8085/
+  #    api/health`, with no timeout, so any apply that leaves this at 0 wedges
+  #    the Helm release in pending-upgrade -- including the apply that would
+  #    restore it. Observed 2026-08-23; recovered by scaling up with kubectl to
+  #    satisfy the wait. See the migration runbook.
+  replicas: 2
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
   # leader-elected finalizer; `lifespan` additionally starts the finalizer and
@@ -537,7 +538,12 @@ databases:
     # override: the ~2.5x a logical import needs is a rounding error here, and
     # the headroom is wanted anyway (checkpoint_blobs bloat has filled this
     # volume twice, at 16Gi and again at 32Gi).
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source: all 138 tables identical
+    # by exact COUNT(*), and locale/sequences/extensions/index-validity
+    # identical. The srw_canvas_gateway role does NOT come across -- microservice
+    # import carries no roles -- but canvas-gateway-role-<revision> is recreated
+    # by this same apply against srw-postgres-rw and provisions it.
+    engine: "cnpg"
     # To externalize later, add externalUrl to THIS block — a second
     # `postgres:` key further down would silently shadow the storageSize
     # above and re-arm the shrink failure.
@@ -626,10 +632,6 @@ agent:
   # tiers stay pinned/refused.
   stateless:
     enabled: true
-    # QUIESCED (chart default 2) for the postgres cutover, 2026-08-23. These
-    # connect to the srw database as the `srw` superuser role, so they are
-    # writers. Remove this override once the cutover is done.
-    replicas: 0
     # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. Admission
     # remains independently rollbackable from the default-selection flag.
     #
