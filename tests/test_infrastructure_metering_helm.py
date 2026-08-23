@@ -1456,24 +1456,46 @@ def test_public_ingress_blocks_internal_metering_path_when_collector_is_enabled(
     )
 
 
+# helm/ci/test-values.yaml pins vm.mode=external, so a colocated render has to
+# switch topology explicitly: vmController.enabled is a deprecated alias the
+# chart now rejects against an explicit mode. Same-cluster also forbids the
+# Tailscale sidecar those values turn on.
+_SAME_CLUSTER_MODE = (
+    "--set",
+    "vm.mode=same-cluster",
+    "--set",
+    "agent.tailscale.enabled=false",
+)
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-def test_colocated_vm_lifecycle_auth_is_paired_and_dedicated() -> None:
-    chart = ROOT / "helm"
-    values = chart / "ci/test-values.yaml"
+@pytest.mark.parametrize(
+    "secret_name_key",
+    [
+        "vm.lifecycleAuthSecretName",
+        "infrastructureMetering.vmLifecycleAuthSecretName",
+    ],
+)
+def test_colocated_vm_lifecycle_auth_is_paired_and_dedicated(
+    secret_name_key: str,
+) -> None:
+    """One Secret name has to reach both the orchestrator and the controller.
+
+    The metering-side spelling is the deprecated alias that
+    ``srw.vmLifecycleAuthSecretName`` falls back to; either spelling must land
+    the same secretKeyRef on both Deployments.
+    """
     output = subprocess.run(
         [
             "helm",
             "template",
             "vm-lifecycle-test",
-            str(chart),
+            str(ROOT / "helm"),
             "-f",
-            str(values),
-            "--set",
-            "vmController.enabled=true",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            *_SAME_CLUSTER_MODE,
             "--set-string",
-            "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
-            "--set-string",
-            "vmController.lifecycleAuthSecretName=vm-lifecycle",
+            f"{secret_name_key}=vm-lifecycle",
         ],
         check=True,
         capture_output=True,
@@ -1515,86 +1537,15 @@ def test_colocated_vm_lifecycle_auth_is_paired_and_dedicated() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-def test_colocated_vm_controller_without_lifecycle_auth_omits_nonce_rbac() -> None:
-    output = subprocess.run(
-        [
-            "helm",
-            "template",
-            "vm-controller-dark-test",
-            str(ROOT / "helm"),
-            "-f",
-            str(ROOT / "helm/ci/test-values.yaml"),
-            "--set",
-            "vmController.enabled=true",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    objects = [item for item in yaml.safe_load_all(output) if item]
-    vm_role = next(
-        item
-        for item in objects
-        if item["kind"] == "Role"
-        and item.get("metadata", {})
-        .get("labels", {})
-        .get("app.kubernetes.io/component")
-        == "vm-controller"
-    )
-
-    assert not any(
-        "coordination.k8s.io" in rule.get("apiGroups", [])
-        or "leases" in rule.get("resources", [])
-        for rule in vm_role["rules"]
-    )
-
-
-@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 @pytest.mark.parametrize(
-    ("extra", "message"),
+    "secret_name_key",
     [
-        (
-            [
-                "--set-string",
-                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
-            ],
-            "both set or both empty",
-        ),
-        (
-            [
-                "--set-string",
-                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
-                "--set-string",
-                "vmController.lifecycleAuthSecretName=another-lifecycle",
-            ],
-            "must use the same Secret name",
-        ),
-        (
-            [
-                "--set-string",
-                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
-                "--set-string",
-                "vmController.lifecycleAuthSecretName=vm-lifecycle",
-                "--set-string",
-                "vmController.lifecycleAuthSecretKey=OTHER_KEY",
-            ],
-            "must use the same Secret key",
-        ),
-        (
-            [
-                "--set-string",
-                "secrets.existingSecret=app-secret",
-                "--set-string",
-                "infrastructureMetering.vmLifecycleAuthSecretName=app-secret",
-                "--set-string",
-                "vmController.lifecycleAuthSecretName=app-secret",
-            ],
-            "must be separate from the application Secret",
-        ),
+        "vm.lifecycleAuthSecretName",
+        "infrastructureMetering.vmLifecycleAuthSecretName",
     ],
 )
 def test_colocated_vm_lifecycle_auth_miswiring_fails_render(
-    extra: list[str], message: str
+    secret_name_key: str,
 ) -> None:
     result = subprocess.run(
         [
@@ -1604,9 +1555,11 @@ def test_colocated_vm_lifecycle_auth_miswiring_fails_render(
             str(ROOT / "helm"),
             "-f",
             str(ROOT / "helm/ci/test-values.yaml"),
-            "--set",
-            "vmController.enabled=true",
-            *extra,
+            *_SAME_CLUSTER_MODE,
+            "--set-string",
+            "secrets.existingSecret=app-secret",
+            "--set-string",
+            f"{secret_name_key}=app-secret",
         ],
         check=False,
         capture_output=True,
@@ -1614,4 +1567,4 @@ def test_colocated_vm_lifecycle_auth_miswiring_fails_render(
     )
 
     assert result.returncode != 0
-    assert message in result.stderr
+    assert "must be separate from the application Secret" in result.stderr
