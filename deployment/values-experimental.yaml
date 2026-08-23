@@ -495,6 +495,14 @@ databases:
     #    rule is ~2.5x. Separate key because storageSize sizes the live
     #    StatefulSet's PVC, and a PVC cannot shrink.
     cnpgStorageSize: "64Gi"
+  # Gitea's database (srw-giteadb) — 50 MB. First real cutover, chosen first
+  # because it is the smallest blast radius of the three: Gitea only, not auth
+  # and not the orchestrator. Writer quiesced via gitea.replicas: 0 above; the
+  # database was verified idle (no connections, table write counters frozen)
+  # before this flip. Chart default storage (8Gi) is ~160x the data, so no
+  # cnpgStorageSize override is needed.
+  gitea:
+    engine: "migrating"
   # Main postgres (srw-postgres) — same story as audit above, one env narrower.
   # The chart default stays 16Gi (right for a fresh/self-hosted install); only
   # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
