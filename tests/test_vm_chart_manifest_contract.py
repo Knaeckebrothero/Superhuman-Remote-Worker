@@ -404,9 +404,13 @@ def test_preflight_job_only_renders_for_same_cluster() -> None:
     container = pod_spec["containers"][0]
     image = container["image"]
     assert image == "registry.k8s.io/kubectl:v1.33.0"
+    assert container["command"] == ["/bin/kubectl"], "distroless image: no shell"
+    assert container["args"][:2] == ["get", "crd"]
     assert jobs[0]["metadata"]["name"].endswith(f"-{RELEASE_NAMESPACE}-vm-preflight")
     assert pod_spec["securityContext"] == {
         "runAsNonRoot": True,
+        "runAsUser": 65532,
+        "runAsGroup": 65532,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
     assert container["securityContext"] == {
