@@ -36,6 +36,11 @@ function mountLogic(overrides: {
     getJobStatisticsFiltered: vi.fn().mockReturnValue(of({total_jobs: 0, by_status: {}})),
     getSnapshotStats: vi.fn().mockReturnValue(of(null)),
     getProjects: vi.fn().mockReturnValue(of([])),
+    // Expanding a row lazily loads the three things the list payload cannot
+    // supply (model, duration, usage). Defaulted here so every test can expand.
+    getJob: vi.fn().mockReturnValue(of(null)),
+    getJobUsage: vi.fn().mockReturnValue(of(null)),
+    getJobProgress: vi.fn().mockReturnValue(of(null)),
     ...overrides.api,
   } as unknown as ApiService;
 
@@ -129,12 +134,51 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(component.displayRows()[0].hasChildren).toBe(true);
 
     component.toggleExpand('root-1');
-    expect(component.displayRows().map((row) => row.job.id)).toEqual([
-      'root-1',
-      'kid-a',
-      'kid-b',
-      'root-2',
+    // Expanding now yields the detail panel first, then the children still
+    // nested under it — one gesture, one expansion, both meanings. The panel
+    // shares the root's job id, which is why the @for tracks kind + id.
+    expect(component.displayRows().map((row) => `${row.kind}:${row.job.id}`)).toEqual([
+      'job:root-1',
+      'detail:root-1',
+      'job:kid-a',
+      'job:kid-b',
+      'job:root-2',
     ]);
+  });
+
+  it('loads panel data once per job and never again on re-expand', () => {
+    const getJob = vi.fn().mockReturnValue(of(null));
+    const getJobUsage = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJob,
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    component.toggleExpand('root-1'); // collapse
+    component.toggleExpand('root-1'); // re-expand — must be free
+
+    expect(getJob).toHaveBeenCalledTimes(1);
+    expect(getJobUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it('expands a row that has no children at all', () => {
+    // The chevron used to appear only on parents. Details are worth reading on
+    // a leaf job too, so every row now carries the gesture.
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('lonely')]))),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    expect(component.displayRows()[0].hasChildren).toBe(false);
+    component.toggleExpand('lonely');
+    expect(component.displayRows().map((row) => row.kind)).toEqual(['job', 'detail']);
   });
 
   it('counts display roots, not rows — the page size is expressed in roots', () => {
