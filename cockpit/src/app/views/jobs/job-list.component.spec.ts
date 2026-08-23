@@ -166,6 +166,47 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(getJobUsage).toHaveBeenCalledTimes(1);
   });
 
+  it('opens the panel when the row itself is clicked, not just the chevron', () => {
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.onRowClick('root-1');
+    expect(component.isExpanded('root-1')).toBe(true);
+    expect(component.selectedJobId()).toBe('root-1');
+
+    component.onRowClick('root-1');
+    expect(component.isExpanded('root-1')).toBe(false);
+  });
+
+  it('does not toggle when the click ended a text selection', () => {
+    // The job id lives in the row and gets copied constantly. Selecting it must
+    // not collapse the panel out from under the cursor.
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    const selection = {
+      isCollapsed: false,
+      toString: () => 'root-1',
+    } as unknown as Selection;
+    const spy = vi.spyOn(window, 'getSelection').mockReturnValue(selection);
+    try {
+      component.onRowClick('root-1', new MouseEvent('click'));
+      expect(component.isExpanded('root-1')).toBe(false);
+      // Selection still counts as picking the row out, just not as expanding it.
+      expect(component.selectedJobId()).toBe('root-1');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('expands a row that has no children at all', () => {
     // The chevron used to appear only on parents. Details are worth reading on
     // a leaf job too, so every row now carries the gesture.
