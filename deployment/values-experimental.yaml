@@ -125,7 +125,7 @@ orchestrator:
   #    would restore it (observed twice on 2026-08-23). Fixed in the chart: the
   #    seed Job no longer renders at replicas 0, and its wait is bounded. A
   #    quiesce is now an ordinary apply. See the migration runbook §B2a.
-  replicas: 0
+  replicas: 2
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
   # leader-elected finalizer; `lifespan` additionally starts the finalizer and
@@ -615,7 +615,14 @@ databases:
     #    `C` while the source is en_US.utf8; fixed chart-side in
     #    `databases.locale`. Root cause and proof:
     #    knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source before the flip: 16
+    # tables identical by exact COUNT(*) with writers quiesced (no drift this
+    # time, unlike the rehearsal's 40 rows), locale/sequences identical, zero
+    # invalid indexes, and all three FTS plus all four HNSW indexes valid --
+    # including idx_sources_content_fts, the 237 MB index whose failure started
+    # this whole investigation. Only metadata difference is the operand's
+    # pgvector 0.8.2 -> 0.8.6.
+    engine: "cnpg"
     # -- Peak disk measured at 38 GB in the rehearsal: the 17 GB dump and the
     #    restored data occupy this volume simultaneously. The inherited 32Gi
     #    runs out ~2h in, after the dump has already completed. Separate key
@@ -664,9 +671,6 @@ agent:
   # tiers stay pinned/refused.
   stateless:
     enabled: true
-    # QUIESCED for the auditdb + pgvector cutovers, 2026-08-23. Writers to the
-    # srw database as the `srw` superuser. Remove once both are on `cnpg`.
-    replicas: 0
     # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. Admission
     # remains independently rollbackable from the default-selection flag.
     #
