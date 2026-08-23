@@ -46,6 +46,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   annotations:
+    srw.io/preflight: "Requires the KubeVirt and CDI CRDs; see helm/README.md#vm-workspaces-on-your-cluster"
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
@@ -57,6 +58,10 @@ spec:
       restartPolicy: Never
       securityContext:
         runAsNonRoot: true
+        # registry.k8s.io/kubectl is distroless and declares no USER; without an
+        # explicit uid the kubelet refuses runAsNonRoot ("image will run as root").
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -73,11 +78,12 @@ spec:
             limits:
               cpu: 100m
               memory: 64Mi
-          command: ["/bin/sh", "-ec"]
+          # Distroless image: no shell. kubectl's own NotFound error names the
+          # missing CRD; the Job annotation and NOTES.txt carry the doc pointer.
+          command: ["/bin/kubectl"]
           args:
-            - |
-              kubectl get crd virtualmachines.kubevirt.io datavolumes.cdi.kubevirt.io >/dev/null || {
-                echo "KubeVirt/CDI CRDs are required; see helm/README.md#vm-workspaces-on-your-cluster"
-                exit 1
-              }
+            - get
+            - crd
+            - virtualmachines.kubevirt.io
+            - datavolumes.cdi.kubevirt.io
 {{- end }}
