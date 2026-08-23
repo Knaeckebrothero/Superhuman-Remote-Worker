@@ -92,6 +92,23 @@ spec:
       owner: {{ .owner | quote }}
       secret:
         name: {{ include "srw.fullname" $ctx }}-{{ .component }}-app
+      {{- with $ctx.Values.databases.locale }}
+      # initdb defaults --lc-collate/--lc-ctype to `C` because the operand
+      # image sets no LANG, while every legacy SRW database is en_US.utf8.
+      # Left unpinned the import silently re-sorts text, breaks upper() on
+      # non-ASCII, and re-tokenises full text -- which is what made pgvector's
+      # restore die on `string is too long for tsvector`. initdb-only: these
+      # cannot be changed once the Cluster exists.
+      {{- with .encoding }}
+      encoding: {{ . | quote }}
+      {{- end }}
+      {{- with .collate }}
+      localeCollate: {{ . | quote }}
+      {{- end }}
+      {{- with .ctype }}
+      localeCType: {{ . | quote }}
+      {{- end }}
+      {{- end }}
       {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "migrating" }}
       # Logical dump/restore straight from the legacy Service. Chosen over
       # pg_basebackup because the fleet spans PG15 and PG16, the legacy pods

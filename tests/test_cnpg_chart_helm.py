@@ -536,3 +536,78 @@ def test_operator_renders_when_asked_for():
     documents = _render("databases.operator.install=true")
     names = [d["metadata"].get("name", "") for d in documents]
     assert any("cloudnative-pg" in name for name in names)
+
+
+class TestInitdbLocale:
+    """The locale the target cluster is initialised under.
+
+    CNPG defaults `--lc-collate`/`--lc-ctype` to `C` because the operand image
+    sets no LANG. Every legacy SRW database is en_US.utf8, because the
+    StatefulSet runs docker.io/library/postgres, which does. Migrating without
+    pinning this re-initialises under `C`, which silently changes text sort
+    order and upper()/lower() on non-ASCII -- and, because non-ASCII stops
+    being alphabetic, re-tokenises full text hard enough to breach the 1MB
+    tsvector cap. That is a restore failure, not a cosmetic difference:
+    `string is too long for tsvector (1237068 bytes, max 1048575 bytes)`.
+    Verified on one PG16.15 binary: identical rows, `C` fails, en_US.utf8
+    builds the index.
+    """
+
+    # The locale docker.io/library/postgres initdb's under, hence the locale of
+    # every database this chart migrates. Hardcoded so that weakening the
+    # default fails here rather than during a restore.
+    LEGACY_LOCALE = "en_US.utf8"
+
+    def test_every_cluster_pins_all_three_initdb_locale_fields(self):
+        clusters = _cluster(*_all_cnpg())
+        assert len(clusters) == len(DATABASES)
+        for cluster in clusters:
+            initdb = cluster["spec"]["bootstrap"]["initdb"]
+            name = cluster["metadata"]["name"]
+            assert initdb["encoding"] == "UTF8", name
+            assert initdb["localeCollate"] == self.LEGACY_LOCALE, name
+            assert initdb["localeCType"] == self.LEGACY_LOCALE, name
+
+    def test_locale_is_pinned_while_migrating(self):
+        """The engine that actually performs the import.
+
+        `bootstrap` is read only at creation, so a Cluster created on the
+        `migrating` engine keeps whatever locale it was born with forever.
+        """
+        for key, (component, _, _) in DATABASES.items():
+            clusters = _cluster(f"databases.{key}.engine=migrating")
+            initdb = clusters[0]["spec"]["bootstrap"]["initdb"]
+            assert "import" in initdb, component
+            assert initdb["localeCollate"] == self.LEGACY_LOCALE, component
+            assert initdb["localeCType"] == self.LEGACY_LOCALE, component
+
+    def test_default_is_not_the_cnpg_default(self):
+        """Negative control: the bug was inheriting CNPG's own default."""
+        initdb = _cluster("databases.postgres.engine=cnpg")[0]["spec"]["bootstrap"][
+            "initdb"
+        ]
+        assert initdb["localeCollate"] != "C"
+        assert initdb["localeCType"] != "C"
+
+    def test_locale_is_overridable(self):
+        initdb = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.locale.collate=C.UTF-8",
+            "databases.locale.ctype=C.UTF-8",
+            "databases.locale.encoding=LATIN1",
+        )[0]["spec"]["bootstrap"]["initdb"]
+        assert initdb["localeCollate"] == "C.UTF-8"
+        assert initdb["localeCType"] == "C.UTF-8"
+        assert initdb["encoding"] == "LATIN1"
+
+    def test_blank_locale_omits_the_fields_rather_than_passing_empty_strings(self):
+        """`--lc-collate=""` is not the same as not passing it: initdb rejects it."""
+        initdb = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.locale.collate=",
+            "databases.locale.ctype=",
+            "databases.locale.encoding=",
+        )[0]["spec"]["bootstrap"]["initdb"]
+        assert "localeCollate" not in initdb
+        assert "localeCType" not in initdb
+        assert "encoding" not in initdb
