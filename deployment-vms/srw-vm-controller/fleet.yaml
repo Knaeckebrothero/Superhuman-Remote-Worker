@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-5c6a68d"
+  version: "0.0.0-dev.sha-7d3ec47"
   takeOwnership: true
   values:
     license:
@@ -49,10 +49,10 @@ helm:
       orchestrator:
         # Independently-built component identity; CI updates this from
         # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
-        tag: "sha-2220274"
+        tag: "sha-2d84dc2"
         digest: ""
       vmController:
-        tag: "sha-bfb11e9"
+        tag: "sha-7d3ec47"
     # Pre-wire the observed private ingestion route while every collector gate
     # remains dark. These values render no resources until an inventory gate is
     # explicitly enabled, but preserve api.srw.works as the TLS SNI hostname.
@@ -80,7 +80,7 @@ helm:
         orchestratorCidrs:
           - "10.0.51.11/32"
     vmController:
-      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-4104e99"
+      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-7d3ec47"
       # Golden-image boot acceleration: import the VM base image ONCE into a
       # per-digest golden PVC, then clone per-VM rootdisks from it (CDI
       # host-assisted on local-path) instead of a ~10-min GHCR registry
