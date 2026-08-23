@@ -25,7 +25,10 @@ metadata:
     {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
 spec:
   serviceName: {{ include "srw.fullname" . }}-gitea
-  replicas: 1
+  # 0 quiesces the writer for a database cutover; never above 1 (exclusive lock
+  # on the data volume, no leader election). NOT `default 1` -- Helm's `default`
+  # treats 0 as empty, so the quiesce would silently render as 1.
+  replicas: {{ if kindIs "invalid" .Values.gitea.replicas }}1{{ else }}{{ .Values.gitea.replicas }}{{ end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 6 }}

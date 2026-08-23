@@ -121,6 +121,17 @@ mcp:
 # -----------------------------------------------------------------------------
 orchestrator:
   persistentAgentReconciliationEnabled: true
+  # -- 0 quiesces the orchestrator for a database cutover; it writes to
+  #    postgres, auditdb and pgvector, and anything it writes after pg_dump's
+  #    snapshot is silently lost. Restore it in the SAME commit that flips the
+  #    engine to cnpg.
+  #
+  #    This used to be a trap: the llm-seed post-upgrade hook blocked on
+  #    `until wget .../api/health` with no timeout, so any apply that left this
+  #    at 0 wedged the release in pending-upgrade -- including the apply that
+  #    would restore it (observed twice on 2026-08-23). Fixed in the chart: the
+  #    seed Job no longer renders at replicas 0, and its wait is bounded. A
+  #    quiesce is now an ordinary apply. See the migration runbook §B2a.
   replicas: 2
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
@@ -283,7 +294,15 @@ canvas:
           existingSecret: ""
           vaultPath: "homelab/superhuman-remote-worker/canvas-gateway-db"
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
-        provisionRole: false
+        # -- TRUE since the 2026-08-23 CNPG cutover. The role used to exist only
+        #    because someone created it by hand on the legacy StatefulSet, so it
+        #    was never code -- and a microservice import carries no roles, which
+        #    left canvas-gateway unable to log in to the new cluster (its
+        #    wait-for-canvas-database init container looped and the pod never
+        #    came up). The job reconciles the role from the Vault-supplied
+        #    password, idempotently and under an advisory lock, so the next
+        #    migration does not repeat this.
+        provisionRole: true
         pool:
           min: 1
           max: 4
@@ -343,7 +362,12 @@ codexProxy:
 # so the repos cannot be silently orphaned. Rollback is restoring this block.
 # Procedure: knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
 # -----------------------------------------------------------------------------
-gitea: {}
+gitea:
+  # -- Back up after the giteadb cutover, 2026-08-23. Gitea reads its database
+  #    host from env on the pod spec, so this fresh pod starts against
+  #    srw-giteadb-rw with no reloader dependency. Set to 0 to quiesce the
+  #    writer for a future cutover.
+  replicas: 1
 # -----------------------------------------------------------------------------
 # Cloud storage — migrated OpenCloud -> Nextcloud 2026-08-02.
 #
@@ -459,6 +483,29 @@ databases:
       externalTrafficPolicy: Local
       allowedClientCIDRs:
         - "192.168.178.0/24"
+  # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
+  #    CNPG-I plugin. Applies ONLY to databases on the cnpg/migrating engines.
+  #
+  #    Prerequisites, all already satisfied on dev:
+  #      * plugin installed in cnpg-system (HomeLab/deployments_managed/cnpg-barman-plugin)
+  #      * bucket `srw-pgbackup` with a key scoped to it alone
+  #      * BACKUP_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY in the Vault bundle,
+  #        hence in the chart's own Secret -- so credentialsSecret stays empty
+  #
+  #    Target is the homelab MinIO, which is a DIFFERENT failure domain from
+  #    this cluster. Deliberately not the bundled Garage: same cluster, single
+  #    node, one PVC -- whatever kills the database plausibly kills the backup
+  #    while still looking like one.
+  backup:
+    method: "objectstore"
+    # Each cluster gets its own folder underneath, named after the cluster.
+    # Dev and prod use separate buckets, so no environment prefix is needed.
+    destinationPath: "s3://srw-pgbackup"
+    endpointURL: "http://minio.minio.svc.cluster.local:9000"
+    retentionPolicy: "30d"
+    # SIX-field cron, seconds first. 02:00:00 daily.
+    schedule: "0 0 2 * * *"
+    immediate: true
   # Audit store (srw-auditdb) — append-only observability tier. Bumped from the
   # chart default 10Gi to 32Gi after the 10Gi Longhorn volume filled 2026-07-07,
   # crashlooping auditdb ("No space left on device" on postmaster.pid) and
@@ -468,6 +515,56 @@ databases:
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
     storageSize: "32Gi"
+    # Cut over 2026-08-23. Verified against the source before the flip: 29
+    # tables identical by exact COUNT(*), 26 GB on both sides with the large
+    # llm_requests partitions matching, locale/sequences/extensions/index
+    # validity identical, and Ready=True on the cluster. Writers were quiesced
+    # and frozen (685365, flat across three samples) throughout.
+    #
+    # NOTE: no backup plugin, by chart default and on purpose -- append-heavy,
+    # WAL-dominant, retention-bounded, non-fatal by contract. Flip
+    # backupEnabled if the audit trail ever becomes a compliance artefact.
+    engine: "cnpg"
+    # -- 26 GB of data. A logical import holds the dump and the restored data on
+    #    the SAME volume, measured at ~2.2x the source on pgvector, so 32Gi runs
+    #    out roughly two hours in -- after the dump has already completed. The
+    #    rule is ~2.5x. Separate key because storageSize sizes the live
+    #    StatefulSet's PVC, and a PVC cannot shrink.
+    cnpgStorageSize: "64Gi"
+    # -- The shared `resources` sizes the legacy StatefulSet, which idles at 14m
+    #    CPU / 183Mi and is capped at 500m / 1Gi. That is fine for serving and
+    #    hopeless for importing 26 GB: pgvector needed 4 CPU to move 20 GB in
+    #    63 minutes, so half a core here would run for most of a day, and 1Gi
+    #    risks an OOM an hour in. Memory stays modest on purpose -- this
+    #    database is only 281 MB of indexes, so the restore is COPY-bound, not
+    #    index-bound, which is also why importRestoreJobs stays serial.
+    cnpgResources:
+      requests:
+        cpu: "1"
+        memory: "1Gi"
+      limits:
+        cpu: "4"
+        memory: "4Gi"
+  # Gitea's database (srw-giteadb) — 50 MB. First real cutover, chosen first
+  # because it is the smallest blast radius of the three: Gitea only, not auth
+  # and not the orchestrator. Writer quiesced via gitea.replicas: 0 above; the
+  # database was verified idle (no connections, table write counters frozen)
+  # before this flip. Chart default storage (8Gi) is ~160x the data, so no
+  # cnpgStorageSize override is needed.
+  gitea:
+    # Cut over 2026-08-23. Verified against the source before the flip: all 110
+    # tables identical by exact COUNT(*), locale/sequences/extensions/index
+    # validity identical, clean restore log. First database on CNPG.
+    engine: "cnpg"
+  # Keycloak's database (srw-keycloakdb) — 13 MB, but the blast radius is every
+  # login, so it goes second rather than first despite being the smallest.
+  # Holds sessions and Infinispan jdbc-ping rows as well as realm config;
+  # expect to re-authenticate afterwards. Chart default storage is ample.
+  keycloak:
+    # Cut over 2026-08-23. Verified against the source: all 88 tables identical
+    # by exact COUNT(*), locale/extensions/index-validity identical, clean
+    # restore log, both realms (master, srw) present and enabled.
+    engine: "cnpg"
   # Main postgres (srw-postgres) — same story as audit above, one env narrower.
   # The chart default stays 16Gi (right for a fresh/self-hosted install); only
   # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
@@ -481,6 +578,16 @@ databases:
   # (orchestrator/services/checkpoint_retention.py) rather than by more disk.
   postgres:
     storageSize: "32Gi"
+    # 1 GB of data against an inherited 32Gi volume, so no cnpgStorageSize
+    # override: the ~2.5x a logical import needs is a rounding error here, and
+    # the headroom is wanted anyway (checkpoint_blobs bloat has filled this
+    # volume twice, at 16Gi and again at 32Gi).
+    # Cut over 2026-08-23. Verified against the source: all 138 tables identical
+    # by exact COUNT(*), and locale/sequences/extensions/index-validity
+    # identical. The srw_canvas_gateway role does NOT come across -- microservice
+    # import carries no roles -- but canvas-gateway-role-<revision> is recreated
+    # by this same apply against srw-postgres-rw and provisions it.
+    engine: "cnpg"
     # To externalize later, add externalUrl to THIS block — a second
     # `postgres:` key further down would silently shadow the storageSize
     # above and re-arm the shrink failure.
@@ -515,7 +622,14 @@ databases:
     #    `C` while the source is en_US.utf8; fixed chart-side in
     #    `databases.locale`. Root cause and proof:
     #    knowledge-base/knowledge/superpowers/plans/2026-08-22-cnpg-migrations.md
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source before the flip: 16
+    # tables identical by exact COUNT(*) with writers quiesced (no drift this
+    # time, unlike the rehearsal's 40 rows), locale/sequences identical, zero
+    # invalid indexes, and all three FTS plus all four HNSW indexes valid --
+    # including idx_sources_content_fts, the 237 MB index whose failure started
+    # this whole investigation. Only metadata difference is the operand's
+    # pgvector 0.8.2 -> 0.8.6.
+    engine: "cnpg"
     # -- Peak disk measured at 38 GB in the rehearsal: the 17 GB dump and the
     #    restored data occupy this volume simultaneously. The inherited 32Gi
     #    runs out ~2h in, after the dump has already completed. Separate key
@@ -668,6 +782,10 @@ keycloak:
   # on both replicas at once against an empty database. This realm already
   # exists, so there is no import to race — the same reasoning that lets
   # orchestrator run replicas:2 here ahead of the chart default.
+  # Restored to 2 after the keycloakdb cutover, 2026-08-23. Both pods now
+  # discover each other through the CNPG cluster's -rw Service. Set to 0 to
+  # quiesce for a future cutover -- both replicas, since jdbc-ping and session
+  # storage mean any surviving pod keeps writing.
   replicas: 2
   bridgeCert:
     enabled: true

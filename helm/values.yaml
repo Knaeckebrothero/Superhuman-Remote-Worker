@@ -1640,6 +1640,15 @@ databases:
 # =============================================================================
 gitea:
   enabled: true
+  # -- Gitea is single-writer: it holds an exclusive lock on its data volume and
+  #    its StatefulSet has no leader election, so this is 0 or 1, never more.
+  #
+  #    It exists so a database cutover can quiesce the writer THROUGH GitOps.
+  #    `kubectl scale` is reverted within ~90s, mid-migration, and
+  #    `gitea.enabled: false` is not a substitute -- that guard also covers the
+  #    PersistentVolumeClaim, so disabling Gitea to quiet it would delete its
+  #    data volume.
+  replicas: 1
   # -- Deploy Gitea StatefulSet within the chart. Set false to use external git server.
   internal: true
   # -- Internal cluster URL (when internal=false, set to your existing git server's internal URL)
@@ -2303,6 +2312,13 @@ llm:
   # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
   # to bring the stack up empty and configure providers via Admin → Providers.
+  #
+  # The Job is a post-upgrade hook that waits on the orchestrator's health
+  # endpoint, so it also renders only while `orchestrator.replicas` is above
+  # zero — a cutover that quiesces the orchestrator carries no hook and cannot
+  # wedge the release. Setting enabled:false is the explicit form of the same
+  # thing; the seeder is insert-only, so turning it off for a window and back
+  # on afterwards seeds nothing twice.
   # ---------------------------------------------------------------------------
   seed:
     # -- Enable the seed Job. Missing/false leaves system tables untouched.

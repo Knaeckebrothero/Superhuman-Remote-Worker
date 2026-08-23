@@ -84,6 +84,20 @@ def _clusters(*settings: str) -> dict[str, dict]:
     }
 
 
+def _seed_objects(*settings: str) -> dict[str, dict]:
+    """kind -> object for the two `-llm-seed` hook resources.
+
+    Rendered from the whole chart rather than with `--show-only`, because helm
+    errors when `--show-only` matches nothing and "nothing" is exactly half of
+    what these assertions are about.
+    """
+    return {
+        document["kind"]: document
+        for document in _render(*settings)
+        if str(document.get("metadata", {}).get("name", "")).endswith("-llm-seed")
+    }
+
+
 def _configmap(*settings: str) -> dict:
     documents = _render(*settings, show_only="templates/configmap.yaml")
     return _kinds(documents, "ConfigMap")[0]["data"]
@@ -466,3 +480,136 @@ def test_cnpg_cluster_pods_keep_the_component_labels(key):
     cluster = _clusters(f"databases.{key}.engine=cnpg")[f"{FULLNAME}-{component}"]
     labels = cluster["spec"]["inheritedMetadata"]["labels"]
     assert labels["app.kubernetes.io/component"] == component
+
+
+class TestWriterQuiesce:
+    """Scaling the writers to zero for a cutover, through GitOps.
+
+    A cutover imports from a live source. Anything written between `pg_dump`'s
+    snapshot and the traffic flip is silently absent from the target -- the
+    pgvector rehearsal measured 40 such rows in 63 minutes. So each database's
+    writer has to be stoppable, and stoppable *through Fleet*: a `kubectl scale`
+    is reverted by GitOps within ~90s, mid-migration.
+    """
+
+    def test_gitea_replicas_defaults_to_one(self):
+        sts = _kinds(_render(show_only="templates/services/gitea.yaml"), "StatefulSet")
+        assert len(sts) == 1
+        assert sts[0]["spec"]["replicas"] == 1
+
+    def test_gitea_can_be_quiesced_to_zero(self):
+        """Regression: `default 1` renders 0 as 1, because Helm's `default`
+        treats zero as empty. The quiesce would have silently not happened."""
+        sts = _kinds(
+            _render("gitea.replicas=0", show_only="templates/services/gitea.yaml"),
+            "StatefulSet",
+        )
+        assert sts[0]["spec"]["replicas"] == 0
+
+    def test_keycloak_can_be_quiesced_to_zero(self):
+        deployments = _kinds(
+            _render(
+                "keycloak.replicas=0", show_only="templates/services/keycloak.yaml"
+            ),
+            "Deployment",
+        )
+        assert deployments, "keycloak Deployment did not render"
+        assert deployments[0]["spec"]["replicas"] == 0
+
+    def test_disabling_gitea_is_not_a_quiesce_because_it_drops_the_volume(self):
+        """Guard, not a preference. `gitea.enabled` gates the whole template
+        including the PVC, so reaching for it to quiet Gitea during a cutover
+        deletes the data volume. If this ever stops being true the runbook's
+        warning should be revisited -- until then, keep the warning."""
+        enabled = _render(show_only="templates/services/gitea.yaml")
+        assert _kinds(enabled, "PersistentVolumeClaim"), "expected a PVC when enabled"
+
+        disabled = subprocess.run(
+            _template_command(
+                "gitea.enabled=false", show_only="templates/services/gitea.yaml"
+            ),
+            capture_output=True,
+            text=True,
+        )
+        # helm errors when --show-only matches nothing, which is itself the proof.
+        rendered = [d for d in yaml.safe_load_all(disabled.stdout) if d]
+        assert not _kinds(rendered, "PersistentVolumeClaim")
+        assert not _kinds(rendered, "StatefulSet")
+
+    # --- the llm-seed hook, which used to make the quiesce impossible -------
+
+    def test_the_llm_seed_hook_renders_while_the_orchestrator_runs(self):
+        """Control for the two tests below: with the flag on and replicas at the
+        chart default, both halves of the hook are present."""
+        objects = _seed_objects("llm.seed.enabled=true")
+        assert sorted(objects) == ["ConfigMap", "Job"]
+
+    def test_a_quiesced_orchestrator_renders_no_seed_job(self):
+        """The deadlock this whole file exists to avoid. The seed Job is a
+        post-upgrade hook that waits on the orchestrator's health endpoint, so
+        at replicas 0 it can never finish -- Helm keeps waiting, the release
+        stays `pending-upgrade`, and every later apply is blocked, including the
+        one that would scale the orchestrator back up. Observed twice on
+        2026-08-23. A quiesce apply must therefore carry no hook at all.
+
+        Also a regression test for Helm's `default`, which treats 0 as empty: a
+        guard written as `.Values.orchestrator.replicas | default 1` renders the
+        Job straight through the quiesce."""
+        objects = _seed_objects("llm.seed.enabled=true", "orchestrator.replicas=0")
+        assert "Job" not in objects
+
+    def test_the_seed_payload_configmap_survives_the_quiesce(self):
+        """Deliberate asymmetry, not an oversight. The ConfigMap is a
+        hook-weight-0 hook that Helm applies without waiting for anything, so it
+        cannot wedge an apply. Leaving it rendered keeps it in step with the Job
+        for the apply that restores the replicas."""
+        objects = _seed_objects("llm.seed.enabled=true", "orchestrator.replicas=0")
+        assert "ConfigMap" in objects
+
+    def test_the_seed_flag_switches_the_whole_hook_off(self):
+        """The explicit lever, for an operator who wants a hook-free apply
+        without touching replicas. Off is also the chart default."""
+        assert _seed_objects("llm.seed.enabled=false") == {}
+        assert _seed_objects() == {}
+
+    def test_the_orchestrator_wait_terminates_and_fails_the_hook(self):
+        """The wait was `until wget ...; do sleep 3; done` with no ceiling, so a
+        rollout that never became Ready held Helm open forever. Run the rendered
+        script with a probe that always fails and the sleep removed: it must
+        stop, and it must stop non-zero.
+
+        Non-zero on purpose. A failed hook marks the release `failed`, which is
+        re-appliable; `pending-upgrade` is not, which is what made the original
+        bug a deadlock rather than a slow rollout. Exiting 0 would hand the seed
+        job a schema the orchestrator never applied."""
+        job = _seed_objects("llm.seed.enabled=true")["Job"]
+        waits = [
+            c
+            for c in job["spec"]["template"]["spec"]["initContainers"]
+            if c["name"] == "wait-for-orchestrator"
+        ]
+        assert len(waits) == 1
+        script = waits[0]["command"][-1]
+
+        ceiling = int(re.search(r"-ge (\d+)", script).group(1))
+        neutered = re.sub(r"until wget .*; do", "until false; do", script).replace(
+            "sleep 3", "true"
+        )
+        assert "until false; do" in neutered, "probe substitution missed the loop"
+
+        result = subprocess.run(
+            ["sh", "-c", neutered], capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 1, result.stdout
+        assert "orchestrator not ready" in result.stdout
+        # One attempt short of the ceiling, then the bail-out -- pins the
+        # arithmetic, not just the fact that it stops.
+        assert result.stdout.count("waiting for orchestrator") == ceiling - 1
+
+    def test_the_seed_job_is_capped_end_to_end(self):
+        """backoffLimit is not a ceiling: it retries the pod, so the bounded
+        init container alone still allows ~3x the wait. activeDeadlineSeconds
+        is what bounds the hook, and therefore the apply."""
+        job = _seed_objects("llm.seed.enabled=true")["Job"]["spec"]
+        assert job["activeDeadlineSeconds"] == 600
+        assert job["backoffLimit"] == 2
