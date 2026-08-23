@@ -670,3 +670,61 @@ class TestOperatorStatusPort:
         """Negative control: nothing CNPG-shaped leaks into a pre-migration render."""
         policy = _policies()[f"{FULLNAME}-postgres"]
         assert not self._operator_rules(policy)
+
+
+class TestCredentialsPreCreated:
+    """`existingSecret` + `engine: cnpg` was uninstallable before this flag.
+
+    CloudNativePG reads each database's credentials from a per-cluster
+    basic-auth Secret. With `secrets.existingSecret` the chart never sees the
+    password, so it cannot build that Secret -- and it refuses to render rather
+    than install a Cluster whose owner credentials do not exist. Correct, but it
+    also meant the entire self-hosted HA path could not be installed at all,
+    since that is exactly the mode the config generator emits.
+    """
+
+    EXISTING = (
+        "externalSecrets.enabled=false",
+        "secrets.create=false",
+        "secrets.existingSecret=srw-secrets",
+        "databases.postgres.engine=cnpg",
+    )
+
+    def test_existing_secret_mode_still_refuses_without_the_flag(self):
+        message = _render_fails(*self.EXISTING)
+        assert "cannot see the database password" in message
+        # The error must name the way out, or it is just a wall.
+        assert "credentialsPreCreated" in message
+
+    def test_the_flag_lets_the_cluster_render(self):
+        clusters = _cluster(*self.EXISTING, "databases.credentialsPreCreated=true")
+        assert [c["metadata"]["name"] for c in clusters] == [f"{FULLNAME}-postgres"]
+
+    def test_the_flag_renders_no_credential_resource_of_its_own(self):
+        """It is an assertion that the Secret exists, not a way to make one."""
+        documents = _render(*self.EXISTING, "databases.credentialsPreCreated=true")
+        for kind in ("Secret", "ExternalSecret"):
+            names = [
+                d["metadata"]["name"]
+                for d in _kinds(documents, kind)
+                if d["metadata"]["name"].endswith("-app")
+            ]
+            assert names == [], f"expected no {kind} ending in -app, got {names}"
+
+    def test_the_flag_does_not_disturb_the_modes_that_can_build_it(self):
+        """secrets.create and externalSecrets can see the value; both still do."""
+        created = _render(
+            "externalSecrets.enabled=false",
+            "secrets.create=true",
+            "secrets.values.POSTGRES_PASSWORD=pw",
+            "databases.postgres.engine=cnpg",
+            "databases.credentialsPreCreated=true",
+            show_only=CREDENTIALS,
+        )
+        secrets = _kinds(created, "Secret")
+        assert [s["metadata"]["name"] for s in secrets] == [f"{FULLNAME}-postgres-app"]
+        assert secrets[0]["type"] == "kubernetes.io/basic-auth"
+
+    def test_default_is_false_so_nothing_changes_for_existing_installs(self):
+        values = yaml.safe_load((CHART / "values.yaml").read_text())
+        assert values["databases"]["credentialsPreCreated"] is False

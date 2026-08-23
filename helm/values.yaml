@@ -1021,6 +1021,22 @@ databases:
     #    out and a failover simply never happens. Dev: cnpg-system.
     namespace: "cnpg-system"
 
+  # -- Set true when you have pre-created the per-cluster basic-auth Secrets
+  #    yourself. ONLY meaningful with `secrets.existingSecret`: in that mode the
+  #    chart never sees the database password, so it cannot build
+  #    `<release>-<component>-app` for CloudNativePG and refuses to render
+  #    rather than install a Cluster whose owner credentials do not exist.
+  #
+  #    Without this flag `existingSecret` + `engine: cnpg` is uninstallable,
+  #    which is the whole self-hosted HA path. With it, you are asserting the
+  #    Secrets exist and match the passwords in your own Secret -- the chart
+  #    cannot verify either, and a mismatch surfaces as the application
+  #    authenticating against a database whose owner has a different password.
+  #
+  #    externalSecrets and `secrets.create` do not need this: both can see the
+  #    value and build the Secret themselves.
+  credentialsPreCreated: false
+
   # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
   #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
   #    Anti-affinity, PDBs and topology all derive from the RESOLVED count, so
