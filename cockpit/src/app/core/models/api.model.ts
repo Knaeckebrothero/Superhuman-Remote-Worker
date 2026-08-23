@@ -2158,6 +2158,72 @@ export interface JobLivenessSource {
  * retained for payload-shape compatibility and are honest `null` from this
  * producer: no percentage telemetry exists and none is fabricated.
  */
+/**
+ * One metered (category, resource, unit) line for a job — the shape
+ * `GET /api/jobs/{id}/usage` returns in `rows`.
+ */
+export interface JobUsageRow {
+  category: string;
+  /** Model id for `llm`, `workspace_pod` for `compute`, etc. */
+  resource: string;
+  unit: string;
+  quantity: number;
+  /** **null = not priced** (no rate card covered it). Never render this as $0.00. */
+  cost_usd: number | null;
+  events: number;
+  priced_events: number;
+}
+
+export interface JobUsageCategory {
+  category: string;
+  /** null when nothing in the category carried a rate. */
+  cost_usd: number | null;
+  events: number;
+  priced_events: number;
+}
+
+/**
+ * Which kind of answer the usage read is. Only `no_usage` means zero:
+ * `predates_ledger` is a job older than the materializer's forward-only anchor
+ * (it has no rows and never will), `unavailable` is the audit tier being off.
+ */
+export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
+
+/** `GET /api/jobs/{job_id}/usage` — see per_job_cost_and_token_accounting.md §7. */
+export interface JobUsage {
+  job_id: string;
+  /** `subtree` when the caller asked for descendants too (`?include_subjobs=true`). */
+  scope: 'job' | 'subtree';
+  /** How many jobs the figures cover: 1 for `job`, 1 + descendants for `subtree`. */
+  job_count: number;
+  state: JobUsageState;
+  /** Derived from the job, not from a caller-supplied window. Zulu. */
+  window: {from: string; to: string};
+  /**
+   * `live` is true while the job is not terminal; `lag_seconds` is how far
+   * behind the ledger can be (120s materializer poll + 60s aging window), so a
+   * running job's figure is a lower bound.
+   */
+  freshness: {as_of: string; live: boolean; lag_seconds: number};
+  rows: JobUsageRow[];
+  llm: {
+    prompt_tokens: number;
+    cached_prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    cache_hit_ratio: number;
+  };
+  by_category: JobUsageCategory[];
+  cost: {
+    /** **null = unknown**, not free. */
+    usd: number | null;
+    /** false = some metered events were unpriced, so `usd` is a floor. */
+    complete: boolean;
+    priced_events: number;
+    events: number;
+  };
+}
+
 export interface JobProgress {
   job_id: string;
   status: JobStatus;

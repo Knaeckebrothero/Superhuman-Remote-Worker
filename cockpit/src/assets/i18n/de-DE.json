@@ -674,7 +674,7 @@
         "project": "Projekt: {{name}}",
         "noProject": "Ohne Projekt",
         "search": "Suche: {{term}}",
-"systemHidden": "Systemjobs ausgeblendet",
+        "systemHidden": "Systemjobs ausgeblendet",
         "archived": "Archivierte Projekte ausgeblendet"
       },
       "statusGroup": "Nach Status filtern",
@@ -743,31 +743,33 @@
       "approveRequest": "Anfrage freigeben"
     },
     "tooltip": {
-      "collapse": "Unteraufträge einklappen",
-      "expand": "Unteraufträge ausklappen",
-      "view": "In der Workbench öffnen",
-      "workspace": "Arbeitsbereich in Gitea öffnen",
-      "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
-      "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",
-      "ideStarting": "IDE-Sitzung wird gestartet...",
-      "pauseJob": "Auftrag pausieren",
+      "approveRequest": "Dieser Auftrag wartet auf eine Sudo-/VM-Upgrade-Entscheidung — Anfrage im Posteingang öffnen",
       "cancelJob": "Auftrag abbrechen",
       "canceling": "Auftrag wird abgebrochen...",
+      "collapse": "Unteraufträge einklappen",
+      "collapseDetails": "Job-Details ausblenden",
       "confirmCancel": "Erneut klicken, um Abbruch zu bestätigen",
+      "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
+      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})",
+      "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
+      "deleteJob": "Auftrag löschen",
+      "expand": "Unteraufträge ausklappen",
+      "expandDetails": "Job-Details anzeigen",
+      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
+      "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",
+      "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
+      "ideStarting": "IDE-Sitzung wird gestartet...",
+      "moreActions": "Weitere Aktionen",
+      "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
+      "pauseJob": "Auftrag pausieren",
+      "promoteJob": "Zu Projekt heraufstufen",
+      "resumeJob": "Vom Checkpoint fortsetzen",
       "reviewJob": "Prüfen und genehmigen/fortsetzen",
       "reviewQueue": "Prüfungswarteschlange öffnen",
-      "resumeJob": "Vom Checkpoint fortsetzen",
-      "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
-      "deleteJob": "Auftrag löschen",
-      "moreActions": "Weitere Aktionen",
-      "promoteJob": "Zu Projekt heraufstufen",
-      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
-      "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
-      "snapshotStats": "S3-Snapshot-Speicher",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
-      "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
-      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})",
-      "approveRequest": "Dieser Auftrag wartet auf eine Sudo-/VM-Upgrade-Entscheidung — Anfrage im Posteingang öffnen"
+      "snapshotStats": "S3-Snapshot-Speicher",
+      "view": "In der Workbench öffnen",
+      "workspace": "Arbeitsbereich in Gitea öffnen"
     },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {
@@ -814,6 +816,29 @@
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
       "uploading": "Wird hochgeladen..."
+    },
+    "detail": {
+      "auditSteps": "Audit-Schritte",
+      "children": "{{count}} Teil-Jobs entsprechen dem aktuellen Filter.",
+      "cost": "Kosten",
+      "costFloor": "{{priced}} von {{total}} erfassten Ereignissen bepreist — die tatsächlichen Kosten liegen höher.",
+      "costFloorHint": "Teilweise bepreist: die tatsächlichen Kosten liegen höher als angezeigt.",
+      "costMeteringOff": "Die Verbrauchserfassung ist in dieser Installation deaktiviert.",
+      "costNoUsage": "Für diesen Job wurde kein Verbrauch erfasst.",
+      "costPredatesLedger": "Dieser Job lief vor Beginn der Verbrauchserfassung und hat daher keine Werte.",
+      "costUnknown": "Verbrauch konnte nicht geladen werden.",
+      "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
+      "duration": "Dauer",
+      "expert": "Experte",
+      "loading": "Details werden geladen…",
+      "model": "Modell",
+      "modelDefault": "Experten-Standard",
+      "origin": "Herkunft",
+      "tokens": "Tokens",
+      "unknown": "Unbekannt",
+      "usage": "Verbrauch",
+      "usageLive": "läuft noch — Werte bis zu 3 Min. verzögert",
+      "workspace": "Workspace"
     }
   },
   "admin": {
@@ -3377,7 +3402,9 @@
       "unlimited": "unbegrenzt",
       "worker": "Arbeiterstandard"
     },
-    "digest": {"title": "Digest — was er für dich vorgemerkt hat"},
+    "digest": {
+      "title": "Digest — was er für dich vorgemerkt hat"
+    },
     "errors": {
       "commission": "Einsetzung fehlgeschlagen",
       "conference": "Konferenz konnte nicht geöffnet werden",
@@ -3394,7 +3421,10 @@
       "noteLabel": "Notiz zur Aussetzung",
       "placeholder": "Wartung"
     },
-    "holdKind": {"maintenance": "Wartung", "conference": "Konferenz"},
+    "holdKind": {
+      "maintenance": "Wartung",
+      "conference": "Konferenz"
+    },
     "immediacy": {
       "nextDelivery": "gilt ab der nächsten Zustellung",
       "nextDispatch": "gilt ab der nächsten Entsendung",
@@ -3497,7 +3527,12 @@
       "slotPlaceholder": "Linie",
       "workspace": "Arbeitsbereich"
     },
-    "sections": {"brain": "Sein Modell", "budgets": "Budgets", "kit": "Ausrüstung", "sleep": "Schlaf"},
+    "sections": {
+      "brain": "Sein Modell",
+      "budgets": "Budgets",
+      "kit": "Ausrüstung",
+      "sleep": "Schlaf"
+    },
     "sleep": {
       "hint": "Er meldet seine Schlafzeit zwischen Weckrufen selbst; der Server begrenzt sie auf diese Werte.",
       "min": "Min. (Minuten)",
@@ -3545,7 +3580,12 @@
       "inMinutes": "in {{count}} Min.",
       "overdueMinutes": "seit {{count}} Min. überfällig"
     },
-    "workspace": {"sandbox": "Sandbox", "virtual": "virtuell", "none": "keiner", "vmRoot": "VM (Root)"}
+    "workspace": {
+      "sandbox": "Sandbox",
+      "virtual": "virtuell",
+      "none": "keiner",
+      "vmRoot": "VM (Root)"
+    }
   },
   "statistics": {
     "stuckPolicy": "{{threshold}} Min. · {{source}}",

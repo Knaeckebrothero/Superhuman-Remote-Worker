@@ -50,6 +50,7 @@ import {
     JobDiffFile,
     JobDiffSummary,
     JobProgress,
+    JobUsage,
     JobRejectResult,
     JobReviewSessionResult,
     JobStatistics,
@@ -2142,6 +2143,28 @@ export class ApiService {
     return this.http.get<JobProgress>(`${this.baseUrl}/jobs/${jobId}/progress`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch progress for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Metered tokens and cost for one job.
+   *
+   * Deliberately not `/api/usage?ref_id=` — that endpoint takes its window from
+   * a caller-supplied `days`, and a window that misses the job returns
+   * `total_cost_usd: 0` with `available: true`. This one derives the window from
+   * the job itself. `cost.usd` is null when nothing was priced, which the UI must
+   * render as unknown rather than $0.00.
+   *
+   * @param includeSubjobs sum the job and every descendant. Not cosmetic — a
+   *   parent's own spend can be a fraction of its tree's.
+   */
+  getJobUsage(jobId: string, includeSubjobs = false): Observable<JobUsage | null> {
+    const params = includeSubjobs ? '?include_subjobs=true' : '';
+    return this.http.get<JobUsage>(`${this.baseUrl}/jobs/${jobId}/usage${params}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch usage for job ${jobId}:`, error);
         return of(null);
       }),
     );

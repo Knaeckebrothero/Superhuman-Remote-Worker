@@ -10,12 +10,17 @@ import {
   viewChild,
 } from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {forkJoin} from 'rxjs';
 import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
 import {JobSummary} from '../../core/models/audit.model';
+import {
+  JobDetailPanelComponent,
+  type JobDetailState,
+} from './job-detail-panel.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
@@ -68,6 +73,12 @@ interface JobRow {
   depth: number;        // 0 = root, 1 = child
   hasChildren: boolean;
   isChild: boolean;
+  /**
+   * `'detail'` is the expanded panel for `job`, rendered as its own row so the
+   * table keeps one cell grid. It shares the job's id, so the @for must track
+   * on kind + id or the two collide.
+   */
+  kind: 'job' | 'detail';
 }
 
 /**
@@ -114,6 +125,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     JobFilterBarComponent,
     JobFilterPanelComponent,
     JobListFooterComponent,
+    JobDetailPanelComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -248,7 +260,18 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
               </tr>
             </thead>
             <tbody>
-              @for (row of displayRows(); track row.job.id) {
+              @for (row of displayRows(); track row.kind + ':' + row.job.id) {
+                @if (row.kind === 'detail') {
+                  <tr class="detail-row">
+                    <td colspan="5">
+                      <app-job-detail-panel
+                        [job]="row.job"
+                        [data]="jobDetails()[row.job.id] ?? null"
+                        [childCount]="getChildCount(row.job.id)"
+                      />
+                    </td>
+                  </tr>
+                } @else {
                 <tr
                   [class.selected]="selectedJobId() === row.job.id"
                   [class.child-row]="row.isChild"
@@ -256,16 +279,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                 >
                   <td class="prompt-cell">
                     <div class="prompt-inner" [style.padding-left.px]="row.isChild ? 16 : 0">
-                      @if (row.hasChildren) {
-                        <button
-                          class="expand-btn"
-                          [class.expanded]="isExpanded(row.job.id)"
-                          (click)="toggleExpand(row.job.id); $event.stopPropagation()"
-                          [title]="(isExpanded(row.job.id) ? 'jobs.tooltip.collapse' : 'jobs.tooltip.expand') | transloco"
-                        >
-                          <span class="expand-chevron">&#9206;</span>
-                        </button>
-                      }
+                      <button
+                        class="expand-btn"
+                        [class.expanded]="isExpanded(row.job.id)"
+                        (click)="toggleExpand(row.job.id); $event.stopPropagation()"
+                        [title]="(isExpanded(row.job.id) ? 'jobs.tooltip.collapseDetails' : 'jobs.tooltip.expandDetails') | transloco"
+                        [attr.aria-expanded]="isExpanded(row.job.id)"
+                        [attr.aria-label]="(isExpanded(row.job.id) ? 'jobs.tooltip.collapseDetails' : 'jobs.tooltip.expandDetails') | transloco"
+                      >
+                        <span class="expand-chevron">&#9206;</span>
+                      </button>
                       @if (row.isChild) {
                         <span class="child-connector">\u2514</span>
                       }
@@ -576,6 +599,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                     </td>
                   </tr>
                 }
+                }
               }
             </tbody>
           </table>
@@ -835,6 +859,10 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         gap: 4px;
       }
 
+      .detail-row > td {
+        padding: 0 12px 10px;
+        background: var(--surface-0);
+      }
       .expand-btn {
         background: color-mix(in srgb, var(--text-muted) 10%, transparent);
         border: 1px solid color-mix(in srgb, var(--text-muted) 25%, transparent);
@@ -1267,6 +1295,16 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   // Expand/collapse state for parent jobs
   readonly expandedJobIds = signal<Set<string>>(new Set());
+  /**
+   * Lazily-loaded panel data, keyed by job id and kept for the life of the view.
+   *
+   * Cached rather than refetched so collapsing and re-expanding is free, and so
+   * expanding five rows costs five loads rather than five per re-open. The list
+   * payload cannot supply these: it carries no `config_override` (so no model),
+   * no `completed_at` (so no duration) and no usage — verified against the live
+   * `/api/jobs` response, which contradicts what the plan assumed.
+   */
+  readonly jobDetails = signal<Record<string, JobDetailState>>({});
 
   // In-flight action tracking
   readonly cancelingJobIds = signal<Set<string>>(new Set());
@@ -1337,15 +1375,43 @@ export class JobListComponent implements OnInit, OnDestroy {
     const rows: JobRow[] = [];
     for (const root of roots) {
       const children = childrenByRoot.get(root.id) ?? [];
+      const isExpanded = expanded.has(root.id);
       rows.push({
         job: root,
         depth: 0,
         hasChildren: children.length > 0,
         isChild: false,
+        kind: 'job',
       });
-      if (children.length > 0 && expanded.has(root.id)) {
+      if (isExpanded) {
+        // One gesture, one expansion, both meanings: the panel first, then the
+        // children still nested underneath it. Children keep their own rows
+        // rather than moving inside the panel so they stay clickable, sortable
+        // and visually nested exactly as before.
+        rows.push({
+          job: root,
+          depth: 0,
+          hasChildren: children.length > 0,
+          isChild: false,
+          kind: 'detail',
+        });
         for (const child of children) {
-          rows.push({job: child, depth: 1, hasChildren: false, isChild: true});
+          rows.push({
+            job: child,
+            depth: 1,
+            hasChildren: false,
+            isChild: true,
+            kind: 'job',
+          });
+          if (expanded.has(child.id)) {
+            rows.push({
+              job: child,
+              depth: 1,
+              hasChildren: false,
+              isChild: true,
+              kind: 'detail',
+            });
+          }
         }
       }
     }
@@ -1625,8 +1691,43 @@ export class JobListComponent implements OnInit, OnDestroy {
       next.delete(jobId);
     } else {
       next.add(jobId);
+      this.loadJobDetail(jobId);
     }
     this.expandedJobIds.set(next);
+  }
+
+  /**
+   * Fetch the three things the list row cannot supply, once per job.
+   *
+   * Runs them concurrently rather than in sequence — a panel that appears in
+   * three steps reads as broken — and each call already degrades to null on
+   * error inside ApiService, so one failing source still renders the rest. Only
+   * a total failure sets `error`.
+   */
+  private loadJobDetail(jobId: string): void {
+    if (this.jobDetails()[jobId]) return; // cached, including a failed attempt
+    this.jobDetails.update((cache) => ({
+      ...cache,
+      [jobId]: {loading: true, error: false, detail: null, usage: null, progress: null},
+    }));
+    forkJoin({
+      detail: this.api.getJob(jobId),
+      usage: this.api.getJobUsage(jobId),
+      progress: this.api.getJobProgress(jobId),
+    })
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((result) => {
+        this.jobDetails.update((cache) => ({
+          ...cache,
+          [jobId]: {
+            loading: false,
+            error: !result.detail && !result.usage && !result.progress,
+            detail: result.detail,
+            usage: result.usage,
+            progress: result.progress,
+          },
+        }));
+      });
   }
 
   isExpanded(jobId: string): boolean {

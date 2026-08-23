@@ -674,7 +674,7 @@
         "project": "Project: {{name}}",
         "noProject": "No project",
         "search": "Search: {{term}}",
-"systemHidden": "System jobs hidden",
+        "systemHidden": "System jobs hidden",
         "archived": "Archived projects hidden"
       },
       "statusGroup": "Filter by status",
@@ -743,31 +743,33 @@
       "approveRequest": "Approve request"
     },
     "tooltip": {
-      "collapse": "Collapse sub-jobs",
-      "expand": "Expand sub-jobs",
-      "view": "Open in Workbench",
-      "workspace": "Browse workspace in Gitea",
-      "ideSnapshot": "Open workspace in Web IDE (from snapshot)",
-      "ideCode": "Open workspace in Web IDE (code only)",
-      "ideStarting": "Starting IDE session...",
-      "pauseJob": "Pause job",
+      "approveRequest": "This job is waiting on a sudo/VM-upgrade decision — open the request in the inbox",
       "cancelJob": "Cancel job",
       "canceling": "Canceling job...",
+      "collapse": "Collapse sub-jobs",
+      "collapseDetails": "Hide job details",
       "confirmCancel": "Click again to confirm cancellation",
+      "confirmDelete": "Click again to confirm deletion",
+      "delegationChild": "Delegation child (creation order {{order}})",
+      "delegationWaiting": "Waiting for delegation children to complete",
+      "deleteJob": "Delete job",
+      "expand": "Expand sub-jobs",
+      "expandDetails": "Show job details",
+      "exportToCloud": "Copy this job's deliverables to a shared cloud folder",
+      "ideCode": "Open workspace in Web IDE (code only)",
+      "ideSnapshot": "Open workspace in Web IDE (from snapshot)",
+      "ideStarting": "Starting IDE session...",
+      "moreActions": "More actions",
+      "openCloudFolder": "Open this job's cloud folder in a new tab",
+      "pauseJob": "Pause job",
+      "promoteJob": "Promote to project",
+      "resumeJob": "Resume from checkpoint",
       "reviewJob": "Review and approve/continue",
       "reviewQueue": "Open the review queue",
-      "resumeJob": "Resume from checkpoint",
-      "confirmDelete": "Click again to confirm deletion",
-      "deleteJob": "Delete job",
-      "moreActions": "More actions",
-      "promoteJob": "Promote to project",
-      "exportToCloud": "Copy this job's deliverables to a shared cloud folder",
-      "openCloudFolder": "Open this job's cloud folder in a new tab",
-      "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
-      "delegationWaiting": "Waiting for delegation children to complete",
-      "delegationChild": "Delegation child (creation order {{order}})",
-      "approveRequest": "This job is waiting on a sudo/VM-upgrade decision — open the request in the inbox"
+      "snapshotStats": "S3 snapshot storage",
+      "view": "Open in Workbench",
+      "workspace": "Browse workspace in Gitea"
     },
     "delegationChildren": "{{count}} children",
     "promote": {
@@ -814,6 +816,29 @@
       "submit": "Create Job",
       "creating": "Creating...",
       "uploading": "Uploading..."
+    },
+    "detail": {
+      "auditSteps": "Audit steps",
+      "children": "{{count}} sub-jobs match the current filter.",
+      "cost": "Cost",
+      "costFloor": "Priced {{priced}} of {{total}} metered events — the real cost is higher.",
+      "costFloorHint": "Partially priced: the real cost is higher than shown.",
+      "costMeteringOff": "Usage metering is turned off on this deployment.",
+      "costNoUsage": "No usage was metered for this job.",
+      "costPredatesLedger": "This job ran before usage metering started, so it has no figures.",
+      "costUnknown": "Usage could not be loaded.",
+      "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
+      "duration": "Duration",
+      "expert": "Expert",
+      "loading": "Loading details…",
+      "model": "Model",
+      "modelDefault": "Expert default",
+      "origin": "Origin",
+      "tokens": "Tokens",
+      "unknown": "Unknown",
+      "usage": "Usage",
+      "usageLive": "still running — figures lag by up to 3 min",
+      "workspace": "Workspace"
     }
   },
   "admin": {
@@ -3377,7 +3402,9 @@
       "unlimited": "unlimited",
       "worker": "worker default"
     },
-    "digest": {"title": "Digest — what he queued for you"},
+    "digest": {
+      "title": "Digest — what he queued for you"
+    },
     "errors": {
       "commission": "Commission failed",
       "conference": "Could not open the conference",
@@ -3394,7 +3421,10 @@
       "noteLabel": "Hold note",
       "placeholder": "maintenance"
     },
-    "holdKind": {"maintenance": "maintenance", "conference": "conference"},
+    "holdKind": {
+      "maintenance": "maintenance",
+      "conference": "conference"
+    },
     "immediacy": {
       "nextDelivery": "applies at next delivery",
       "nextDispatch": "applies at next dispatch",
@@ -3497,7 +3527,12 @@
       "slotPlaceholder": "line",
       "workspace": "Workspace"
     },
-    "sections": {"brain": "His brain", "budgets": "Budgets", "kit": "Kit", "sleep": "Sleep"},
+    "sections": {
+      "brain": "His brain",
+      "budgets": "Budgets",
+      "kit": "Kit",
+      "sleep": "Sleep"
+    },
     "sleep": {
       "hint": "He files his own sleep between wakes; the server clamps to these bounds.",
       "min": "Min (minutes)",
@@ -3545,7 +3580,12 @@
       "inMinutes": "in {{count}} min",
       "overdueMinutes": "overdue {{count}} min"
     },
-    "workspace": {"sandbox": "sandbox", "virtual": "virtual", "none": "none", "vmRoot": "VM (root)"}
+    "workspace": {
+      "sandbox": "sandbox",
+      "virtual": "virtual",
+      "none": "none",
+      "vmRoot": "VM (root)"
+    }
   },
   "statistics": {
     "stuckPolicy": "{{threshold}} min · {{source}}",
