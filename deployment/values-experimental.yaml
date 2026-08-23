@@ -508,10 +508,16 @@ databases:
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
     storageSize: "32Gi"
-    # Cut over 2026-08-23. Writers (orchestrator, agent-stateless) quiesced and
-    # verified frozen in the previous commit -- tuple counters flat at 685365
-    # across three samples, zero client connections.
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source before the flip: 29
+    # tables identical by exact COUNT(*), 26 GB on both sides with the large
+    # llm_requests partitions matching, locale/sequences/extensions/index
+    # validity identical, and Ready=True on the cluster. Writers were quiesced
+    # and frozen (685365, flat across three samples) throughout.
+    #
+    # NOTE: no backup plugin, by chart default and on purpose -- append-heavy,
+    # WAL-dominant, retention-bounded, non-fatal by contract. Flip
+    # backupEnabled if the audit trail ever becomes a compliance artefact.
+    engine: "cnpg"
     # -- 26 GB of data. A logical import holds the dump and the restored data on
     #    the SAME volume, measured at ~2.2x the source on pgvector, so 32Gi runs
     #    out roughly two hours in -- after the dump has already completed. The
