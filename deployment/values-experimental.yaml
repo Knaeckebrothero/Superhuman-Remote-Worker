@@ -508,6 +508,10 @@ databases:
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
     storageSize: "32Gi"
+    # Cut over 2026-08-23. Writers (orchestrator, agent-stateless) quiesced and
+    # verified frozen in the previous commit -- tuple counters flat at 685365
+    # across three samples, zero client connections.
+    engine: "migrating"
     # -- 26 GB of data. A logical import holds the dump and the restored data on
     #    the SAME volume, measured at ~2.2x the source on pgvector, so 32Gi runs
     #    out roughly two hours in -- after the dump has already completed. The
