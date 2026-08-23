@@ -732,6 +732,13 @@ async def user_can_access_job_or_thread(
         return True
     if not entity_id:
         return False
+    # Callers hand us ids straight out of asyncpg rows, where a uuid column
+    # arrives as asyncpg.pgproto.UUID rather than str. uuid.UUID() calls
+    # .replace() on its argument, so an unstringified value raises
+    # AttributeError — not the ValueError get_job guards — and escapes as a
+    # 500. That took out every /api/sudo/requests route (list, get, approve,
+    # deny) once sudo rows carried a thread_id. Normalize once, here.
+    entity_id = str(entity_id)
     job = await db.get_job(entity_id)
     if job:
         if not _scope_permits_project(user, job.get("project_id")):
