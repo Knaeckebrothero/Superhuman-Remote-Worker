@@ -114,7 +114,12 @@ mcp:
 # -----------------------------------------------------------------------------
 orchestrator:
   persistentAgentReconciliationEnabled: true
-  replicas: 2
+  # QUIESCED (was 2) for the postgres cutover, 2026-08-23. Unlike giteadb and
+  # keycloakdb, this database has a LIVE write stream -- tuple counters moved
+  # every sample -- so the writers stop in their own apply and are verified
+  # stopped before the import starts. Restore to 2 once
+  # databases.postgres.engine is `cnpg`.
+  replicas: 0
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
   # leader-elected finalizer; `lifespan` additionally starts the finalizer and
@@ -616,6 +621,10 @@ agent:
   # tiers stay pinned/refused.
   stateless:
     enabled: true
+    # QUIESCED (chart default 2) for the postgres cutover, 2026-08-23. These
+    # connect to the srw database as the `srw` superuser role, so they are
+    # writers. Remove this override once the cutover is done.
+    replicas: 0
     # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. Admission
     # remains independently rollbackable from the default-selection flag.
     #
