@@ -114,12 +114,17 @@ mcp:
 # -----------------------------------------------------------------------------
 orchestrator:
   persistentAgentReconciliationEnabled: true
-  # -- MUST come back in the SAME apply that flips the engine. The llm-seed
-  #    post-upgrade hook blocks on `until wget http://srw-orchestrator:8085/
-  #    api/health`, with no timeout, so any apply that leaves this at 0 wedges
-  #    the Helm release in pending-upgrade -- including the apply that would
-  #    restore it. Observed 2026-08-23; recovered by scaling up with kubectl to
-  #    satisfy the wait. See the migration runbook.
+  # -- 0 quiesces the orchestrator for a database cutover; it writes to
+  #    postgres, auditdb and pgvector, and anything it writes after pg_dump's
+  #    snapshot is silently lost. Restore it in the SAME commit that flips the
+  #    engine to cnpg.
+  #
+  #    This used to be a trap: the llm-seed post-upgrade hook blocked on
+  #    `until wget .../api/health` with no timeout, so any apply that left this
+  #    at 0 wedged the release in pending-upgrade -- including the apply that
+  #    would restore it (observed twice on 2026-08-23). Fixed in the chart: the
+  #    seed Job no longer renders at replicas 0, and its wait is bounded. A
+  #    quiesce is now an ordinary apply. See the migration runbook §B2a.
   replicas: 2
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
