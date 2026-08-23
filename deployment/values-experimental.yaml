@@ -337,11 +337,11 @@ codexProxy:
 # Procedure: knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
 # -----------------------------------------------------------------------------
 gitea:
-  # -- QUIESCED for the giteadb cutover, 2026-08-23. A cutover imports from a
-  #    live source, and anything written between pg_dump's snapshot and the
-  #    traffic flip is silently absent from the target. Restore to 1 once
-  #    databases.gitea.engine is `cnpg`.
-  replicas: 0
+  # -- Back up after the giteadb cutover, 2026-08-23. Gitea reads its database
+  #    host from env on the pod spec, so this fresh pod starts against
+  #    srw-giteadb-rw with no reloader dependency. Set to 0 to quiesce the
+  #    writer for a future cutover.
+  replicas: 1
 # -----------------------------------------------------------------------------
 # Cloud storage — migrated OpenCloud -> Nextcloud 2026-08-02.
 #
@@ -502,7 +502,10 @@ databases:
   # before this flip. Chart default storage (8Gi) is ~160x the data, so no
   # cnpgStorageSize override is needed.
   gitea:
-    engine: "migrating"
+    # Cut over 2026-08-23. Verified against the source before the flip: all 110
+    # tables identical by exact COUNT(*), locale/sequences/extensions/index
+    # validity identical, clean restore log. First database on CNPG.
+    engine: "cnpg"
   # Main postgres (srw-postgres) — same story as audit above, one env narrower.
   # The chart default stays 16Gi (right for a fresh/self-hosted install); only
   # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
