@@ -18,6 +18,7 @@ import {AppSelectComponent} from '../../../ui/select';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {AppDialogComponent} from '../../../ui/dialog';
 import {formatTokens, parseTokens} from '../../../core/util/format-tokens';
 
 interface ProviderOption {
@@ -72,6 +73,66 @@ function hintsToCapabilities(
  * string, or null when the window is healthy / unset.
  * See knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §5.4.
  */
+/**
+ * The three states `params_json.pricing_id` can express, mirroring
+ * `orchestrator/services/openrouter_pricing.py`:
+ *
+ *  - key absent  → `auto`  : resolve from the model id itself (exact OpenRouter
+ *                            id, the once-stripped remainder, then a unique bare
+ *                            suffix). Works for `MiniMax-M3`; cannot work for a
+ *                            name OpenRouter has never heard of.
+ *  - non-empty   → `map`   : resolve against this exact OpenRouter id.
+ *  - empty string→ `never` : force unpriced (self-hosted / free). `cost_usd`
+ *                            stays NULL, which is NOT the same as $0.00.
+ */
+export type PricingMode = 'auto' | 'map' | 'never';
+
+export function pricingModeOf(params: Record<string, unknown> | null): PricingMode {
+  const raw = params?.['pricing_id'];
+  if (typeof raw !== 'string') return 'auto';
+  return raw.trim() ? 'map' : 'never';
+}
+
+export function pricingIdOf(params: Record<string, unknown> | null): string {
+  const raw = params?.['pricing_id'];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+export function pricingLabelOf(params: Record<string, unknown> | null): string {
+  switch (pricingModeOf(params)) {
+    case 'map':
+      return pricingIdOf(params);
+    case 'never':
+      return 'Never price';
+    default:
+      return 'Auto';
+  }
+}
+
+/**
+ * Merge a pricing choice into an existing `params_json`, preserving every other
+ * key.
+ *
+ * PATCH replaces `params_json` **wholesale** (`params_json = $n` in
+ * `PostgresDB.update_model` — there is no jsonb merge), so sending
+ * `{pricing_id}` on its own would silently delete a TTS `voice` or an inference
+ * override that the row already carried. Pass `undefined` to clear the key back
+ * to auto-detect, `''` to force-unprice.
+ */
+export function mergePricingId(
+  params: Record<string, unknown> | null,
+  pricingId: string | undefined,
+): Record<string, unknown> | null {
+  const next: Record<string, unknown> = {...(params ?? {})};
+  if (pricingId === undefined) {
+    delete next['pricing_id'];
+  } else {
+    next['pricing_id'] = pricingId;
+  }
+  // A row left with no overrides at all goes back to SQL NULL rather than {}.
+  return Object.keys(next).length ? next : null;
+}
+
 export function reasoningStarveWarning(ctx: number | null): string | null {
   if (ctx == null || ctx <= 0) return null; // unset → family/default governs
   const backstop = Math.max(4096, ctx - Math.floor(ctx * 0.8) - 4096);
@@ -94,6 +155,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     AppCheckboxComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
+    AppDialogComponent,
   ],
   template: `
     <div class="admin-models">
@@ -125,6 +187,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     <span class="col-capability">Capabilities</span>
                     <span class="col-family">Family</span>
                     <span class="col-context">Context</span>
+                    <span class="col-pricing">Pricing</span>
                     <span class="col-enabled">Enabled</span>
                     <span class="col-actions"></span>
                   </div>
@@ -145,6 +208,17 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         [class.muted]="m.context_window_source === 'family_default'"
                         [title]="m.context_window_source === 'family_default' ? 'Family default' : 'Explicit per-model cap'"
                       >{{ fmtTokens(m.resolved_context_window) }}</span>
+                      <span class="col-pricing">
+                        <button
+                          type="button"
+                          class="pricing-cell"
+                          [class.muted]="pricingModeOf(m.params_json) !== 'map'"
+                          [class.mono]="pricingModeOf(m.params_json) === 'map'"
+                          [title]="pricingHint(m)"
+                          [attr.aria-label]="'Pricing source for ' + m.display_label + ': ' + pricingLabelOf(m.params_json) + '. Edit.'"
+                          (click)="openPricing(m)"
+                        >{{ pricingLabelOf(m.params_json) }}</button>
+                      </span>
                       <span class="col-enabled">
                         <app-checkbox
                           size="sm"
@@ -383,6 +457,22 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               }
             }
 
+            <div class="form-row">
+              <app-form-field label="Pricing ID (optional)">
+                <app-input
+                  [value]="formPricingId()"
+                  [disabled]="creating()"
+                  placeholder="OpenRouter ID, e.g. google/gemma-4-26b-a4b-it"
+                  (valueChange)="formPricingId.set($event)"
+                />
+              </app-form-field>
+              <p class="field-hint">
+                Leave empty to auto-detect from the model ID. Set it when the
+                model ID is not an OpenRouter name — otherwise usage meters with
+                cost unknown. Editable later from the Pricing column.
+              </p>
+            </div>
+
             @if (formError()) {
               <p class="form-error">{{ formError() }}</p>
             }
@@ -400,6 +490,77 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
             </div>
           </div>
         </section>
+
+        @if (pricingRow(); as row) {
+          <app-dialog
+            [open]="true"
+            title="Pricing source"
+            size="md"
+            (closed)="closePricing()"
+          >
+            <p class="dialog-intro">
+              How <strong>{{ row.display_label }}</strong> resolves to a $/token
+              rate. Rates sync from OpenRouter's public catalog and are snapshotted
+              onto each usage event when it is written, so a change here prices
+              <em>future</em> usage — it does not reprice history.
+            </p>
+
+            <app-form-field label="Source">
+              <app-select
+                [value]="pricingMode()"
+                [disabled]="pricingSaving()"
+                (changed)="onPricingModeChange($event)"
+              >
+                <option value="auto">Auto-detect from the model ID</option>
+                <option value="map">Map to an OpenRouter model ID</option>
+                <option value="never">Never price (self-hosted / free)</option>
+              </app-select>
+            </app-form-field>
+
+            @if (pricingMode() === 'map') {
+              <app-form-field label="OpenRouter model ID">
+                <app-input
+                  [value]="pricingDraft()"
+                  [disabled]="pricingSaving()"
+                  placeholder="e.g. google/gemma-4-26b-a4b-it"
+                  (valueChange)="pricingDraft.set($event)"
+                />
+              </app-form-field>
+              <p class="field-hint">
+                The full ID as OpenRouter publishes it, provider prefix included.
+                Use this for a self-hosted model whose name has no OpenRouter
+                equivalent — the rate is then a list-price equivalent, not billed
+                spend.
+              </p>
+            }
+            @if (pricingMode() === 'never') {
+              <p class="field-hint">
+                Usage is still metered in full; only the cost stays unknown
+                (<code>null</code>), which the UI must not render as $0.00.
+              </p>
+            }
+
+            @if (pricingError(); as err) {
+              <p class="form-error">{{ err }}</p>
+            }
+
+            <div appDialogActions>
+              <app-button
+                variant="secondary"
+                size="sm"
+                [disabled]="pricingSaving()"
+                (clicked)="closePricing()"
+              >Cancel</app-button>
+              <app-button
+                variant="primary"
+                size="sm"
+                [loading]="pricingSaving()"
+                [disabled]="pricingSaving()"
+                (clicked)="savePricing()"
+              >Save</app-button>
+            </div>
+          </app-dialog>
+        }
     </div>
   `,
   styles: [`
@@ -438,7 +599,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .model-header,
     .model-row {
       display: grid;
-      grid-template-columns: 1.4fr 2fr 160px 100px 100px 70px 260px;
+      grid-template-columns: 1.4fr 2fr 160px 100px 100px 150px 70px 260px;
       gap: 8px;
       align-items: center;
       padding: 8px 12px;
@@ -457,6 +618,40 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       color: var(--text-primary);
     }
     .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    /* Reads as a cell, behaves as a button — the whole value is the hit target
+       so there is no separate pencil competing for width in a dense row. */
+    .pricing-cell {
+      background: none;
+      border: none;
+      padding: 2px 4px;
+      margin: -2px -4px;
+      font: inherit;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+      border-radius: var(--radius-control);
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .pricing-cell:hover,
+    .pricing-cell:focus-visible {
+      background: var(--hover);
+      color: var(--text-primary);
+    }
+    .dialog-intro {
+      margin: 0 0 12px;
+      color: var(--text-secondary);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .field-hint {
+      margin: 6px 0 0;
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
     .empty-state {
       padding: 24px;
       text-align: center;
@@ -644,9 +839,19 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
         content: 'Context: ';
         color: var(--text-muted);
       }
-      .col-actions {
+      .col-pricing {
         grid-column: 1 / -1;
         grid-row: 5;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .col-pricing::before {
+        content: 'Pricing: ';
+        color: var(--text-muted);
+      }
+      .col-actions {
+        grid-column: 1 / -1;
+        grid-row: 6;
         margin-top: 2px;
       }
       /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
@@ -700,10 +905,28 @@ export class AdminModelsComponent implements OnInit {
   // the catalog row's params_json and read by the TTS service. Only sent when
   // the tts capability is selected.
   readonly formVoice = signal('');
+  // Optional OpenRouter pricing ID, also params_json. Empty = auto-detect.
+  readonly formPricingId = signal('');
   // True when the operator picked "Custom…" (or the backend is unrecognized);
   // then formVoice is a free-text voice id rather than a catalog selection.
   readonly formVoiceCustom = signal(false);
   protected readonly CUSTOM_VOICE = TTS_VOICE_CUSTOM;
+
+  // --- Pricing source ------------------------------------------------------
+  // Which OpenRouter catalog entry the rate sync should use for a row. Lives in
+  // params_json.pricing_id; before this it was settable only by hand in the DB,
+  // which is why self-hosted models sat unpriced and metered as cost NULL.
+  /** The row whose pricing dialog is open; null when closed. */
+  readonly pricingRow = signal<CatalogModel | null>(null);
+  readonly pricingMode = signal<PricingMode>('auto');
+  /** Free-text OpenRouter id, only meaningful while pricingMode() === 'map'. */
+  readonly pricingDraft = signal('');
+  readonly pricingSaving = signal(false);
+  readonly pricingError = signal<string | null>(null);
+  // Exposed for the template (pure helpers, unit-tested in admin-models.pricing.spec.ts).
+  protected readonly pricingModeOf = pricingModeOf;
+  protected readonly pricingLabelOf = pricingLabelOf;
+
 
   // Mirror for the number input — keeps an empty string when null so the
   // input renders blank instead of "0".
@@ -933,9 +1156,13 @@ export class AdminModelsComponent implements OnInit {
       return;
     }
     const voice = this.formVoice().trim();
-    // Voice rides in the catalog row's params_json; only meaningful for TTS.
-    const paramsJson =
-      capabilities.includes('tts') && voice ? {voice} : undefined;
+    const pricingId = this.formPricingId().trim();
+    // Both ride in the catalog row's params_json: voice is TTS-only, pricing_id
+    // points the OpenRouter rate sync at a specific catalog entry.
+    const params: Record<string, unknown> = {};
+    if (capabilities.includes('tts') && voice) params['voice'] = voice;
+    if (pricingId) params['pricing_id'] = pricingId;
+    const paramsJson = Object.keys(params).length ? params : undefined;
     this.creating.set(true);
     this.models
       .createModel({
@@ -955,6 +1182,7 @@ export class AdminModelsComponent implements OnInit {
           this.formContextWindow.set(null);
           this.formVoice.set('');
           this.formVoiceCustom.set(false);
+          this.formPricingId.set('');
           this.creating.set(false);
         },
         error: (err) => {
@@ -966,6 +1194,64 @@ export class AdminModelsComponent implements OnInit {
 
   toggleEnabled(model: CatalogModel, checked: boolean): void {
     this.models.updateModel(model.id, {enabled: checked}).subscribe();
+  }
+
+  /** Hover/title text spelling out what the cell's shorthand actually means. */
+  pricingHint(m: CatalogModel): string {
+    switch (pricingModeOf(m.params_json)) {
+      case 'map':
+        return `Priced from OpenRouter model ${pricingIdOf(m.params_json)}.`;
+      case 'never':
+        return 'Explicitly never priced — usage is metered, cost stays unknown.';
+      default:
+        return (
+          `Resolved from the model ID (${m.model_id}). Unpriced if OpenRouter ` +
+          'publishes no model under that name.'
+        );
+    }
+  }
+
+  openPricing(m: CatalogModel): void {
+    this.pricingRow.set(m);
+    this.pricingMode.set(pricingModeOf(m.params_json));
+    this.pricingDraft.set(pricingIdOf(m.params_json));
+    this.pricingError.set(null);
+  }
+
+  closePricing(): void {
+    if (this.pricingSaving()) return;
+    this.pricingRow.set(null);
+  }
+
+  onPricingModeChange(mode: string | null): void {
+    this.pricingMode.set((mode ?? 'auto') as PricingMode);
+    this.pricingError.set(null);
+  }
+
+  savePricing(): void {
+    const row = this.pricingRow();
+    if (!row) return;
+    const mode = this.pricingMode();
+    const id = this.pricingDraft().trim();
+    if (mode === 'map' && !id) {
+      this.pricingError.set('Enter an OpenRouter model ID, or choose auto-detect.');
+      return;
+    }
+    // undefined removes the key (auto), '' forces unpriced, else the mapping.
+    const pricingId = mode === 'auto' ? undefined : mode === 'never' ? '' : id;
+    this.pricingSaving.set(true);
+    this.models
+      .updateModel(row.id, {params_json: mergePricingId(row.params_json, pricingId)})
+      .subscribe({
+        next: () => {
+          this.pricingSaving.set(false);
+          this.pricingRow.set(null);
+        },
+        error: (err) => {
+          this.pricingError.set(err?.error?.detail ?? 'Failed to save pricing source.');
+          this.pricingSaving.set(false);
+        },
+      });
   }
 
   deleteRow(model: CatalogModel): void {
