@@ -340,6 +340,79 @@ class TestSessionWorkspaceBackendDefaultChain:
         )
         assert upd.persistent_agent == {"headless_mode": "eager", "greeting": "hi"}
 
+    def test_settings_patch_round_trips_communication(self):
+        # Regression: the cockpit's Communication card PATCHes this whole
+        # sub-object. Until 2026-08-23 the model did not declare the field, so
+        # Pydantic dropped it and the endpoint 400'd with "No settings
+        # provided" — every channel toggle, quiet-hours window and reply-
+        # delivery choice was silently discarded for every user.
+        payload = {
+            "delivery": {"async_reply": "llm_triage", "urgent_override": True},
+            "channels": {
+                "email": False,
+                "cockpit": True,
+                "ntfy": False,
+                "slack_webhook": False,
+                "discord_webhook": False,
+            },
+            "quiet_hours": {
+                "enabled": True,
+                "start": "22:00",
+                "end": "08:00",
+                "timezone": "Europe/Berlin",
+            },
+        }
+        upd = orch_main.UserSettingsUpdate(communication=payload)
+        assert upd.communication == payload
+        assert "communication" in upd.model_fields_set
+
+    def test_settings_patch_communication_survives_the_endpoint_filter(self):
+        # The endpoint drops keys that are None and unset; a communication-only
+        # PATCH must survive it, or update_user_preferences raises 400.
+        upd = orch_main.UserSettingsUpdate(communication={"channels": {"email": False}})
+        settings = {
+            k: v
+            for k, v in upd.model_dump().items()
+            if v is not None or k in upd.model_fields_set
+        }
+        assert settings == {"communication": {"channels": {"email": False}}}
+
+    @pytest.mark.parametrize("bad", ["off", 0, 1, None, "true"])
+    def test_settings_patch_rejects_non_boolean_channel(self, bad):
+        # Readers gate on channels.get(name, True); a truthy non-bool would
+        # leave the channel on after the user switched it off.
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(communication={"channels": {"email": bad}})
+
+    @pytest.mark.parametrize("key", ["delivery", "channels", "quiet_hours"])
+    def test_settings_patch_rejects_non_object_communication_subkey(self, key):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(communication={key: "nope"})
+
+    def test_settings_patch_leaves_unknown_communication_keys_free_form(self):
+        upd = orch_main.UserSettingsUpdate(
+            communication={"channels": {"email": True}, "future_knob": 7}
+        )
+        assert upd.communication["future_knob"] == 7
+
+    @pytest.mark.parametrize("lang", ["en", "de-DE"])
+    def test_settings_patch_round_trips_language(self, lang):
+        # Same regression as communication: I18nService.setLanguage PATCHes
+        # {language} on its own, so an undeclared field meant a 400 and the
+        # locale choice never survived a reload.
+        upd = orch_main.UserSettingsUpdate(language=lang)
+        settings = {
+            k: v
+            for k, v in upd.model_dump().items()
+            if v is not None or k in upd.model_fields_set
+        }
+        assert settings == {"language": lang}
+
+    @pytest.mark.parametrize("bad", ["", "a", "de_DE", "not a tag", "x" * 40])
+    def test_settings_patch_rejects_junk_language(self, bad):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(language=bad)
+
     def test_resolved_preference_defaults_surface_workspace_backend(self):
         # The Settings UI shows the resolved system default as the placeholder;
         # it must match what create_thread will actually apply.

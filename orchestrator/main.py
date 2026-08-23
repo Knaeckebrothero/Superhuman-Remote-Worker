@@ -10513,6 +10513,21 @@ class UserSettingsUpdate(BaseModel):
     # standing style/summarization instructions). Read by services/tts.py's
     # rewrite path. Patch-replaces the whole sub-object.
     read_aloud: dict[str, Any] | None = None
+    # Notification/communication preferences: {delivery, channels, quiet_hours}.
+    # Read by services/notification_service.py (_get_user_channels,
+    # _is_in_quiet_hours) and by the agent-message delivery path. This field was
+    # missing until 2026-08-23: the cockpit's Communication card PATCHed
+    # ``communication`` into a model that did not declare it, Pydantic dropped it
+    # (extra="ignore"), the request 400'd as "No settings provided", and no user
+    # ever had the key. Patch-replaces the whole sub-object.
+    communication: dict[str, Any] | None = None
+    # Cockpit UI locale (BCP-47, e.g. "en" / "de-DE"). Client-only — nothing
+    # server-side reads it; the cockpit stores it here and reads it back from
+    # GET /api/settings/preferences. Kept as a free string rather than an enum
+    # so shipping a new locale is a cockpit-only change; I18nService.toSupported
+    # already normalises unknown tags to its default on read. Undeclared until
+    # 2026-08-23, so language choice never persisted for anyone.
+    language: str | None = None
 
     @field_validator("persistent_agent")
     @classmethod
@@ -10564,6 +10579,44 @@ class UserSettingsUpdate(BaseModel):
                 raise ValueError(
                     f"custom_prompt must be at most {READ_ALOUD_PROMPT_MAX} characters"
                 )
+        return v
+
+    @field_validator("communication")
+    @classmethod
+    def _validate_communication(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Guard the communication sub-object. ``channels`` values must be real
+        booleans: every reader gates on ``channels.get(name, True)``, so a string
+        ``"false"`` would be truthy and silently leave a channel switched on —
+        the exact failure the user would be trying to fix. The three known
+        sub-objects must be objects; other keys stay free-form, matching the
+        persistent_agent contract."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("communication must be an object")
+        for key in ("delivery", "channels", "quiet_hours"):
+            sub = v.get(key)
+            if sub is not None and not isinstance(sub, dict):
+                raise ValueError(f"communication.{key} must be an object")
+        for name, enabled in (v.get("channels") or {}).items():
+            if not isinstance(enabled, bool):
+                raise ValueError(
+                    f"communication.channels.{name} must be a boolean, "
+                    f"got {type(enabled).__name__}"
+                )
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def _validate_language(cls, v: str | None) -> str | None:
+        """Sanity-cap the locale tag. Deliberately not an enum — see the field
+        comment. Just enough to keep junk out of the settings JSONB."""
+        if v is None:
+            return v
+        if not isinstance(v, str) or not re.fullmatch(
+            r"[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*", v
+        ):
+            raise ValueError("language must be a BCP-47 tag such as 'en' or 'de-DE'")
         return v
 
 
