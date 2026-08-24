@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { reasoningStarveWarning } from './admin-models.component';
+import { reasoningStarveWarning } from './admin-catalog.component';
 
 /**
  * The Admin → Models low-context-window warning. The threshold + backstop math

@@ -8,6 +8,6 @@ import {Subject} from 'rxjs';
  * endpoint cards.
  */
 @Injectable({providedIn: 'root'})
-export class AdminLlmCoordinatorService {
+export class AdminModelsCoordinatorService {
   readonly discoverEndpoint$ = new Subject<string>();
 }
