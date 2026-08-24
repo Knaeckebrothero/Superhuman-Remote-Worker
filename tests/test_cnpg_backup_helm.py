@@ -503,3 +503,63 @@ class TestVolumeSnapshotMethod:
         scheduled = _scheduled("databases.postgres.engine=cnpg", *BACKUP_ON)
         for name, sb in scheduled.items():
             assert sb["spec"]["method"] == "plugin", name
+
+
+class TestSidecarResources:
+    """The Barman Cloud sidecar is sized, not left unbounded.
+
+    The plugin injects it into every instance pod of every backing-up Cluster
+    and ships it with NO resources at all. Two consequences: an unbounded
+    container sits next to a database on a busy node, and -- because the
+    sidecar is a NATIVE sidecar (an initContainer with restartPolicy: Always)
+    and Kubernetes computes QoS over every container in the pod including
+    those -- one unsized container drags the whole pod's QoS class down no
+    matter how carefully the postgres container is sized.
+
+    Verified against the live pod spec on dev 2026-08-24: `resources: {}`.
+    """
+
+    def test_the_sidecar_is_sized(self):
+        store = _kinds(_render(*BACKUP_ON, *_all_cnpg()), "ObjectStore")[0]
+        resources = store["spec"]["instanceSidecarConfiguration"]["resources"]
+        assert resources["requests"]["memory"]
+        assert resources["limits"]["memory"]
+
+    def test_sidecar_memory_has_parity(self):
+        """It streams and compresses; it does not accumulate."""
+        store = _kinds(_render(*BACKUP_ON, *_all_cnpg()), "ObjectStore")[0]
+        resources = store["spec"]["instanceSidecarConfiguration"]["resources"]
+        assert resources["requests"]["memory"] == resources["limits"]["memory"]
+
+    def test_sidecar_cpu_can_burst(self):
+        """Negative control, and the reason this pod is not Guaranteed.
+
+        Both compressions default to gzip, which is single-threaded and
+        CPU-bound, so the CPU limit is a direct throttle on base-backup
+        throughput. On a 26 GB database at a low cap that is the difference
+        between minutes and hours.
+        """
+        store = _kinds(_render(*BACKUP_ON, *_all_cnpg()), "ObjectStore")[0]
+        resources = store["spec"]["instanceSidecarConfiguration"]["resources"]
+        assert resources["requests"]["cpu"] != resources["limits"]["cpu"]
+
+    def test_it_is_overridable(self):
+        store = _kinds(
+            _render(
+                *BACKUP_ON,
+                *_all_cnpg(),
+                "databases.backup.sidecarResources.limits.memory=512Mi",
+                "databases.backup.sidecarResources.requests.memory=512Mi",
+            ),
+            "ObjectStore",
+        )[0]
+        resources = store["spec"]["instanceSidecarConfiguration"]["resources"]
+        assert resources["limits"]["memory"] == "512Mi"
+
+    def test_clearing_it_omits_the_block(self):
+        """An empty map must not render `resources:` with no children."""
+        store = _kinds(
+            _render(*BACKUP_ON, *_all_cnpg(), "databases.backup.sidecarResources=null"),
+            "ObjectStore",
+        )[0]
+        assert "instanceSidecarConfiguration" not in store["spec"]

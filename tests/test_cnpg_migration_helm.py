@@ -146,13 +146,17 @@ def test_operand_tag_is_pinned_not_floating():
 
 
 def test_parameters_passthrough_merges_with_max_connections():
+    # 2GB here would now be refused by the memory-fits guard: against the 1Gi
+    # default limit, maintenance_work_mem is also autovacuum_work_mem for each
+    # of three workers. That refusal is the point of the guard, so this asserts
+    # passthrough with a value that fits.
     cluster = _clusters(
         "databases.postgres.engine=cnpg",
-        "databases.postgres.parameters.maintenance_work_mem=2GB",
+        "databases.postgres.parameters.maintenance_work_mem=64MB",
     )[f"{FULLNAME}-postgres"]
     parameters = cluster["spec"]["postgresql"]["parameters"]
     assert parameters["max_connections"] == "100"
-    assert parameters["maintenance_work_mem"] == "2GB"
+    assert parameters["maintenance_work_mem"] == "64MB"
 
 
 def test_all_parameters_render_as_strings():
@@ -185,13 +189,32 @@ def test_vector_has_headroom_for_the_index_build():
     assert resources["limits"]["memory"] == "8Gi"
 
 
-def test_other_databases_ship_no_extra_parameters():
-    for key in ("postgres", "audit", "gitea", "keycloak"):
+# Derived from limits.memory for every cnpg cluster; see databases.tuning.
+DERIVED_PARAMETERS = {"shared_buffers", "effective_cache_size"}
+
+
+def test_other_databases_ship_no_hand_written_parameters():
+    """Only auditdb and pgvector carry parameters chosen by a human.
+
+    Everything else on those clusters is either the connection budget or
+    derived from the memory limit, so a new key appearing here means someone
+    tuned a database by hand without recording why.
+    """
+    for key in ("postgres", "gitea", "keycloak"):
         component = DATABASES[key]
         parameters = _clusters(f"databases.{key}.engine=cnpg")[
             f"{FULLNAME}-{component}"
         ]["spec"]["postgresql"]["parameters"]
-        assert set(parameters) == {"max_connections"}, key
+        assert set(parameters) == {"max_connections"} | DERIVED_PARAMETERS, key
+
+
+def test_audit_ships_only_the_measured_parameter():
+    """auditdb's work_mem was raised off a measurement (185 MB of sorts spilled
+    to disk in 17 hours), not a hunch. Nothing else there is hand-set."""
+    parameters = _clusters("databases.audit.engine=cnpg")[f"{FULLNAME}-auditdb"][
+        "spec"
+    ]["postgresql"]["parameters"]
+    assert set(parameters) == {"max_connections", "work_mem"} | DERIVED_PARAMETERS
 
 
 def test_legacy_statefulset_resources_are_untouched():

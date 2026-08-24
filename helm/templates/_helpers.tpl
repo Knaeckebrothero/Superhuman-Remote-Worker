@@ -1042,3 +1042,151 @@ Both warnings exist because the failure they describe is otherwise silent.
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{/*
+Convert a Kubernetes memory quantity to whole MiB.
+
+Helm has no unit-aware arithmetic, so this parses the suffix by hand. Only the
+suffixes Kubernetes actually accepts for memory are handled; anything else is a
+bare byte count. Returns an integer, so callers can `mul`/`div` it directly.
+
+PostgreSQL's "MB" is 1024*1024 bytes despite the name, so a MiB figure can be
+handed to a GUC as "<n>MB" with no conversion.
+*/}}
+{{- define "srw.quantityToMi" -}}
+{{- $q := . | toString -}}
+{{- if hasSuffix "Gi" $q -}}
+{{- mulf (trimSuffix "Gi" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "Mi" $q -}}
+{{- trimSuffix "Mi" $q | float64 | int64 -}}
+{{- else if hasSuffix "Ki" $q -}}
+{{- divf (trimSuffix "Ki" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "G" $q -}}
+{{- divf (mulf (trimSuffix "G" $q | float64) 1e9) 1048576 | int64 -}}
+{{- else if hasSuffix "M" $q -}}
+{{- divf (mulf (trimSuffix "M" $q | float64) 1e6) 1048576 | int64 -}}
+{{- else if hasSuffix "k" $q -}}
+{{- divf (mulf (trimSuffix "k" $q | float64) 1e3) 1048576 | int64 -}}
+{{- else -}}
+{{- divf ($q | float64) 1048576 | int64 -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The postgresql.parameters map for one CNPG Cluster.
+
+Exists as a helper, rather than inline in cnpg-cluster.yaml, because it MERGES
+three sources into one map: the connection budget, the memory GUCs derived from
+resources.limits.memory, and the operator's explicit per-database overrides.
+Rendering them as three separate blocks would emit duplicate YAML keys whenever
+an operator set one of the derived GUCs by hand.
+
+Precedence, lowest to highest: derived, then `parameters`. An explicit value
+always wins -- deriving is a floor for people who never think about it, not a
+ceiling on people who do.
+
+Why derive at all: CNPG ships a fixed shared_buffers of 128MB and does NOT
+scale it with the memory limit. Raising limits.memory alone therefore buys the
+database nothing, which is exactly the drift this fleet shipped with -- a 19 GB
+pgvector on a 12Gi limit was still running 128MB of buffers at an 84% cache hit
+ratio. Tying the two together makes that state unreachable.
+
+Takes: dict "context" $ $ "db" $db
+*/}}
+{{- define "srw.dbParameters" -}}
+{{- $db := .db -}}
+{{- $tuning := .context.Values.databases.tuning -}}
+{{- $params := dict "max_connections" ($db.maxConnections | default 100 | toString) -}}
+{{- $res := $db.cnpgResources | default $db.resources -}}
+{{- $lim := "" -}}
+{{- if $res -}}
+{{- if $res.limits -}}
+{{- $lim = $res.limits.memory | default "" -}}
+{{- end -}}
+{{- end -}}
+{{- if $lim -}}
+{{- $limMi := include "srw.quantityToMi" $lim | int64 -}}
+{{- if gt (int $tuning.sharedBuffersPercent) 0 -}}
+{{- $_ := set $params "shared_buffers" (printf "%dMB" (div (mul $limMi (int $tuning.sharedBuffersPercent)) 100)) -}}
+{{- end -}}
+{{- if gt (int $tuning.effectiveCacheSizePercent) 0 -}}
+{{- $_ := set $params "effective_cache_size" (printf "%dMB" (div (mul $limMi (int $tuning.effectiveCacheSizePercent)) 100)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := $db.parameters -}}
+{{- $_ := set $params $key ($value | toString) -}}
+{{- end -}}
+{{- if $lim -}}
+{{- include "srw.assertMemoryFits" (dict "params" $params "limitMi" (include "srw.quantityToMi" $lim | int64) "name" .name) -}}
+{{- end -}}
+{{- toYaml $params -}}
+{{- end }}
+
+{{/*
+Convert a PostgreSQL memory GUC value to whole MiB.
+
+PostgreSQL's own units, which are NOT Kubernetes' units: kB/MB/GB/TB, all
+binary, case-insensitive. A unit-less value is rejected rather than guessed --
+PostgreSQL reads it as the GUC's own base unit, which is 8kB blocks for
+shared_buffers but kB for maintenance_work_mem, so a silent guess here would be
+wrong for one of them and there is no way to tell which from the value alone.
+*/}}
+{{- define "srw.pgMemToMi" -}}
+{{- $q := . | toString | lower | replace " " "" -}}
+{{- if hasSuffix "tb" $q -}}
+{{- mulf (trimSuffix "tb" $q | float64) 1048576 | int64 -}}
+{{- else if hasSuffix "gb" $q -}}
+{{- mulf (trimSuffix "gb" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "mb" $q -}}
+{{- trimSuffix "mb" $q | float64 | int64 -}}
+{{- else if hasSuffix "kb" $q -}}
+{{- divf (trimSuffix "kb" $q | float64) 1024 | int64 -}}
+{{- else -}}
+{{- fail (printf "PostgreSQL memory setting %q has no unit. Give it an explicit kB/MB/GB suffix: a bare number means 8kB blocks for shared_buffers but kB for maintenance_work_mem, and this chart will not guess which you meant." $q) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Refuse a memory configuration that cannot fit in its own limit.
+
+The failure this prevents is not a slow query, it is an OOM kill. shared_buffers
+is allocated for the life of the postmaster; maintenance_work_mem is allocated
+again by each CREATE INDEX/REINDEX/manual VACUUM; and autovacuum_work_mem --
+which DEFAULTS TO maintenance_work_mem when unset -- is allocated by each of
+autovacuum_max_workers workers simultaneously. The last of those is the one that
+surprises people: setting maintenance_work_mem to 2GB on a cluster with the
+default three autovacuum workers quietly authorises 6GB of autovacuum on top of
+shared_buffers, with nothing in the config that says 6GB anywhere.
+
+Deriving shared_buffers from the limit makes this reachable by editing only the
+LIMIT, so the invariant has to be enforced rather than documented.
+
+Only the certain-failure case fails the render: if the floor alone meets or
+exceeds the limit, no query has run yet and the budget is already gone.
+
+Takes: dict "params" $params "limitMi" $limitMi "name" <cluster name>
+*/}}
+{{- define "srw.assertMemoryFits" -}}
+{{- $p := .params -}}
+{{- $limitMi := .limitMi | int64 -}}
+{{- $sb := 0 -}}
+{{- if hasKey $p "shared_buffers" -}}
+{{- $sb = include "srw.pgMemToMi" (get $p "shared_buffers") | int64 -}}
+{{- end -}}
+{{- $mwm := 0 -}}
+{{- if hasKey $p "maintenance_work_mem" -}}
+{{- $mwm = include "srw.pgMemToMi" (get $p "maintenance_work_mem") | int64 -}}
+{{- end -}}
+{{- $workers := 3 -}}
+{{- if hasKey $p "autovacuum_max_workers" -}}
+{{- $workers = get $p "autovacuum_max_workers" | int -}}
+{{- end -}}
+{{- $avwm := $mwm -}}
+{{- if hasKey $p "autovacuum_work_mem" -}}
+{{- $avwm = include "srw.pgMemToMi" (get $p "autovacuum_work_mem") | int64 -}}
+{{- end -}}
+{{- $floor := add $sb $mwm (mul $avwm $workers) -}}
+{{- if ge (int $floor) (int $limitMi) -}}
+{{- fail (printf "database %s: shared_buffers (%dMi) + maintenance_work_mem (%dMi) + autovacuum_work_mem (%dMi x %d workers) = %dMi, which is at or above the memory limit of %dMi. That is an OOM kill during the first index build or autovacuum, not a slow one. Raise cnpgResources.limits.memory, lower databases.tuning.sharedBuffersPercent, or set autovacuum_work_mem explicitly -- it defaults to maintenance_work_mem, once per worker." .name $sb $mwm $avwm $workers $floor $limitMi) -}}
+{{- end -}}
+{{- end }}
