@@ -321,7 +321,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
               <div class="detail-ids">
                 @if (selectedItem()!.sudo!.job_id) {
-                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.sudo!.job_id" />
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.sudo!.job_id!" />
                 }
                 <app-copy-field [label]="'inbox.detail.requestId' | transloco" [value]="selectedItem()!.sudo!.id" />
               </div>
