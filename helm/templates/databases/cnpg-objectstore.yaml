@@ -10,7 +10,7 @@ Requires the Barman Cloud plugin, which this chart cannot install -- it is a raw
 manifest pinned to the operator's namespace. See
 knowledge-base/knowledge/operations/cnpg_backup_runbook.md
 */}}
-{{- if (include "srw.anyDbBacksUp" .) }}
+{{- if and (include "srw.anyDbBacksUp" .) (include "srw.backupIsObjectStore" .) }}
 {{- $backup := .Values.databases.backup }}
 {{- if not $backup.destinationPath }}
 {{- fail "databases.backup.method is objectstore but databases.backup.destinationPath is empty. Set it to s3://bucket/prefix -- there is no safe default, and a backup nobody can find is not a backup." }}

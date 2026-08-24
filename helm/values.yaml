@@ -1021,6 +1021,31 @@ databases:
     #    out and a failover simply never happens. Dev: cnpg-system.
     namespace: "cnpg-system"
 
+  # -- Seconds Postgres spends in SMART shutdown before CloudNativePG escalates
+  #    to a fast one. CNPG's own default is 180; this chart lowers it, on
+  #    purpose.
+  #
+  #    Smart shutdown waits for existing client SESSIONS to end, not
+  #    transactions. Every SRW component reaches Postgres through a connection
+  #    pool, and a pool holds its sessions open indefinitely by design, so the
+  #    wait cannot succeed -- it simply runs out. Measured on dev 2026-08-23: a
+  #    plain `kubectl delete pod` on a primary cost 195s of write
+  #    unavailability, of which 180 was this timer, because CNPG will not
+  #    promote the replica until the old primary is down.
+  #
+  #    That is the number every node drain and every rolling operand upgrade
+  #    pays, per cluster. A hard failure does not: there is no graceful
+  #    shutdown to wait for, and the same cluster promoted in 9s.
+  #
+  #    Fast shutdown is still clean -- it disconnects clients, rolls back open
+  #    transactions and checkpoints. It is not a crash. Raise this only if you
+  #    genuinely have short-lived sessions worth waiting for.
+  #
+  #    Safe to change on a live cluster: verified on dev 2026-08-24 that CNPG
+  #    applies it in place. Pods kept their uptime and restart count, and the
+  #    cluster never left "healthy" -- there is no rolling restart to pay for.
+  smartShutdownTimeout: 30
+
   # -- Set true when you have pre-created the per-cluster basic-auth Secrets
   #    yourself. ONLY meaningful with `secrets.existingSecret`: in that mode the
   #    chart never sees the database password, so it cannot build
@@ -1086,6 +1111,13 @@ databases:
     #    cluster as the databases -- whatever kills the database plausibly kills
     #    the backup, while looking like a backup. Use storage in a different
     #    failure domain, and confirm a restore before believing it.
+    #    volumeSnapshot: CSI VolumeSnapshots of the data volume instead. CNPG
+    #    coordinates them (pg_backup_start/stop) rather than snapshotting behind
+    #    the database's back, which a storage-layer cron job cannot do. Needs
+    #    the snapshot.storage.k8s.io CRDs and an external-snapshotter controller
+    #    -- neither ships with Kubernetes and neither is part of this chart.
+    #    Check with `kubectl get volumesnapshotclass`; if that errors, the
+    #    prerequisite is missing.
     method: "none"
     # -- s3://bucket/prefix. Required when method is objectstore. Each cluster
     #    gets its own folder underneath, named after the cluster.
@@ -1102,7 +1134,29 @@ databases:
     credentialsSecret: ""
     accessKeyIdKey: "BACKUP_S3_ACCESS_KEY_ID"
     secretAccessKeyKey: "BACKUP_S3_SECRET_ACCESS_KEY"
+    # -- CSI VolumeSnapshot settings. Used only when method is volumeSnapshot.
+    volumeSnapshot:
+      # -- VolumeSnapshotClass for the data volume. REQUIRED for this method;
+      #    there is no safe default, because it is storage-driver specific.
+      className: ""
+      # -- Separate class for a WAL volume. Only meaningful with `walStorage`,
+      #    which this chart does not configure -- WAL lives inside PGDATA, so
+      #    one snapshot captures both. Left empty deliberately.
+      walClassName: ""
+      # -- Take the snapshot with Postgres running. `false` fences the instance
+      #    first, which is cleaner and, on a replica, usually free.
+      online: true
+      # -- CNPG defaults this to TRUE, which is wrong for a snapshot-only
+      #    install: it waits for the backup's closing WAL segment to reach an
+      #    archive that does not exist, so the backup never completes. It is
+      #    safe to skip here precisely because there is no separate walStorage
+      #    -- the WAL is inside the volume being snapshotted. Set it true if you
+      #    ever run volume snapshots ALONGSIDE an object store.
+      waitForArchive: false
     # -- XXu, u in [dwm]. Applies to base backups AND the WALs between them.
+    #    OBJECT STORE ONLY: CloudNativePG does not expire VolumeSnapshots, so
+    #    with method volumeSnapshot they accumulate until something else removes
+    #    them. Longhorn recurring jobs or a storage-side policy own that.
     retentionPolicy: "30d"
     wal:
       # -- bzip2 | gzip | lz4 | snappy | xz | zstd

@@ -48,6 +48,10 @@ spec:
     labels:
       {{- include "srw.componentSelectorLabels" (dict "context" $ctx "component" .component) | nindent 6 }}
   {{- end }}
+  # Smart shutdown waits for client SESSIONS to end; pooled clients never end
+  # theirs, so this timer is what a node drain or rolling upgrade actually pays
+  # before CNPG will promote a replica. See databases.smartShutdownTimeout.
+  smartShutdownTimeout: {{ $ctx.Values.databases.smartShutdownTimeout | int }}
   storage:
     # cnpgStorageSize when set. A logical import needs room for the data, the
     # indexes it rebuilds AND the WAL it generates, all on this one volume --
@@ -78,6 +82,7 @@ spec:
       {{- toYaml . | nindent 6 }}
     {{- end }}
   {{- if (include "srw.dbBacksUp" (dict "context" $ctx "key" .key)) }}
+  {{- if (include "srw.backupIsObjectStore" $ctx) }}
   # Continuous WAL archiving. Base backups come from the ScheduledBackup beside
   # this; both go through the same plugin and the same ObjectStore.
   plugins:
@@ -85,6 +90,27 @@ spec:
       isWALArchiver: true
       parameters:
         barmanObjectName: {{ include "srw.fullname" $ctx }}-backups
+  {{- else }}
+  {{- $snap := $ctx.Values.databases.backup.volumeSnapshot }}
+  {{- if not $snap.className }}
+  {{- fail "databases.backup.method is volumeSnapshot but databases.backup.volumeSnapshot.className is empty. It is storage-driver specific, so there is no safe default -- `kubectl get volumesnapshotclass` lists yours. If that command errors, the snapshot.storage.k8s.io CRDs are not installed and this method cannot work at all." }}
+  {{- end }}
+  # CSI snapshots, coordinated by CloudNativePG (pg_backup_start/stop) rather
+  # than taken behind the database's back. NOTE: no WAL archiving in this mode,
+  # so recovery granularity is the snapshot interval, not point-in-time.
+  backup:
+    volumeSnapshot:
+      className: {{ $snap.className | quote }}
+      {{- with $snap.walClassName }}
+      walClassName: {{ . | quote }}
+      {{- end }}
+      online: {{ $snap.online }}
+      onlineConfiguration:
+        # The closing WAL segment is inside the volume being snapshotted (no
+        # separate walStorage), so waiting for it to reach an archive that does
+        # not exist would hang the backup forever.
+        waitForArchive: {{ $snap.waitForArchive }}
+  {{- end }}
   {{- end }}
   bootstrap:
     initdb:
