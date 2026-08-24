@@ -2187,6 +2187,42 @@ export interface JobUsageCategory {
  * `predates_ledger` is a job older than the materializer's forward-only anchor
  * (it has no rows and never will), `unavailable` is the audit tier being off.
  */
+/**
+ * One descendant in a job's subjob roster.
+ *
+ * Every field here is one `GET /api/jobs` already publishes for a child that
+ * the filter let through — the roster adds reach, not new data.
+ */
+export interface JobSubjob {
+  id: string;
+  parent_job_id: string | null;
+  /** 0 = a direct child of the job asked about. */
+  depth: number;
+  description: string;
+  status: string;
+  /** The role: `scholar`, `critic`, `curator`. What makes a row readable. */
+  config_name: string | null;
+  origin: string | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * `GET /api/jobs/{job_id}/subjobs` — the tree under a job, filter-independent.
+ *
+ * Exists because a parent's status is not self-explanatory: `waiting` means
+ * *blocked on a child*, and the jobs list is precisely where those children are
+ * missing. Walks the tree rather than the list query, so the answer is a
+ * property of the job rather than of the view it is being looked at through.
+ */
+export interface JobSubjobRoster {
+  job_id: string;
+  count: number;
+  subjobs: JobSubjob[];
+}
+
 export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
 
 /** `GET /api/jobs/{job_id}/usage` — see per_job_cost_and_token_accounting.md §7. */

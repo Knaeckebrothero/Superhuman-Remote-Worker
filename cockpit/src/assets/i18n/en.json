@@ -768,6 +768,7 @@
       "reviewQueue": "Open the review queue",
       "snapshotAvailable": "Environment snapshot available",
       "snapshotStats": "S3 snapshot storage",
+      "subjobCount": "{{count}} sub-job(s) in this tree, filter or no filter",
       "view": "Open in Workbench",
       "workspace": "Browse workspace in Gitea"
     },
@@ -819,7 +820,6 @@
     },
     "detail": {
       "auditSteps": "Audit steps",
-      "children": "{{count}} sub-jobs match the current filter.",
       "cost": "Cost",
       "costFloor": "Priced {{priced}} of {{total}} metered events — the real cost is higher.",
       "costFloorHint": "Partially priced: the real cost is higher than shown.",
@@ -839,10 +839,15 @@
       "scopeLabel": "Usage scope",
       "scopeNoSubjobs": "This job has no sub-jobs, so both figures are the same.",
       "scopeSubtree": "Incl. sub-jobs",
+      "showSubjobRows": "Show {{count}} hidden as rows",
+      "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
+      "subjobs": "Sub-jobs ({{count}})",
       "tokens": "Tokens",
       "unknown": "Unknown",
       "usage": "Usage",
       "usageLive": "still running — figures lag by up to 3 min",
+      "waitingNoLiveSubjobs": "Parked on a sub-job, but every one below has finished.",
+      "waitingOnSubjobs": "Parked on {{count}} unfinished sub-job(s) — the work is one level down.",
       "workspace": "Workspace"
     }
   },

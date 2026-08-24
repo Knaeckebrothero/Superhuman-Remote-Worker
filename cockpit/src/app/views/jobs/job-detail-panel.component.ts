@@ -10,12 +10,14 @@ import {TranslocoModule} from '@jsverse/transloco';
 import {
   Job,
   JobProgress,
+  JobSubjob,
   JobUsage,
   WorkspaceContractProjection,
 } from '../../core/models/api.model';
 import {JobSummary} from '../../core/models/audit.model';
-import {AppBadgeComponent} from '../../ui/badge';
+import {AppBadgeComponent, BadgeTone} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -41,6 +43,14 @@ export interface JobDetailState {
   subtreeAttempted: boolean;
   usage: JobUsage | null;
   progress: JobProgress | null;
+  /**
+   * The job's tree, straight from the database rather than from the list query.
+   *
+   * Null while loading or after a failed fetch; an empty array is the positive
+   * answer "this job spawned nothing". The distinction matters — the panel
+   * renders nothing in both cases, but only one of them is a fact.
+   */
+  subjobs: JobSubjob[] | null;
 }
 
 /**
@@ -138,6 +148,59 @@ export function formatUsd(amount: number): string {
   if (amount === 0) return '$0.00';
   if (amount < 0.01) return `$${amount.toPrecision(2)}`;
   return `$${amount.toFixed(2)}`;
+}
+
+/** Short id for the roster, which has far less room than a list row. */
+export function shortJobId(id: string): string {
+  return id.slice(0, 8);
+}
+
+/**
+ * How long a subjob has run, or ran for, in seconds.
+ *
+ * A live subjob is measured against `now` — that is the number the reader
+ * actually wants when the question is "is this thing progressing". Terminal
+ * jobs prefer `completed_at` and fall back to `updated_at`, because
+ * `completed_at` is null on rows that reached a terminal status by a path that
+ * never stamped it (cancellation, older rows).
+ */
+export function subjobElapsedSeconds(sub: JobSubjob, now: number): number | null {
+  const started = Date.parse(sub.created_at);
+  if (!Number.isFinite(started)) return null;
+  const endRaw = sub.completed_at ?? (isTerminalJobStatus(sub.status) ? sub.updated_at : null);
+  const ended = endRaw ? Date.parse(endRaw) : now;
+  if (!Number.isFinite(ended) || ended < started) return null;
+  return Math.floor((ended - started) / 1000);
+}
+
+/** Subjobs still capable of moving on their own. */
+export function liveSubjobCount(subjobs: readonly JobSubjob[]): number {
+  return subjobs.filter((sub) => !isTerminalJobStatus(sub.status)).length;
+}
+
+/**
+ * The sentence a parent owes its reader, or null when its status speaks for
+ * itself.
+ *
+ * `waiting` is the one job status that is meaningless in isolation: the
+ * orchestrator parks a parent there *because* a child is running
+ * (`_spawn_scholar_job` holds it there while the scholar works). A reader
+ * seeing `waiting` on a row with no visible children reasonably concludes the
+ * job is stuck, when in fact the work is happening one level down. That is the
+ * misreading this whole panel section exists to prevent.
+ *
+ * Returned as a key rather than a string so the caller interpolates the count
+ * through transloco — and note the double braces the catalogue needs, which a
+ * typecheck and a full AOT build will both happily accept if you get wrong.
+ */
+export function subjobBlockedKey(
+  parentStatus: string | null | undefined,
+  subjobs: readonly JobSubjob[],
+): string | null {
+  if (parentStatus !== 'waiting') return null;
+  return liveSubjobCount(subjobs) > 0
+    ? 'jobs.detail.waitingOnSubjobs'
+    : 'jobs.detail.waitingNoLiveSubjobs';
 }
 
 @Component({
@@ -272,10 +335,63 @@ export function formatUsd(amount: number): string {
         </div>
       }
 
-      @if (childCount() > 0) {
-        <p class="detail-children">
-          {{ 'jobs.detail.children' | transloco: {count: childCount()} }}
-        </p>
+      @if (subjobs().length > 0) {
+        <div class="detail-subjobs">
+          <div class="subjobs-head">
+            <span class="subjobs-label">
+              {{ 'jobs.detail.subjobs' | transloco: {count: subjobs().length} }}
+            </span>
+            @if (blockedKey(); as key) {
+              <span class="subjobs-blocked">
+                {{ key | transloco: {count: liveCount()} }}
+              </span>
+            }
+            @if (hiddenCount() > 0) {
+              <button
+                type="button"
+                class="subjobs-reveal"
+                (click)="revealRows.emit()"
+                [title]="'jobs.detail.showSubjobRowsHint' | transloco"
+              >
+                {{ 'jobs.detail.showSubjobRows' | transloco: {count: hiddenCount()} }}
+              </button>
+            }
+          </div>
+          <table class="subjob-table">
+            <tbody>
+              @for (sub of subjobs(); track sub.id) {
+                <tr
+                  class="subjob-row"
+                  [class.subjob-live]="!isTerminal(sub.status)"
+                  (click)="subjobSelected.emit(sub.id)"
+                >
+                  <td class="sub-role">
+                    <span [style.padding-left.px]="sub.depth * 12">
+                      {{ sub.config_name || ('jobs.detail.unknown' | transloco) }}
+                    </span>
+                  </td>
+                  <td class="sub-status">
+                    <app-badge [tone]="statusTone(sub.status)" size="xs">
+                      {{ 'jobs.status.' + sub.status | transloco }}
+                    </app-badge>
+                  </td>
+                  <td class="sub-desc">
+                    <span class="sub-desc-text" [title]="sub.description">
+                      {{ sub.description }}
+                    </span>
+                    @if (sub.error_message) {
+                      <span class="sub-error" [title]="sub.error_message">
+                        {{ sub.error_message }}
+                      </span>
+                    }
+                  </td>
+                  <td class="sub-elapsed">{{ elapsedLabel(sub) || '—' }}</td>
+                  <td class="sub-id"><code>{{ shortId(sub.id) }}</code></td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
       }
     </div>
   `,
@@ -431,10 +547,110 @@ export function formatUsd(amount: number): string {
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
       }
-      .detail-children {
-        margin: 0;
-        font-size: 12px;
+      .detail-subjobs {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .subjobs-head {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      .subjobs-label {
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
         color: var(--text-muted);
+      }
+      .subjobs-blocked {
+        font-size: 12px;
+        color: var(--warning);
+      }
+      .subjobs-reveal {
+        background: none;
+        border: none;
+        padding: 0;
+        cursor: pointer;
+        font-size: 12px;
+        color: var(--accent-color);
+        text-decoration: underline;
+      }
+      .subjobs-reveal:hover {
+        color: var(--accent-hover);
+      }
+      .subjob-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .subjob-row {
+        cursor: pointer;
+        border-top: 1px solid var(--border-color);
+      }
+      .subjob-row:hover {
+        background: var(--hover);
+      }
+      .subjob-row td {
+        padding: 5px 8px 5px 0;
+        vertical-align: top;
+      }
+      /* The live row is the answer to "why is the parent waiting" — it earns
+         the only accent in the table. */
+      .subjob-live .sub-role {
+        color: var(--accent-color);
+        font-weight: 600;
+      }
+      .sub-role {
+        color: var(--text-primary);
+        white-space: nowrap;
+        width: 1%;
+      }
+      .sub-status {
+        width: 1%;
+        white-space: nowrap;
+      }
+      .sub-desc {
+        color: var(--text-secondary);
+        max-width: 0;
+      }
+      .sub-desc-text {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .sub-error {
+        display: block;
+        margin-top: 2px;
+        color: var(--danger);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .sub-elapsed {
+        width: 1%;
+        white-space: nowrap;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .sub-id {
+        width: 1%;
+        white-space: nowrap;
+      }
+      .sub-id code {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--text-muted);
+      }
+      @media (max-width: 720px) {
+        /* Narrow: the description and the id are the first things to go —
+           the role, status and elapsed are what answer the question. */
+        .sub-desc,
+        .sub-id {
+          display: none;
+        }
       }
     `,
   ],
@@ -457,11 +673,59 @@ export class JobDetailPanelComponent {
    */
   readonly subtreeRequested = output<void>();
 
+  /** A roster row was clicked — the parent decides what "open" means. */
+  readonly subjobSelected = output<string>();
+
+  /**
+   * The reader wants the hidden subjobs back as real list rows.
+   *
+   * The panel deliberately does not reach for the filter itself: the roster is
+   * a read-only view of a job, while widening the origin filter changes the URL
+   * and the whole page. That belongs to the list.
+   */
+  readonly revealRows = output<void>();
+
   /** Which figure is on screen. Resets with the panel, which is cheap and honest. */
   readonly scope = signal<UsageScope>('job');
 
   protected readonly formatCount = formatCount;
   protected readonly formatUsd = formatUsd;
+  protected readonly shortId = shortJobId;
+  protected readonly isTerminal = isTerminalJobStatus;
+
+  statusTone(status: string): BadgeTone {
+    return jobStatusTone(status);
+  }
+
+  /**
+   * Elapsed time for one roster row.
+   *
+   * A method rather than a computed because a live subjob's elapsed time is
+   * measured against *now*: the value has to be recomputed on each change
+   * detection pass, and the panel is refreshed every 30s by the list's poller
+   * while the job is not terminal.
+   */
+  elapsedLabel(sub: JobSubjob): string | null {
+    return formatDurationSeconds(subjobElapsedSeconds(sub, Date.now()));
+  }
+
+  /** The tree as the server knows it. Empty while loading or after a failure. */
+  readonly subjobs = computed<JobSubjob[]>(() => this.data()?.subjobs ?? []);
+
+  /** Subjobs still able to move on their own. */
+  readonly liveCount = computed(() => liveSubjobCount(this.subjobs()));
+
+  /** Set only for a `waiting` parent — see {@link subjobBlockedKey}. */
+  readonly blockedKey = computed(() => subjobBlockedKey(this.job().status, this.subjobs()));
+
+  /**
+   * Subjobs the list is not showing as rows.
+   *
+   * The gap between the real tree and `childCount` IS the filter, made visible.
+   * Under the default origin filter it equals the whole roster, which is
+   * precisely the state that made a `waiting` parent look stalled.
+   */
+  readonly hiddenCount = computed(() => Math.max(0, this.subjobs().length - this.childCount()));
 
   setScope(scope: UsageScope): void {
     this.scope.set(scope);

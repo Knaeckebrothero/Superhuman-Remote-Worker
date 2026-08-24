@@ -29528,6 +29528,68 @@ async def get_job_usage(
     }
 
 
+@app.get("/api/jobs/{job_id}/subjobs")
+async def get_job_subjobs(request: Request, job_id: str) -> dict[str, Any]:
+    """The subjob roster for one job — what it spawned, and where each stands.
+
+    Exists because a parent's own status is not self-explanatory. ``waiting``
+    means *blocked on a child* (``_spawn_scholar_job`` holds the parent there
+    while the scholar runs), so a reader looking at a ``waiting`` row is looking
+    at the one status that cannot be understood without its children — and the
+    jobs list is exactly where they are missing. Paging is over display roots
+    and children ride along only if they *also* match the filter, so under the
+    default ``origin IN ('user','session')`` a subjob never does. The row shows
+    a parked-looking parent and no children whatsoever.
+
+    So this deliberately does **not** reuse the list's query. It walks the tree
+    (``get_job_subjob_roster``), which makes the answer independent of the
+    caller's filters: the roster of a job is a property of the job, not of the
+    view someone is looking at it through.
+
+    Authorization is the parent's. A subjob inherits its parent's project and
+    owner at creation, so seeing the parent is seeing the family, and every
+    field returned is one ``GET /api/jobs`` already publishes for a child that
+    the filter happened to let through.
+
+    ``count`` is the honest size of the tree — the number the list's own
+    ``childCount`` cannot give, because that one counts what survived filtering.
+    """
+    await require_job_access(request, postgres_db, job_id)
+
+    try:
+        rows = await postgres_db.get_job_subjob_roster(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {
+        "job_id": job_id,
+        "count": len(rows),
+        "subjobs": [
+            {
+                "id": str(row["id"]),
+                "parent_job_id": str(row["parent_job_id"])
+                if row.get("parent_job_id")
+                else None,
+                # 0 = a direct child. Present so a nested renderer does not have
+                # to rebuild the tree from parent ids it may only partly hold.
+                "depth": row["depth"],
+                "description": row["description"],
+                "status": row["status"],
+                # The role label: 'scholar', 'critic', 'curator'. This is what
+                # makes a roster row readable at a glance, and it is the same
+                # value the list's own child rows badge themselves with.
+                "config_name": row["config_name"],
+                "origin": row["origin"],
+                "error_message": row["error_message"],
+                "created_at": row["created_at"],
+                "completed_at": row["completed_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.get("/api/jobs/{job_id}/audit")
 async def get_job_audit(
     request: Request,

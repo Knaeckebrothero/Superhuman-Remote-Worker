@@ -1909,12 +1909,47 @@ class PostgresDB:
         async with self.acquire() as conn:
             fetched = await conn.fetch(
                 f"""
-                WITH {matched_cte},
+                WITH RECURSIVE {matched_cte},
                 page AS (
                     SELECT id, created_at
                       FROM display_roots
                      ORDER BY created_at DESC, id DESC
                      LIMIT {limit_param} OFFSET {offset_param}
+                ),
+                -- Every row this query is about to return: the page's display
+                -- roots plus the children riding along with them. Counting is
+                -- seeded from all of them, not just the roots, so a nested
+                -- child's own badge is right too rather than silently 0.
+                roster_seed AS (
+                    SELECT id FROM page
+                    UNION
+                    SELECT j.id
+                      FROM jobs j
+                     WHERE j.parent_job_id IN (SELECT id FROM page)
+                       AND j.id IN (SELECT id FROM matched)
+                ),
+                -- The UNFILTERED tree under each of those rows. This is the
+                -- one count in the list that deliberately ignores the caller's
+                -- filters: it answers "is there something under here", and the
+                -- default origin filter hides every subjob, so a filtered count
+                -- would be 0 on every row and the reader could never tell a
+                -- childless job from one whose children are merely hidden.
+                -- Depth-capped like get_job_descendant_ids: the schema permits
+                -- a cycle and an uncapped walk would spin.
+                subtree AS (
+                    SELECT s.id AS root_id, j.id, 0 AS depth
+                      FROM roster_seed s
+                      JOIN jobs j ON j.parent_job_id = s.id
+                    UNION ALL
+                    SELECT t.root_id, j.id, t.depth + 1
+                      FROM jobs j
+                      JOIN subtree t ON j.parent_job_id = t.id
+                     WHERE t.depth < 20
+                ),
+                subtree_counts AS (
+                    SELECT root_id, COUNT(DISTINCT id) AS n
+                      FROM subtree
+                     GROUP BY root_id
                 )
                 SELECT j.id, j.description, j.status, j.origin,
                        j.config_name, j.assigned_agent_id, j.user_id,
@@ -1931,13 +1966,15 @@ class PostgresDB:
                        (pa.id IS NOT NULL) AS pending_approval,
                        pa.id AS pending_approval_request_id,
                        page.id AS display_root_id,
-                       (page.id = j.id) AS is_display_root
+                       (page.id = j.id) AS is_display_root,
+                       COALESCE(sc.n, 0) AS subjob_count
                 FROM page
                 JOIN jobs j
                   ON j.id = page.id
                   OR (j.parent_job_id = page.id
                       AND j.id IN (SELECT id FROM matched))
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN subtree_counts sc ON sc.root_id = j.id
                 LEFT JOIN LATERAL (
                     SELECT s.id FROM sudo_approval_requests s
                     WHERE s.job_id = j.id AND s.status = 'pending'
@@ -4585,6 +4622,70 @@ class PostgresDB:
             )
 
         return [str(row["id"]) for row in rows]
+
+    async def get_job_subjob_roster(
+        self, job_id: str, *, max_depth: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Every descendant job, with enough detail to explain a parent's status.
+
+        The roster the jobs list structurally cannot supply. A parent sitting in
+        ``waiting`` is *by definition* blocked on a child — ``_spawn_scholar_job``
+        holds it there while the scholar runs — but the list's children are
+        filtered: under the default ``origin IN ('user','session')`` a subjob is
+        never in the matched set, so the row rides along with no children at all
+        and the parent's status reads as stalled work. This walks the tree rather
+        than the filtered page, so what it returns never depends on what the
+        reader happens to be filtering for.
+
+        Shares the recursion and the depth cap with
+        :meth:`get_job_descendant_ids`, terminal children included, for the same
+        reason that method gives: a finished critic is exactly the thing that
+        explains why its parent moved on. Deduped by id so a cycle (which the
+        schema permits) yields each job once, at its shallowest depth.
+
+        Every column here is already public on ``GET /api/jobs`` — this adds no
+        field the list would not have shown had the filter let the child through.
+
+        Ordered by depth then creation: the order they were spawned in, and the
+        order a nested list wants to render.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id, parent_job_id, 0 AS depth
+                    FROM jobs
+                    WHERE parent_job_id = $1
+
+                    UNION ALL
+
+                    SELECT j.id, j.parent_job_id, d.depth + 1
+                    FROM jobs j
+                    JOIN descendants d ON j.parent_job_id = d.id
+                    WHERE d.depth < $2
+                ),
+                unique_descendants AS (
+                    SELECT DISTINCT ON (id) id, parent_job_id, depth
+                      FROM descendants
+                     ORDER BY id, depth
+                )
+                SELECT j.id, j.parent_job_id, u.depth, j.description, j.status,
+                       j.config_name, j.origin, j.error_message,
+                       j.created_at, j.completed_at, j.updated_at
+                  FROM unique_descendants u
+                  JOIN jobs j ON j.id = u.id
+                 ORDER BY u.depth, j.created_at, j.id
+                """,
+                uuid_val,
+                max_depth,
+            )
+
+        return [dict(row) for row in rows]
 
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]

@@ -272,6 +272,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         [data]="jobDetails()[row.job.id] ?? null"
                         [childCount]="getChildCount(row.job.id)"
                         (subtreeRequested)="loadSubtreeUsage(row.job.id)"
+                        (subjobSelected)="openSubjob($event)"
+                        (revealRows)="revealSubjobRows()"
                       />
                     </td>
                   </tr>
@@ -293,6 +295,13 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                       >
                         <span class="expand-chevron">&#9206;</span>
                       </button>
+                      @if (!row.isChild && (row.job.subjob_count ?? 0) > 0) {
+                        <span
+                          class="subjob-count"
+                          [class.live]="row.job.status === 'waiting'"
+                          [title]="'jobs.tooltip.subjobCount' | transloco: {count: row.job.subjob_count}"
+                        >{{ row.job.subjob_count }}</span>
+                      }
                       @if (row.isChild) {
                         <span class="child-connector">\u2514</span>
                       }
@@ -899,6 +908,31 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
 
       .expand-btn.expanded .expand-chevron {
         transform: rotate(180deg);
+      }
+
+      /* The UNFILTERED size of the tree under this row. It exists because the
+         rendered child count cannot carry this signal: the default origin
+         filter hides every subjob, so the row would otherwise look childless
+         whether or not it has a whole research job running underneath it. */
+      .subjob-count {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 16px;
+        height: 16px;
+        padding: 0 4px;
+        border-radius: var(--radius-pill);
+        background: var(--surface-2);
+        color: var(--text-secondary);
+        font-size: 10px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      /* A waiting job is blocked on a child, so on that status the count is
+         not a footnote — it is the explanation for the row's own state. */
+      .subjob-count.live {
+        background: var(--warning-tint);
+        color: var(--warning);
       }
 
       .child-connector {
@@ -1784,12 +1818,19 @@ export class JobListComponent implements OnInit, OnDestroy {
         usageSubtree: null,
         loadingSubtree: false,
         subtreeAttempted: false,
+        subjobs: null,
       },
     }));
     forkJoin({
       detail: this.api.getJob(jobId),
       usage: this.api.getJobUsage(jobId),
       progress: this.api.getJobProgress(jobId),
+      // Fetched eagerly, unlike the subtree cost figure. That one is lazy
+      // because most jobs are leaves and its answer usually repeats what is
+      // already on screen; this one is the opposite — the reader cannot know
+      // to ask for it, and for a `waiting` parent it is the single thing that
+      // explains the status they opened the panel to understand.
+      subjobs: this.api.getJobSubjobs(jobId),
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
@@ -1798,10 +1839,12 @@ export class JobListComponent implements OnInit, OnDestroy {
           [jobId]: {
             ...cache[jobId],
             loading: false,
-            error: !result.detail && !result.usage && !result.progress,
+            error:
+              !result.detail && !result.usage && !result.progress && !result.subjobs,
             detail: result.detail,
             usage: result.usage,
             progress: result.progress,
+            subjobs: result.subjobs?.subjobs ?? null,
           },
         }));
       });
@@ -1948,6 +1991,35 @@ export class JobListComponent implements OnInit, OnDestroy {
     const next = new Set(this.ideLoadingJobIds());
     next.delete(jobId);
     this.ideLoadingJobIds.set(next);
+  }
+
+  /**
+   * Open a subjob picked from a panel's roster.
+   *
+   * `viewJob` is what the row's own View button does, so a roster click behaves
+   * the same way. If the subjob also happens to be on screen as a row — which
+   * it is once the reader has widened the origin filter — its panel opens too,
+   * so the click lands somewhere visible rather than only changing state the
+   * workbench can see.
+   */
+  openSubjob(jobId: string): void {
+    this.viewJob(jobId);
+    if (!this.jobs().some((job) => job.id === jobId)) return;
+    if (!this.expandedJobIds().has(jobId)) this.toggleExpand(jobId);
+  }
+
+  /**
+   * Bring hidden subjobs back as real list rows.
+   *
+   * Adds `subjob` to the origin filter rather than clearing it: the reader
+   * asked to see subjobs, not to also unhide automation, loop, officer and
+   * bench work. The filter chips then say so, and the change is in the URL like
+   * every other filter, so it is shareable and reversible by the back button.
+   */
+  revealSubjobRows(): void {
+    const current = this.filters().origin;
+    if (current.length === 0 || current.includes('subjob')) return;
+    this.patchFilters({origin: [...current, 'subjob']});
   }
 
   viewJob(jobId: string): void {
