@@ -155,6 +155,16 @@ export interface JobSummary {
   display_root_id?: string;
   /** True when this row IS its display root, false when it is a child of one. */
   is_display_root?: boolean;
+  /**
+   * How many jobs hang under this one in the database — the UNFILTERED tree.
+   *
+   * Deliberately not the number of child rows the list is showing. Those two
+   * disagree by design: the default `origin` filter hides every subjob, so the
+   * rendered child count is 0 on every row and cannot distinguish a job with no
+   * children from one whose children are merely filtered out. This is the count
+   * that tells a reader there is something under here worth opening.
+   */
+  subjob_count?: number;
   /** Safe requested/assigned/effective workspace tier observation. */
   workspace_contract?: WorkspaceContractProjection;
 }

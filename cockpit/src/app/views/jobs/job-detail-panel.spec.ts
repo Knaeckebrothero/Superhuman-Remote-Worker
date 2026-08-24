@@ -5,9 +5,13 @@ import {
   formatDurationSeconds,
   formatUsd,
   jobModelLabel,
+  liveSubjobCount,
+  shortJobId,
+  subjobBlockedKey,
+  subjobElapsedSeconds,
   workspaceBackendLabel,
 } from './job-detail-panel.component';
-import type {Job, JobUsage} from '../../core/models/api.model';
+import type {Job, JobSubjob, JobUsage} from '../../core/models/api.model';
 
 /**
  * The panel's job is to be honest about what it does not know, so that is what
@@ -181,5 +185,135 @@ describe('formatCount', () => {
     expect(formatCount(0)).toBe('0');
     expect(formatCount(null)).toBe('—');
     expect(formatCount(undefined)).toBe('—');
+  });
+});
+
+/**
+ * The roster half of the panel.
+ *
+ * These helpers exist because a parent's status is not self-explanatory:
+ * `waiting` means *blocked on a child*, and the jobs list is precisely where
+ * those children are missing — the default `origin` filter excludes every
+ * subjob, so a parked parent renders with no children and reads as stalled.
+ * The panel is the only surface that can say otherwise, and `subjobBlockedKey`
+ * is where it decides to.
+ */
+
+const HOUR = 3600_000;
+const NOW = Date.parse('2026-08-23T12:00:00Z');
+
+function sub(over: Partial<JobSubjob> = {}): JobSubjob {
+  return {
+    id: 'a2826a91-38a7-4d25-b889-46fabcc93b96',
+    parent_job_id: 'cac3f2b1-be31-4e6a-9c07-ef84d535ae9b',
+    depth: 0,
+    description: 'Research phase for: build a calculator',
+    status: 'processing',
+    config_name: 'scholar',
+    origin: 'subjob',
+    error_message: null,
+    created_at: '2026-08-23T10:00:00Z',
+    completed_at: null,
+    updated_at: '2026-08-23T11:00:00Z',
+    ...over,
+  };
+}
+
+describe('shortJobId', () => {
+  it('keeps the first segment, which is what people actually match on', () => {
+    expect(shortJobId('a2826a91-38a7-4d25-b889-46fabcc93b96')).toBe('a2826a91');
+  });
+
+  it('does not throw on an id shorter than the slice', () => {
+    expect(shortJobId('abc')).toBe('abc');
+  });
+});
+
+describe('subjobElapsedSeconds', () => {
+  it('measures a running subjob against now, not against its last update', () => {
+    // The whole point of the number: "is this thing progressing". A live row
+    // measured to `updated_at` would freeze the moment the row stopped being
+    // written to, which is exactly when a reader starts to worry.
+    expect(subjobElapsedSeconds(sub(), NOW)).toBe(2 * 3600);
+  });
+
+  it('prefers completed_at once the subjob is terminal', () => {
+    const elapsed = subjobElapsedSeconds(
+      sub({status: 'completed', completed_at: '2026-08-23T10:30:00Z'}),
+      NOW,
+    );
+    expect(elapsed).toBe(30 * 60);
+  });
+
+  it('falls back to updated_at for a terminal row that never stamped completed_at', () => {
+    // Cancellation and older rows reach a terminal status without stamping it;
+    // measuring those against `now` would show a finished job still counting up.
+    const elapsed = subjobElapsedSeconds(
+      sub({status: 'cancelled', completed_at: null, updated_at: '2026-08-23T11:00:00Z'}),
+      NOW,
+    );
+    expect(elapsed).toBe(3600);
+  });
+
+  it('returns null rather than a negative age when the clocks disagree', () => {
+    const elapsed = subjobElapsedSeconds(
+      sub({status: 'completed', completed_at: '2026-08-23T09:00:00Z'}),
+      NOW,
+    );
+    expect(elapsed).toBeNull();
+  });
+
+  it('returns null on an unparseable timestamp instead of NaN', () => {
+    expect(subjobElapsedSeconds(sub({created_at: 'not a date'}), NOW)).toBeNull();
+  });
+});
+
+describe('liveSubjobCount', () => {
+  it('counts only what can still move on its own', () => {
+    const rows = [
+      sub({status: 'processing'}),
+      sub({status: 'completed'}),
+      sub({status: 'failed'}),
+      sub({status: 'waiting'}),
+    ];
+    expect(liveSubjobCount(rows)).toBe(2);
+  });
+
+  it('treats pending_review as live, matching the shared vocabulary', () => {
+    // Not terminal: an approval flips it to completed. A panel that called it
+    // finished would stop explaining a parent that is still genuinely blocked.
+    expect(liveSubjobCount([sub({status: 'pending_review'})])).toBe(1);
+  });
+
+  it('is zero for an empty roster', () => {
+    expect(liveSubjobCount([])).toBe(0);
+  });
+});
+
+describe('subjobBlockedKey', () => {
+  it('explains a waiting parent that has a live child', () => {
+    expect(subjobBlockedKey('waiting', [sub({status: 'processing'})])).toBe(
+      'jobs.detail.waitingOnSubjobs',
+    );
+  });
+
+  it('says so when a waiting parent has no live child left', () => {
+    // A real state, and the more alarming one: the parent is parked but nothing
+    // is working. Collapsing it into the same message would hide a stuck job.
+    expect(subjobBlockedKey('waiting', [sub({status: 'completed'})])).toBe(
+      'jobs.detail.waitingNoLiveSubjobs',
+    );
+  });
+
+  it('stays silent for every other parent status', () => {
+    // `waiting` is the only status whose meaning depends on the children.
+    for (const status of ['processing', 'completed', 'failed', 'pending_review', 'paused']) {
+      expect(subjobBlockedKey(status, [sub()])).toBeNull();
+    }
+  });
+
+  it('stays silent when the status is missing', () => {
+    expect(subjobBlockedKey(null, [sub()])).toBeNull();
+    expect(subjobBlockedKey(undefined, [sub()])).toBeNull();
   });
 });

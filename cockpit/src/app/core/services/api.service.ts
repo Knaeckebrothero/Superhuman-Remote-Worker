@@ -51,6 +51,7 @@ import {
     JobDiffSummary,
     JobProgress,
     JobUsage,
+    JobSubjobRoster,
     JobRejectResult,
     JobReviewSessionResult,
     JobStatistics,
@@ -2165,6 +2166,27 @@ export class ApiService {
     return this.http.get<JobUsage>(`${this.baseUrl}/jobs/${jobId}/usage${params}`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch usage for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * The subjob roster for one job — what it spawned and where each stands.
+   *
+   * Independent of the jobs list's filters by construction: the server walks
+   * the tree rather than re-running the list query. That is the whole point —
+   * under the default `origin` filter a subjob is never in the list's matched
+   * set, so a `waiting` parent renders with no children and its status reads as
+   * stalled work when a child is in fact running.
+   *
+   * Degrades to null like the rest of the panel's sources, so a failure here
+   * costs the roster and nothing else.
+   */
+  getJobSubjobs(jobId: string): Observable<JobSubjobRoster | null> {
+    return this.http.get<JobSubjobRoster>(`${this.baseUrl}/jobs/${jobId}/subjobs`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch subjobs for job ${jobId}:`, error);
         return of(null);
       }),
     );

@@ -768,6 +768,7 @@
       "reviewQueue": "Prüfungswarteschlange öffnen",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
       "snapshotStats": "S3-Snapshot-Speicher",
+      "subjobCount": "{{count}} Unterauftrag/-aufträge in diesem Baum, unabhängig vom Filter",
       "view": "In der Workbench öffnen",
       "workspace": "Arbeitsbereich in Gitea öffnen"
     },
@@ -819,7 +820,6 @@
     },
     "detail": {
       "auditSteps": "Audit-Schritte",
-      "children": "{{count}} Teil-Jobs entsprechen dem aktuellen Filter.",
       "cost": "Kosten",
       "costFloor": "{{priced}} von {{total}} erfassten Ereignissen bepreist — die tatsächlichen Kosten liegen höher.",
       "costFloorHint": "Teilweise bepreist: die tatsächlichen Kosten liegen höher als angezeigt.",
@@ -839,10 +839,15 @@
       "scopeLabel": "Verbrauchsbereich",
       "scopeNoSubjobs": "Dieser Job hat keine Teil-Jobs, beide Werte sind daher identisch.",
       "scopeSubtree": "Inkl. Teil-Jobs",
+      "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
+      "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
+      "subjobs": "Unteraufträge ({{count}})",
       "tokens": "Tokens",
       "unknown": "Unbekannt",
       "usage": "Verbrauch",
       "usageLive": "läuft noch — Werte bis zu 3 Min. verzögert",
+      "waitingNoLiveSubjobs": "Wartet auf einen Unterauftrag, aber alle darunter sind fertig.",
+      "waitingOnSubjobs": "Wartet auf {{count}} unfertige(n) Unterauftrag — die Arbeit liegt eine Ebene tiefer.",
       "workspace": "Workspace"
     }
   },

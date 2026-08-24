@@ -41,6 +41,7 @@ function mountLogic(overrides: {
     getJob: vi.fn().mockReturnValue(of(null)),
     getJobUsage: vi.fn().mockReturnValue(of(null)),
     getJobProgress: vi.fn().mockReturnValue(of(null)),
+    getJobSubjobs: vi.fn().mockReturnValue(of(null)),
     ...overrides.api,
   } as unknown as ApiService;
 
@@ -54,7 +55,7 @@ function mountLogic(overrides: {
     ],
     providers: [
       {provide: ApiService, useValue: api},
-      {provide: DataService, useValue: {}},
+      {provide: DataService, useValue: {setCurrentJob: vi.fn()}},
       {provide: UserService, useValue: {currentUser: signal({id: 'user-1'})}},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: Router, useValue: {navigate}},
@@ -361,6 +362,167 @@ describe('JobListComponent — server-resolved tree', () => {
 
     expect(component.rootCount()).toBe(2);
     expect(component.getChildCount('root-1')).toBe(1);
+  });
+
+  /**
+   * The subjob roster.
+   *
+   * A parent parked in `waiting` is blocked on a child, but the default origin
+   * filter (`user`, `session`) excludes every subjob from the matched set, so
+   * the row rides along with no children and reads as stalled work. The panel
+   * asks the server for the real tree instead; these pin the wiring that makes
+   * that possible and the escape hatch back to real rows.
+   */
+
+  it('fetches the roster with the rest of the panel, not lazily', () => {
+    // Unlike the subtree COST figure, which is lazy because most jobs are
+    // leaves and its answer usually repeats what is already shown. The roster
+    // is the opposite: the reader cannot know to ask for it.
+    const getJobSubjobs = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobSubjobs,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+
+    expect(getJobSubjobs).toHaveBeenCalledTimes(1);
+    expect(getJobSubjobs).toHaveBeenCalledWith('root-1');
+  });
+
+  it('unwraps the roster envelope into the panel state', () => {
+    const roster = {
+      job_id: 'root-1',
+      count: 1,
+      subjobs: [{id: 'kid-a', status: 'processing', config_name: 'scholar'}],
+    };
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobSubjobs: vi.fn().mockReturnValue(of(roster)),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+
+    expect(component.jobDetails()['root-1'].subjobs).toEqual(roster.subjobs);
+  });
+
+  it('keeps the panel alive when only the roster call fails', () => {
+    // Each source degrades to null independently; `error` is reserved for a
+    // total failure, so a missing roster must not blank out the cost figures.
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJob: vi.fn().mockReturnValue(of({id: 'root-1'})),
+        getJobSubjobs: vi.fn().mockReturnValue(of(null)),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+
+    const state = component.jobDetails()['root-1'];
+    expect(state.error).toBe(false);
+    expect(state.subjobs).toBeNull();
+  });
+
+  it('adds subjob to the origin filter when asked to show hidden rows', () => {
+    const {fixture, component, navigate} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    component.revealSubjobRows();
+
+    const extras = navigate.mock.calls[0][1];
+    expect(extras.queryParams.origin).toEqual(['user', 'session', 'subjob']);
+  });
+
+  it('widens the filter rather than clearing it', () => {
+    // The reader asked to see subjobs, not to also unhide automation, loop,
+    // officer and bench work. Clearing would be a much larger change than the
+    // one the button offers.
+    const {fixture, component, navigate} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    component.revealSubjobRows();
+
+    expect(navigate.mock.calls[0][1].queryParams.origin).not.toBe('all');
+  });
+
+  it('does not touch an origin filter that already shows everything', () => {
+    // An empty origin list is the "every origin" sentinel; appending `subjob`
+    // to it would NARROW the view to three origins while the reader was asking
+    // to see more.
+    const params = new BehaviorSubject(paramMap({origin: 'all'}));
+    const {fixture, component, navigate} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')])))} as Partial<ApiService>,
+      params,
+    });
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    component.revealSubjobRows();
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('does not re-add subjob when it is already in the filter', () => {
+    const params = new BehaviorSubject(paramMap({origin: ['user', 'subjob']}));
+    const {fixture, component, navigate} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')])))} as Partial<ApiService>,
+      params,
+    });
+    fixture.detectChanges();
+    navigate.mockClear();
+
+    component.revealSubjobRows();
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('opens a roster subjob that is also on screen, expanding its panel', () => {
+    const rows = [
+      job('root-1'),
+      job('kid-a', {is_display_root: false, display_root_id: 'root-1'}),
+    ];
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(rows)))} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.openSubjob('kid-a');
+
+    expect(component.selectedJobId()).toBe('kid-a');
+    expect(component.isExpanded('kid-a')).toBe(true);
+  });
+
+  it('selects a roster subjob that is not on screen without inventing a row', () => {
+    // The common case: the roster lists a child the filter is hiding, so there
+    // is nothing in the list to expand. Selecting it must still work rather
+    // than throwing or leaving a phantom expanded id behind.
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')])))} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.openSubjob('hidden-kid');
+
+    expect(component.selectedJobId()).toBe('hidden-kid');
+    expect(component.isExpanded('hidden-kid')).toBe(false);
   });
 
   it('reports the FILTERED child count, so the expander cannot overpromise', () => {
