@@ -778,6 +778,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             ready=ready,
             message="Ready to accept jobs" if ready else "Not ready",
             connections=status["connections"],
+            capabilities={"resolved_config_resume": True},
         )
 
     @app.get("/status", response_model=AgentStatusResponse, tags=["Health"])
@@ -1135,7 +1136,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         try:
             validate_worker_workspace_projection(
                 config_override=request.config_override,
-                resolved_config=None,
+                resolved_config=request.resolved_config,
                 workspace_runtime=request.workspace_runtime,
             )
         except WorkspaceContractError as exc:
@@ -1170,6 +1171,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["config_upload_id"] = request.config_upload_id
         if request.config_override:
             resume_metadata["config_override"] = request.config_override
+        if request.resolved_config:
+            resume_metadata["resolved_config"] = request.resolved_config
         if request.datasources:
             resume_metadata["datasources"] = request.datasources
         if request.repositories:

@@ -4831,66 +4831,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if isinstance(config_override, str):
             config_override = json.loads(config_override)
 
-        # Resume PEP (decision 9, B3): resume replays the write-once frozen blob and
-        # would otherwise skip grant enforcement — a grant revoked since dispatch must
-        # still block the resume. Re-resolve the merged config and re-check the
-        # runner's CURRENT grants. Fail closed: deny -> mark failed + refuse.
-        if await _user_experts_enabled():
-            try:
-                _rbase = canonical_config_name(job.get("config_name") or "worker_base")
-                _rcap: dict = {}
-                resolve_config(
-                    base_config_name=_rbase,
-                    base_defaults=await _resolve_default_models(job.get("user_id")),
-                    expert_row=(
-                        await postgres_db.get_expert_by_id(str(job["expert_id"]))
-                        if job.get("expert_id")
-                        else None
-                    ),
-                    request_override=config_override,
-                    expert_type="worker",
-                    capture=_rcap,
-                )
-                await _enforce_dispatch_grants(
-                    _rcap["merged_fragment"],
-                    runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
-                    project_ids=[str(job["project_id"])]
-                    if job.get("project_id")
-                    else [],
-                    runner_kind=str(job.get("runner_kind") or "user"),
-                )
-            except GrantDenied as gd:
-                logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
-                if not COMPLETION_COMMANDS_ENABLED:
-                    await postgres_db.update_job_status(
-                        str(job["id"]),
-                        status="failed",
-                        error_message=_grant_violations_detail(gd.violations),
-                    )
-                return False
-
         if resolved_ds:
             config_override = _build_datasource_tool_override(
                 resolved_ds, config_override
             )
-
-        # Re-inject API keys and model routing. The first dispatch already
-        # did this, but the result was passed inline to the agent and never
-        # written back to jobs.config_override — so on resume the persisted
-        # row only carries the bare creation-time override. Without this
-        # call, an orphaned/paused job picked up by a fresh agent would have
-        # no llm.api_key and the loader would silently fall back to
-        # OPENAI_API_KEY=not-needed and 401 against the user's router.
-        config_override = await _inject_dispatch_credentials(
-            job,
-            config_override,
-            include_kb_profile=has_knowledge_scope,
-        )
-        logger.info(
-            "Dispatch (resume): job %s injected env_key names=%s",
-            job_id,
-            sorted((config_override.get("env_keys") or {}).keys()),
-        )
 
         config_override, workspace_decision = _inject_matching_workspace_config(
             job, config_override, replace_endpoint=True
@@ -4986,6 +4930,121 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                     )
                 return False
 
+        # Resolve the same complete, layered config used for a fresh dispatch,
+        # after datasource/workspace overlays have been attached. The runtime
+        # user-experts switch controls grant enforcement only; it must not make
+        # a resumed job fall back to the generic pod's boot config. The env flag
+        # remains the compatibility switch for resolved-config delivery.
+        experts_db_enabled = _is_experts_db_enabled()
+        resolved_resume_supported = False
+        if experts_db_enabled:
+            ready_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/ready"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    ready_response = await client.get(ready_url)
+                if ready_response.status_code == 200:
+                    ready_payload = ready_response.json()
+                    resolved_resume_supported = bool(
+                        (ready_payload.get("capabilities") or {}).get(
+                            "resolved_config_resume"
+                        )
+                    )
+            except Exception as exc:
+                # Rolling-upgrade compatibility is fail-safe: an old agent (or
+                # one whose readiness surface cannot be probed) receives the
+                # same credential-injected flat override it understood before.
+                logger.info(
+                    "Resume dispatch: agent %s resolved-config capability "
+                    "unavailable (%s); using legacy payload",
+                    agent_id,
+                    type(exc).__name__,
+                )
+        user_experts_enabled = await _user_experts_enabled()
+        resolved_config: dict[str, Any] | None = None
+        if resolved_resume_supported or user_experts_enabled:
+            try:
+                _rbase = canonical_config_name(job.get("config_name") or "worker_base")
+                _rcap: dict = {}
+                _skills_payload = await _gather_in_scope_skills(
+                    str(job["user_id"]) if job.get("user_id") else None,
+                    [str(job["project_id"])] if job.get("project_id") else None,
+                )
+                _req_override = await _seed_registry_model_overrides(
+                    config_override,
+                    user_id=str(job["user_id"]) if job.get("user_id") else None,
+                )
+                _resolved = resolve_config(
+                    base_config_name=_rbase,
+                    base_defaults=await _resolve_default_models(job.get("user_id")),
+                    expert_row=(
+                        await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                        if job.get("expert_id")
+                        else None
+                    ),
+                    request_override=_req_override,
+                    expert_type="worker",
+                    capture=_rcap,
+                    skills=_skills_payload,
+                )
+                from src.core.skill_resolution import filter_bound_skills
+
+                filter_bound_skills(_resolved)
+
+                # Resume PEP (decision 9, B3): a grant revoked since dispatch
+                # must still block the resume. Keep this check before credential
+                # injection and delivery, and fail closed on an explicit denial.
+                if user_experts_enabled:
+                    await _enforce_dispatch_grants(
+                        _rcap["merged_fragment"],
+                        runner_user_id=(
+                            str(job["user_id"]) if job.get("user_id") else None
+                        ),
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                        runner_kind=str(job.get("runner_kind") or "user"),
+                    )
+
+                if experts_db_enabled and resolved_resume_supported:
+                    resolved_config = await inject_blob_credentials(
+                        _resolved,
+                        lambda co: _inject_dispatch_credentials(
+                            job,
+                            co,
+                            include_kb_profile=has_knowledge_scope,
+                        ),
+                    )
+            except GrantDenied as gd:
+                logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
+                if not COMPLETION_COMMANDS_ENABLED:
+                    await postgres_db.update_job_status(
+                        str(job["id"]),
+                        status="failed",
+                        error_message=_grant_violations_detail(gd.violations),
+                    )
+                return False
+
+        # The blob and flat fallback are mutually exclusive on the wire. Inject
+        # credentials once into whichever representation will actually be sent:
+        # inject_blob_credentials for the preferred path, the legacy flat
+        # override only when resolved-config delivery is disabled.
+        if resolved_config is None:
+            config_override = await _inject_dispatch_credentials(
+                job,
+                config_override,
+                include_kb_profile=has_knowledge_scope,
+            )
+            injected_env_keys = (config_override.get("env_keys") or {}).keys()
+        else:
+            injected_env_keys = (
+                (resolved_config.get("agent") or {}).get("env_keys") or {}
+            ).keys()
+        logger.info(
+            "Dispatch (resume): job %s injected env_key names=%s",
+            job_id,
+            sorted(injected_env_keys),
+        )
+
         # Extract queued feedback (stored by the resume endpoint when no agent
         # was available). The pop only mutates this local copy — the DB keys are
         # dropped AFTER the agent accepts (below), so a rejected resume no longer
@@ -5014,7 +5073,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 job.get("config_name") or "worker_base"
             ),
             "config_upload_id": job_context.get("config_upload_id"),
-            "config_override": config_override,
+            "config_override": None if resolved_config else config_override,
+            "resolved_config": resolved_config,
             "datasources": datasources_payload,
             "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job.get("status"),
