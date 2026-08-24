@@ -221,7 +221,20 @@ APP_MANAGED_REPOSITORY_THREAD_DETACH = (
     ROOT
     / "orchestrator/database/migrations/app/0177_managed_repository_thread_detach.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_THREAD_DETACH
+APP_SUDO_REQUESTS_THREAD_SCOPE = (
+    ROOT / "orchestrator/database/migrations/app/0178_sudo_requests_thread_scope.sql"
+)
+APP_SUDO_REQUESTS_ENTITY_CHECK = (
+    ROOT / "orchestrator/database/migrations/app/0179_sudo_requests_entity_check.sql"
+)
+APP_SUDO_REQUESTS_THREAD_INDEX = (
+    ROOT / "orchestrator/database/migrations/app/0180_sudo_requests_thread_idx.notx.sql"
+)
+APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS = (
+    ROOT
+    / "orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -4202,3 +4215,68 @@ async def test_app_composite_foreign_keys_fail_closed_on_postgres16(
             await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
         finally:
             await admin.close()
+
+
+def test_sudo_thread_scope_chain_defers_every_table_scan_to_0181() -> None:
+    """0178-0181 broaden sudo ownership without ever scanning under a lock.
+
+    The split is not cosmetic: the FK and the CHECK land NOT VALID, the lookup
+    index is built CONCURRENTLY in its own non-transactional file, and only the
+    last file pays the validation scans. Collapsing any two of them back
+    together reintroduces an ACCESS EXCLUSIVE scan on the sudo gate's table.
+    """
+
+    scope = APP_SUDO_REQUESTS_THREAD_SCOPE.read_text()
+    check = APP_SUDO_REQUESTS_ENTITY_CHECK.read_text()
+    index = APP_SUDO_REQUESTS_THREAD_INDEX.read_text()
+    validate = APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS.read_text()
+
+    chain = (
+        (scope, "0178_sudo_requests_thread_scope.sql", None),
+        (check, "0179_sudo_requests_entity_check.sql", scope),
+        (index, "0180_sudo_requests_thread_idx.notx.sql", check),
+        (validate, "0181_sudo_requests_validate_constraints.sql", index),
+    )
+    previous_name = "0177_managed_repository_thread_detach.sql"
+    for raw, name, _ in chain:
+        assert f"-- migration:     {name}" in raw
+        assert f"-- depends-on:    {previous_name}" in raw
+        assert "-- expected:" in raw
+        assert "-- locks:" in raw
+        previous_name = name
+
+    for raw in (scope, check, validate):
+        sql = _compact(raw)
+        assert "-- transactional: yes" in raw
+        assert "SET LOCAL lock_timeout = '2s'" in sql
+        assert "SET LOCAL statement_timeout = '15min'" in sql
+        assert "SET LOCAL idle_in_transaction_session_timeout = '5min'" in sql
+        assert "SET LOCAL timezone = 'UTC'" in sql
+
+    scope_sql = _compact(scope)
+    assert "ALTER COLUMN job_id DROP NOT NULL" in scope_sql
+    assert "ADD COLUMN thread_id uuid" in scope_sql
+    assert "REFERENCES public.threads(id) ON DELETE CASCADE NOT VALID" in scope_sql
+    assert "squawk-ignore ban-drop-not-null" in scope
+
+    assert "CHECK (num_nonnulls(job_id, thread_id) = 1) NOT VALID" in _compact(check)
+
+    index_body = _compact(
+        "\n".join(
+            line for line in index.splitlines() if not line.lstrip().startswith("--")
+        )
+    )
+    assert "-- transactional: NO" in index
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sudo_requests_thread" in (
+        index_body
+    )
+    assert "BEGIN;" not in index_body
+    # The runner sends a .notx.sql file as one simple query, and Postgres wraps
+    # a multi-statement simple query in an implicit transaction — which is
+    # exactly what CREATE INDEX CONCURRENTLY cannot run inside.
+    assert index_body.count(";") == 1
+
+    validate_sql = _compact(validate)
+    assert "VALIDATE CONSTRAINT sudo_approval_requests_thread_id_fkey" in validate_sql
+    assert "VALIDATE CONSTRAINT sudo_approval_requests_one_entity" in validate_sql
+    assert "NOT VALID" not in validate_sql
