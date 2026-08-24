@@ -728,3 +728,37 @@ class TestCredentialsPreCreated:
     def test_default_is_false_so_nothing_changes_for_existing_installs(self):
         values = yaml.safe_load((CHART / "values.yaml").read_text())
         assert values["databases"]["credentialsPreCreated"] is False
+
+
+class TestSmartShutdownTimeout:
+    """What a node drain or rolling upgrade actually costs.
+
+    Smart shutdown waits for client SESSIONS to end, not transactions. Every SRW
+    component reaches Postgres through a pool, and a pool holds its sessions
+    open by design, so the wait cannot succeed -- it runs out. CNPG will not
+    promote a replica until the old primary is down, so this timer is paid in
+    full on every planned maintenance event.
+
+    Measured on dev 2026-08-23: `kubectl delete pod` on a primary cost 195s of
+    write unavailability against CNPG's 180s default. The same cluster,
+    hard-killed, promoted in 9s.
+    """
+
+    def test_every_cluster_pins_it(self):
+        clusters = _cluster(*_all_cnpg())
+        assert len(clusters) == len(DATABASES)
+        for cluster in clusters:
+            assert cluster["spec"]["smartShutdownTimeout"] == 30, cluster["metadata"][
+                "name"
+            ]
+
+    def test_the_default_is_not_cnpgs(self):
+        """Negative control. Inheriting 180 is the bug, not the baseline."""
+        values = yaml.safe_load((CHART / "values.yaml").read_text())
+        assert values["databases"]["smartShutdownTimeout"] != 180
+
+    def test_it_is_overridable(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg", "databases.smartShutdownTimeout=120"
+        )[0]
+        assert cluster["spec"]["smartShutdownTimeout"] == 120

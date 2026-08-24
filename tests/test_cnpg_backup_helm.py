@@ -84,6 +84,15 @@ def _all_cnpg() -> list[str]:
     return [f"databases.{key}.engine=cnpg" for key in DATABASES]
 
 
+def _render_fails(*settings: str) -> str:
+    """Stderr from a render expected to fail on a chart guard."""
+    result = subprocess.run(
+        _template_command(*settings), capture_output=True, text=True
+    )
+    assert result.returncode != 0, "expected the render to fail, it succeeded"
+    return result.stderr
+
+
 def _renders_nothing(*settings: str, show_only: str) -> bool:
     """helm errors when --show-only matches a template that produced nothing."""
     result = subprocess.run(
@@ -417,3 +426,80 @@ def test_notes_do_not_warn_about_an_external_endpoint(probe_chart):
         "databases.backup.destinationPath=s3://srw-pgbackup/x",
         "databases.backup.endpointURL=https://s3.eu-central-1.amazonaws.com",
     )
+
+
+class TestVolumeSnapshotMethod:
+    """CSI snapshots instead of an object store.
+
+    CloudNativePG coordinates these (pg_backup_start/stop) rather than letting
+    the storage layer snapshot behind the database's back, which a Longhorn
+    recurring job cannot do. The two methods are mutually exclusive on purpose:
+    running the plugin as well would archive WAL for a base backup the archive
+    cannot be replayed onto unless the object store is configured too.
+
+    PREREQUISITE, and it is not optional: the snapshot.storage.k8s.io CRDs and
+    an external-snapshotter controller. Neither ships with Kubernetes and
+    neither is in this chart. Verified against the live API 2026-08-24 -- the
+    Cluster is accepted, and the ScheduledBackup is rejected with "Cannot use
+    volumeSnapshot backup method due to missing VolumeSnapshot CRD ... please
+    restart it to enable VolumeSnapshot support". So these are render tests by
+    necessity; the cluster this repo develops against cannot validate them.
+    """
+
+    SNAP = (
+        "databases.backup.method=volumeSnapshot",
+        "databases.backup.volumeSnapshot.className=longhorn",
+    )
+
+    def test_cluster_gets_a_backup_stanza_and_no_plugin(self):
+        cluster = _clusters("databases.postgres.engine=cnpg", *self.SNAP)[
+            f"{FULLNAME}-postgres"
+        ]
+        assert _plugins(cluster) == []
+        snap = cluster["spec"]["backup"]["volumeSnapshot"]
+        assert snap["className"] == "longhorn"
+
+    def test_wait_for_archive_is_off(self):
+        """CNPG defaults it to true, which hangs a snapshot-only backup forever:
+        it waits for the closing WAL segment to reach an archive that does not
+        exist. Safe to skip only because WAL lives inside PGDATA -- there is no
+        walStorage -- so the snapshot already contains it."""
+        cluster = _clusters("databases.postgres.engine=cnpg", *self.SNAP)[
+            f"{FULLNAME}-postgres"
+        ]
+        online = cluster["spec"]["backup"]["volumeSnapshot"]["onlineConfiguration"]
+        assert online["waitForArchive"] is False
+
+    def test_no_object_store_is_rendered(self):
+        assert _renders_nothing(
+            "databases.postgres.engine=cnpg", *self.SNAP, show_only=OBJECTSTORE
+        )
+
+    def test_scheduled_backups_use_the_snapshot_method(self):
+        scheduled = _scheduled("databases.postgres.engine=cnpg", *self.SNAP)
+        assert scheduled, "expected a ScheduledBackup"
+        for name, sb in scheduled.items():
+            assert sb["spec"]["method"] == "volumeSnapshot", name
+            assert "pluginConfiguration" not in sb["spec"], name
+
+    def test_class_name_is_required(self):
+        message = _render_fails(
+            "databases.postgres.engine=cnpg", "databases.backup.method=volumeSnapshot"
+        )
+        assert "volumeSnapshot.className is empty" in message
+        # The message must say how to find the value, and how to tell that the
+        # prerequisite is missing at all.
+        assert "volumesnapshotclass" in message
+
+    def test_object_store_method_is_untouched(self):
+        """Regression guard: dev runs on the object-store path."""
+        cluster = _clusters("databases.postgres.engine=cnpg", *BACKUP_ON)[
+            f"{FULLNAME}-postgres"
+        ]
+        assert [p["name"] for p in _plugins(cluster)] == [
+            "barman-cloud.cloudnative-pg.io"
+        ]
+        assert "backup" not in cluster["spec"]
+        scheduled = _scheduled("databases.postgres.engine=cnpg", *BACKUP_ON)
+        for name, sb in scheduled.items():
+            assert sb["spec"]["method"] == "plugin", name

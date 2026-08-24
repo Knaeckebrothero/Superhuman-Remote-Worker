@@ -951,8 +951,18 @@ up at all, the database renders a CNPG Cluster (a StatefulSet has no plugin to
 hook), and the database has not opted out.
 Usage: {{ if (include "srw.dbBacksUp" (dict "context" . "key" "postgres")) }}
 */}}
+{{/*
+True when backups go to an object store (Barman plugin + WAL archiving), as
+opposed to CSI volume snapshots. The two are mutually exclusive here on purpose:
+running both would archive WAL for a base backup the archive cannot be replayed
+onto without also configuring the object store.
+*/}}
+{{- define "srw.backupIsObjectStore" -}}
+{{- if eq .Values.databases.backup.method "objectstore" -}}true{{- end -}}
+{{- end }}
+
 {{- define "srw.dbBacksUp" -}}
-{{- if eq .context.Values.databases.backup.method "objectstore" -}}
+{{- if has .context.Values.databases.backup.method (list "objectstore" "volumeSnapshot") -}}
 {{- if include "srw.dbRendersCnpg" . -}}
 {{- $db := index .context.Values.databases .key -}}
 {{- if ne $db.backupEnabled false -}}true{{- end -}}
