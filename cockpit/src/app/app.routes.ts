@@ -78,13 +78,17 @@ export const routes: Routes = [
   // handful of admin visits, and pushed the build past its initial-bundle
   // budget.
   {
-    path: 'admin/llm',
+    path: 'admin/models',
     loadComponent: () =>
-      import('./views/admin/llm/admin-llm.component').then(m => m.AdminLlmComponent),
+      import('./views/admin/models/admin-models.component').then(m => m.AdminModelsComponent),
     canActivate: [authGuard, adminGuard],
   },
-  { path: 'admin/providers', redirectTo: 'admin/llm' },
-  { path: 'admin/models', redirectTo: 'admin/llm' },
+  // The page was 'admin/llm' until the catalog grew past chat models — it now
+  // holds TTS, speech-to-text, vision and embedding entries too, so the name
+  // described a third of its contents. Both former paths still resolve;
+  // 'admin/llm' in particular is in the wild via the readiness-gate banners.
+  { path: 'admin/providers', redirectTo: 'admin/models' },
+  { path: 'admin/llm', redirectTo: 'admin/models' },
   {
     path: 'admin/users',
     loadComponent: () =>

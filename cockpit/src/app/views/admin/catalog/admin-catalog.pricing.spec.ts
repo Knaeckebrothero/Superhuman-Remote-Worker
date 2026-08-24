@@ -4,7 +4,7 @@ import {
   pricingIdOf,
   pricingLabelOf,
   pricingModeOf,
-} from './admin-models.component';
+} from './admin-catalog.component';
 
 /**
  * `params_json.pricing_id` decides whether a catalog model gets a $/token rate
@@ -14,7 +14,7 @@ import {
  * The pure helpers are tested here rather than through the component because
  * vitest runs Angular JIT: signal inputs cannot be property-bound and signal
  * `viewChild` never resolves, so a rendered test of this dialog would assert
- * the harness rather than the logic. Same split as admin-models.warning.spec.ts.
+ * the harness rather than the logic. Same split as admin-catalog.warning.spec.ts.
  */
 describe('pricing mode', () => {
   it('treats an absent key as auto-detect', () => {

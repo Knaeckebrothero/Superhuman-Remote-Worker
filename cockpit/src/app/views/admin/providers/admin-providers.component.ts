@@ -3,7 +3,7 @@ import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
-import {AdminLlmCoordinatorService} from '../llm/admin-llm-coordinator.service';
+import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
 import {
   ApiKeyProvider,
   CATALOG_CAPABILITIES,
@@ -843,7 +843,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
 export class AdminProvidersComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly catalog = inject(AdminModelsService);
-  private readonly coordinator = inject(AdminLlmCoordinatorService);
+  private readonly coordinator = inject(AdminModelsCoordinatorService);
   private readonly transloco = inject(TranslocoService);
 
   readonly switchTab = output<'providers' | 'models'>();
