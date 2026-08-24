@@ -15,8 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import src.api.app as primary_app
 import src.api.dual_app as dual_app
+from orchestrator.services.config_resolver import resolve_config
 from src.api.models import JobResumeRequest
+from src.core.loader import get_all_tool_names, load_config_from_resolved
 
 
 def _empty_async_gen():
@@ -47,6 +50,44 @@ def _resume_endpoint():
     return next(
         r.endpoint for r in app.routes if getattr(r, "path", "") == "/job/resume"
     )
+
+
+def _primary_resume_endpoint():
+    app = primary_app.create_app()
+    return next(
+        r.endpoint for r in app.routes if getattr(r, "path", "") == "/job/resume"
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_ready_endpoints_advertise_resolved_resume(monkeypatch):
+    agent = MagicMock()
+    agent.get_status.return_value = {
+        "initialized": True,
+        "connections": {"postgres": True},
+    }
+
+    monkeypatch.setattr(primary_app, "_agent", agent)
+    monkeypatch.setattr(primary_app, "_shutdown_requested", False)
+    primary_ready = next(
+        route.endpoint
+        for route in primary_app.create_app().routes
+        if getattr(route, "path", "") == "/ready"
+    )
+    primary_response = await primary_ready()
+
+    monkeypatch.setattr(dual_app, "_agent", agent)
+    monkeypatch.setattr(dual_app, "_shutdown_requested", False)
+    monkeypatch.setattr(dual_app, "_pod_state", dual_app.PodState.IDLE)
+    dual_ready = next(
+        route.endpoint
+        for route in dual_app.create_dual_app().routes
+        if getattr(route, "path", "") == "/ready"
+    )
+    dual_response = await dual_ready()
+
+    assert primary_response.capabilities["resolved_config_resume"] is True
+    assert dual_response.capabilities["resolved_config_resume"] is True
 
 
 def _sandbox_runtime() -> dict[str, str]:
@@ -108,3 +149,70 @@ async def test_resume_endpoint_omits_git_remote_when_not_sent(monkeypatch):
 
     metadata = agent.process_job.await_args.kwargs["metadata"]
     assert not metadata or "git_remote_url" not in metadata
+    assert not metadata or "resolved_config" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_dual_resume_endpoint_hydrates_non_default_expert_tools(monkeypatch):
+    agent = _wire_idle_agent(monkeypatch)
+    resume_ep = _resume_endpoint()
+    blob = resolve_config(
+        base_config_name="developer", request_override=_sandbox_config()
+    )
+
+    await resume_ep(
+        JobResumeRequest(
+            job_id="j3",
+            config_name="developer",
+            previous_status="processing",
+            resolved_config=blob,
+            workspace_runtime=_sandbox_runtime(),
+        )
+    )
+    await dual_app._current_job_task
+
+    metadata = agent.process_job.await_args.kwargs["metadata"]
+    effective = load_config_from_resolved(metadata["resolved_config"])
+    assert effective.agent_id == "developer"
+    assert {"run_command", "cancel_command", "shell_read"} <= set(
+        get_all_tool_names(effective)
+    )
+    assert "config_override" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_primary_resume_endpoint_hydrates_non_default_expert_tools(monkeypatch):
+    agent = MagicMock()
+    agent.config.agent_id = "worker_base"
+    agent.process_job = AsyncMock(return_value=_empty_async_gen())
+    monkeypatch.setattr(primary_app, "_agent", agent)
+    monkeypatch.setattr(primary_app, "_current_job_id", None)
+    monkeypatch.setattr(primary_app, "_shutdown_requested", False)
+    monkeypatch.setattr(primary_app, "_orchestrator_client", None)
+    monkeypatch.setattr(primary_app, "_setup_job_file_logging", MagicMock())
+    monkeypatch.setattr(primary_app, "_cleanup_job_file_handler", MagicMock())
+    primary_app._stop_requested.clear()
+    resume_ep = _primary_resume_endpoint()
+    blob = resolve_config(
+        base_config_name="developer", request_override=_sandbox_config()
+    )
+
+    await resume_ep(
+        JobResumeRequest(
+            job_id="j4",
+            config_name="developer",
+            previous_status="processing",
+            resolved_config=blob,
+            workspace_runtime=_sandbox_runtime(),
+        ),
+        MagicMock(),
+    )
+    await primary_app._current_job_task
+
+    metadata = agent.process_job.await_args.kwargs["metadata"]
+    effective = load_config_from_resolved(metadata["resolved_config"])
+    assert effective.agent_id == "developer"
+    assert {"run_command", "cancel_command", "shell_read"} <= set(
+        get_all_tool_names(effective)
+    )
+    assert "config_override" not in metadata

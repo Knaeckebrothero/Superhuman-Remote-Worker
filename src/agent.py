@@ -2902,6 +2902,44 @@ Do not replace `origin`; its authority is selected and installed by the server.
             logger.warning(f"VM workspace seeding failed: {e}")
             return False
 
+    async def _hydrate_dispatched_config(
+        self,
+        job_id: str,
+        metadata: Dict[str, Any],
+        *,
+        resume: bool,
+    ) -> bool:
+        """Hydrate the authoritative config snapshot for one dispatch.
+
+        An in-flight orchestrator blob wins over the database snapshot because
+        it contains credentials re-injected specifically for this delivery.
+        Older orchestrators omit the field, preserving the existing resume
+        fallback to the write-once database snapshot (and then local config).
+        """
+        delivered = metadata.get("resolved_config")
+        if delivered:
+            self.config = load_config_from_resolved(delivered)
+            logger.info(f"Hydrated orchestrator-resolved config for job {job_id}")
+            return True
+
+        if resume and self.postgres_conn:
+            try:
+                import uuid as _uuid
+
+                resolved = await self.postgres_conn.jobs.get_resolved_config(
+                    _uuid.UUID(job_id)
+                )
+                if resolved:
+                    self.config = load_config_from_resolved(resolved)
+                    logger.info(f"Loaded frozen config for resumed job {job_id}")
+                    return True
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load frozen config, falling back to disk: {e}"
+                )
+
+        return False
+
     async def _setup_job_workspace(
         self,
         job_id: str,
@@ -2959,43 +2997,14 @@ Do not replace `origin`; its authority is selected and installed by the server.
             logger.warning(f"Instructions upload resolution failed (non-fatal): {e}")
             self._resolved_instructions_md = None
 
-        # On resume: try to load frozen config from JSONB (prevents config drift).
-        # NOTE: serialize_resolved_config strips api_key from agent.llm before
-        # storage, so the loaded config has llm.api_key=None. The orchestrator's
-        # resume dispatch re-injects credentials into metadata.config_override
-        # (see _inject_dispatch_credentials), which the override block below
-        # layers on top — so we deliberately defer _create_phase_llms() until
-        # after that merge happens at line ~1014 instead of recreating LLMs
-        # twice with a half-built config.
-        _config_from_db = False
-        if resume and self.postgres_conn:
-            try:
-                import uuid as _uuid
-
-                resolved = await self.postgres_conn.jobs.get_resolved_config(
-                    _uuid.UUID(job_id)
-                )
-                if resolved:
-                    self.config = load_config_from_resolved(resolved)
-                    _config_from_db = True
-                    logger.info(f"Loaded frozen config for resumed job {job_id}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load frozen config, falling back to disk: {e}"
-                )
-
-        # Orchestrator-resolved config (supersedes agent-side Decision 6): a
-        # delivered blob is already fully merged, credential-injected, and frozen
-        # by the orchestrator. Hydrate it and skip ALL local resolution
-        # (config_name / upload / config_override / DB-overrides) and the freeze —
-        # exactly like the resume frozen-config path above. The orchestrator
-        # delivers config_override=None alongside the blob, so the override block
-        # below is a no-op and the resolved layers are never degraded by a flat
-        # re-merge. Absent blob → today's path (fallback).
-        if not _config_from_db and metadata.get("resolved_config"):
-            self.config = load_config_from_resolved(metadata["resolved_config"])
-            _config_from_db = True
-            logger.info(f"Hydrated orchestrator-resolved config for job {job_id}")
+        # A delivered blob is already fully merged, credential-injected, and
+        # frozen by the orchestrator. It must win over the secret-free database
+        # snapshot on resume; otherwise config_override=None would leave the
+        # hydrated LLM without the credentials carried by the delivery blob.
+        # Absent blob -> the historical DB/local fallback remains unchanged.
+        _config_from_db = await self._hydrate_dispatched_config(
+            job_id, metadata, resume=resume
+        )
 
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override

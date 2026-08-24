@@ -114,9 +114,13 @@ def _agent(**overrides) -> dict:
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, text: str = ""):
+    def __init__(self, status_code: int, text: str = "", payload: dict | None = None):
         self.status_code = status_code
         self.text = text
+        self.payload = payload or {}
+
+    def json(self):
+        return self.payload
 
 
 class _FakeAsyncClient:
@@ -125,6 +129,7 @@ class _FakeAsyncClient:
     posts: list[tuple[str, dict]] = []
     next_status: int = 202
     next_text: str = ""
+    resolved_config_resume: bool = True
 
     def __init__(self, *args, **kwargs):
         pass
@@ -138,6 +143,16 @@ class _FakeAsyncClient:
     async def post(self, url, json=None):
         _FakeAsyncClient.posts.append((url, json))
         return _FakeResponse(_FakeAsyncClient.next_status, _FakeAsyncClient.next_text)
+
+    async def get(self, url):
+        return _FakeResponse(
+            200,
+            payload={
+                "capabilities": {
+                    "resolved_config_resume": self.resolved_config_resume,
+                }
+            },
+        )
 
 
 @pytest.fixture
@@ -174,8 +189,12 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     _FakeAsyncClient.posts = []
     _FakeAsyncClient.next_status = 202
     _FakeAsyncClient.next_text = ""
+    _FakeAsyncClient.resolved_config_resume = True
     monkeypatch.setattr(main.httpx, "AsyncClient", _FakeAsyncClient)
 
+    # Most tests in this fixture exercise the legacy flat-override fallback.
+    # Resolved-config delivery gets a focused regression below.
+    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: False)
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(
         main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
@@ -293,6 +312,7 @@ class TestResumeJobOnAgentInjection:
 
         assert ok is True
         payload = _posted_payload()
+        assert "resolved_config" not in payload
         assert payload["config_override"]["env_keys"] == INJECTED_ENV
         assert payload["config_override"]["llm"]["api_key"] == "sk-llm"
         assert payload["runtime_actor"]["caller_kind"] == "worker"
@@ -308,6 +328,114 @@ class TestResumeJobOnAgentInjection:
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is True
         )
+
+    @pytest.mark.asyncio
+    async def test_non_default_expert_resume_sends_effective_expert_tools(
+        self, resume_collaborators, monkeypatch
+    ):
+        """A generic worker pod must receive the developer tool profile.
+
+        This asserts the effective hydrated config, not merely the presence of
+        a wire field: the exact live defect was a syntactically successful
+        resume whose effective tools still came from worker_base.
+        """
+        from src.core.loader import get_all_tool_names, load_config_from_resolved
+
+        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
+        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
+        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            main,
+            "_seed_registry_model_overrides",
+            AsyncMock(side_effect=lambda config, **_kwargs: config),
+        )
+
+        ok = await main._resume_job_on_agent(
+            _job(
+                config_name="developer",
+                config_override={
+                    "llm": {"model": "RedHatAI/gemma-4-31B-it-FP8-Dynamic"}
+                },
+            ),
+            _agent(),
+        )
+
+        assert ok is True
+        payload = _posted_payload()
+        assert "config_override" not in payload
+        effective = load_config_from_resolved(payload["resolved_config"])
+        tool_names = set(get_all_tool_names(effective))
+        assert effective.agent_id == "developer"
+        assert set(effective.tools.shell) == {
+            "run_command",
+            "cancel_command",
+            "shell_read",
+        }
+        assert {"run_command", "cancel_command", "shell_read"} <= tool_names
+        assert effective.llm.api_key == "sk-llm"
+        assert effective.extra["env_keys"] == INJECTED_ENV
+        resume_collaborators.injector.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolved_resume_grant_denial_still_fails_closed(
+        self, resume_collaborators, monkeypatch
+    ):
+        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
+        monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
+        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
+        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            main,
+            "_seed_registry_model_overrides",
+            AsyncMock(side_effect=lambda config, **_kwargs: config),
+        )
+        monkeypatch.setattr(
+            main,
+            "_enforce_dispatch_grants",
+            AsyncMock(
+                side_effect=main.GrantDenied(
+                    ["shell_tools: tools.shell requires the shell_tools grant"]
+                )
+            ),
+        )
+
+        ok = await main._resume_job_on_agent(_job(config_name="developer"), _agent())
+
+        assert ok is False
+        assert _FakeAsyncClient.posts == []
+        resume_collaborators.injector.assert_not_awaited()
+        main.postgres_db.update_job_status.assert_awaited_once_with(
+            JOB_ID,
+            status="failed",
+            error_message=(
+                "config exceeds your capability grants: shell_tools: "
+                "tools.shell requires the shell_tools grant"
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_older_agent_keeps_credential_injected_flat_fallback(
+        self, resume_collaborators, monkeypatch
+    ):
+        """A mixed-version rollout must not send a blob the old agent ignores."""
+        _FakeAsyncClient.resolved_config_resume = False
+        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
+        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
+        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            main,
+            "_seed_registry_model_overrides",
+            AsyncMock(side_effect=lambda config, **_kwargs: config),
+        )
+
+        ok = await main._resume_job_on_agent(_job(config_name="developer"), _agent())
+
+        assert ok is True
+        payload = _posted_payload()
+        assert "resolved_config" not in payload
+        assert payload["config_override"]["llm"]["api_key"] == "sk-llm"
+        assert payload["config_override"]["env_keys"] == INJECTED_ENV
+        resume_collaborators.injector.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_kb_profile_off_without_project_or_kb_datasource(

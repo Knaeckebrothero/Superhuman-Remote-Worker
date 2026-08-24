@@ -405,6 +405,15 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Inline config overrides from the original job",
     )
+    resolved_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Orchestrator-resolved config blob for the resumed job. When "
+            "present the agent hydrates this complete, credential-injected "
+            "snapshot instead of retaining its generic boot config. Absent "
+            "keeps the legacy resume fallback."
+        ),
+    )
     feedback: Optional[str] = Field(
         default=None,
         description="Optional feedback to inject before resuming",
