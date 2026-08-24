@@ -26,6 +26,16 @@ metadata:
   # live in the bucket. Keeping it would only leave litter behind an uninstall.
 spec:
   retentionPolicy: {{ $backup.retentionPolicy | quote }}
+  {{- with $backup.sidecarResources }}
+  # The plugin injects this sidecar into every instance pod of every backing-up
+  # Cluster, and ships it with no resources. Sizing it here is the only way to
+  # reach a QoS class better than the weakest container in the pod: native
+  # sidecars (restartPolicy: Always initContainers) count toward QoS like any
+  # other container.
+  instanceSidecarConfiguration:
+    resources:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
   configuration:
     destinationPath: {{ $backup.destinationPath | quote }}
     {{- with $backup.endpointURL }}

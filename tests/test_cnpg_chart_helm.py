@@ -762,3 +762,208 @@ class TestSmartShutdownTimeout:
             "databases.postgres.engine=cnpg", "databases.smartShutdownTimeout=120"
         )[0]
         assert cluster["spec"]["smartShutdownTimeout"] == 120
+
+
+def _parameters(*settings: str) -> dict[str, dict[str, str]]:
+    """component name -> its rendered postgresql.parameters."""
+    return {
+        c["metadata"]["name"]: c["spec"]["postgresql"]["parameters"]
+        for c in _cluster(*settings)
+    }
+
+
+class TestDerivedMemoryGucs:
+    """shared_buffers and effective_cache_size scale with limits.memory.
+
+    CloudNativePG ships a FIXED shared_buffers of 128MB and never scales it
+    with the memory limit, so raising limits.memory on its own buys the
+    database nothing. That is not hypothetical: measured on dev 2026-08-24,
+    all five clusters ran 128MB of buffers against limits between 512Mi and
+    12Gi, and the two LARGEST databases had the worst cache hit ratios for it
+    (pgvector 19 GB / 12Gi / 84.2%, auditdb 26 GB / 4Gi / 90.6%, against 99%+
+    on the two small ones).
+
+    These tests exist so that combination is unreachable.
+    """
+
+    def test_shared_buffers_is_a_quarter_of_the_limit(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=4Gi",
+        )[0]
+        assert cluster["spec"]["postgresql"]["parameters"]["shared_buffers"] == "1024MB"
+
+    def test_effective_cache_size_is_three_quarters(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=4Gi",
+        )[0]
+        parameters = cluster["spec"]["postgresql"]["parameters"]
+        assert parameters["effective_cache_size"] == "3072MB"
+
+    def test_it_tracks_the_limit(self):
+        """The regression this whole mechanism exists for.
+
+        Doubling the limit must double the buffers. A chart where these two
+        move independently is the state we shipped and had to diagnose.
+        """
+        small = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=2Gi",
+        )[0]["spec"]["postgresql"]["parameters"]["shared_buffers"]
+        large = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=4Gi",
+        )[0]["spec"]["postgresql"]["parameters"]["shared_buffers"]
+        assert (small, large) == ("512MB", "1024MB")
+
+    def test_no_cluster_is_left_on_the_operand_default(self):
+        """Negative control: 128MB is CNPG's default, i.e. nobody chose it."""
+        for name, parameters in _parameters(*_all_cnpg()).items():
+            assert "shared_buffers" in parameters, name
+            if not name.endswith(("giteadb", "keycloakdb")):
+                # The two small ones legitimately land on 128MB from a 512Mi
+                # limit; every other cluster must have moved off it.
+                assert parameters["shared_buffers"] != "128MB", name
+
+    def test_mebibyte_limits_parse(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=512Mi",
+        )[0]
+        assert cluster["spec"]["postgresql"]["parameters"]["shared_buffers"] == "128MB"
+
+    def test_an_explicit_parameter_wins(self):
+        """Deriving is a floor for people who never think about it."""
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=4Gi",
+            "databases.postgres.parameters.shared_buffers=333MB",
+        )[0]
+        assert cluster["spec"]["postgresql"]["parameters"]["shared_buffers"] == "333MB"
+
+    def test_zero_percent_omits_the_guc(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.tuning.sharedBuffersPercent=0",
+        )[0]
+        parameters = cluster["spec"]["postgresql"]["parameters"]
+        assert "shared_buffers" not in parameters
+        # The other derived GUC is unaffected.
+        assert "effective_cache_size" in parameters
+
+    def test_max_connections_still_renders(self):
+        """The parameters map was rebuilt; its original occupant must survive."""
+        for name, parameters in _parameters(*_all_cnpg()).items():
+            assert parameters["max_connections"] == "100", name
+
+
+class TestMemoryFitsGuard:
+    """A memory budget that cannot fit its limit fails the render.
+
+    The failure being prevented is an OOM kill, not a slow query, and the
+    arithmetic is genuinely non-obvious: autovacuum_work_mem DEFAULTS to
+    maintenance_work_mem and is allocated once per autovacuum_max_workers, so
+    a 2GB maintenance_work_mem silently authorises 6GB of autovacuum on top of
+    shared_buffers -- a number that appears nowhere in the config.
+
+    This guard caught exactly that in the shipping chart: pgvector's
+    maintenance_work_mem of 2GB against an 8Gi limit needed 10240Mi.
+    """
+
+    def test_an_impossible_budget_fails(self):
+        stderr = _render_fails(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=1Gi",
+            "databases.postgres.parameters.maintenance_work_mem=4GB",
+        )
+        assert "memory limit" in stderr
+
+    def test_the_failure_names_the_database(self):
+        """A guard that does not say which of five clusters is wrong is noise."""
+        stderr = _render_fails(
+            "databases.audit.engine=cnpg",
+            "databases.audit.cnpgResources.limits.memory=1Gi",
+            "databases.audit.parameters.maintenance_work_mem=4GB",
+        )
+        assert "auditdb" in stderr
+
+    def test_autovacuum_multiplication_is_counted(self):
+        """The whole point: this fits if you forget it runs once per worker."""
+        fits = (
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=8Gi",
+            "databases.postgres.parameters.maintenance_work_mem=2GB",
+        )
+        stderr = _render_fails(*fits)
+        assert "x 3 workers" in stderr
+        # Pinning autovacuum_work_mem is what makes the same budget legal.
+        cluster = _cluster(
+            *fits, "databases.postgres.parameters.autovacuum_work_mem=256MB"
+        )[0]
+        assert (
+            cluster["spec"]["postgresql"]["parameters"]["maintenance_work_mem"] == "2GB"
+        )
+
+    def test_a_unitless_value_is_refused_not_guessed(self):
+        """8kB blocks for shared_buffers, kB for maintenance_work_mem.
+
+        There is no way to tell which was meant from the digits alone, so
+        guessing would be wrong roughly half the time and silently so.
+        """
+        stderr = _render_fails(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.parameters.maintenance_work_mem=200000",
+        )
+        assert "no unit" in stderr
+
+    def test_the_shipped_defaults_pass(self):
+        """Guard against a guard that only ever fires on hypotheticals."""
+        clusters = _cluster(*_all_cnpg())
+        assert len(clusters) == len(DATABASES)
+
+
+class TestMemoryRequestParity:
+    """requests.memory == limits.memory on every CNPG cluster.
+
+    A memory limit is a hard wall -- cross it and the container is OOM-killed,
+    and PostgreSQL has no graceful degradation past that point. Meanwhile the
+    kubelet ranks memory-pressure evictions by how far a pod has run ABOVE ITS
+    REQUEST. Setting the request to the limit makes the pod unable to exceed
+    its own request, which removes it from that ranking. Measured on dev
+    2026-08-24, node memory LIMITS were overcommitted 110-163% while requests
+    sat at 31-55%, which is precisely the gap this closes.
+    """
+
+    def test_every_cluster_has_memory_parity(self):
+        clusters = _cluster(*_all_cnpg())
+        assert len(clusters) == len(DATABASES)
+        for cluster in clusters:
+            resources = cluster["spec"]["resources"]
+            assert resources["requests"]["memory"] == resources["limits"]["memory"], (
+                cluster["metadata"]["name"]
+            )
+
+    def test_cpu_is_deliberately_not_pinned(self):
+        """Negative control.
+
+        CPU parity would buy the `Guaranteed` QoS label, whose only remaining
+        benefit is the kernel OOM killer's victim scoring. The cost is a
+        reserved core per instance and a hard throttle on vacuum, index builds
+        and gzip base backups exactly when they need to burst. A CPU limit
+        throttles; it does not kill.
+        """
+        for cluster in _cluster(*_all_cnpg()):
+            resources = cluster["spec"]["resources"]
+            assert resources["requests"]["cpu"] != resources["limits"]["cpu"], cluster[
+                "metadata"
+            ]["name"]
+
+    def test_parity_holds_when_the_limit_is_overridden(self):
+        cluster = _cluster(
+            "databases.postgres.engine=cnpg",
+            "databases.postgres.cnpgResources.limits.memory=4Gi",
+            "databases.postgres.cnpgResources.requests.memory=4Gi",
+        )[0]
+        resources = cluster["spec"]["resources"]
+        assert resources["requests"]["memory"] == resources["limits"]["memory"] == "4Gi"

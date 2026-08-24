@@ -1098,6 +1098,43 @@ databases:
     collate: "en_US.utf8"
     ctype: "en_US.utf8"
 
+  # -- Memory GUCs derived from each database's own resources.limits.memory,
+  #    as a percentage of it. Applies only to databases on the `cnpg` engine.
+  #
+  #    WHY THIS EXISTS: CloudNativePG ships a FIXED shared_buffers of 128MB and
+  #    does not scale it with the memory limit. Raising limits.memory on its own
+  #    therefore buys the database nothing, and the two values drift apart
+  #    silently -- which is what this fleet shipped with. Measured 2026-08-24 on
+  #    dev, every cluster ran 128MB of buffers regardless of a limit between
+  #    512Mi and 12Gi, and the two LARGEST databases had the WORST cache hit
+  #    ratios for it (pgvector 19 GB / 12Gi limit / 84.2%, audit 26 GB / 4Gi /
+  #    90.6%, against 99%+ on the two small ones). Deriving makes that
+  #    combination unreachable.
+  #
+  #    Any of these can be overridden per database by setting the GUC directly
+  #    in that database's `parameters` map, which always wins. Set a percentage
+  #    to 0 to stop emitting that GUC entirely and fall back to the operand
+  #    default.
+  #
+  #    Changing either value REWRITES postgresql.conf and rolls the Cluster --
+  #    shared_buffers is postmaster-level and cannot be reloaded in place. On a
+  #    multi-instance Cluster that is a switchover, not an outage, but it is not
+  #    free either. Batch it with any resources change.
+  tuning:
+    # -- shared_buffers, as a percent of limits.memory. 25 is the long-standing
+    #    PostgreSQL starting point and leaves the rest of the limit for backend
+    #    work_mem, maintenance work and page cache. Note that page cache IS
+    #    charged to the container's cgroup, so the remainder is not wasted: the
+    #    kernel caches database files in it up to the limit.
+    sharedBuffersPercent: 25
+    # -- effective_cache_size, as a percent of limits.memory. This is a PLANNER
+    #    HINT and allocates nothing -- it tells the planner how much of the
+    #    database it can expect to find in shared_buffers plus page cache, which
+    #    is what makes it choose an index scan over a sequential one. Costing it
+    #    like the 128MB default on a multi-gigabyte limit biases every plan
+    #    toward seq scans.
+    effectiveCacheSizePercent: 75
+
   # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
   #    CNPG-I plugin. Applies only to databases on the `cnpg` engine.
   #
@@ -1173,6 +1210,35 @@ databases:
     #    install has a base backup before the first scheduled window. Without a
     #    base backup the WAL archive restores nothing.
     immediate: true
+    # -- Resources for the Barman Cloud sidecar the plugin injects into EVERY
+    #    instance pod of every backing-up Cluster.
+    #
+    #    It ships with NO resources at all, which has two consequences worth
+    #    knowing. First, an unbounded container next to a database can starve it
+    #    on a busy node. Second -- and this is the one that bites -- the sidecar
+    #    is a NATIVE sidecar (an initContainer with restartPolicy: Always), and
+    #    Kubernetes QoS is computed over every container in the pod including
+    #    those. One container without resources therefore drags the WHOLE pod
+    #    down in QoS class no matter how carefully the postgres container is
+    #    sized.
+    #
+    #    Memory is request == limit, matching the databases: this process
+    #    streams and compresses, it does not accumulate, so a ceiling it cannot
+    #    exceed is also a floor it always has.
+    #
+    #    CPU is deliberately NOT pinned. Both compressions default to gzip,
+    #    which is single-threaded and CPU-bound, so the CPU limit is a direct
+    #    throttle on base-backup throughput -- on a 26 GB database at a low cap
+    #    that is the difference between minutes and hours. Requesting a floor
+    #    and letting it burst keeps backups fast without reserving a core per
+    #    instance for something idle 23 hours a day.
+    sidecarResources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "2"
 
   postgres:
     enabled: true
@@ -1256,6 +1322,42 @@ databases:
     #    every index, and generates WAL, all onto this one volume.
     cnpgStorageSize: ""
     storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Separate from `resources` below because that one
+    #    also sizes the legacy StatefulSet, and raising it there restarts a live
+    #    database to reserve memory it never uses.
+    #
+    #    MEMORY IS REQUEST == LIMIT, deliberately, on every database here.
+    #
+    #    A memory limit is not a soft target: cross it and the container is
+    #    OOM-killed, and PostgreSQL has no graceful degradation on the far side
+    #    of that. Meanwhile the kubelet ranks memory-pressure evictions by how
+    #    far a pod has run ABOVE ITS REQUEST, so a database requesting 256Mi and
+    #    using 1Gi sits near the front of that queue. Setting the request to the
+    #    limit makes the pod unable to exceed its own request, which takes it
+    #    out of the ranking entirely -- the guarantee is in the parity, not in
+    #    the QoS class name.
+    #
+    #    CPU IS DELIBERATELY NOT PINNED. Pinning it too would buy the
+    #    `Guaranteed` label, but that label's only remaining benefit is the
+    #    kernel OOM killer's victim scoring, which matters only when a node
+    #    exhausts memory faster than the kubelet's eviction loop reacts. The
+    #    cost is real and constant: a reserved core per instance for a process
+    #    that is idle almost all the time, and a hard throttle on vacuum, index
+    #    builds and gzip base backups exactly when they need to burst. A CPU
+    #    limit throttles; it does not kill. Request a floor, allow the burst.
+    #
+    #    Note that shared_buffers and effective_cache_size are DERIVED from
+    #    limits.memory here -- see databases.tuning. Changing this rewrites
+    #    postgresql.conf, so a resize and a retune are one rolling restart, not
+    #    two.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "2"
     resources:
       requests:
         memory: "256Mi"
@@ -1299,6 +1401,20 @@ databases:
     parameters:
       maintenance_work_mem: "2GB"
       max_parallel_maintenance_workers: "4"
+      # Measured, not guessed: this database spilled 109 MB of sorts to disk in
+      # 17 hours on the 4MB default (dev, 2026-08-24). work_mem is per sort or
+      # hash NODE, not per connection, so the worst case scales with
+      # max_connections -- keep the product well under limits.memory, which the
+      # chart does not enforce because a plan using every node at once is rare
+      # enough that failing the render on it would be wrong.
+      work_mem: "32MB"
+      # NOT optional next to that maintenance_work_mem. autovacuum_work_mem
+      # defaults to it, and autovacuum_max_workers of them run at once, so the
+      # 2GB above silently authorises 6GB of autovacuum on top of
+      # shared_buffers -- a figure that appears nowhere in the config. Pinning
+      # it here keeps routine vacuum small while leaving the deliberate,
+      # one-at-a-time index build the full 2GB.
+      autovacuum_work_mem: "256MB"
     # -- Include this database in backups when databases.backup.method is set.
     backupEnabled: true
     # -- CloudNativePG operand image, used ONLY when `engine` is not
@@ -1364,18 +1480,24 @@ databases:
     # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
     #    not `statefulset`. Separate from `resources` above because that one
     #    also sizes the legacy StatefulSet, and raising it there restarts a
-    #    live database to reserve memory it never uses. Empty = inherit.
+    #    live database to reserve memory it never uses. Memory is request ==
+    #    limit and CPU is left burstable, for the reasons spelled out on
+    #    databases.postgres above.
+    #
+    #    Sized for the index REBUILD a logical import performs, not for steady
+    #    state: this database carries 3.9 GB of HNSW across ~850k rows, and the
+    #    legacy pod idled at ~169Mi. maintenance_work_mem above this limit is an
+    #    OOM kill, not a slow build -- and with shared_buffers now derived at
+    #    25% of it, the ceiling this has to clear is shared_buffers PLUS
+    #    maintenance_work_mem. At 8Gi that is 2 GB + 2 GB, which the chart
+    #    enforces rather than trusts; see the guard in cnpg-cluster.yaml.
     cnpgResources:
       requests:
-        # Sized for the index REBUILD a logical import performs, not for steady
-        # state: this database carries 3.9 GB of HNSW across ~850k rows, and
-        # the legacy pod ran it in ~169Mi. maintenance_work_mem above this
-        # limit is an OOM kill, not a slow build.
-        memory: "2Gi"
-        cpu: "100m"
-      limits:
         memory: "8Gi"
         cpu: "500m"
+      limits:
+        memory: "8Gi"
+        cpu: "4"
     resources:
       requests:
         memory: "256Mi"
@@ -1410,7 +1532,13 @@ databases:
     # -- Extra postgresql.conf settings, merged over max_connections above.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
-    parameters: {}
+    parameters:
+      # Measured, not guessed: this database spilled 185 MB of sorts to disk in
+      # 17 hours on the 4MB default (dev, 2026-08-24), which is what an audit
+      # trail does -- it is written once and then read by wide, sorted,
+      # date-ranged scans. Per sort or hash NODE, so the worst case scales with
+      # max_connections; keep the product well under limits.memory.
+      work_mem: "32MB"
     # -- Audit is append-heavy, so it dominates WAL volume, and it is non-fatal
     #    by contract and already retention-bounded. Off by default; turn it on
     #    if the audit trail is a compliance artefact for you.
@@ -1460,6 +1588,18 @@ databases:
     #    every index, and generates WAL, all onto this one volume.
     cnpgStorageSize: ""
     storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "2"
     resources:
       requests:
         memory: "256Mi"
@@ -1534,6 +1674,18 @@ databases:
     #    every index, and generates WAL, all onto this one volume.
     cnpgStorageSize: ""
     storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "512Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "1"
     resources:
       requests:
         memory: "128Mi"
@@ -1603,6 +1755,18 @@ databases:
     #    every index, and generates WAL, all onto this one volume.
     cnpgStorageSize: ""
     storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "512Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "1"
     resources:
       requests:
         memory: "128Mi"

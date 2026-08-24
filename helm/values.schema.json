@@ -1331,6 +1331,24 @@
               ]
             }
           }
+        },
+        "tuning": {
+          "type": "object",
+          "description": "Memory GUCs derived from each database's own resources.limits.memory. 0 disables that GUC and falls back to the operand default.",
+          "properties": {
+            "sharedBuffersPercent": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "shared_buffers as a percent of limits.memory."
+            },
+            "effectiveCacheSizePercent": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "effective_cache_size as a percent of limits.memory. A planner hint; allocates nothing."
+            }
+          }
         }
       }
     },

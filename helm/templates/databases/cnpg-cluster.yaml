@@ -71,12 +71,10 @@ spec:
     # Always render parameters, never an empty mapping: `postgresql:` with no
     # children YAML-parses to null, which breaks every consumer that expects a
     # dict. The connection budget lives here now, where the StatefulSet used to
-    # inherit the image default of 100.
+    # inherit the image default of 100, alongside the memory GUCs derived from
+    # resources.limits.memory. See srw.dbParameters for the precedence rules.
     parameters:
-      max_connections: {{ $db.maxConnections | default 100 | quote }}
-      {{- range $key, $value := $db.parameters }}
-      {{ $key }}: {{ $value | quote }}
-      {{- end }}
+      {{- include "srw.dbParameters" (dict "context" $ctx "db" $db "name" .component) | nindent 6 }}
     {{- with $db.extensions }}
     extensions:
       {{- toYaml . | nindent 6 }}
