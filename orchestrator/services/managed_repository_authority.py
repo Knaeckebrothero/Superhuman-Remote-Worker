@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -26,6 +27,10 @@ from cryptography.hazmat.primitives.serialization import (
     PrivateFormat,
     PublicFormat,
 )
+
+from security.access import vm_workspaces_on_pod_network
+
+logger = logging.getLogger(__name__)
 
 _MANAGED_REPO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RUNTIME_BUNDLE_VERSION = 1
@@ -558,6 +563,16 @@ async def prepare_job_primary_repository_authority(
 ) -> dict[str, Any] | None:
     """Prove and CAS-adopt whichever primary contract the job actually uses."""
 
+    if "repo_name" not in job and job.get("id"):
+        # Dispatcher rows are projections; one that omits repo_name would be
+        # mistaken for a job without a managed scope and silently dispatched
+        # with a credential-less remote. Read the full row before deciding.
+        try:
+            full = await postgres_db.get_job(str(job["id"]))
+        except Exception:
+            full = None
+        if isinstance(full, Mapping) and full.get("repo_name") is not None:
+            job = full
     if job.get("repo_name"):
         return await prepare_job_repository_authority(postgres_db, gitea_client, job)
     authority = await ensure_job_primary_repository_authority(
@@ -609,6 +624,15 @@ async def authorize_job_repository_transport(
         # jobs are identified by repo_name/project rows and take the scoped
         # path above; this fallback never manufactures Gitea authority.
         git_remote_url = str(context.get("git_remote_url") or "") or None
+        if git_remote_url:
+            # Nothing on the workspace can authenticate this remote; pushes
+            # fail and the workspace becomes the only copy of the work.
+            logger.warning(
+                "No managed repository authority for job %s; dispatching a "
+                "credential-less remote (repo_name=%r)",
+                job.get("id"),
+                job.get("repo_name"),
+            )
         if repository_url_has_credentials(git_remote_url):
             # Historical managed rows without enough durable identity to adopt
             # must not carry their old administrator bearer into a runtime.

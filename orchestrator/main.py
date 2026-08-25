@@ -4153,6 +4153,21 @@ async def _prepare_job_repository_before_claim(job: Mapping[str, Any]) -> bool:
         return False
 
 
+def _mask_repository_transport(url: str | None) -> str:
+    """Describe a repository URL for a log line without leaking userinfo."""
+    if not url:
+        return "none"
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url))
+    except ValueError:
+        return "unparseable"
+    host = parts.hostname or "?"
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{host}{port}{parts.path}"
+
+
 async def _build_job_start_request(
     job: dict,
     *,
@@ -4320,6 +4335,14 @@ async def _build_job_start_request(
                 "(provisioner=%s)",
                 job_id,
                 container_ctx.get("provisioner", "k8s"),
+            )
+        if workspace_decision.effective_backend in {"sandbox", "vm"}:
+            logger.info(
+                "Dispatch: repository transport for job %s: %s (%d managed "
+                "credential(s))",
+                job_id,
+                _mask_repository_transport(git_remote_url),
+                len(managed_repository_credentials or []),
             )
 
         # Sticky sudo denial (vm_upgrade denied / resumed without VM): block

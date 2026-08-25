@@ -1016,3 +1016,31 @@ def test_external_vm_transport_still_requires_the_routed_endpoint(monkeypatch) -
 
     assert exc.value.code == "repository_ssh_endpoint_unavailable"
 
+
+@pytest.mark.asyncio
+async def test_primary_authority_reads_the_full_row_when_repo_name_is_missing(
+    monkeypatch,
+) -> None:
+    """A dispatcher projection without repo_name must not be mistaken for a job
+    without a managed scope — that silently ships a credential-less remote."""
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services import managed_repository_authority as mra
+
+    seen: list[dict] = []
+
+    async def _prepare(postgres_db, gitea_client, job):
+        seen.append(dict(job))
+        return {"id": "authority-1"}
+
+    monkeypatch.setattr(mra, "prepare_job_repository_authority", _prepare)
+    db = AsyncMock()
+    db.get_job = AsyncMock(return_value={"id": "job-1", "repo_name": "job-12345678"})
+
+    result = await mra.prepare_job_primary_repository_authority(
+        db, object(), {"id": "job-1", "status": "created"}
+    )
+
+    assert result == {"id": "authority-1"}
+    db.get_job.assert_awaited_once_with("job-1")
+    assert seen and seen[0]["repo_name"] == "job-12345678"
