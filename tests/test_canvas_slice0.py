@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from tests._route_inventory import mounted_routes
 from services.canvas import (
     BrowserSource,
     CanvasCapabilities,
@@ -864,35 +865,10 @@ def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
     assert db.acquire_count == 0
 
 
-def _iter_mounted_routes(routes):
-    """Yield ``(method, path)`` for every route reachable from ``routes``.
-
-    FastAPI >= 0.139 (Starlette >= 1.3) no longer flattens ``include_router``
-    routes into ``app.routes``. It inserts a ``_IncludedRouter`` wrapper that
-    exposes the underlying router via ``original_router`` and carries no
-    ``path``/``methods`` of its own, so the naive ``app.routes`` comprehension
-    silently drops every included endpoint. Recurse into those wrappers (and
-    into Starlette ``Mount`` sub-apps via ``.routes``) so route assertions keep
-    working across FastAPI versions.
-    """
-    for route in routes:
-        methods = getattr(route, "methods", None)
-        path = getattr(route, "path", None)
-        if methods and path:
-            for method in methods:
-                yield method, path
-        original_router = getattr(route, "original_router", None)
-        if original_router is not None:
-            yield from _iter_mounted_routes(original_router.routes)
-        sub_routes = getattr(route, "routes", None)
-        if sub_routes:
-            yield from _iter_mounted_routes(sub_routes)
-
-
 def test_main_app_mounts_slice_one_canvas_routes() -> None:
     from main import app
 
-    routes = set(_iter_mounted_routes(app.routes))
+    routes = mounted_routes(app)
     path = "/api/persistent/threads/{thread_id}/canvases/main"
     assert ("GET", path) in routes
     assert ("DELETE", path) in routes
