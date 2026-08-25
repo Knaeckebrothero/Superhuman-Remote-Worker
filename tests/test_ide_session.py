@@ -459,3 +459,58 @@ async def test_restore_snapshot_for_resume_returns_true_when_extract_succeeds(
     result = await svc.restore_snapshot_for_resume("job-0017", "10.0.0.10", 30022)
 
     assert result is True
+
+
+@pytest.mark.asyncio
+async def test_live_vm_status_is_unavailable_until_code_server_answers(
+    service_factory,
+):
+    """A routable (same-cluster) VM must not be advertised as an active IDE
+    when nothing answers on the code-server port — the proxy would 502."""
+    svc = service_factory
+    svc._get_job = AsyncMock(
+        return_value={
+            "id": "job-0018",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.42.0.46"}},
+        }
+    )
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.orchestrator_can_reach",
+            return_value=True,
+        ),
+        patch.object(
+            type(svc), "_wait_for_code_server", AsyncMock(return_value=False)
+        ) as probe,
+    ):
+        result = await svc.get_session_status("job-0018")
+
+    assert result["status"] == "unavailable"
+    assert result["code_server_url"] is None
+    assert "code-server" in result["error"]
+    probe.assert_awaited_once_with("http://10.42.0.46:38080", timeout=ANY)
+
+
+@pytest.mark.asyncio
+async def test_live_vm_status_is_active_when_code_server_answers(service_factory):
+    svc = service_factory
+    svc._get_job = AsyncMock(
+        return_value={
+            "id": "job-0019",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.42.0.46"}},
+        }
+    )
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.orchestrator_can_reach",
+            return_value=True,
+        ),
+        patch.object(type(svc), "_wait_for_code_server", AsyncMock(return_value=True)),
+    ):
+        result = await svc.get_session_status("job-0019")
+
+    assert result["status"] == "active"
+    assert result["source"] == "live_vm"
+    assert result["code_server_url"]
