@@ -70,6 +70,10 @@ GATE_NAMES = {
     "require_datasource_access",
     "require_datasource_owner",
     "require_sudo_request_authority",
+    # Per-VM bearer + provision-generation check for guest->orchestrator calls
+    # (orchestrator/security/vm_guest.py). Authenticated service boundary, no
+    # user identity involved, so it classifies alongside require_internal.
+    "require_vm_guest",
     "user_can_access_any_job",
     "user_can_access_job",
     # job-first then thread-owner resolver — gates session citations whose
@@ -274,6 +278,7 @@ def _classify(
         "_require_infrastructure_fleet_admin": 2,
         "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
+        "require_vm_guest": 2,
         "is_internal_call": 2,
         "require_approved_user": 3,
     }
@@ -283,6 +288,7 @@ def _classify(
     if primary in (
         "_dispatch_infrastructure_ingestion",
         "require_internal",
+        "require_vm_guest",
         "is_internal_call",
     ):
         return f"internal:{primary}"
