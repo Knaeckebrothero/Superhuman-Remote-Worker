@@ -8,6 +8,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from tests._route_inventory import mounted_routes
 from orchestrator.security.vm_guest import VmGuestIdentity
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.vm_guest_events import record_heartbeat, record_register
@@ -322,14 +323,13 @@ async def test_heartbeat_ide_merge_failure_is_non_fatal():
 async def test_main_app_registers_all_vm_guest_routes():
     from main import app
 
-    registered = {
-        (route.path, method)
-        for route in app.routes
-        for method in getattr(route, "methods", set())
-    }
+    # mounted_routes, not a comprehension over app.routes: FastAPI >= 0.139
+    # keeps included routers behind a wrapper, and the guest bridge is a
+    # router. See tests/_route_inventory.py.
+    registered = mounted_routes(app)
     assert {
-        ("/api/internal/vm/{entity_id}/register", "POST"),
-        ("/api/internal/vm/{entity_id}/heartbeat", "POST"),
-        ("/api/internal/vm/{entity_id}/sudo", "POST"),
-        ("/api/internal/vm/{entity_id}/sudo/{request_id}", "GET"),
+        ("POST", "/api/internal/vm/{entity_id}/register"),
+        ("POST", "/api/internal/vm/{entity_id}/heartbeat"),
+        ("POST", "/api/internal/vm/{entity_id}/sudo"),
+        ("GET", "/api/internal/vm/{entity_id}/sudo/{request_id}"),
     } <= registered
