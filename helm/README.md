@@ -538,6 +538,47 @@ approval request in the cockpit; approve it and the command runs.
 | the agent logs `the final git push did NOT land` and the job's Gitea repo stays at "Initial commit" | the workspace was handed a remote it cannot authenticate. The orchestrator logs `Dispatch: repository transport for job …` at every dispatch: it must name an `ssh://srw-repo-…` alias with `1 managed credential(s)`; a plain `http://…` with `0 managed credential(s)` means the job row reached dispatch without `repo_name` or the managed repository authority could not be proven (a `No managed repository authority for job …` warning precedes it) |
 | the job page reports the IDE as `unavailable: code-server is not running on the live VM` | expected: the VM image ships `code-server.service` disabled and the live-VM IDE is not wired yet; the snapshot-based IDE still works after the job ends |
 | the orchestrator logs `VM controller rejected delete … persistentvolumeclaims … is forbidden` after a job completes | a chart older than 2026-08-25 granted the controller only `get,list` on PersistentVolumeClaims; the captured teardown deletes the exact rootdisk PVC by UID and needs `delete`. Upgrade the chart |
+| `srw-vmi-metering` / `srw-storage-metering` crash-loop with `configuration is invalid` or post to an empty URL | a chart older than 2026-08-25 rendered the same-cluster collectors' orchestrator URL as `""` and `maxSnapshotBytes` as `6.7108864e+07`; upgrade the chart |
+| the orchestrator logs `Infrastructure metering collection requested but capabilities are incomplete (vm/claim-requested durable source shadow activation)` and every collector gets `503` on `/v1/tickets` | a Helm shadow gate (`vmShadowEnabled`, `vmPvcShadowEnabled`) is on before the durable activation row is in `shadow`. Order: inventory gates on → fleet-admin `…/compute-activation/workspace_vm/shadow` and `…/storage-source-activation/vm/claim-requested/shadow` → shadow gates on |
+| `POST …/compute-activation/workspace_vm/schedule` answers `409 … requires a fresh item-for-item shadow snapshot` while VMs are running, or `500 … scheduling failed` | metering-engine limits fixed after 2026-08-25 (VMI shadow comparisons; initial authority on a recovery epoch) — upgrade the orchestrator; on an older release the class can only be scheduled with no VM in the last relist snapshot |
+
+### Metering the VM tier
+
+VM compute and root-disk storage are metered by two extra collectors that the chart
+renders only in `same-cluster` mode. They are dark-launched: inventory and shadow
+evidence first, publication never before a fleet-admin activation boundary.
+
+```yaml
+infrastructureMetering:
+  collectorEnabled: true              # mandatory master (also runs the Pod collector)
+  shadowEnabled: true
+  stableClusterId: my-cluster
+  vmInventoryEnabled: true            # VMI collector
+  vmShadowEnabled: true               # only after the durable row is in shadow — see below
+  vmIngestionSecretName: srw-infra-metering-vmi-ingestion
+  vmPvcInventoryEnabled: true         # root-disk PVC collector
+  vmPvcShadowEnabled: true
+  vmStorageIngestionSecretName: srw-infra-metering-vm-storage-ingestion
+  networkPolicy:
+    enabled: true                     # or allowUnrestrictedEgress: true on a dev cluster
+    apiServerCidrs: ["10.43.0.1/32"]
+```
+
+`vmStableClusterId` and `vmNamespace` default to the release's own values in this mode.
+The two ingestion Secrets hold `INFRASTRUCTURE_METERING_VMI_INGESTION_KEY` and
+`INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY` (≥ 32 random bytes each) and must be
+distinct from each other, from the application Secret and from the chart-managed
+`<release>-infra-ingestion`. Leave `pvcInventoryEnabled` off: the release namespace holds the
+root-disk PVCs and inventorying them twice is refused at render time.
+
+Enable in this order, rolling the orchestrator between steps: inventory gates on → as a
+fleet admin `POST /api/admin/usage/v2/compute-activation/workspace_vm/shadow` and
+`POST /api/admin/usage/v2/storage-source-activation/vm/claim-requested/shadow` → shadow gates
+on. Evidence lands in `compute_shadow_observations` (one row per VMI per relist,
+`owner_kind=job|thread`) and `storage_shadow_observations` (`vm_rootdisk_claim`); evidence
+is written at relist time (`relistIntervalSeconds`, default 300 s), so a VM shorter than
+that may not be observed. Durable intervals require scheduling the class for a future UTC
+midnight; nothing is backfilled.
 
 ### Network isolation
 
