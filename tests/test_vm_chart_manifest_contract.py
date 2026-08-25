@@ -552,6 +552,14 @@ def test_installer_alias_stays_unauthenticated_without_missing_secret_key() -> N
         rule for rule in role["rules"] if "leases" in rule.get("resources", [])
     )
     assert "create" in lease_rule["verbs"]
+    # A captured teardown deletes the exact rootdisk PVC by UID precondition
+    # after the DataVolume; without the verb every such teardown 403s.
+    pvc_rule = next(
+        rule
+        for rule in role["rules"]
+        if "persistentvolumeclaims" in rule.get("resources", [])
+    )
+    assert "delete" in pvc_rule["verbs"]
     notes = (ROOT / "helm/templates/NOTES.txt").read_text()
     assert "Guest tokens cannot be minted" in notes
     assert "Set vm.lifecycleAuthSecretName" in notes
