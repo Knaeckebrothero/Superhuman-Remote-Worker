@@ -114,6 +114,27 @@ class TestSingleFixtureEverySurface:
         assert "no audit activity for 45m" in rendered
 
     @pytest.mark.asyncio
+    async def test_sitrep_presents_blocked_undelivered_as_steady_terminal_state(self):
+        blocked = {
+            "id": JOB_ID,
+            "status": "cancelled",
+            "completion_outcome_kind": "blocked_undelivered",
+            "description": "publication could not be delivered",
+            "error_message": "pull request missing",
+        }
+        db = SimpleNamespace(
+            query_jobs=AsyncMock(return_value=JobQueryResult(jobs=[blocked]))
+        )
+        previous = {JOB_ID: {"status": "blocked_undelivered", "steps": None}}
+
+        lines, fingerprints = await sitrep._jobs_section(
+            db, None, PROJECT_ID, previous, None, NOW
+        )
+
+        assert "Unchanged: 1 blocked_undelivered." in "\n".join(lines)
+        assert fingerprints[JOB_ID]["status"] == "blocked_undelivered"
+
+    @pytest.mark.asyncio
     async def test_stuck_row_and_progress_render_the_same_verdict(self):
         verdict = await compute_job_liveness(
             _stalled_job(),

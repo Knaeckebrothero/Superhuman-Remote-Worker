@@ -31,7 +31,12 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
     }
 )
 _SERVER_OWNED_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
-    "evidence_manifest"
+    "evidence_manifest",
+    "pull_request",
+    "required_deliverables",
+    "deliverable_contract_provenance",
+    "prior_deliverable_contract",
+    "required_pr_repositories",
 }
 
 
@@ -72,9 +77,9 @@ async def resume_job_with_feedback(
     conversation context, archives its in-flight todos, and re-plans from
     scratch against the feedback. Use it when the plan itself is wrong; for a
     mid-run course correction use send_message_to_job (non-destructive, lands
-    in the worker's next LLM turn with urgent=true). The job can be in any
-    status except 'completed'. If the originally assigned agent is
-    unavailable, the orchestrator auto-selects a ready agent.
+    in the worker's next LLM turn with urgent=true). Completed jobs and jobs
+    terminalized as blocked/undelivered cannot be resumed. If the originally
+    assigned agent is unavailable, the orchestrator auto-selects a ready agent.
 
     Args:
         job_id: Job UUID to resume
@@ -190,11 +195,13 @@ async def create_job(
             caller's own project lineage. Membership is validated
             server-side, so only projects the caller can access are accepted.
         priority: Dispatch priority from 0 (low) to 10 (high), default 5
-        required_deliverables: Deliverable contract — workspace-relative
-            artifact paths (e.g. "output/report.md") or "kb:<slug>" note
-            slugs that must exist before a completion claiming success may
-            seal. Shown to the worker at dispatch; missing deliverables
-            bounce the seal back to the worker with the precise list.
+        required_deliverables: Immutable deliverable contract — workspace-
+            relative artifact paths (e.g. "output/report.md"), "kb:<slug>"
+            notes, or one exact "pr:<owner>/<repository>" publication bound
+            to a writable attached repository. Files under repos/<alias>/
+            are not a verifiable contract and are refused; select the named
+            compatible pr: contract rather than substituting a note. Missing
+            PR proof can end blocked/undelivered, never completed.
         slot: Officer roster slot for this dispatch. Translated to
             context.officer_slot. Slot-pinned model/backend values are an
             allocation contract, not silent overrides: conflicting explicit

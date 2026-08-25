@@ -7,6 +7,8 @@ import {
 import {NormalizedToolCall} from '../models/tool-card.model';
 import {
     asRecord,
+    canResumeJob,
+    effectiveJobStatus,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -197,7 +199,19 @@ describe('job status vocabulary', () => {
         expect(jobStatusTone('completed')).toBe('success');
         expect(jobStatusTone('failed')).toBe('danger');
         expect(jobStatusTone('pending_review')).toBe('warning');
+        expect(jobStatusTone('blocked_undelivered')).toBe('warning');
         expect(jobStatusTone('reviewing')).toBe('accent');
         expect(jobStatusTone('anything-else')).toBe('neutral');
+    });
+
+    it('presents a terminal blocker distinctly and never offers resume', () => {
+        const blocked = {
+            status: 'cancelled',
+            completion_outcome_kind: 'blocked_undelivered',
+        };
+        expect(effectiveJobStatus(blocked)).toBe('blocked_undelivered');
+        expect(canResumeJob(blocked)).toBe(false);
+        expect(effectiveJobStatus({status: 'failed'})).toBe('failed');
+        expect(canResumeJob({status: 'failed'})).toBe(true);
     });
 });

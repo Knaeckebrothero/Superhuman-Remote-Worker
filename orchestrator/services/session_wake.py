@@ -67,6 +67,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from services.session_lifecycle import probe_ready
+from src.shared.job_outcome import effective_job_status
 from services.usage_ledger import llm_tokens_from_rows
 
 logger = logging.getLogger(__name__)
@@ -381,13 +382,14 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
         # durable trigger (its by-status backstop still finds the job); the
         # event outbox is the single officer delivery channel.
         try:
+            effective_status = effective_job_status(row)
             await db.enqueue_session_wake_event(
                 thread_id,
                 source="job_transition",
-                dedup_key=_officer_job_dedup_key(row["id"], row.get("status")),
+                dedup_key=_officer_job_dedup_key(row["id"], effective_status),
                 payload={
                     "job_id": str(row["id"]),
-                    "status": str(row.get("status") or ""),
+                    "status": effective_status,
                     "description": _truncate(str(row.get("description") or ""), 200),
                 },
                 project_id=(str(row["project_id"]) if row.get("project_id") else None),
@@ -650,7 +652,7 @@ async def _notify_owner(
     job_id = str(row["id"])
     short = job_id[:8]
     description = (row.get("description") or "")[:100]
-    status = str(row.get("status") or "finished")
+    status = effective_job_status(row, fallback="finished")
     await notification_service.dispatch(
         user_id=str(user_id),
         job_id=job_id,
@@ -689,7 +691,7 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
     cockpit a cheap literal to match.
     """
     job_id = str(row["id"])
-    status = str(row.get("status") or "unknown")
+    status = effective_job_status(row, fallback="unknown")
     description = (row.get("description") or "").strip()
 
     lines = [
@@ -1035,12 +1037,13 @@ async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> b
         if not job or not job.get("project_id"):
             return False
         project_id = str(job["project_id"])
+        effective_status = effective_job_status(job, fallback=str(status))
         decision = await db.route_project_officer_job_transition(
             project_id,
             job_id=str(job_id),
-            status=str(status),
+            status=effective_status,
             description=_truncate(str(job.get("description") or ""), 200),
-            dedup_key=_officer_job_dedup_key(job_id, status),
+            dedup_key=_officer_job_dedup_key(job_id, effective_status),
         )
         enqueued = bool(decision.get("enqueued"))
         if enqueued:

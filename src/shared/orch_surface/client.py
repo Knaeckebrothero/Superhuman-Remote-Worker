@@ -725,7 +725,8 @@ class AsyncCockpitClient:
         """List jobs with optional status filter.
 
         Args:
-            status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
+            status: Filter by status/outcome (created, processing, completed,
+                failed, cancelled, blocked_undelivered, pending_review)
             limit: Maximum number of jobs to return (1-500)
 
         Returns:
@@ -1104,8 +1105,10 @@ class AsyncCockpitClient:
             user_id: User UUID who created this job
             thread_id: Persistent session origin used for server-side lineage
             priority: Dispatch priority from 0 (low) to 10 (high)
-            required_deliverables: Deliverable contract (P1-C) — paths /
-                "kb:<slug>" entries validated at the seal
+            required_deliverables: Immutable paths, "kb:<slug>" notes, or
+                one exact "pr:<owner>/<repository>" bound to a writable
+                attached repository. Do not use repos/<alias>/ paths or
+                replace a refused publication contract with a note.
             ticket: Backlog ticket (knowledge-note slug) this job claims —
                 the funnel stamps it into ``context.ticket_note_id``, the
                 one key the one-shot claim ledger reads
@@ -2304,8 +2307,10 @@ class AsyncCockpitClient:
             config_override: Per-job config overrides
             context: Additional context dictionary
             priority: Dispatch priority from 0 (low) to 10 (high)
-            required_deliverables: Deliverable contract (P1-C) — paths /
-                "kb:<slug>" entries validated at the seal
+            required_deliverables: Immutable paths, "kb:<slug>" notes, or
+                one exact "pr:<owner>/<repository>" bound to a writable
+                attached repository. Do not use repos/<alias>/ paths or
+                replace a refused publication contract with a note.
 
         Returns:
             Created job record with ID

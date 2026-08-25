@@ -177,6 +177,28 @@ class TestJobErrorFormatters:
         )
         assert "Error: clone failed" in out
 
+    def test_blocked_delivery_is_not_rendered_as_cancellation_or_success(self):
+        job = {
+            "id": "job1",
+            "status": "cancelled",
+            "completion_outcome_kind": "blocked_undelivered",
+            "config_name": "executor",
+            "error_message": "declared pull request was not delivered",
+        }
+        detail = format_job_detail(job)
+        listed = format_jobs([job])
+        summary = format_job_summary(
+            "job1",
+            {
+                "observed_at": "2026-08-24T12:00:00+00:00",
+                "sources": [{"name": "control_db", "status": "fresh"}],
+                "data": {"job": job},
+            },
+        )
+        for rendered in (detail, listed, summary):
+            assert "blocked_undelivered" in rendered
+            assert "Status: cancelled" not in rendered
+
     def test_workspace_contract_is_prominent_without_transport_details(self):
         job = {
             "id": "job1",

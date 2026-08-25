@@ -12,7 +12,12 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
-import {asRecord, jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
+import {
+  asRecord,
+  effectiveJobStatus,
+  jobStatusLabelKey,
+  jobStatusTone as sharedJobStatusTone,
+} from '../../core/util/job-status';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -204,8 +209,12 @@ export function selectDeliveryRepository(
       } @else if (job()!.status !== 'pending_review') {
         <div class="not-review-state">
           <div class="status-info">
-            <app-badge [tone]="jobStatusTone(job()!.status)" size="sm">
-              {{ job()!.status }}
+            <app-badge [tone]="jobStatusTone(effectiveJobStatus(job()!))" size="sm">
+              @if (jobStatusLabelKey(effectiveJobStatus(job()!)); as statusKey) {
+                {{ statusKey | transloco }}
+              } @else {
+                {{ effectiveJobStatus(job()!) }}
+              }
             </app-badge>
           </div>
           <span class="status-message">
@@ -1255,6 +1264,9 @@ export class JobReviewComponent {
   jobStatusTone(status: string): BadgeTone {
     return sharedJobStatusTone(status);
   }
+
+  protected readonly effectiveJobStatus = effectiveJobStatus;
+  protected readonly jobStatusLabelKey = jobStatusLabelKey;
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);

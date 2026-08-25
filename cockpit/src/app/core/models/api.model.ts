@@ -1844,7 +1844,7 @@ export interface Agent {
 /**
  * Job status types.
  */
-export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'pending_review' | 'paused' | 'reviewing' | 'waiting';
+export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'blocked_undelivered' | 'pending_review' | 'paused' | 'reviewing' | 'waiting';
 
 /** Live, normalized state of the pull request persisted against a job. */
 export interface PullRequestStatus {
@@ -1901,6 +1901,7 @@ export interface Job {
   change_record_type?: 'job_record' | 'loop_record' | null;
   priority?: number;
   status: JobStatus;
+  completion_outcome_kind?: 'blocked_undelivered' | null;
   created_at: string;
   updated_at?: string;
   completed_at?: string;
@@ -2308,6 +2309,7 @@ export interface JobStatistics {
   completed: number;
   failed: number;
   cancelled: number;
+  blocked_undelivered?: number;
   pending_review: number;
   paused: number;
   reviewing: number;
@@ -2325,6 +2327,7 @@ export interface DailyStatistics {
   jobs_completed: number;
   jobs_failed: number;
   jobs_cancelled: number;
+  jobs_blocked_undelivered?: number;
 }
 
 /**

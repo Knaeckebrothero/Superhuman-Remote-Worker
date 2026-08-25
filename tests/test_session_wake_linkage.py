@@ -104,6 +104,9 @@ class TestPublicPathStripsThreadId:
                     "source_repository": "victim-private-repo",
                     "source_revision": "f" * 40,
                 },
+                "pull_request": {"repo": "victim/private", "number": 1},
+                "deliverable_contract_provenance": {"forged": True},
+                "required_pr_repositories": ["victim/private"],
             },
         )
         assert job.context == {"ordinary": "preserved"}

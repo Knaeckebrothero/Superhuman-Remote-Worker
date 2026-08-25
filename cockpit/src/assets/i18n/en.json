@@ -706,7 +706,8 @@
       "completed": "Completed",
       "paused": "Paused",
       "failed": "Failed",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "blocked_undelivered": "Blocked / undelivered"
     },
     "status": {
       "pending": "Pending",
@@ -719,6 +720,7 @@
       "paused": "Paused",
       "failed": "Failed",
       "cancelled": "Cancelled",
+      "blocked_undelivered": "Blocked / undelivered",
       "waiting_for_reply": "Waiting for reply",
       "waiting_approval": "Waiting · approval"
     },

@@ -54,6 +54,10 @@ import {
                 <span class="metric-value">{{ jobStats()!.cancelled }}</span>
                 <span class="metric-label">Cancelled</span>
               </div>
+              <div class="metric-card status-blocked">
+                <span class="metric-value">{{ jobStats()!.blocked_undelivered ?? 0 }}</span>
+                <span class="metric-label">{{ 'jobs.status.blocked_undelivered' | transloco }}</span>
+              </div>
             </div>
           } @else {
             <div class="loading-placeholder">Loading job statistics...</div>
@@ -97,6 +101,7 @@ import {
                 <span class="col-num">Created</span>
                 <span class="col-num">Completed</span>
                 <span class="col-num">Failed</span>
+                <span class="col-num">{{ 'jobs.status.blocked_undelivered' | transloco }}</span>
               </div>
               @for (day of dailyStats(); track day.date) {
                 <div class="daily-row">
@@ -104,6 +109,7 @@ import {
                   <span class="col-num created">{{ day.jobs_created }}</span>
                   <span class="col-num completed">{{ day.jobs_completed }}</span>
                   <span class="col-num failed">{{ day.jobs_failed }}</span>
+                  <span class="col-num blocked">{{ day.jobs_blocked_undelivered ?? 0 }}</span>
                 </div>
               }
             </div>
@@ -300,6 +306,7 @@ import {
       .metric-card.status-completed .metric-value { color: var(--success); }
       .metric-card.status-failed .metric-value { color: var(--danger); }
       .metric-card.status-cancelled .metric-value { color: var(--text-muted); }
+      .metric-card.status-blocked .metric-value { color: var(--warning); }
 
       .metric-card.agent-ready .metric-value { color: var(--success); }
       .metric-card.agent-working .metric-value { color: var(--warning); }
@@ -344,6 +351,7 @@ import {
       .col-num.created { color: var(--info); }
       .col-num.completed { color: var(--success); }
       .col-num.failed { color: var(--danger); }
+      .col-num.blocked { color: var(--warning); }
 
       /* Stuck Jobs */
       .stuck-list {

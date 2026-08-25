@@ -15,10 +15,11 @@ def make_context(read_only=False, forge="github"):
     git_mgr.push.return_value = True
     git_mgr.pull.return_value = True
     git_mgr.current_branch.return_value = "job/abc12345"
-    git_mgr.rev_parse.return_value = None
+    git_mgr.rev_parse.return_value = "a" * 40
     ws.source_repos = {"widget": git_mgr}
     ws.source_repo_meta = {
         "widget": {
+            "datasource_id": "22222222-2222-4222-8222-222222222222",
             "forge": forge,
             "api_base": "https://api.github.com",
             "owner": "acme",
@@ -270,10 +271,24 @@ async def test_repo_open_pr_calls_the_forge_adapter():
     context, _ = make_context()
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch(
-        "src.tools.repo.repo_tools.open_pull_request",
-        return_value={"number": 9, "url": "https://gh/pr/9"},
-    ) as mock_pr:
+    with (
+        patch(
+            "src.tools.repo.repo_tools.open_pull_request",
+            return_value={"number": 9, "url": "https://gh/pr/9"},
+        ) as mock_pr,
+        patch(
+            "src.tools.repo.repo_tools.get_pull_request_status",
+            return_value={
+                "number": 9,
+                "url": "https://gh/pr/9",
+                "state": "open",
+                "head": "job/abc12345",
+                "base": "develop",
+                "head_sha": "a" * 40,
+                "draft": False,
+            },
+        ),
+    ):
         out = await tool.ainvoke(
             {"repo": "widget", "title": "T", "base": "develop", "body": "B"}
         )
@@ -290,14 +305,30 @@ async def test_repo_open_pr_calls_the_forge_adapter():
 @pytest.mark.asyncio
 async def test_repo_open_pr_persists_structured_delivery_against_the_job():
     context, _ = make_context()
+    git_mgr = context.workspace_manager.source_repos["widget"]
+    git_mgr.current_branch.return_value = "feature/review-links"
     context.job_id = "11111111-1111-1111-1111-111111111111"
     context.postgres_db = MagicMock()
-    context.postgres_db.jobs.merge_context = AsyncMock(return_value=True)
+    context.postgres_db.jobs.record_pull_request = AsyncMock(return_value=True)
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch(
-        "src.tools.repo.repo_tools.open_pull_request",
-        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    with (
+        patch(
+            "src.tools.repo.repo_tools.open_pull_request",
+            return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+        ),
+        patch(
+            "src.tools.repo.repo_tools.get_pull_request_status",
+            return_value={
+                "number": 9,
+                "url": "https://github.com/acme/widget/pull/9",
+                "state": "open",
+                "head": "feature/review-links",
+                "base": "develop",
+                "head_sha": "a" * 40,
+                "draft": False,
+            },
+        ),
     ):
         out = await tool.ainvoke(
             {
@@ -308,19 +339,26 @@ async def test_repo_open_pr_persists_structured_delivery_against_the_job():
             }
         )
 
-    context.postgres_db.jobs.merge_context.assert_awaited_once()
-    job_id, updates = context.postgres_db.jobs.merge_context.await_args.args
+    context.postgres_db.jobs.record_pull_request.assert_awaited_once()
+    job_id, datasource_id, updates = (
+        context.postgres_db.jobs.record_pull_request.await_args.args
+    )
     assert str(job_id) == context.job_id
+    assert str(datasource_id) == "22222222-2222-4222-8222-222222222222"
     assert updates == {
-        "pull_request": {
-            "forge": "github",
-            "repo": "acme/widget",
-            "number": 9,
-            "url": "https://github.com/acme/widget/pull/9",
-            "head": "feature/review-links",
-            "base": "develop",
-        }
+        "forge": "github",
+        "repo": "acme/widget",
+        "number": 9,
+        "url": "https://github.com/acme/widget/pull/9",
+        "head": "feature/review-links",
+        "base": "develop",
     }
+    assert (
+        context.postgres_db.jobs.record_pull_request.await_args.kwargs[
+            "source_revision"
+        ]
+        == "a" * 40
+    )
     assert "https://github.com/acme/widget/pull/9" in out
 
 
@@ -329,12 +367,26 @@ async def test_repo_open_pr_reports_when_the_opened_pr_cannot_be_persisted():
     context, _ = make_context()
     context.job_id = "11111111-1111-1111-1111-111111111111"
     context.postgres_db = MagicMock()
-    context.postgres_db.jobs.merge_context = AsyncMock(return_value=False)
+    context.postgres_db.jobs.record_pull_request = AsyncMock(return_value=False)
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch(
-        "src.tools.repo.repo_tools.open_pull_request",
-        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    with (
+        patch(
+            "src.tools.repo.repo_tools.open_pull_request",
+            return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+        ),
+        patch(
+            "src.tools.repo.repo_tools.get_pull_request_status",
+            return_value={
+                "number": 9,
+                "url": "https://github.com/acme/widget/pull/9",
+                "state": "open",
+                "head": "job/abc12345",
+                "base": "develop",
+                "head_sha": "a" * 40,
+                "draft": False,
+            },
+        ),
     ):
         out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
 
@@ -347,19 +399,68 @@ async def test_repo_open_pr_does_not_hide_an_opened_pr_when_persistence_raises()
     context, _ = make_context()
     context.job_id = "11111111-1111-1111-1111-111111111111"
     context.postgres_db = MagicMock()
-    context.postgres_db.jobs.merge_context = AsyncMock(
+    context.postgres_db.jobs.record_pull_request = AsyncMock(
         side_effect=OSError("database unavailable")
     )
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
 
-    with patch(
-        "src.tools.repo.repo_tools.open_pull_request",
-        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    with (
+        patch(
+            "src.tools.repo.repo_tools.open_pull_request",
+            return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+        ),
+        patch(
+            "src.tools.repo.repo_tools.get_pull_request_status",
+            return_value={
+                "number": 9,
+                "url": "https://github.com/acme/widget/pull/9",
+                "state": "open",
+                "head": "job/abc12345",
+                "base": "develop",
+                "head_sha": "a" * 40,
+                "draft": False,
+            },
+        ),
     ):
         out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
 
     assert "https://github.com/acme/widget/pull/9" in out
     assert "do not open a duplicate" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_repo_open_pr_refuses_a_model_selected_non_current_head():
+    context, _ = make_context()
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with patch("src.tools.repo.repo_tools.open_pull_request") as mock_open:
+        out = await tool.ainvoke(
+            {
+                "repo": "widget",
+                "title": "T",
+                "base": "develop",
+                "head": "someone-elses-branch",
+            }
+        )
+
+    assert "currently checked out" in out
+    mock_open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repo_open_pr_refuses_an_unpushed_current_branch():
+    context, git_mgr = make_context()
+    git_mgr.rev_parse.side_effect = lambda ref: {
+        "job/abc12345": "a" * 40,
+        "origin/job/abc12345": "b" * 40,
+    }.get(ref)
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with patch("src.tools.repo.repo_tools.open_pull_request") as mock_open:
+        out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
+
+    assert "not proven at the pushed remote revision" in out
+    mock_open.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ function createMockJobStats(overrides: Partial<JobStatistics> = {}): JobStatisti
     completed: 75,
     failed: 8,
     cancelled: 2,
+    blocked_undelivered: 0,
     ...overrides,
   };
 }
@@ -74,6 +75,8 @@ function createMockDailyStats(days: number = 7): DailyStatistics[] {
       jobs_created: 10 + i,
       jobs_completed: 8 + i,
       jobs_failed: i,
+      jobs_cancelled: 0,
+      jobs_blocked_undelivered: 0,
     };
   });
 }
@@ -163,6 +166,7 @@ describe('StatisticsComponent utilities', () => {
       expect(stats.completed).toBe(75);
       expect(stats.failed).toBe(8);
       expect(stats.cancelled).toBe(2);
+      expect(stats.blocked_undelivered).toBe(0);
     });
 
     it('should allow overriding values', () => {
@@ -225,6 +229,7 @@ describe('StatisticsComponent utilities', () => {
       expect(typeof stats.jobs_created).toBe('number');
       expect(typeof stats.jobs_completed).toBe('number');
       expect(typeof stats.jobs_failed).toBe('number');
+      expect(typeof stats.jobs_blocked_undelivered).toBe('number');
     });
   });
 

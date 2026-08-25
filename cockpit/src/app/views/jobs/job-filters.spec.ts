@@ -47,7 +47,8 @@ function tokenOfKind(list: JobFilterToken[], kind: JobFilterToken['kind']): JobF
 describe('constants', () => {
   it('exposes the vocabularies the server accepts', () => {
     expect(KNOWN_JOB_STATUSES).toContain('pending_review');
-    expect(KNOWN_JOB_STATUSES).toHaveLength(10);
+    expect(KNOWN_JOB_STATUSES).toContain('blocked_undelivered');
+    expect(KNOWN_JOB_STATUSES).toHaveLength(11);
     expect(KNOWN_JOB_ORIGINS).toEqual([
       'user',
       'session',

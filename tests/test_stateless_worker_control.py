@@ -551,8 +551,8 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         if normalized.startswith("SELECT execution_lane"):
             lock_order.append("job")
             return {"execution_lane": "stateless", "delete_pending": True}
-        if normalized.startswith("SELECT status FROM jobs"):
-            return {"status": "created"}
+        if normalized.startswith("SELECT status, completion_outcome_kind FROM jobs"):
+            return {"status": "created", "completion_outcome_kind": None}
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)

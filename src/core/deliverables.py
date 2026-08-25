@@ -1,8 +1,9 @@
 """Deliverable-contract helpers (agent side).
 
 P1-C of knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md: jobs may
-carry ``context.required_deliverables`` — a list of workspace-relative paths
-(or ``kb:<slug>`` knowledge-note slugs) the seal is validated against. This
+carry ``context.required_deliverables`` — workspace-relative paths,
+``kb:<slug>`` knowledge-note slugs, or one exact
+``pr:<owner>/<repository>`` publication promise. This
 module is the agent-side half of that contract:
 
 * :func:`parse_required_deliverables` — tolerant manifest reader (the value
@@ -22,9 +23,12 @@ the same path normalization against the job branch HEAD in Gitea.
 
 from typing import Any, List, Optional, Tuple
 
-# Prefix marking a knowledge-note deliverable (checked server-side, not in the
-# workspace).
-KB_DELIVERABLE_PREFIX = "kb:"
+from src.shared.deliverable_contract import (
+    KB_DELIVERABLE_PREFIX,
+    PR_DELIVERABLE_PREFIX,
+    normalize_deliverable,
+    parse_required_deliverables as _parse_required_deliverables,
+)
 
 
 def normalize_deliverable_path(path: Any) -> Optional[str]:
@@ -35,21 +39,7 @@ def normalize_deliverable_path(path: Any) -> Optional[str]:
     are lowered/stripped but keep their prefix. Empty or non-string input
     returns ``None`` so callers can drop it.
     """
-    if not isinstance(path, str):
-        return None
-    candidate = path.strip()
-    if not candidate:
-        return None
-    if candidate.startswith(KB_DELIVERABLE_PREFIX):
-        slug = candidate[len(KB_DELIVERABLE_PREFIX) :].strip()
-        return f"{KB_DELIVERABLE_PREFIX}{slug}" if slug else None
-    while candidate.startswith("./"):
-        candidate = candidate[2:]
-    candidate = candidate.lstrip("/")
-    if candidate.startswith("repo/"):
-        candidate = candidate[len("repo/") :]
-    candidate = candidate.strip()
-    return candidate or None
+    return normalize_deliverable(path)
 
 
 def parse_required_deliverables(source: Any) -> List[str]:
@@ -59,20 +49,7 @@ def parse_required_deliverables(source: Any) -> List[str]:
     Deduplicates (order-preserving) after normalization; anything that
     doesn't normalize is dropped. Always returns a list (possibly empty).
     """
-    value = source
-    if isinstance(source, dict):
-        value = source.get("required_deliverables")
-    if isinstance(value, str):
-        # A single path is a common LLM-caller mistake — accept it.
-        value = [value]
-    if not isinstance(value, (list, tuple)):
-        return []
-    seen: List[str] = []
-    for entry in value:
-        normalized = normalize_deliverable_path(entry)
-        if normalized and normalized not in seen:
-            seen.append(normalized)
-    return seen
+    return _parse_required_deliverables(source)
 
 
 def deliverable_path_variants(path: str) -> Tuple[str, ...]:
@@ -83,7 +60,9 @@ def deliverable_path_variants(path: str) -> Tuple[str, ...]:
     that neither spelling may fail a seal when the file exists at the other.
     """
     canonical = normalize_deliverable_path(path)
-    if not canonical or canonical.startswith(KB_DELIVERABLE_PREFIX):
+    if not canonical or canonical.startswith(
+        (KB_DELIVERABLE_PREFIX, PR_DELIVERABLE_PREFIX)
+    ):
         return ()
     return (canonical, f"repo/{canonical}")
 
@@ -109,7 +88,7 @@ def resolve_workspace_deliverable(
     canonical = normalize_deliverable_path(path)
     if not canonical:
         return None, False
-    if canonical.startswith(KB_DELIVERABLE_PREFIX):
+    if canonical.startswith((KB_DELIVERABLE_PREFIX, PR_DELIVERABLE_PREFIX)):
         return canonical, False
     first_error: Optional[Exception] = None
     for variant in deliverable_path_variants(canonical):
@@ -143,7 +122,9 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
         "This job carries a deliverable contract. The seal (`job_complete`) is",
         "validated against the EXISTENCE of these artifacts — a completion that",
         "claims success while any of them is missing will be bounced back to",
-        "you with the missing paths listed.",
+        "you with the missing paths listed. A PR publication promise also",
+        "requires proof when you report that delivery was not possible; it",
+        "ends blocked/undelivered rather than completed if retries are exhausted.",
         "",
     ]
     for path in manifest:
@@ -151,6 +132,11 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
             lines.append(
                 f"- `{path}` (knowledge note — write it with kb_write using "
                 f"this exact slug)"
+            )
+        elif path.startswith(PR_DELIVERABLE_PREFIX):
+            lines.append(
+                f"- `{path}` (pull request — use the attached repository's "
+                "repo_open_pr tool; a note or local file cannot satisfy this)"
             )
         else:
             lines.append(f"- `{path}`")
@@ -164,5 +150,7 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
         "  platform validates the listed artifacts directly.",
         '- Keep plan.md\'s "## Deliverables" section mapped to these paths.',
         "- Paths are workspace-relative; `repo/` prefix is accepted either way.",
+        "- A `pr:owner/repository` item is satisfied only by a server-recorded,",
+        "  forge-verifiable pull request for that exact attached repository.",
     ]
     return "\n".join(lines)

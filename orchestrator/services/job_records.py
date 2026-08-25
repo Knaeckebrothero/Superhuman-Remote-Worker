@@ -481,6 +481,7 @@ async def write_loop_retro(
     merge_status: str,
     merged_sha: str | None,
     failed: bool = False,
+    outcome_kind: str | None = None,
     error: str | None = None,
     merge_notes: list[str] | None = None,
     vector_db: Any = None,
@@ -516,7 +517,11 @@ async def write_loop_retro(
                 record_type="loop_record",
                 role=role,
                 iteration=iteration,
-                status="failed" if failed else "completed",
+                status=(
+                    "blocked_undelivered"
+                    if outcome_kind == "blocked_undelivered"
+                    else ("failed" if failed else "completed")
+                ),
                 repo_name=job.get("repo_name"),
                 branch_name=job.get("branch_name"),
                 delivery_status=delivery_status,
@@ -525,7 +530,11 @@ async def write_loop_retro(
                 completion_notes=_freeze_notes(freeze),
                 delivery_notes=[str(note) for note in (merge_notes or [])],
                 changes=changes,
-                error=(str(error)[:_ERROR_LIMIT] if failed and error else None),
+                error=(
+                    str(error)[:_ERROR_LIMIT]
+                    if (failed or outcome_kind == "blocked_undelivered") and error
+                    else None
+                ),
             )
         )
     except Exception:
@@ -604,7 +613,15 @@ async def write_job_record(
                 delivery_notes=[],
                 changes=changes,
                 error=(
-                    str(error)[:_ERROR_LIMIT] if status == "failed" and error else None
+                    str(error)[:_ERROR_LIMIT]
+                    if status
+                    in {
+                        "failed",
+                        "cancelled",
+                        "blocked_undelivered",
+                    }
+                    and error
+                    else None
                 ),
             )
         )

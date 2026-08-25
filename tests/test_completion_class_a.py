@@ -128,6 +128,45 @@ class TestUpdateJobStatusClassA:
         assert args[1:] == ("completed", UUID(JOB_ID), "processing")
 
     @pytest.mark.asyncio
+    async def test_blocked_delivery_outcome_rides_the_terminal_status_update(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="cancelled",
+            completion_outcome_kind="blocked_undelivered",
+            expected_status="processing",
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "status = $1" in sql
+        assert "completion_outcome_kind = $2" in sql
+        assert "WHERE id = $3 AND status::text = $4::text" in sql
+        assert args[1:] == (
+            "cancelled",
+            "blocked_undelivered",
+            UUID(JOB_ID),
+            "processing",
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_delivery_outcome_rejects_invalid_status_pairing(self):
+        conn = AsyncMock()
+        db = _db_with_connection(conn)
+
+        with pytest.raises(ValueError, match="invalid completion outcome"):
+            await db.update_job_status(
+                JOB_ID,
+                status="completed",
+                completion_outcome_kind="blocked_undelivered",
+            )
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_completion_term_and_entry_status_are_one_atomic_cas(self):
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -361,6 +400,9 @@ class _EndpointDB(PostgresDB):
                     if "completed_at = COALESCE" in normalized:
                         db.job["completed_at"] = "set"
                 return "UPDATE 1"
+
+            async def fetchval(self, _sql: str, *_args):
+                return db.job.get("execution_lane", "pinned")
 
         yield _Connection()
 
@@ -652,6 +694,52 @@ class TestCompleteJobClassA:
             "status -> completed",
         ]
         assert job["completed_at"] == "set"
+
+    @pytest.mark.asyncio
+    async def test_strict_delivery_cap_terminalizes_blocked_in_one_class_a_write(
+        self,
+    ):
+        from services.deliverable_gate import DeliverableGateResult
+
+        job = _job(
+            context={"required_deliverables": ["pr:acme/widget"]},
+        )
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            freeze_data={"status": "job_completed", "summary": "no PR produced"},
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "services.completion.apply_deliverable_gate",
+                    AsyncMock(
+                        return_value=DeliverableGateResult(
+                            "cancelled",
+                            ["delivery contract terminalized blocked/undelivered"],
+                            False,
+                            "blocked_undelivered",
+                        )
+                    ),
+                )
+            )
+            verification = stack.enter_context(
+                patch("main._trigger_verification_on_complete", AsyncMock())
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        [(sql, args)] = db.class_a_statements()
+        normalized = _normalized(sql)
+        assert "status = $1" in normalized
+        assert "completion_outcome_kind = $3" in normalized
+        assert args[0] == "cancelled"
+        assert "blocked_undelivered" in args
+        assert handled["new_status"] == "cancelled"
+        assert job["completion_outcome_kind"] == "blocked_undelivered"
+        verification.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_evidence_record_failure_never_persists_private_coordinates(

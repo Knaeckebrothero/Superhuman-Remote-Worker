@@ -403,6 +403,29 @@ class TestApplyTerminalJobSideEffects:
         assert db.records[0]["error"] == "boom"
 
     @pytest.mark.asyncio
+    async def test_blocked_delivery_records_truthful_outcome_without_merge(
+        self,
+    ) -> None:
+        job = _job(context={"required_deliverables": ["pr:acme/widget"]})
+        g = _make_gitea()
+        db = _FakeDB(job)
+
+        out = await apply_terminal_job_side_effects(
+            job,
+            "cancelled",
+            gitea=g,
+            db=db,
+            error="pull request could not be delivered",
+            outcome_kind="blocked_undelivered",
+        )
+
+        assert out["record_written"] is True
+        assert out["merge_status"] is None
+        g.get_compare.assert_not_called()
+        assert db.records[0]["status"] == "blocked_undelivered"
+        assert db.records[0]["error"] == "pull request could not be delivered"
+
+    @pytest.mark.asyncio
     async def test_non_terminal_status_does_nothing(self) -> None:
         g = _make_gitea()
         out = await apply_terminal_job_side_effects(_job(), "pending_review", gitea=g)

@@ -65,6 +65,14 @@ CLAIM_MIGRATION_FILE = (
     / "app"
     / "0162_officer_ticket_claims.sql"
 )
+DELIVERABLE_MIGRATION_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / "0182_deliverable_contract_authority.sql"
+)
 
 DECOMMISSION_STEPS = (
     "post_locked",
@@ -117,6 +125,81 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
     )
     await store.connect()
     async with store.acquire() as conn:
+        # Several migration-boundary cases below intentionally drop the claim
+        # ledger and replay 0162 in this module-scoped database. Restore the
+        # small 0182 claim-audit tail before the next independently isolated
+        # test so later production methods see the actual migration head.
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.officer_ticket_claims') IS NOT NULL"
+        ):
+            await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+        await conn.execute(
+            """
+            ALTER TABLE officer_ticket_claims
+                ADD COLUMN IF NOT EXISTS completion_outcome_kind_at_delete TEXT;
+            DO $restore_0182$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'officer_ticket_claim_delete_outcome_kind'
+                       AND conrelid = 'officer_ticket_claims'::regclass
+                ) THEN
+                    ALTER TABLE officer_ticket_claims
+                        ADD CONSTRAINT officer_ticket_claim_delete_outcome_kind
+                        CHECK (
+                            completion_outcome_kind_at_delete IS NULL
+                            OR completion_outcome_kind_at_delete =
+                               'blocked_undelivered'
+                        ) NOT VALID;
+                END IF;
+            END
+            $restore_0182$;
+            CREATE OR REPLACE FUNCTION audit_officer_ticket_claim_job_delete()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $function$
+            BEGIN
+                UPDATE officer_ticket_claims
+                   SET job_deleted_at = COALESCE(
+                           job_deleted_at, statement_timestamp()
+                       ),
+                       job_status_at_delete = COALESCE(
+                           job_status_at_delete, OLD.status
+                       ),
+                       completion_outcome_kind_at_delete = COALESCE(
+                           completion_outcome_kind_at_delete,
+                           OLD.completion_outcome_kind
+                       ),
+                       deletion_reason = COALESCE(
+                           deletion_reason,
+                           'database_delete_compatibility_trigger'
+                       )
+                 WHERE job_id = OLD.id;
+                RETURN OLD;
+            END
+            $function$;
+            """
+        )
+        if not await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_trigger
+                 WHERE tgname = 'trg_officer_ticket_delivery_writer'
+                   AND tgrelid = 'jobs'::regclass
+                   AND NOT tgisinternal
+            )
+            """
+        ):
+            migration_sql = DELIVERABLE_MIGRATION_FILE.read_text()
+            start = migration_sql.index(
+                "CREATE FUNCTION public.enforce_officer_ticket_delivery_writer()"
+            )
+            terminator = (
+                "FOR EACH ROW EXECUTE FUNCTION "
+                "public.enforce_officer_ticket_delivery_writer();"
+            )
+            end = migration_sql.index(terminator, start) + len(terminator)
+            await conn.execute(migration_sql[start:end])
         await conn.execute(
             "TRUNCATE job_message_routes, session_wake_events, message_log, "
             "jobs, project_officers, threads, projects CASCADE"
@@ -1824,8 +1907,10 @@ async def _remove_claim_migration_boundary(db: PostgresDB) -> None:
     async with db.acquire() as conn:
         await conn.execute(
             """
+            DROP TRIGGER IF EXISTS trg_officer_ticket_delivery_writer ON jobs;
             DROP TRIGGER IF EXISTS officer_ticket_claim_job_integrity ON jobs;
             DROP TRIGGER IF EXISTS officer_ticket_claim_job_delete_audit ON jobs;
+            DROP FUNCTION IF EXISTS enforce_officer_ticket_delivery_writer();
             DROP FUNCTION IF EXISTS enforce_officer_ticket_claim_job_integrity();
             DROP FUNCTION IF EXISTS audit_officer_ticket_claim_job_delete();
             DROP TABLE IF EXISTS officer_ticket_claims;

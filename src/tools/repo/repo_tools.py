@@ -247,7 +247,28 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
                 "called. Set 'forge' on the connector and re-run the job."
             )
 
-        source = head or git_mgr.current_branch()
+        checked_out = git_mgr.current_branch()
+        requested_head = head.strip() if isinstance(head, str) else None
+        if not checked_out:
+            return f"Could not determine the checked-out branch in {repo!r}."
+        if requested_head and requested_head != checked_out:
+            return (
+                "The PR source must be the branch currently checked out in "
+                f"{repo!r} ({checked_out!r}); switch branches before retrying."
+            )
+        source = checked_out
+        source_revision = git_mgr.rev_parse(source)
+        pushed_revision = git_mgr.rev_parse(f"origin/{source}")
+        if (
+            not source_revision
+            or not pushed_revision
+            or source_revision != pushed_revision
+        ):
+            return (
+                f"Branch {source!r} in {repo!r} is not proven at the pushed "
+                "remote revision. Push it successfully before opening the PR."
+            )
+        normalized_base = base.strip()
         target = ForgeRepo(
             forge=meta["forge"],
             api_base=meta["api_base"],
@@ -257,24 +278,46 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         )
         try:
             result = await open_pull_request(
-                target, title=title, head=source, base=base, body=body
+                target, title=title, head=source, base=normalized_base, body=body
             )
         except ForgeError as exc:
             return f"Could not open the pull request: {exc}"
+
+        try:
+            live = await get_pull_request_status(target, int(result["number"]))
+        except ForgeError as exc:
+            return (
+                f"Opened #{result['number']}: {result['url']}\n"
+                "Warning: the forge could not attest the opened PR identity "
+                f"for completion: {exc}"
+            )
+        if (
+            str(live.get("head") or "") != source
+            or str(live.get("base") or "") != normalized_base
+            or str(live.get("head_sha") or "").lower() != source_revision.lower()
+        ):
+            return (
+                f"Opened #{result['number']}: {result['url']}\n"
+                "Warning: the forge returned a different or incomplete source/base "
+                "identity, so this PR was not recorded for completion."
+            )
 
         pull_request = {
             "forge": target.forge,
             "repo": f"{target.owner}/{target.repo}",
             "number": result["number"],
-            "url": result["url"],
+            "url": str(live.get("url") or result["url"]),
             "head": source,
-            "base": base,
+            "base": normalized_base,
         }
         recorded = False
         try:
             if context.postgres_db is not None and context.job_id:
-                recorded = await context.postgres_db.jobs.merge_context(
-                    UUID(str(context.job_id)), {"pull_request": pull_request}
+                recorded = await context.postgres_db.jobs.record_pull_request(
+                    UUID(str(context.job_id)),
+                    UUID(str(meta.get("datasource_id") or "")),
+                    pull_request,
+                    source_revision=source_revision,
                 )
         except Exception:  # noqa: BLE001 - the PR already exists; preserve its URL
             logger.exception(
@@ -284,7 +327,10 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
                 context.job_id,
             )
 
-        opened = f"Opened #{result['number']} ({source} → {base}): {result['url']}"
+        opened = (
+            f"Opened #{result['number']} ({source} → {normalized_base}): "
+            f"{result['url']}"
+        )
         if recorded:
             return opened
         return (

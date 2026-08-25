@@ -257,6 +257,20 @@ class TestBreaker:
         ]
         assert evaluate_breaker(history, {}, "line") is None
 
+    def test_blocked_undelivered_outcomes_never_trip_it(self):
+        history = [
+            {
+                **_terminal("j3", "t3", "cancelled"),
+                "completion_outcome_kind": "blocked_undelivered",
+            },
+            {
+                **_terminal("j2", "t2", "cancelled"),
+                "completion_outcome_kind": "blocked_undelivered",
+            },
+            _terminal("j1", "t1", "failed"),
+        ]
+        assert evaluate_breaker(history, {}, "line") is None
+
     def test_a_success_between_two_failures_breaks_the_chain(self):
         history = [
             _terminal("j3", "t3", "failed"),
@@ -462,6 +476,7 @@ def _db(
     conn = MagicMock()
     conn.execute = AsyncMock()
     conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=None)
 
     runtime_metadata = {
         "config_override": {

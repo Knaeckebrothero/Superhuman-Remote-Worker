@@ -706,7 +706,8 @@
       "completed": "Abgeschlossen",
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
-      "cancelled": "Abgebrochen"
+      "cancelled": "Abgebrochen",
+      "blocked_undelivered": "Blockiert / nicht ausgeliefert"
     },
     "status": {
       "pending": "Ausstehend",
@@ -719,6 +720,7 @@
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
       "cancelled": "Abgebrochen",
+      "blocked_undelivered": "Blockiert / nicht ausgeliefert",
       "waiting_for_reply": "Wartet auf Antwort",
       "waiting_approval": "Wartet · Freigabe"
     },

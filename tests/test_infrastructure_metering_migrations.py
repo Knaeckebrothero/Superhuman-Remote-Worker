@@ -234,7 +234,11 @@ APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS = (
     ROOT
     / "orchestrator/database/migrations/app/0181_sudo_requests_validate_constraints.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_SUDO_REQUESTS_VALIDATE_CONSTRAINTS
+APP_DELIVERABLE_CONTRACT_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_DELIVERABLE_CONTRACT_AUTHORITY
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

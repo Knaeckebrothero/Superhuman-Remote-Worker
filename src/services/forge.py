@@ -441,6 +441,9 @@ async def get_pull_request_status(target: ForgeRepo, number: int) -> dict:
         }.get(raw_state)
         head = data.get("source_branch")
         base = data.get("target_branch")
+        diff_refs = data.get("diff_refs")
+        diff_refs = diff_refs if isinstance(diff_refs, dict) else {}
+        head_sha = data.get("sha") or diff_refs.get("head_sha")
     else:
         if data.get("merged") is True or data.get("merged_at"):
             state = "merged"
@@ -450,6 +453,7 @@ async def get_pull_request_status(target: ForgeRepo, number: int) -> dict:
         raw_base = data.get("base")
         head = raw_head.get("ref") if isinstance(raw_head, dict) else None
         base = raw_base.get("ref") if isinstance(raw_base, dict) else None
+        head_sha = raw_head.get("sha") if isinstance(raw_head, dict) else None
     if state is None:
         raise ForgeError(
             f"{target.forge} returned an unknown pull request state {raw_state!r}"
@@ -462,6 +466,7 @@ async def get_pull_request_status(target: ForgeRepo, number: int) -> dict:
         "state": state,
         "head": str(head or ""),
         "base": str(base or ""),
+        "head_sha": str(head_sha or "").strip().lower(),
         "draft": bool(data.get("draft") or data.get("work_in_progress")),
     }
 

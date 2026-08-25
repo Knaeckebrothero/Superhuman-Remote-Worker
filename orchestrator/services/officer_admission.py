@@ -540,6 +540,59 @@ async def _validate_ticket_claim(
         )
 
 
+async def _validate_ticket_delivery_requirement(
+    conn: Any,
+    *,
+    project_id: str,
+    note_id: str | None,
+    ready_at: datetime | str | None,
+    delivery_contract: Mapping[str, Any] | None,
+) -> None:
+    """Refuse a same-generation downgrade recorded by a prior attempt.
+
+    The Post row is already locked by the caller.  This check therefore
+    linearizes with both requirement recording and the BP-05 claim/job insert;
+    a concurrent rejected ``repos/`` attempt and a rewritten ``kb:`` attempt
+    cannot both pass.
+    """
+
+    if not note_id:
+        return
+    generation = _aware(ready_at)
+    if generation is None:
+        return
+    required = await conn.fetchval(
+        """
+        SELECT required_pr_repositories
+          FROM officer_ticket_deliverable_requirements
+         WHERE project_id = $1
+           AND ticket_note_id = $2
+           AND ready_generation_at = $3
+        """,
+        UUID(project_id),
+        str(note_id),
+        generation,
+    )
+    if required is None:
+        return
+    supplied = {
+        str(value).strip().casefold()
+        for value in list((delivery_contract or {}).get("pr_repositories") or [])
+        if str(value).strip()
+    }
+    expected = {str(value).strip().casefold() for value in list(required)}
+    if supplied != expected:
+        raise _conflict(
+            "deliverable_contract_downgrade",
+            "This ticket generation previously requested publication in an "
+            "attached repository. It must use the exact PR deliverable "
+            "contract; no claim or job was created.",
+            required_pr_deliverables=[
+                f"pr:{repository}" for repository in sorted(expected)
+            ],
+        )
+
+
 async def admit_and_create_job_in_transaction(
     db: Any,
     conn: Any,
@@ -606,6 +659,13 @@ async def admit_and_create_job_in_transaction(
         project_id=preparation.project_id,
         note_id=ticket_note_id,
         ready_at=ticket_ready_at,
+    )
+    await _validate_ticket_delivery_requirement(
+        conn,
+        project_id=preparation.project_id,
+        note_id=ticket_note_id,
+        ready_at=ticket_ready_at,
+        delivery_contract=job_kwargs.get("delivery_contract"),
     )
 
     final_kwargs = dict(job_kwargs)
@@ -699,6 +759,108 @@ async def admit_and_create_job_in_transaction(
     return await db.create_job(**final_kwargs)
 
 
+async def record_rejected_ticket_delivery_requirement(
+    db: Any,
+    *,
+    preparation: OfficerAdmissionPreparation,
+    ticket_note_id: str,
+    ticket_ready_at: datetime | str,
+    required_pr_repositories: Sequence[str],
+) -> dict[str, Any]:
+    """Durably record a rejected external-publication contract.
+
+    This deliberately shares the authoritative Post -> thread lock order with
+    admission.  It inserts neither a ticket claim nor a job.
+    """
+
+    generation = _aware(ticket_ready_at)
+    repositories = sorted(
+        {
+            str(value).strip().casefold()
+            for value in required_pr_repositories
+            if str(value).strip()
+        }
+    )
+    if generation is None or not repositories:
+        raise _conflict(
+            "invalid_deliverable_requirement",
+            "The rejected publication contract could not be recorded safely.",
+        )
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            post, thread = await _lock_current_post(conn, preparation)
+            current = _preparation_from_rows(
+                post,
+                thread,
+                expected_thread_id=preparation.thread_id,
+                requested_slot=preparation.requested_slot,
+                require_auto_pull=preparation.require_auto_pull,
+                expected_category=preparation.category,
+                requested_model=preparation.requested_model,
+                requested_backend=preparation.requested_backend,
+            )
+            if current.config_fingerprint != preparation.config_fingerprint:
+                raise _conflict(
+                    "config_changed",
+                    "Officer Post configuration or lineage changed while work "
+                    "was prepared; retry.",
+                )
+            await _validate_ticket_claim(
+                conn,
+                project_id=preparation.project_id,
+                note_id=ticket_note_id,
+                ready_at=generation,
+            )
+            existing = await conn.fetchrow(
+                """
+                SELECT required_pr_repositories
+                  FROM officer_ticket_deliverable_requirements
+                 WHERE project_id = $1
+                   AND ticket_note_id = $2
+                   AND ready_generation_at = $3
+                 FOR UPDATE
+                """,
+                UUID(preparation.project_id),
+                str(ticket_note_id),
+                generation,
+            )
+            if existing is not None:
+                recorded = sorted(
+                    str(value).casefold()
+                    for value in existing["required_pr_repositories"]
+                )
+                if recorded != repositories:
+                    raise _conflict(
+                        "deliverable_requirement_conflict",
+                        "This ticket generation already has a different "
+                        "server-recorded publication requirement.",
+                    )
+                return {
+                    "recorded": False,
+                    "required_pr_repositories": repositories,
+                }
+            await conn.execute(
+                """
+                INSERT INTO officer_ticket_deliverable_requirements (
+                    project_id, ticket_note_id, ready_generation_at,
+                    required_pr_repositories, officer_thread_id,
+                    officer_incarnation
+                ) VALUES ($1, $2, $3, $4::text[], $5, $6)
+                """,
+                UUID(preparation.project_id),
+                str(ticket_note_id),
+                generation,
+                repositories,
+                UUID(preparation.thread_id),
+                current.incarnation,
+            )
+            return {
+                "recorded": True,
+                "required_pr_repositories": repositories,
+            }
+
+
 async def admit_and_create_job(
     db: Any,
     *,
@@ -754,4 +916,5 @@ __all__ = [
     "count_in_flight_by_slot",
     "officer_is_held",
     "prepare_officer_admission",
+    "record_rejected_ticket_delivery_requirement",
 ]
