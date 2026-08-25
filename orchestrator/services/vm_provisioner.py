@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -656,6 +657,53 @@ class VMProvisioner:
             return VMTeardownResult("identity_superseded", False)
         return VMTeardownResult("retry_pending", False)
 
+    async def _terminal_snapshot_already_captured(self, job_id: str) -> bool:
+        """True when this VM incarnation's terminal snapshot is already in S3.
+
+        A captured teardown is retried whenever the controller has not yet
+        confirmed the exact incarnation gone; re-capturing on every retry
+        SSHes into a VM that is already shutting down. The snapshot from the
+        first attempt is keyed to this incarnation when it was created after
+        the VM was provisioned, so reuse it instead.
+        """
+        if not self._db:
+            return False
+        try:
+            row = await self._db.get_job(job_id)
+            if not isinstance(row, dict):
+                return False
+            ctx = row.get("context") or {}
+            if isinstance(ctx, str):
+                ctx = json.loads(ctx)
+            snapshot = ctx.get("snapshot") or {}
+            vm_ctx = _extract_vm_context(row)
+            if (
+                snapshot.get("status") != "available"
+                or snapshot.get("source_type") != "vm"
+                or snapshot.get("phase_number") is not None
+            ):
+                return False
+            created_at = datetime.fromisoformat(str(snapshot.get("created_at")))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            provisioned_at = float(vm_ctx.get("provisioned_at") or 0)
+            reusable = created_at.timestamp() >= provisioned_at
+            if reusable:
+                logger.info(
+                    "Reusing the terminal snapshot already captured for job %s "
+                    "(created %s); not re-capturing on teardown retry",
+                    job_id,
+                    snapshot.get("created_at"),
+                )
+            return reusable
+        except Exception:
+            logger.debug(
+                "Could not evaluate the existing snapshot for job %s",
+                job_id,
+                exc_info=True,
+            )
+            return False
+
     async def release_vm_captured(
         self,
         job_id: str,
@@ -685,6 +733,7 @@ class VMProvisioner:
             and self._snapshot_service.is_available
             and ssh_host
             and ssh_port
+            and not await self._terminal_snapshot_already_captured(job_id)
         ):
             try:
                 captured = await self._snapshot_service.capture_vm_snapshot(
