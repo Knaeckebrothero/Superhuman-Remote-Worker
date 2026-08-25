@@ -72,6 +72,7 @@ async def db(pg_dsn):
                 runner_kind text,
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 branch_name text,
+                repo_name text,
                 context jsonb,
                 freeze_data jsonb,
                 created_at timestamptz DEFAULT now(),
