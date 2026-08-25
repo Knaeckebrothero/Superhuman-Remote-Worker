@@ -72,7 +72,8 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
-import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
+import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
+import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -343,16 +344,6 @@ export function canComposeDuringSession(
     // between that send and connect(), which isStartingSession excludes by
     // design (it tests threadStatus !== 'ended').
     return isConnected || isStartingSession || isDraftSession || isEnded || isResuming;
-}
-
-/**
- * Whether the status-bar "Cloud changes" badge should show (Slice C,
- * Task 14). Both conditions are needed: `protectedCloud` alone doesn't mean
- * anything is staged yet, and a nonzero count must not survive a switch to
- * an unprotected thread (stale signal from the previous session).
- */
-export function cloudBadgeVisible(protectedCloud: boolean, count: number): boolean {
-    return protectedCloud && count > 0;
 }
 
 export function canSendMessage(canCompose: boolean, text: string, attachmentCount: number): boolean {
@@ -872,7 +863,8 @@ export function clearDraft(threadId: string | null): void {
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
-        JobDiffReviewComponent,
+        CloudReviewDialogComponent,
+        CloudReviewBannerComponent,
     ],
     template: `
     <div class="chat-container"
@@ -938,8 +930,11 @@ export function clearDraft(threadId: string | null): void {
                 @if (chat.citationsByCid().size > 0) {
                   <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
                 }
+                @if (chat.verifiedProjectFolder()) {
+                  <app-menu-item (activated)="openProjectFiles()">{{ 'chat.header.projectFilesButton' | transloco }}</app-menu-item>
+                }
                 @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-                  <app-menu-item (activated)="openSessionFiles()">{{ 'chat.header.filesButton' | transloco }}</app-menu-item>
+                  <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
                 }
                 @if (ideStatus(); as ide) {
                   @if (ide.gitea_url) {
@@ -970,10 +965,22 @@ export function clearDraft(threadId: string | null): void {
                 </button>
               }
 
+              <!-- PC-19. Two unambiguous actions, never one guess: the
+                   project folder the protected diff actually applies to, and
+                   the session scratch folder. The project action only exists
+                   once the mount has been cross-checked against the diff
+                   summary (chat.verifiedProjectFolder). -->
+              @if (chat.verifiedProjectFolder(); as folder) {
+                <button class="ide-btn" (click)="openProjectFiles()"
+                        [title]="'chat.header.projectFilesTooltip' | transloco:{ name: folder.name }">
+                  <app-icon size="sm" class="ide-icon">folder_shared</app-icon>
+                  {{ 'chat.header.projectFilesButton' | transloco }}
+                </button>
+              }
               @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
                 <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
                   <app-icon size="sm" class="ide-icon">cloud</app-icon>
-                  {{ 'chat.header.filesButton' | transloco }}
+                  {{ sessionFilesLabelKey() | transloco }}
                 </button>
               }
               @if (ideStatus(); as ide) {
@@ -999,26 +1006,52 @@ export function clearDraft(threadId: string | null): void {
             <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
-          } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
+          } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
             <!-- Asleep/ended session. Every other header action drives the live
                  agent, so the isConnected() gate above is right for them — but
-                 Files just opens an external cloud URL that loadThreadMeta has
-                 already resolved, and it is the one deliverable surface a user
-                 comes back to a dead session for. Keep it reachable. -->
-            @if (headerCompact()) {
-              <app-icon-button
-                size="sm"
-                [ariaLabel]="'chat.header.filesButton' | transloco"
-                [tooltip]="'chat.header.filesTooltip' | transloco"
-                (clicked)="openSessionFiles()"
-              >
-                <app-icon size="sm">cloud</app-icon>
-              </app-icon-button>
-            } @else {
-              <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
-                <app-icon size="sm" class="ide-icon">cloud</app-icon>
-                {{ 'chat.header.filesButton' | transloco }}
-              </button>
+                 these just open an external cloud URL that loadThreadMeta has
+                 already resolved, and they are the one deliverable surface a
+                 user comes back to a dead session for. Keep them reachable.
+
+                 PC-19: for a protected session the project folder is the one
+                 the staged diff applies to; the legacy session folder is an
+                 empty agent-service directory. Both are offered, each named
+                 for what it is — and the project action exists only when the
+                 mount has been cross-checked against the diff summary. -->
+            @if (chat.verifiedProjectFolder(); as folder) {
+              @if (headerCompact()) {
+                <app-icon-button
+                  size="sm"
+                  [ariaLabel]="'chat.header.projectFilesButton' | transloco"
+                  [tooltip]="'chat.header.projectFilesTooltip' | transloco:{ name: folder.name }"
+                  (clicked)="openProjectFiles()"
+                >
+                  <app-icon size="sm">folder_shared</app-icon>
+                </app-icon-button>
+              } @else {
+                <button class="ide-btn" (click)="openProjectFiles()"
+                        [title]="'chat.header.projectFilesTooltip' | transloco:{ name: folder.name }">
+                  <app-icon size="sm" class="ide-icon">folder_shared</app-icon>
+                  {{ 'chat.header.projectFilesButton' | transloco }}
+                </button>
+              }
+            }
+            @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
+              @if (headerCompact()) {
+                <app-icon-button
+                  size="sm"
+                  [ariaLabel]="sessionFilesLabelKey() | transloco"
+                  [tooltip]="'chat.header.filesTooltip' | transloco"
+                  (clicked)="openSessionFiles()"
+                >
+                  <app-icon size="sm">cloud</app-icon>
+                </app-icon-button>
+              } @else {
+                <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
+                  <app-icon size="sm" class="ide-icon">cloud</app-icon>
+                  {{ sessionFilesLabelKey() | transloco }}
+                </button>
+              }
             }
           }
         </div>
@@ -1052,19 +1085,36 @@ export function clearDraft(threadId: string | null): void {
               {{ 'chat.status.cloudSyncOff' | transloco }}
             </app-badge>
           }
-          @if (cloudBadgeShown()) {
-            <app-badge tone="accent" size="sm" role="button"
-                       [title]="'chat.status.cloudChangesTooltip' | transloco:{ mount: chat.protectedMountName(), stagedAt: formatStagedAt(chat.cloudStagedAt()) }"
-                       (click)="chat.cloudDiffPanelOpen.set(true)">
-              {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
-            </app-badge>
-          }
+          <!-- The staged-cloud-changes entry point used to live here. It was
+               a passive-looking badge, keyboard-unreachable (role="button"
+               with no tabindex), and — fatally — inside this
+               isConnected()-gated bar, so an ended session could never reach
+               a genuine pending review (PC-23, PC-25). It is now
+               the cloud-review banner below, outside the gate. -->
           <app-badge tone="accent" size="sm" role="button" tabindex="0"
                      [title]="'chat.header.settingsTooltip' | transloco"
                      (click)="settingsRequested.emit(undefined)"
                      (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
       }
+
+      <!-- Pending protected-cloud review. Deliberately OUTSIDE the
+           isConnected() gate above: the review API serves ended threads on
+           purpose, and gating the only entry point on the live agent turned a
+           recoverable duplicate stage into a trap whose only exit was Resume
+           (PC-25). Its own component so no rules land in
+           persistent-chat.component.scss, which is already 41kB of a 48kB
+           anyComponentStyle error budget. -->
+      <app-cloud-review-banner
+        [protectedCloud]="chat.protectedCloud()"
+        [count]="chat.cloudChangesCount()"
+        [probe]="chat.cloudDiffProbe()"
+        [folderName]="chat.verifiedProjectFolder()?.name ?? null"
+        [stagedAt]="chat.cloudStagedAt()"
+        [threadId]="chat.threadId()"
+        (review)="chat.cloudDiffPanelOpen.set(true)"
+        (recheck)="chat.refreshCloudDiffCount()"
+      />
 
       <!-- View menu: device-local display prefs (chatPrefs/localStorage).
            Session config (model, temperature, mode, tools, …) lives in the
@@ -1120,62 +1170,30 @@ export function clearDraft(threadId: string | null): void {
         </div>
       }
 
-      <!-- Cloud-diff review drawer (Slice C, Task 14): staged protected-cloud
-           changes. Reuses the citations panel's container classes (no new
-           persistent-chat.component.scss — that file is already near its
-           anyComponentStyle budget); the drawer's own chrome is inline,
-           mirroring citations-panel.component.ts's styles-array pattern. -->
-      @if (chat.cloudDiffPanelOpen()) {
-        <div class="settings-panel citations-panel-wrap"
-             style="display:flex;flex-direction:column;height:70vh;min-height:0;">
-          <div style="display:flex;align-items:center;justify-content:space-between;
-                      flex:0 0 auto;padding:0.5rem 0.75rem;
-                      border-bottom:1px solid var(--border-color, rgba(127,127,127,0.2));">
-            <span style="font-weight:600;font-size:0.9rem;">
-              {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
-            </span>
-            <button type="button" (click)="chat.cloudDiffPanelOpen.set(false)"
-                    [title]="'chat.citations.close' | transloco"
-                    style="background:none;border:none;cursor:pointer;color:inherit;
-                           display:inline-flex;padding:0.15rem;">
-              <app-icon size="sm">close</app-icon>
-            </button>
-          </div>
-          <app-job-diff-review
-            style="flex:1 1 auto;min-height:0;"
+      <!-- Cloud-diff review. Was an inline 70vh block wedged into the chat
+           column with six hard-coded inline style= attributes, no dialog
+           semantics and no focus management; it is now a proper modal
+           (PC-23). @defer is load-bearing, not decoration: the review surface
+           pulls Monaco's loader and is never needed on first paint, and the
+           initial bundle is at 2.70MB against a 2.75MB hard-error budget. -->
+      @defer (when chat.cloudDiffPanelOpen() || !!jobDiffId()) {
+        @if (chat.cloudDiffPanelOpen()) {
+          <app-cloud-review-dialog
+            [open]="true"
             [threadId]="chat.threadId()"
+            [projectFolder]="chat.verifiedProjectFolder()"
             (resolved)="chat.onCloudDiffResolved()"
+            (closed)="chat.closeCloudReview()"
           />
-        </div>
-      }
+        }
 
-      <!-- Job-diff drawer for a job card's "Open diff". Same container and
-           chrome as the cloud-diff drawer above, but bound to a jobId — the
-           component already accepts either. Kept as a separate signal so
-           opening a job's diff can never be confused with, or clobber, the
-           session's own staged cloud changes. -->
-      @if (jobDiffId(); as jobId) {
-        <div class="settings-panel citations-panel-wrap"
-             style="display:flex;flex-direction:column;height:70vh;min-height:0;">
-          <div style="display:flex;align-items:center;justify-content:space-between;
-                      flex:0 0 auto;padding:0.5rem 0.75rem;
-                      border-bottom:1px solid var(--border-color, rgba(127,127,127,0.2));">
-            <span style="font-weight:600;font-size:0.9rem;">
-              {{ 'toolCard.job.diffTitle' | transloco:{ id: jobId.slice(0, 8) } }}
-            </span>
-            <button type="button" (click)="jobDiffId.set(null)"
-                    [title]="'chat.citations.close' | transloco"
-                    style="background:none;border:none;cursor:pointer;color:inherit;
-                           display:inline-flex;padding:0.15rem;">
-              <app-icon size="sm">close</app-icon>
-            </button>
-          </div>
-          <app-job-diff-review
-            style="flex:1 1 auto;min-height:0;"
-            [jobId]="jobId"
-            (resolved)="jobDiffId.set(null)"
-          />
-        </div>
+        <!-- Job-diff twin for a job card's "Open diff". Same component, bound
+             to a jobId. Kept as a separate signal so opening a job's diff can
+             never be confused with, or clobber, the session's own staged
+             cloud changes. -->
+        @if (jobDiffId(); as jobId) {
+          <app-cloud-review-dialog [open]="true" [jobId]="jobId" (closed)="jobDiffId.set(null)" />
+        }
       }
 
       <!-- Task bar -->
@@ -2548,22 +2566,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
-    /** Badge-tooltip timestamp for the staged cloud-diff (Slice C, Task 14).
-     *  Same Intl approach as formatEndedAt (medium date fits a tooltip);
-     *  em-dash when nothing is staged / the summary hasn't reported one. */
-    formatStagedAt(value: string | null): string {
-        if (!value) return '—';
-        const lang = this.i18n.activeLang();
-        try {
-            return new Intl.DateTimeFormat(lang, {
-                dateStyle: 'medium',
-                timeStyle: 'short',
-            }).format(new Date(value));
-        } catch {
-            return value;
-        }
-    }
-
     // Startup step list — drives the provisioning card.
     // Order maps to the phases the orchestrator emits via the `status` WS message.
     private readonly STARTUP_PHASE_ORDER = ['creating', 'provisioning', 'booting', 'connecting'] as const;
@@ -2647,11 +2649,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.threadStatus() === 'ended',
             this.chat.isResuming(),
         ),
-    );
-
-    /** Status-bar "Cloud changes" badge visibility (Slice C, Task 14). */
-    readonly cloudBadgeShown = computed(() =>
-        cloudBadgeVisible(this.chat.protectedCloud(), this.chat.cloudChangesCount()),
     );
 
     stepIcon(state: 'done' | 'active' | 'todo'): string {
@@ -3795,6 +3792,24 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             const url = pickCodeServerUrlToOpen(status);
             if (url) window.open(url, '_blank');
         });
+    }
+
+    /**
+     * The session scratch folder is only relabelled when a project-folder
+     * action sits beside it. On an ordinary session there is nothing to
+     * disambiguate from, and "Files" stays "Files".
+     */
+    readonly sessionFilesLabelKey = computed(() =>
+        this.chat.verifiedProjectFolder()
+            ? 'chat.header.sessionFilesButton'
+            : 'chat.header.filesButton',
+    );
+
+    /** PC-19: the protected project folder, never a guessed URL. Only ever
+     *  reachable when `verifiedProjectFolder` resolved one. */
+    openProjectFiles(): void {
+        const url = this.chat.verifiedProjectFolder()?.url;
+        if (url) window.open(url, '_blank');
     }
 
     openSessionFiles(): void {

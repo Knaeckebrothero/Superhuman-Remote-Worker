@@ -1521,7 +1521,10 @@
       "citationsButton": "Citations",
       "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
-      "disconnect": "Disconnect"
+      "disconnect": "Disconnect",
+      "projectFilesButton": "Project files",
+      "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
+      "sessionFilesButton": "Session files"
     },
     "citations": {
       "title": "Citations",
@@ -1543,10 +1546,25 @@
       "temp": "temp {{value}}",
       "turn": "Turn {{count}}",
       "agentQuiet": "Working — no output for {{seconds}}s",
-      "cloudChanges": "Cloud changes ({{count}})",
-      "cloudChangesTooltip": "Staged on {{mount}} · last staged {{stagedAt}} — click to review",
       "cloudSyncOff": "Cloud sync off",
       "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."
+    },
+    "cloudReview": {
+      "regionLabel": "Pending cloud review",
+      "title": "{{count}} cloud changes are waiting for your review",
+      "titleSingular": "{{count}} cloud change is waiting for your review",
+      "subtitle": "Nothing has been written to your cloud yet",
+      "staged": "staged {{at}}",
+      "action": "Review changes",
+      "unknownTitle": "Couldn't check for pending cloud changes",
+      "unknownBody": "This session uses a protected cloud folder, so there may be changes waiting. Try again, or open the review to see what went wrong.",
+      "recheck": "Check again",
+      "openReview": "Open review",
+      "receiptRegionLabel": "Last cloud review result",
+      "receiptApplied": "Last cloud review: applied — {{applied}} written, {{deleted}} deleted",
+      "receiptRejected": "Last cloud review: staged changes discarded",
+      "receiptLocal": "this browser only",
+      "viewResult": "View result"
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",
@@ -2718,54 +2736,171 @@
     }
   },
   "jobDiffReview": {
-    "title": "Cloud diff review",
-    "subtitle": "{{count}} file(s) changed in this job. Review and decide.",
-    "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
-    "loading": "Loading diff…",
-    "empty": "No changes to review — the agent didn't modify the project folder.",
-    "staleNotice": "The staged diff changed since you loaded it — reloaded the latest version.",
+    "loading": "Loading changes…",
+    "staleNotice": "The staged changes moved on since you loaded them — reloaded the latest version.",
+    "meta": {
+      "staged": "Staged",
+      "mount": "Mount",
+      "epoch": "Epoch",
+      "baseline": "Baseline",
+      "talliesLabel": "Change totals",
+      "openFolder": "Open project files",
+      "openFolderFor": "Open project files for {{name}} in a new tab",
+      "detailsLabel": "Details"
+    },
+    "forbidden": {
+      "title": "You can't review these changes"
+    },
+    "loadFailed": {
+      "title": "Couldn't load the changes",
+      "retry": "Try again"
+    },
     "fileTree": {
       "header": "Files",
       "statusAdded": "Added",
       "statusModified": "Modified",
-      "statusDeleted": "Deleted"
+      "statusDeleted": "Deleted",
+      "chooser": "File {{index}} of {{total}}",
+      "chooserEmpty": "{{total}} changed files"
     },
     "viewer": {
-      "selectPrompt": "Select a file from the list to view the diff.",
+      "regionLabel": "Selected file",
+      "selectPrompt": "Select a file from the list to view its changes.",
       "loadingFile": "Loading file…",
-      "loadFailed": "Couldn't load this file's diff. Check console for details.",
-      "labelOriginal": "Cloud version",
-      "labelChanged": "Agent edit",
-      "deletedNote": "This file will be deleted from the cloud folder on accept.",
-      "addedNote": "This file will be created in the cloud folder on accept.",
+      "loadFailed": "Couldn't load this file",
+      "missingTitle": "This file is no longer staged",
       "monacoUnavailable": "The diff editor failed to load. Showing plain content instead.",
-      "binaryPlaceholder": "Binary file — applied byte-for-byte, no preview"
+      "binaryTitle": "Binary file — no preview",
+      "binaryType": "Type",
+      "binaryStatus": "Change",
+      "binaryNoDownload": "The staged copy of this file cannot be opened or downloaded from here.",
+      "binaryKind": {
+        "pdf": "PDF document",
+        "document": "Word-processor document",
+        "spreadsheet": "Spreadsheet",
+        "presentation": "Presentation",
+        "image": "Image",
+        "audio": "Audio",
+        "video": "Video",
+        "archive": "Archive",
+        "unknown": "Binary file"
+      },
+      "reloadReview": "Reload the review"
     },
     "conflict": {
-      "title": "Cloud folder was modified externally",
-      "body": "Files in the cloud folder changed during this job run. Accept is disabled until you resolve the conflict manually (download the diverged files, reconcile, then retry).",
+      "title": "The cloud folder changed underneath this review",
       "etagMismatch": "Edited externally",
       "missingAtCloud": "Deleted externally",
       "unexpectedAtCloud": "Created externally",
-      "dismiss": "Dismiss"
+      "recheck": "Re-check"
     },
     "partial": {
-      "title": "Partial write failure",
-      "body": "Applied {{applied}} change(s) and {{deleted}} deletion(s), but {{count}} file(s) failed. The job stays in pending review; fix the cause and retry."
+      "title": "Some writes failed"
+    },
+    "receipt": {
+      "at": "Decided",
+      "overlayReset": "Working copy cleared",
+      "overlayResetYes": "Yes",
+      "overlayResetNo": "No",
+      "overlayWarning": "The session's working copy could not be cleared, because its workspace is no longer running. If you resume this session it may stage the same changes again — reject the duplicate if it appears.",
+      "localOnly": "This result is recorded in this browser only. The server does not yet keep a permanent record of review decisions.",
+      "doneHint": "Nothing further is pending for this folder."
+    },
+    "a11y": {
+      "loaded": "{{count}} changed files loaded.",
+      "loadedEmpty": "No changes to review.",
+      "fileLoaded": "Showing changes for {{path}}.",
+      "applying": "Applying changes to the cloud…",
+      "rejecting": "Discarding staged changes…",
+      "applied": "Done. {{applied}} written, {{deleted}} deleted.",
+      "rejected": "Staged changes discarded. Nothing was written to the cloud.",
+      "loadedSingular": "1 changed file loaded."
     },
     "actions": {
-      "accept": "Accept all changes",
-      "accepting": "Applying changes…",
-      "applyToCloud": "Apply to cloud",
-      "reject": "Reject all",
-      "rejecting": "Rejecting…",
-      "confirmAcceptTitle": "Apply these changes to your cloud folder?",
-      "confirmAcceptBody": "{{count}} file(s) will be written to the project's cloud folder. This action is not reversible from the cockpit.",
-      "confirmRejectTitle": "Discard all changes?",
-      "confirmRejectBody": "The agent's edits will be discarded. The Gitea commits stay as an audit trail.",
-      "confirmRejectBodyCloud": "The staged changes will be permanently discarded. Nothing has been written to your cloud.",
       "cancel": "Cancel",
-      "confirm": "Continue"
+      "done": "Done",
+      "close": "Close review"
+    },
+    "session": {
+      "addedNote": "This file will be created in the cloud folder when you apply.",
+      "applyConfirmBody": "This writes all {{count}} reviewed changes to {{mount}}. It cannot be undone from Cockpit — only your cloud provider's own version history or trash can recover the previous state.",
+      "applyConfirmBodySingular": "This writes the one reviewed change to {{mount}}. It cannot be undone from Cockpit — only your cloud provider’s own version history or trash can recover the previous state.",
+      "applyConfirmLabel": "Yes, apply to cloud",
+      "applyLabel": "Apply to cloud",
+      "applyingLabel": "Applying your changes to the cloud…",
+      "binaryBody": "The bytes are applied exactly as staged. There is no text preview, so review it by the path and change type.",
+      "conflictBody": "Files in the protected folder changed outside this session since its changes were staged. Applying is blocked until you reconcile them — there is no force option, by design.",
+      "decisionHint": "Applying writes every reviewed change to the cloud folder. Rejecting discards them all and leaves the cloud untouched.",
+      "deletedNote": "This file will be deleted from the cloud folder when you apply.",
+      "dialogLabel": "Cloud changes review",
+      "directionNew": "After you apply",
+      "directionOld": "Cloud now",
+      "emptyBody": "This session hasn't staged any changes to the protected folder. If the agent has just finished a turn, its changes may still be being captured.",
+      "emptyTitle": "Nothing staged for review",
+      "eyebrow": "Protected cloud · review required",
+      "eyebrowResolved": "Protected cloud · resolved",
+      "forbiddenBody": "Only the owner of this session can review its staged cloud changes.",
+      "missingBody": "It was in the staged set when this review loaded but the session has re-staged since. Reload to see the current changes.",
+      "missingBodyGone": "It was in the staged set when this review loaded, but it is not any more — the session re-staged, or the changes were resolved somewhere else. Reload to see the current state.",
+      "missingBodyUnreadable": "It is still staged, but its stored copy cannot be read, so there is nothing safe to show or apply. Ask the session to stage its changes again.",
+      "partialBody": "Applied {{applied}} changes and {{deleted}} deletions, but {{count}} files failed. The remaining changes are still staged, so you can retry.",
+      "partialBodySingular": "Applied {{applied}} changes and {{deleted}} deletions, but one file failed. The remaining changes are still staged, so you can retry.",
+      "receiptAppliedBody": "{{applied}} written, {{deleted}} deleted in the protected folder.",
+      "receiptAppliedTitle": "Applied to your cloud",
+      "receiptRejectedBody": "Nothing was written to or removed from your cloud.",
+      "receiptRejectedTitle": "Staged changes discarded",
+      "rejectConfirmBody": "This permanently discards all {{count}} staged changes. Nothing is written to or removed from your cloud, and there is no history to restore them from afterwards.",
+      "rejectConfirmBodySingular": "This permanently discards the one staged change. Nothing is written to or removed from your cloud, and there is no history to restore it from afterwards.",
+      "rejectConfirmLabel": "Yes, discard them",
+      "rejectLabel": "Reject staged changes",
+      "rejectingLabel": "Discarding the staged changes…",
+      "subtitle": "{{count}} files changed in this session. Nothing has been written to your cloud yet.",
+      "subtitleSingular": "{{count}} file changed in this session. Nothing has been written to your cloud yet.",
+      "titleFallback": "Protected cloud folder",
+      "unavailableBody": "This session isn't running in protected cloud mode, or it no longer exists. Only sessions created with protected cloud enabled stage their changes for review.",
+      "unavailableTitle": "No protected review for this session"
+    },
+    "job": {
+      "addedNote": "This file will be created in the cloud folder on accept.",
+      "applyConfirmBody": "{{count}} files will be written to the project's cloud folder. This action is not reversible from Cockpit.",
+      "applyConfirmBodySingular": "One file will be written to the project’s cloud folder. This action is not reversible from Cockpit.",
+      "applyConfirmLabel": "Yes, accept them",
+      "applyLabel": "Accept all changes",
+      "applyingLabel": "Writing the changes to the cloud folder…",
+      "binaryBody": "The bytes are applied exactly as produced. There is no text preview, so review it by the path and change type.",
+      "conflictBody": "Files in the cloud folder changed during this job run. Accepting is blocked until you reconcile them manually — download the diverged files, merge, then retry.",
+      "decisionHint": "Accepting writes every change to the project's cloud folder. Rejecting discards them and completes the job.",
+      "deletedNote": "This file will be deleted from the cloud folder on accept.",
+      "dialogLabel": "Project cloud review",
+      "directionNew": "After this job",
+      "directionOld": "Baseline",
+      "emptyBody": "The agent didn't modify anything under the project folder in this job.",
+      "emptyTitle": "No changes to review",
+      "eyebrow": "Project cloud review",
+      "eyebrowResolved": "Project cloud review · resolved",
+      "forbiddenBody": "You don't have access to this job's project cloud changes.",
+      "missingBody": "It was in the diff when this review loaded but the job's diff has changed since. Reload to see the current changes.",
+      "missingBodyGone": "It was in the diff when this review loaded, but it is not any more — the job’s diff has changed since. Reload to see the current state.",
+      "missingBodyUnreadable": "It is still in the diff, but its stored copy cannot be read, so there is nothing safe to show or accept.",
+      "partialBody": "Applied {{applied}} changes and {{deleted}} deletions, but {{count}} files failed. The job stays in pending review; fix the cause and retry.",
+      "partialBodySingular": "Applied {{applied}} changes and {{deleted}} deletions, but one file failed. The job stays in pending review; fix the cause and retry.",
+      "receiptAppliedBody": "{{applied}} written, {{deleted}} deleted in the project’s cloud folder.",
+      "receiptAppliedTitle": "Changes accepted",
+      "receiptRejectedBody": "Nothing was written to the cloud folder. The Gitea commits remain as an audit trail.",
+      "receiptRejectedTitle": "Changes rejected",
+      "rejectConfirmBody": "All {{count}} of the agent's changes will be discarded. The Gitea commits stay as an audit trail.",
+      "rejectConfirmBodySingular": "The agent’s single change will be discarded. The Gitea commits stay as an audit trail.",
+      "rejectConfirmLabel": "Yes, reject them",
+      "rejectLabel": "Reject all changes",
+      "rejectingLabel": "Discarding the changes…",
+      "subtitle": "{{count}} files changed in this job. Review and decide.",
+      "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
+      "titleFallback": "Project cloud folder",
+      "unavailableBody": "This job has no project-cloud baseline to diff against, or it no longer exists.",
+      "unavailableTitle": "No cloud review for this job"
+    },
+    "progress": {
+      "keepOpen": "Keep this open — the result appears here as soon as it finishes."
     }
   },
   "chatHistory": {
@@ -3245,7 +3380,11 @@
       "agent.offline": "The assigned agent is offline.",
       "project.not_found": "That project no longer exists.",
       "project_archived": "This project is archived. Unarchive it before creating new work.",
-      "permission.denied": "You don't have permission to do that."
+      "permission.denied": "You don't have permission to do that.",
+      "nothing_staged": "There are no staged changes left to act on — they were applied or rejected somewhere else.",
+      "no_protected_mount": "This session no longer has a protected cloud mount, so its staged changes cannot be applied.",
+      "staging_missing": "The staged content is no longer available in storage, so it cannot be applied. Re-stage the changes and review them again.",
+      "invalid_epoch": "This review is out of date. Reload it and decide again."
     },
     "projects": {
       "loadFailed": "Couldn't load your projects.",
@@ -3265,7 +3404,9 @@
       "replyFailed": "Couldn't send the reply.",
       "exportFailed": "Couldn't export the job to your cloud.",
       "acceptFailed": "Couldn't accept the diff.",
-      "rejectFailed": "Couldn't reject the diff."
+      "rejectFailed": "Couldn't reject the diff.",
+      "diffLoadFailed": "Couldn't load the job's changes.",
+      "diffFileLoadFailed": "Couldn't load this file's changes."
     },
     "ide": {
       "startFailed": "Couldn't start the IDE session.",
@@ -3281,8 +3422,11 @@
     "cloudDiff": {
       "applyFailed": "Couldn't apply the staged changes.",
       "rejectFailed": "Couldn't reject the staged changes.",
-      "restageFailed": "Couldn't refresh the staged diff."
-    }
+      "restageFailed": "Couldn't refresh the staged diff.",
+      "loadFailed": "Couldn't load the staged changes.",
+      "fileLoadFailed": "Couldn't load this staged file."
+    },
+    "network": "Couldn't reach the server. Check your connection and try again."
   },
   "toasts": {
     "admin": {

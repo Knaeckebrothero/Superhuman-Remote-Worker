@@ -47,6 +47,8 @@ import {
     JobAcceptResult,
     JobCloudExportResult,
     JobCreateRequest,
+    DiffLoadOutcome,
+    DiffRejectOutcome,
     JobDiffFile,
     JobDiffSummary,
     JobProgress,
@@ -87,6 +89,7 @@ import {
     TableDataResponse,
     TableInfo,
     ThreadCloudApplyResult,
+    ThreadCloudRejectResult,
     ThreadCloudDiffFile,
     ThreadCloudDiffSummary,
     User,
@@ -2670,14 +2673,63 @@ export class ApiService {
   // ===== Mode A diff review (job_cloud_export.md §3.4–§3.6) =====
 
   /**
+   * Map an HTTP failure on a diff *read* into a `DiffLoadOutcome`.
+   *
+   * The distinctions the review surface needs are exactly the ones the
+   * routes make: 403 from `require_thread_owner` / job ownership, 404 from
+   * `_require_protected` and "thread not found" (which the backend does not
+   * separate — both are plain-string details), 404 on a per-file read
+   * meaning the path left the staged set, and everything else. Angular
+   * reports network/CORS/DNS failures as `status === 0`; those get the
+   * shared offline copy rather than a bare "Http failure response".
+   */
+  private diffReadFailure<T>(
+    err: HttpErrorResponse,
+    fallbackKey: string,
+    { fileRead = false }: { fileRead?: boolean } = {},
+  ): DiffLoadOutcome<T> {
+    if (err.status === 403) return { kind: 'forbidden' };
+    if (err.status === 404) {
+      if (!fileRead) return { kind: 'unavailable' };
+      // The per-file 404 covers three different situations and the copy for
+      // them differs; carry the backend's code through when it sends one.
+      const detail = err.error?.detail;
+      const code =
+        detail && typeof detail === 'object' && typeof detail.code === 'string'
+          ? (detail.code as string)
+          : undefined;
+      return { kind: 'missing', code };
+    }
+    const detail =
+      err.status === 0
+        ? this.transloco.translate('errors.network')
+        : this.errors.translate(err, fallbackKey);
+    return { kind: 'error', status: err.status, detail };
+  }
+
+  /**
    * Fetch the file-level diff summary for a project-attached job in
-   * pending_review. Returns null when the orchestrator has no Mode A
-   * baseline for the job (loose job, or a pre-Mode-A project job).
+   * pending_review, as a tagged outcome. `unavailable` means the
+   * orchestrator has no Mode A baseline for the job (loose job, or a
+   * pre-Mode-A project job).
+   */
+  getJobDiffOutcome(jobId: string): Observable<DiffLoadOutcome<JobDiffSummary>> {
+    return this.http.get<JobDiffSummary>(`${this.baseUrl}/jobs/${jobId}/diff`).pipe(
+      map((data): DiffLoadOutcome<JobDiffSummary> => ({ kind: 'ok', data })),
+      catchError((err: HttpErrorResponse) =>
+        of(this.diffReadFailure<JobDiffSummary>(err, 'errors.jobs.diffLoadFailed')),
+      ),
+    );
+  }
+
+  /**
+   * Nullable view of {@link getJobDiffOutcome}, kept for callers that only
+   * need "is there a diff" and have no failure branch to render.
    */
   getJobDiff(jobId: string): Observable<JobDiffSummary | null> {
-    return this.http
-      .get<JobDiffSummary>(`${this.baseUrl}/jobs/${jobId}/diff`)
-      .pipe(catchError(() => of(null)));
+    return this.getJobDiffOutcome(jobId).pipe(
+      map((outcome) => (outcome.kind === 'ok' ? outcome.data : null)),
+    );
   }
 
   /**
@@ -2686,14 +2738,31 @@ export class ApiService {
    * anything else with 400. ``old_content`` is null for ``added``,
    * ``new_content`` is null for ``deleted``.
    */
-  getJobDiffFile(jobId: string, filePath: string): Observable<JobDiffFile | null> {
+  getJobDiffFileOutcome(
+    jobId: string,
+    filePath: string,
+  ): Observable<DiffLoadOutcome<JobDiffFile>> {
     // Encode each path segment so spaces / unicode / German umlauts in
     // the slug survive the round-trip. FastAPI's ``:path`` converter
     // happily takes encoded slashes.
     const encoded = filePath.split('/').map(encodeURIComponent).join('/');
-    return this.http
-      .get<JobDiffFile>(`${this.baseUrl}/jobs/${jobId}/diff/${encoded}`)
-      .pipe(catchError(() => of(null)));
+    return this.http.get<JobDiffFile>(`${this.baseUrl}/jobs/${jobId}/diff/${encoded}`).pipe(
+      map((data): DiffLoadOutcome<JobDiffFile> => ({ kind: 'ok', data })),
+      catchError((err: HttpErrorResponse) =>
+        of(
+          this.diffReadFailure<JobDiffFile>(err, 'errors.jobs.diffFileLoadFailed', {
+            fileRead: true,
+          }),
+        ),
+      ),
+    );
+  }
+
+  /** Nullable view of {@link getJobDiffFileOutcome}. */
+  getJobDiffFile(jobId: string, filePath: string): Observable<JobDiffFile | null> {
+    return this.getJobDiffFileOutcome(jobId, filePath).pipe(
+      map((outcome) => (outcome.kind === 'ok' ? outcome.data : null)),
+    );
   }
 
   /**
@@ -2737,16 +2806,38 @@ export class ApiService {
    * and status=completed. No cloud writes happen; the Gitea commits
    * remain as audit trail.
    */
-  rejectJobDiff(jobId: string): Observable<JobRejectResult | null> {
-    return this.http
-      .post<JobRejectResult>(`${this.baseUrl}/jobs/${jobId}/reject`, {})
-      .pipe(
-        catchError((err) => {
-          console.error(`Failed to reject job ${jobId} diff:`, err);
-          this.toast.danger(this.errors.translate(err, 'errors.jobs.rejectFailed'));
-          return of(null);
-        }),
-      );
+  rejectJobDiff(jobId: string): Observable<DiffRejectOutcome<JobRejectResult>> {
+    return this.http.post<JobRejectResult>(`${this.baseUrl}/jobs/${jobId}/reject`, {}).pipe(
+      map((data): DiffRejectOutcome<JobRejectResult> => ({ kind: 'ok', data })),
+      catchError((err: HttpErrorResponse) =>
+        of(this.rejectFailure<JobRejectResult>(err, 'errors.jobs.rejectFailed')),
+      ),
+    );
+  }
+
+  /**
+   * Shared failure mapping for the two reject paths.
+   *
+   * No toast from in here: the review surface renders the outcome itself, and
+   * a service-level toast both duplicates that and fires for callers that
+   * already have somewhere better to put it.
+   */
+  private rejectFailure<T>(err: HttpErrorResponse, fallbackKey: string): DiffRejectOutcome<T> {
+    const detail = err.error?.detail;
+    if (err.status === 409 && detail && typeof detail === 'object') {
+      if (detail.code === 'epoch_stale') {
+        const staged = detail.staged_epoch;
+        return { kind: 'stale', staged_epoch: typeof staged === 'number' ? staged : null };
+      }
+      if (detail.code === 'nothing_staged') return { kind: 'nothing_staged' };
+    }
+    const message =
+      err.status === 0
+        ? this.transloco.translate('errors.network')
+        : typeof detail === 'string'
+          ? detail
+          : this.errors.translate(err, fallbackKey);
+    return { kind: 'error', status: err.status, detail: message };
   }
 
   // ===== Protected cloud mode: thread cloud-diff review (Slice C, Task 8/10) =====
@@ -2763,21 +2854,61 @@ export class ApiService {
    * all-zero/epoch-0/empty-files shape — so `null` here means a hard
    * failure (network, thread not protected, not the owner).
    */
-  getThreadCloudDiff(threadId: string): Observable<ThreadCloudDiffSummary | null> {
+  getThreadCloudDiffOutcome(
+    threadId: string,
+  ): Observable<DiffLoadOutcome<ThreadCloudDiffSummary>> {
     return this.http
       .get<ThreadCloudDiffSummary>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff`)
-      .pipe(catchError(() => of(null)));
+      .pipe(
+        map((data): DiffLoadOutcome<ThreadCloudDiffSummary> => ({ kind: 'ok', data })),
+        catchError((err: HttpErrorResponse) =>
+          of(this.diffReadFailure<ThreadCloudDiffSummary>(err, 'errors.cloudDiff.loadFailed')),
+        ),
+      );
+  }
+
+  /**
+   * Nullable view of {@link getThreadCloudDiffOutcome}, used by the badge /
+   * pending-count path which has no failure branch to render and just keeps
+   * its previous count.
+   */
+  getThreadCloudDiff(threadId: string): Observable<ThreadCloudDiffSummary | null> {
+    return this.getThreadCloudDiffOutcome(threadId).pipe(
+      map((outcome) => (outcome.kind === 'ok' ? outcome.data : null)),
+    );
   }
 
   /**
    * Fetch one staged file's old/new content for the thread cloud-diff
-   * viewer. Mirrors getJobDiffFile's per-segment path encoding.
+   * viewer. Mirrors getJobDiffFile's per-segment path encoding. A 404 is
+   * `missing`, not an error: the endpoint 404s both for "not in the staged
+   * diff" and for "nothing staged at all", which after a successful load of
+   * the summary means the staged set moved underneath the reviewer.
    */
-  getThreadCloudDiffFile(threadId: string, filePath: string): Observable<ThreadCloudDiffFile | null> {
+  getThreadCloudDiffFileOutcome(
+    threadId: string,
+    filePath: string,
+  ): Observable<DiffLoadOutcome<ThreadCloudDiffFile>> {
     const encoded = filePath.split('/').map(encodeURIComponent).join('/');
     return this.http
       .get<ThreadCloudDiffFile>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff/${encoded}`)
-      .pipe(catchError(() => of(null)));
+      .pipe(
+        map((data): DiffLoadOutcome<ThreadCloudDiffFile> => ({ kind: 'ok', data })),
+        catchError((err: HttpErrorResponse) =>
+          of(
+            this.diffReadFailure<ThreadCloudDiffFile>(err, 'errors.cloudDiff.fileLoadFailed', {
+              fileRead: true,
+            }),
+          ),
+        ),
+      );
+  }
+
+  /** Nullable view of {@link getThreadCloudDiffFileOutcome}. */
+  getThreadCloudDiffFile(threadId: string, filePath: string): Observable<ThreadCloudDiffFile | null> {
+    return this.getThreadCloudDiffFileOutcome(threadId, filePath).pipe(
+      map((outcome) => (outcome.kind === 'ok' ? outcome.data : null)),
+    );
   }
 
   /**
@@ -2821,17 +2952,19 @@ export class ApiService {
    * Reject the staged protected-cloud diff, same epoch pin as apply. Never
    * touches the cloud — just discards the staged upperdir capture.
    */
-  rejectThreadCloudDiff(threadId: string, epoch: number): Observable<{ rejected: boolean } | null> {
+  rejectThreadCloudDiff(
+    threadId: string,
+    epoch: number,
+  ): Observable<DiffRejectOutcome<ThreadCloudRejectResult>> {
     return this.http
-      .post<{ rejected: boolean }>(
+      .post<ThreadCloudRejectResult>(
         `${this.baseUrl}/agents/threads/${threadId}/cloud-diff/reject`, { epoch },
       )
       .pipe(
-        catchError((err) => {
-          console.error(`Failed to reject thread ${threadId} cloud diff:`, err);
-          this.toast.danger(this.errors.translate(err, 'errors.cloudDiff.rejectFailed'));
-          return of(null);
-        }),
+        map((data): DiffRejectOutcome<ThreadCloudRejectResult> => ({ kind: 'ok', data })),
+        catchError((err: HttpErrorResponse) =>
+          of(this.rejectFailure<ThreadCloudRejectResult>(err, 'errors.cloudDiff.rejectFailed')),
+        ),
       );
   }
 

@@ -1521,7 +1521,10 @@
       "citationsButton": "Quellen",
       "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
-      "disconnect": "Trennen"
+      "disconnect": "Trennen",
+      "projectFilesButton": "Projektdateien",
+      "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
+      "sessionFilesButton": "Sitzungsdateien"
     },
     "citations": {
       "title": "Quellen",
@@ -1543,10 +1546,25 @@
       "temp": "Temp. {{value}}",
       "turn": "Zug {{count}}",
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
-      "cloudChanges": "Cloud-Änderungen ({{count}})",
-      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt · zuletzt {{stagedAt}} — zum Prüfen klicken",
       "cloudSyncOff": "Cloud-Sync aus",
       "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
+    },
+    "cloudReview": {
+      "regionLabel": "Ausstehende Cloud-Prüfung",
+      "title": "{{count}} Cloud-Änderungen warten auf deine Prüfung",
+      "titleSingular": "{{count}} Cloud-Änderung wartet auf deine Prüfung",
+      "subtitle": "In deine Cloud wurde noch nichts geschrieben",
+      "staged": "bereitgestellt {{at}}",
+      "action": "Änderungen prüfen",
+      "unknownTitle": "Ausstehende Cloud-Änderungen konnten nicht geprüft werden",
+      "unknownBody": "Diese Sitzung verwendet einen geschützten Cloud-Ordner, es könnten also Änderungen warten. Versuchen Sie es erneut oder öffnen Sie die Prüfung, um die Ursache zu sehen.",
+      "recheck": "Erneut prüfen",
+      "openReview": "Prüfung öffnen",
+      "receiptRegionLabel": "Letztes Ergebnis der Cloud-Prüfung",
+      "receiptApplied": "Letzte Cloud-Prüfung: übernommen — {{applied}} geschrieben, {{deleted}} gelöscht",
+      "receiptRejected": "Letzte Cloud-Prüfung: bereitgestellte Änderungen verworfen",
+      "receiptLocal": "nur in diesem Browser",
+      "viewResult": "Ergebnis ansehen"
     },
     "turn": {
       "collapsedEmpty": "Nur Werkzeugaufrufe",
@@ -2718,54 +2736,171 @@
     }
   },
   "jobDiffReview": {
-    "title": "Cloud-Diff prüfen",
-    "subtitle": "{{count}} Datei(en) wurden in diesem Job geändert. Prüfen und entscheiden.",
-    "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
-    "loading": "Diff wird geladen…",
-    "empty": "Keine Änderungen zu prüfen — der Agent hat den Projektordner nicht angefasst.",
-    "staleNotice": "Der gespeicherte Diff hat sich geändert, seit du ihn geladen hast — die neueste Version wurde nachgeladen.",
+    "loading": "Änderungen werden geladen…",
+    "staleNotice": "Die bereitgestellten Änderungen haben sich geändert, seit du sie geladen hast — die neueste Version wurde nachgeladen.",
+    "meta": {
+      "staged": "Bereitgestellt",
+      "mount": "Mount",
+      "epoch": "Epoche",
+      "baseline": "Basis",
+      "talliesLabel": "Summen der Änderungen",
+      "openFolder": "Projektdateien öffnen",
+      "openFolderFor": "Projektdateien von {{name}} in einem neuen Tab öffnen",
+      "detailsLabel": "Details"
+    },
+    "forbidden": {
+      "title": "Du kannst diese Änderungen nicht prüfen"
+    },
+    "loadFailed": {
+      "title": "Änderungen konnten nicht geladen werden",
+      "retry": "Erneut versuchen"
+    },
     "fileTree": {
       "header": "Dateien",
       "statusAdded": "Hinzugefügt",
       "statusModified": "Geändert",
-      "statusDeleted": "Gelöscht"
+      "statusDeleted": "Gelöscht",
+      "chooser": "Datei {{index}} von {{total}}",
+      "chooserEmpty": "{{total}} geänderte Dateien"
     },
     "viewer": {
-      "selectPrompt": "Wähle eine Datei aus der Liste, um den Diff anzuzeigen.",
+      "regionLabel": "Ausgewählte Datei",
+      "selectPrompt": "Wähle eine Datei aus der Liste, um ihre Änderungen zu sehen.",
       "loadingFile": "Datei wird geladen…",
-      "loadFailed": "Diff dieser Datei konnte nicht geladen werden. Details in der Konsole.",
-      "labelOriginal": "Cloud-Version",
-      "labelChanged": "Agent-Änderung",
-      "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
-      "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
+      "loadFailed": "Diese Datei konnte nicht geladen werden",
+      "missingTitle": "Diese Datei ist nicht mehr bereitgestellt",
       "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt.",
-      "binaryPlaceholder": "Binärdatei — wird byteidentisch übernommen, keine Vorschau"
+      "binaryTitle": "Binärdatei — keine Vorschau",
+      "binaryType": "Typ",
+      "binaryStatus": "Änderung",
+      "binaryNoDownload": "Die bereitgestellte Kopie dieser Datei kann hier nicht geöffnet oder heruntergeladen werden.",
+      "binaryKind": {
+        "pdf": "PDF-Dokument",
+        "document": "Textdokument",
+        "spreadsheet": "Tabelle",
+        "presentation": "Präsentation",
+        "image": "Bild",
+        "audio": "Audio",
+        "video": "Video",
+        "archive": "Archiv",
+        "unknown": "Binärdatei"
+      },
+      "reloadReview": "Prüfung neu laden"
     },
     "conflict": {
-      "title": "Cloud-Ordner wurde extern geändert",
-      "body": "Während dieses Jobs wurden Dateien im Cloud-Ordner verändert. Annehmen ist deaktiviert, bis der Konflikt manuell aufgelöst wird (extern geänderte Dateien herunterladen, zusammenführen, dann erneut versuchen).",
+      "title": "Der Cloud-Ordner hat sich während dieser Prüfung geändert",
       "etagMismatch": "Extern geändert",
       "missingAtCloud": "Extern gelöscht",
       "unexpectedAtCloud": "Extern angelegt",
-      "dismiss": "Schließen"
+      "recheck": "Erneut prüfen"
     },
     "partial": {
-      "title": "Schreiben teilweise fehlgeschlagen",
-      "body": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) angewandt, aber {{count}} Datei(en) sind fehlgeschlagen. Der Job bleibt zur Prüfung; Ursache beheben und erneut versuchen."
+      "title": "Einige Schreibvorgänge sind fehlgeschlagen"
+    },
+    "receipt": {
+      "at": "Entschieden",
+      "overlayReset": "Arbeitskopie geleert",
+      "overlayResetYes": "Ja",
+      "overlayResetNo": "Nein",
+      "overlayWarning": "Die Arbeitskopie der Session konnte nicht geleert werden, weil ihr Workspace nicht mehr läuft. Wenn du diese Session fortsetzt, stellt sie dieselben Änderungen möglicherweise erneut bereit — verwirf das Duplikat, falls es auftaucht.",
+      "localOnly": "Dieses Ergebnis ist nur in diesem Browser gespeichert. Der Server führt noch keinen dauerhaften Nachweis über Prüfentscheidungen.",
+      "doneHint": "Für diesen Ordner steht nichts weiter aus."
+    },
+    "a11y": {
+      "loaded": "{{count}} geänderte Dateien geladen.",
+      "loadedEmpty": "Keine Änderungen zu prüfen.",
+      "fileLoaded": "Änderungen für {{path}} werden angezeigt.",
+      "applying": "Änderungen werden in die Cloud übernommen…",
+      "rejecting": "Bereitgestellte Änderungen werden verworfen…",
+      "applied": "Fertig. {{applied}} geschrieben, {{deleted}} gelöscht.",
+      "rejected": "Bereitgestellte Änderungen verworfen. In die Cloud wurde nichts geschrieben.",
+      "loadedSingular": "1 geänderte Datei geladen."
     },
     "actions": {
-      "accept": "Alle Änderungen annehmen",
-      "accepting": "Wird angewandt…",
-      "applyToCloud": "In die Cloud übernehmen",
-      "reject": "Alle verwerfen",
-      "rejecting": "Wird verworfen…",
-      "confirmAcceptTitle": "Diese Änderungen in deinen Cloud-Ordner schreiben?",
-      "confirmAcceptBody": "{{count}} Datei(en) werden in den Projektordner geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
-      "confirmRejectTitle": "Alle Änderungen verwerfen?",
-      "confirmRejectBody": "Die Bearbeitungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
-      "confirmRejectBodyCloud": "Die bereitgestellten Änderungen werden endgültig verworfen. In deine Cloud wurde nichts geschrieben.",
       "cancel": "Abbrechen",
-      "confirm": "Fortfahren"
+      "done": "Fertig",
+      "close": "Prüfung schließen"
+    },
+    "session": {
+      "addedNote": "Diese Datei wird beim Übernehmen im Cloud-Ordner angelegt.",
+      "applyConfirmBody": "Damit werden alle {{count}} geprüften Änderungen nach {{mount}} geschrieben. Aus dem Cockpit lässt sich das nicht rückgängig machen — nur die Versionshistorie oder der Papierkorb deines Cloud-Anbieters können den vorherigen Stand wiederherstellen.",
+      "applyConfirmBodySingular": "Damit wird die eine geprüfte Änderung nach {{mount}} geschrieben. Das lässt sich in Cockpit nicht rückgängig machen — nur der Versionsverlauf oder Papierkorb Ihres Cloud-Anbieters kann den vorherigen Stand wiederherstellen.",
+      "applyConfirmLabel": "Ja, in die Cloud übernehmen",
+      "applyLabel": "In die Cloud übernehmen",
+      "applyingLabel": "Änderungen werden in die Cloud übertragen…",
+      "binaryBody": "Die Bytes werden exakt so übernommen, wie sie bereitgestellt wurden. Es gibt keine Textvorschau — prüfe sie anhand von Pfad und Änderungsart.",
+      "conflictBody": "Dateien im geschützten Ordner wurden außerhalb dieser Session geändert, seit ihre Änderungen bereitgestellt wurden. Das Übernehmen ist blockiert, bis du sie zusammengeführt hast — eine Erzwingen-Option gibt es bewusst nicht.",
+      "decisionHint": "Übernehmen schreibt jede geprüfte Änderung in den Cloud-Ordner. Verwerfen löscht sie alle und lässt die Cloud unberührt.",
+      "deletedNote": "Diese Datei wird beim Übernehmen aus dem Cloud-Ordner gelöscht.",
+      "dialogLabel": "Cloud-Änderungen prüfen",
+      "directionNew": "Nach dem Übernehmen",
+      "directionOld": "Cloud jetzt",
+      "emptyBody": "Diese Session hat keine Änderungen am geschützten Ordner bereitgestellt. Wenn der Agent gerade einen Zug beendet hat, werden seine Änderungen möglicherweise noch erfasst.",
+      "emptyTitle": "Nichts zur Prüfung bereitgestellt",
+      "eyebrow": "Geschützte Cloud · Prüfung erforderlich",
+      "eyebrowResolved": "Geschützte Cloud · erledigt",
+      "forbiddenBody": "Nur die Eigentümerin oder der Eigentümer dieser Session kann ihre bereitgestellten Cloud-Änderungen prüfen.",
+      "missingBody": "Sie war beim Laden dieser Prüfung Teil der bereitgestellten Änderungen, aber die Session hat seitdem neu bereitgestellt. Lade neu, um die aktuellen Änderungen zu sehen.",
+      "missingBodyGone": "Beim Laden dieser Prüfung war sie noch bereitgestellt, jetzt nicht mehr — die Sitzung hat neu bereitgestellt, oder die Änderungen wurden anderswo entschieden. Laden Sie neu, um den aktuellen Stand zu sehen.",
+      "missingBodyUnreadable": "Sie ist weiterhin bereitgestellt, aber ihre gespeicherte Kopie lässt sich nicht lesen — es gibt also nichts, was sicher angezeigt oder übernommen werden könnte. Lassen Sie die Sitzung die Änderungen erneut bereitstellen.",
+      "partialBody": "{{applied}} Änderungen und {{deleted}} Löschungen übernommen, aber {{count}} Dateien sind fehlgeschlagen. Die restlichen Änderungen sind weiterhin bereitgestellt, du kannst es also erneut versuchen.",
+      "partialBodySingular": "{{applied}} Änderungen und {{deleted}} Löschungen angewendet, aber eine Datei ist fehlgeschlagen. Die übrigen Änderungen bleiben bereitgestellt, Sie können es erneut versuchen.",
+      "receiptAppliedBody": "{{applied}} geschrieben, {{deleted}} gelöscht im geschützten Ordner.",
+      "receiptAppliedTitle": "In deine Cloud übernommen",
+      "receiptRejectedBody": "In deine Cloud wurde nichts geschrieben und nichts daraus entfernt.",
+      "receiptRejectedTitle": "Bereitgestellte Änderungen verworfen",
+      "rejectConfirmBody": "Damit werden alle {{count}} bereitgestellten Änderungen endgültig verworfen. In deine Cloud wird nichts geschrieben und nichts daraus entfernt — danach gibt es aber auch keine Historie, aus der sie sich wiederherstellen ließen.",
+      "rejectConfirmBodySingular": "Damit wird die eine bereitgestellte Änderung endgültig verworfen. Es wird nichts in Ihre Cloud geschrieben oder daraus entfernt, und es gibt danach keinen Verlauf, aus dem sie wiederhergestellt werden könnte.",
+      "rejectConfirmLabel": "Ja, verwerfen",
+      "rejectLabel": "Änderungen verwerfen",
+      "rejectingLabel": "Bereitgestellte Änderungen werden verworfen…",
+      "subtitle": "{{count}} Dateien wurden in dieser Session geändert. In deine Cloud wurde noch nichts geschrieben.",
+      "subtitleSingular": "{{count}} Datei wurde in dieser Session geändert. In deine Cloud wurde noch nichts geschrieben.",
+      "titleFallback": "Geschützter Cloud-Ordner",
+      "unavailableBody": "Diese Session läuft nicht im geschützten Cloud-Modus oder existiert nicht mehr. Nur Sessions, die mit geschützter Cloud angelegt wurden, stellen ihre Änderungen zur Prüfung bereit.",
+      "unavailableTitle": "Keine geschützte Prüfung für diese Session"
+    },
+    "job": {
+      "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
+      "applyConfirmBody": "{{count}} Dateien werden in den Cloud-Ordner des Projekts geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
+      "applyConfirmBodySingular": "Eine Datei wird in den Cloud-Ordner des Projekts geschrieben. Diese Aktion lässt sich in Cockpit nicht rückgängig machen.",
+      "applyConfirmLabel": "Ja, annehmen",
+      "applyLabel": "Alle Änderungen annehmen",
+      "applyingLabel": "Änderungen werden in den Cloud-Ordner geschrieben…",
+      "binaryBody": "Die Bytes werden exakt so übernommen, wie sie erzeugt wurden. Es gibt keine Textvorschau — prüfe sie anhand von Pfad und Änderungsart.",
+      "conflictBody": "Während dieses Jobs wurden Dateien im Cloud-Ordner geändert. Annehmen ist blockiert, bis du sie manuell zusammengeführt hast — extern geänderte Dateien herunterladen, zusammenführen, dann erneut versuchen.",
+      "decisionHint": "Annehmen schreibt jede Änderung in den Cloud-Ordner des Projekts. Verwerfen löscht sie und schließt den Job ab.",
+      "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
+      "dialogLabel": "Projekt-Cloud prüfen",
+      "directionNew": "Nach diesem Job",
+      "directionOld": "Basis",
+      "emptyBody": "Der Agent hat in diesem Job nichts unterhalb des Projektordners geändert.",
+      "emptyTitle": "Keine Änderungen zu prüfen",
+      "eyebrow": "Projekt-Cloud-Prüfung",
+      "eyebrowResolved": "Projekt-Cloud-Prüfung · erledigt",
+      "forbiddenBody": "Du hast keinen Zugriff auf die Projekt-Cloud-Änderungen dieses Jobs.",
+      "missingBody": "Sie war beim Laden dieser Prüfung Teil des Diffs, aber der Diff des Jobs hat sich seitdem geändert. Lade neu, um die aktuellen Änderungen zu sehen.",
+      "missingBodyGone": "Beim Laden dieser Prüfung war sie noch im Diff, jetzt nicht mehr — das Diff des Auftrags hat sich seitdem geändert. Laden Sie neu, um den aktuellen Stand zu sehen.",
+      "missingBodyUnreadable": "Sie ist weiterhin im Diff, aber ihre gespeicherte Kopie lässt sich nicht lesen — es gibt also nichts, was sicher angezeigt oder übernommen werden könnte.",
+      "partialBody": "{{applied}} Änderungen und {{deleted}} Löschungen übernommen, aber {{count}} Dateien sind fehlgeschlagen. Der Job bleibt zur Prüfung; Ursache beheben und erneut versuchen.",
+      "partialBodySingular": "{{applied}} Änderungen und {{deleted}} Löschungen angewendet, aber eine Datei ist fehlgeschlagen. Der Auftrag bleibt in der Prüfung; beheben Sie die Ursache und versuchen Sie es erneut.",
+      "receiptAppliedBody": "{{applied}} geschrieben, {{deleted}} gelöscht im Cloud-Ordner des Projekts.",
+      "receiptAppliedTitle": "Änderungen angenommen",
+      "receiptRejectedBody": "In den Cloud-Ordner wurde nichts geschrieben. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "receiptRejectedTitle": "Änderungen verworfen",
+      "rejectConfirmBody": "Alle {{count}} Änderungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "rejectConfirmBodySingular": "Die eine Änderung des Agenten wird verworfen. Die Gitea-Commits bleiben als Prüfspur erhalten.",
+      "rejectConfirmLabel": "Ja, verwerfen",
+      "rejectLabel": "Alle Änderungen verwerfen",
+      "rejectingLabel": "Änderungen werden verworfen…",
+      "subtitle": "{{count}} Dateien wurden in diesem Job geändert. Prüfen und entscheiden.",
+      "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
+      "titleFallback": "Projekt-Cloud-Ordner",
+      "unavailableBody": "Dieser Job hat keine Projekt-Cloud-Basis zum Vergleichen, oder er existiert nicht mehr.",
+      "unavailableTitle": "Keine Cloud-Prüfung für diesen Job"
+    },
+    "progress": {
+      "keepOpen": "Bitte offen lassen — das Ergebnis erscheint hier, sobald der Vorgang abgeschlossen ist."
     }
   },
   "chatHistory": {
@@ -3245,7 +3380,11 @@
       "agent.offline": "Der zugewiesene Agent ist offline.",
       "project.not_found": "Dieses Projekt existiert nicht mehr.",
       "project_archived": "Dieses Projekt ist archiviert. Heben Sie die Archivierung auf, bevor Sie neue Arbeit anlegen.",
-      "permission.denied": "Dafür fehlt dir die Berechtigung."
+      "permission.denied": "Dafür fehlt dir die Berechtigung.",
+      "nothing_staged": "Es sind keine bereitgestellten Änderungen mehr vorhanden — sie wurden anderswo übernommen oder verworfen.",
+      "no_protected_mount": "Diese Session hat keinen geschützten Cloud-Mount mehr, ihre bereitgestellten Änderungen können also nicht übernommen werden.",
+      "staging_missing": "Der bereitgestellte Inhalt ist im Speicher nicht mehr vorhanden und kann daher nicht übernommen werden. Stelle die Änderungen erneut bereit und prüfe sie noch einmal.",
+      "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut."
     },
     "projects": {
       "loadFailed": "Projekte konnten nicht geladen werden.",
@@ -3265,7 +3404,9 @@
       "replyFailed": "Antwort konnte nicht gesendet werden.",
       "exportFailed": "Auftrag konnte nicht in deine Cloud exportiert werden.",
       "acceptFailed": "Diff konnte nicht angenommen werden.",
-      "rejectFailed": "Diff konnte nicht verworfen werden."
+      "rejectFailed": "Diff konnte nicht verworfen werden.",
+      "diffLoadFailed": "Die Änderungen des Jobs konnten nicht geladen werden.",
+      "diffFileLoadFailed": "Die Änderungen dieser Datei konnten nicht geladen werden."
     },
     "ide": {
       "startFailed": "IDE-Sitzung konnte nicht gestartet werden.",
@@ -3281,8 +3422,11 @@
     "cloudDiff": {
       "applyFailed": "Änderungen konnten nicht übernommen werden.",
       "rejectFailed": "Änderungen konnten nicht verworfen werden.",
-      "restageFailed": "Diff konnte nicht aktualisiert werden."
-    }
+      "restageFailed": "Diff konnte nicht aktualisiert werden.",
+      "loadFailed": "Die bereitgestellten Änderungen konnten nicht geladen werden.",
+      "fileLoadFailed": "Diese bereitgestellte Datei konnte nicht geladen werden."
+    },
+    "network": "Der Server ist nicht erreichbar. Prüfe deine Verbindung und versuche es erneut."
   },
   "toasts": {
     "admin": {

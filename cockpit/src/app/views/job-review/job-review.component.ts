@@ -223,11 +223,19 @@ export function selectDeliveryRepository(
           <span class="job-desc">{{ job()!.description }}</span>
         </div>
       } @else if (job()!.diff_status === 'pending') {
-        <!-- Mode A diff review (see knowledge-history/done/job_cloud_export.md) -->
-        <app-job-diff-review
-          [jobId]="job()!.id"
-          (resolved)="onDiffResolved()"
-        />
+        <!-- Mode A diff review (see knowledge-history/done/job_cloud_export.md).
+             @defer keeps the review surface (and Monaco's loader with it) out
+             of the initial bundle, which sits at 2.70MB against a 2.75MB
+             hard-error budget. It is only lazy if EVERY usage site defers it —
+             the two in persistent-chat.component.ts do too. -->
+        @defer {
+          <app-job-diff-review
+            [jobId]="job()!.id"
+            (resolved)="onDiffResolved()"
+          />
+        } @placeholder {
+          <div class="diff-defer-placeholder"></div>
+        }
       } @else {
         <!-- Pending Review State -->
         <div class="review-content">

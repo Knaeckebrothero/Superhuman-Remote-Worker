@@ -1168,3 +1168,114 @@ describe('ApiService job list envelope', () => {
     expect(page.has_more).toBe(false);
   });
 });
+
+describe('ApiService — protected cloud diff outcomes', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+  const toast = {danger: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn()};
+
+  beforeEach(() => {
+    toast.danger.mockClear();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: toast},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k: string) => k}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  async function failWith(
+    call: Promise<unknown>,
+    match: (url: string) => boolean,
+    status: number,
+    body: unknown,
+  ): Promise<unknown> {
+    const request = httpMock.expectOne((item) => match(item.url));
+    request.flush(body, {status, statusText: 'error'});
+    return call;
+  }
+
+  it('separates a permission failure from "no changes"', async () => {
+    const pending = firstValueFrom(api.getThreadCloudDiffOutcome('t1'));
+    await expect(
+      failWith(pending, (u) => u.endsWith('/threads/t1/cloud-diff'), 403, {detail: 'nope'}),
+    ).resolves.toEqual({kind: 'forbidden'});
+  });
+
+  it('reports an offline browser as a network error, not a bare HTTP string', async () => {
+    const pending = firstValueFrom(api.getThreadCloudDiffOutcome('t1'));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/threads/t1/cloud-diff'));
+    request.error(new ProgressEvent('error'), {status: 0, statusText: 'Unknown Error'});
+    await expect(pending).resolves.toEqual({
+      kind: 'error',
+      status: 0,
+      detail: 'errors.network',
+    });
+  });
+
+  it('carries the backend reason behind a per-file 404', async () => {
+    // The endpoint 404s for three different situations and the review UI has
+    // to explain which; without the code it guessed "the session re-staged".
+    const pending = firstValueFrom(api.getThreadCloudDiffFileOutcome('t1', 'a/b.txt'));
+    await expect(
+      failWith(pending, (u) => u.includes('/cloud-diff/a/b.txt'), 404, {
+        detail: {code: 'staged_content_unreadable', message: 'unreadable'},
+      }),
+    ).resolves.toEqual({kind: 'missing', code: 'staged_content_unreadable'});
+  });
+
+  it('still reports a per-file 404 from an older orchestrator', async () => {
+    const pending = firstValueFrom(api.getThreadCloudDiffFileOutcome('t1', 'a/b.txt'));
+    await expect(
+      failWith(pending, (u) => u.includes('/cloud-diff/a/b.txt'), 404, {
+        detail: "Path 'a/b.txt' is not in the staged diff.",
+      }),
+    ).resolves.toEqual({kind: 'missing', code: undefined});
+  });
+
+  it('tags a stale reject instead of returning a bare null', async () => {
+    const pending = firstValueFrom(api.rejectThreadCloudDiff('t1', 5));
+    await expect(
+      failWith(pending, (u) => u.endsWith('/cloud-diff/reject'), 409, {
+        detail: {code: 'epoch_stale', staged_epoch: 9},
+      }),
+    ).resolves.toEqual({kind: 'stale', staged_epoch: 9});
+    // No toast from the service: the surface renders the outcome itself.
+    expect(toast.danger).not.toHaveBeenCalled();
+  });
+
+  it('tags an already-resolved reject as nothing_staged', async () => {
+    const pending = firstValueFrom(api.rejectThreadCloudDiff('t1', 5));
+    await expect(
+      failWith(pending, (u) => u.endsWith('/cloud-diff/reject'), 409, {
+        detail: {code: 'nothing_staged'},
+      }),
+    ).resolves.toEqual({kind: 'nothing_staged'});
+  });
+
+  it('tags an invalid epoch pin as an actionable error', async () => {
+    const pending = firstValueFrom(api.rejectThreadCloudDiff('t1', 5));
+    await expect(
+      failWith(pending, (u) => u.endsWith('/cloud-diff/reject'), 422, {
+        detail: {code: 'invalid_epoch'},
+      }),
+    ).resolves.toMatchObject({kind: 'error', status: 422});
+  });
+
+  it('returns the reject body on success', async () => {
+    const pending = firstValueFrom(api.rejectThreadCloudDiff('t1', 5));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/cloud-diff/reject'));
+    expect(request.request.body).toEqual({epoch: 5});
+    request.flush({thread_id: 't1', rejected: true, epoch: 6, overlay_reset: true});
+    await expect(pending).resolves.toMatchObject({kind: 'ok'});
+  });
+});

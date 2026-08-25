@@ -4,7 +4,6 @@ import {
     canComposeDuringSession,
     canSendMessage,
     clearDraft,
-    cloudBadgeVisible,
     composeDenyPrefill,
     countTurnsAfter,
     describeAttachmentRejection,
@@ -41,6 +40,7 @@ import {
     uploadStageFor,
     uploadStageKey,
 } from './persistent-chat.component';
+import {cloudReviewBannerVisible} from './cloud-review-banner/cloud-review-banner.component';
 import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
 
 /**
@@ -803,25 +803,27 @@ describe('textSizeToCss', () => {
     });
 });
 
-describe('cloudBadgeVisible', () => {
-    // Protected cloud mode (Slice C, Task 14): the status-bar badge that
-    // opens the staged-diff review drawer.
+describe('cloudReviewBannerVisible', () => {
+    // Protected cloud mode: the pending-review call to action. Note what is
+    // NOT in the predicate — connection state. The review API serves ended
+    // threads, so gating this on isConnected() (as the old status-bar badge
+    // was) is what hid a genuine pending diff from its owner (PC-25).
     it('shows when the thread is protected and something is staged', () => {
-        expect(cloudBadgeVisible(true, 3)).toBe(true);
+        expect(cloudReviewBannerVisible(true, 3)).toBe(true);
     });
 
     it('hides when the thread is not protected, even with a nonzero count', () => {
         // Guards against a stale count signal surviving a thread switch away
         // from a protected session.
-        expect(cloudBadgeVisible(false, 3)).toBe(false);
+        expect(cloudReviewBannerVisible(false, 3)).toBe(false);
     });
 
     it('hides when protected but nothing is staged yet', () => {
-        expect(cloudBadgeVisible(true, 0)).toBe(false);
+        expect(cloudReviewBannerVisible(true, 0)).toBe(false);
     });
 
     it('hides when neither protected nor staged', () => {
-        expect(cloudBadgeVisible(false, 0)).toBe(false);
+        expect(cloudReviewBannerVisible(false, 0)).toBe(false);
     });
 });
 

@@ -1,0 +1,108 @@
+@use '../../../../styles/variables' as v;
+@use '../../../../styles/typography-recipes' as type;
+@use '../../../../styles/mixins' as m;
+
+:host {
+  display: block;
+  flex-shrink: 0;
+}
+
+// Pending authorization, not a status chip. Warning tint plus an accent rail:
+// caution without implying that anything has already happened to the cloud.
+.crb {
+  display: flex;
+  align-items: center;
+  gap: v.$space-sm;
+  padding: v.$space-sm v.$space-md;
+  background: var(--warning-tint);
+  border-bottom: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent-color);
+}
+
+// The post-decision record. Nothing is pending and nothing is at risk, so it
+// carries none of the pending state's urgency.
+.crb--quiet {
+  background: var(--surface-0);
+  border-left-color: var(--border-color);
+}
+
+.crb__icon {
+  flex: 0 0 auto;
+  color: var(--warning);
+}
+
+.crb--quiet .crb__icon {
+  color: var(--text-muted);
+}
+
+.crb__body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.crb__actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: v.$space-xs;
+}
+
+.crb__title {
+  margin: 0;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+
+  // --text-primary, not --text-muted: muted over a 15-18% tint measures
+  // ~3.4:1 in Travertine, under the 4.5:1 AA floor.
+  color: var(--text-primary);
+}
+
+.crb__meta {
+  margin: 0;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 v.$space-xs;
+}
+
+.crb__folder {
+  @include m.truncate;
+
+  max-width: 24rem;
+  color: var(--text-primary);
+}
+
+.crb__sep {
+  color: var(--text-muted);
+}
+
+.crb__provenance {
+  @include type.mono;
+
+  color: var(--text-muted);
+}
+
+@include m.breakpoint-down(sm) {
+  .crb {
+    flex-wrap: wrap;
+  }
+
+  // Explanation first, action second. The previous rule gave the body
+  // `order: 2` while icon and button both sat at the default 0, which put the
+  // Review button ABOVE the sentence explaining what it would do — the exact
+  // inversion of what was intended.
+  .crb__body {
+    flex: 1 1 100%;
+    order: 1;
+  }
+
+  .crb__actions {
+    order: 2;
+    width: 100%;
+
+    app-button {
+      flex: 1 1 auto;
+    }
+  }
+}
