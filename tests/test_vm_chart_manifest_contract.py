@@ -307,6 +307,8 @@ def test_same_cluster_vm_and_cloud_init_contract() -> None:
     }
     assert "NATS_URL" not in cloud_init(rendered)
     assert "tailscale up" not in cloud_init(rendered)
+    assert "rm -f /etc/ssh/ssh_host_*" not in cloud_init(rendered)
+    assert "ssh-keygen -A" not in cloud_init(rendered)
 
 
 def test_same_cluster_network_policy_ports() -> None:

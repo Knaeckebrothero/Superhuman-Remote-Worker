@@ -10,6 +10,7 @@ from orchestrator.services.ssh_helpers import orchestrator_can_reach
 
 
 GENERATION = "11111111-1111-4111-8111-111111111111"
+HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
 def test_same_cluster_reachability_ignores_address_class(monkeypatch):
@@ -24,6 +25,7 @@ def candidate(entity_id="11111111-1111-4111-8111-111111111112", **vm):
         "vm": {
             "status": "created",
             "provision_generation": GENERATION,
+            "ssh_host_key_fingerprint": HOST_KEY_FINGERPRINT,
             **vm,
         },
     }
@@ -81,10 +83,8 @@ class FakeProvisioner:
 
 @pytest.fixture
 def successful_ssh(monkeypatch):
-    tcp = AsyncMock(return_value=True)
     auth = AsyncMock(return_value=(True, 1, ""))
     seed = AsyncMock()
-    monkeypatch.setattr("orchestrator.services.vm_readiness.probe_workspace_ssh", tcp)
     monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", auth)
     monkeypatch.setattr(
         "orchestrator.services.vm_readiness.seed_ide_config_for_user", seed
@@ -92,7 +92,7 @@ def successful_ssh(monkeypatch):
     monkeypatch.setattr(
         "orchestrator.services.vm_readiness.resolve_ssh_key_path", lambda: "/key"
     )
-    return tcp, auth, seed
+    return auth, seed
 
 
 @pytest.mark.asyncio
@@ -122,7 +122,16 @@ async def test_first_probe_success_promotes_once_with_cas(successful_ssh):
     assert updates["ssh_registration_id"]
     assert updates["ssh_probe_error"] is None
     assert updates["recovering"] is False
-    successful_ssh[2].assert_awaited_once()
+    successful_ssh[0].assert_awaited_once_with(
+        "10.42.0.10",
+        22,
+        key_path="/key",
+        deadline_s=10.0,
+        connect_timeout_s=10,
+        interval_s=0.5,
+        expected_host_key_fingerprint=HOST_KEY_FINGERPRINT,
+    )
+    successful_ssh[1].assert_awaited_once()
     trigger.assert_called_once()
     assert len(provisioner.writes) == 1
 
@@ -130,8 +139,8 @@ async def test_first_probe_success_promotes_once_with_cas(successful_ssh):
 @pytest.mark.asyncio
 async def test_transient_failure_records_pending_attempt(monkeypatch):
     monkeypatch.setattr(
-        "orchestrator.services.vm_readiness.probe_workspace_ssh",
-        AsyncMock(return_value=False),
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(False, 1, "SSH authentication failed")),
     )
     row = candidate(ssh_probe_attempts=2)
     provisioner = FakeProvisioner(
@@ -148,8 +157,60 @@ async def test_transient_failure_records_pending_attempt(monkeypatch):
     updates = provisioner.writes[-1][3]
     assert updates["status"] == "ssh_pending"
     assert updates["ssh_probe_attempts"] == 3
-    assert "TCP" in updates["ssh_probe_error"]
+    assert "authentication" in updates["ssh_probe_error"]
     assert provisioner.writes[-1][4] is True
+
+
+@pytest.mark.asyncio
+async def test_wrong_presented_host_key_refuses_promotion_and_records_mismatch(
+    monkeypatch,
+):
+    ssh = AsyncMock(return_value=(False, 1, "SSH host-key fingerprint mismatch"))
+    monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", ssh)
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.14",
+            "active_pod_uid": "pod-wrong-key",
+            "phase": "Running",
+        }
+    )
+    trigger = MagicMock()
+
+    await VMReadinessService(
+        FakeDB(jobs=[candidate()]), provisioner, trigger_dispatch=trigger
+    ).run_cycle()
+
+    updates = provisioner.writes[-1][3]
+    assert updates["status"] == "ssh_pending"
+    assert updates["ssh_probe_error"] == "SSH host-key fingerprint mismatch"
+    assert all(write[3].get("status") != "ready" for write in provisioner.writes)
+    trigger.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_absent_host_key_pin_refuses_promotion_without_ssh(monkeypatch):
+    ssh = AsyncMock()
+    monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", ssh)
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.15",
+            "active_pod_uid": "pod-no-pin",
+            "phase": "Running",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(jobs=[candidate(ssh_host_key_fingerprint=None)]),
+        provisioner,
+        trigger_dispatch=lambda: None,
+    ).run_cycle()
+
+    updates = provisioner.writes[-1][3]
+    assert updates["status"] == "ssh_pending"
+    assert updates["ssh_probe_error"] == "SSH host-key fingerprint pin is absent"
+    ssh.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -168,8 +229,8 @@ async def test_reprobe_controller_blip_preserves_ready_row(successful_ssh):
 @pytest.mark.asyncio
 async def test_reprobe_probe_failure_preserves_ready_row(monkeypatch):
     monkeypatch.setattr(
-        "orchestrator.services.vm_readiness.probe_workspace_ssh",
-        AsyncMock(return_value=False),
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(False, 1, "SSH authentication failed")),
     )
     row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
     provisioner = FakeProvisioner(
@@ -189,6 +250,31 @@ async def test_reprobe_probe_failure_preserves_ready_row(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reprobe_fingerprint_mismatch_demotes_ready_row(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(False, 1, "SSH host-key fingerprint mismatch")),
+    )
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.20",
+            "active_pod_uid": "pod-old",
+            "phase": "Running",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes[-1][3]["status"] == "ssh_pending"
+    assert "fingerprint mismatch" in provisioner.writes[-1][3]["ssh_probe_error"]
+    assert provisioner.writes[-1][4] is False
+
+
+@pytest.mark.asyncio
 async def test_not_found_marks_ready_vm_unreachable(successful_ssh):
     row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
     provisioner = FakeProvisioner({"status": "not_found"})
@@ -205,8 +291,8 @@ async def test_not_found_marks_ready_vm_unreachable(successful_ssh):
 
 @pytest.mark.asyncio
 async def test_stopped_guest_becomes_unreachable(monkeypatch):
-    tcp = AsyncMock()
-    monkeypatch.setattr("orchestrator.services.vm_readiness.probe_workspace_ssh", tcp)
+    ssh = AsyncMock()
+    monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", ssh)
     provisioner = FakeProvisioner(
         {"ready": False, "phase": "Succeeded", "pod_ip": "10.42.0.12"}
     )
@@ -217,7 +303,7 @@ async def test_stopped_guest_becomes_unreachable(monkeypatch):
         "status": "ssh_unreachable",
         "ssh_probe_error": "vm stopped",
     }
-    tcp.assert_not_awaited()
+    ssh.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -240,7 +326,9 @@ async def test_ip_change_reprobes_ready_vm(successful_ssh):
 
 
 @pytest.mark.asyncio
-async def test_reprobe_unchanged_identity_is_noop(successful_ssh):
+async def test_reprobe_unchanged_identity_reverifies_pin_without_repromotion(
+    successful_ssh,
+):
     row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
     provisioner = FakeProvisioner(
         {
@@ -256,7 +344,7 @@ async def test_reprobe_unchanged_identity_is_noop(successful_ssh):
     ).run_cycle()
 
     assert provisioner.writes == []
-    successful_ssh[0].assert_not_awaited()
+    successful_ssh[0].assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -296,7 +384,7 @@ async def test_rejected_promotion_suppresses_seed_and_dispatch(successful_ssh):
     ).run_cycle()
 
     assert len(provisioner.writes) == 1
-    successful_ssh[2].assert_not_awaited()
+    successful_ssh[1].assert_not_awaited()
     trigger.assert_not_called()
 
 

@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+TEST_HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
 # =============================================================================
@@ -298,6 +299,60 @@ class TestCreateVm:
         assert updates["max_concurrent_vms"] == 4
 
     @pytest.mark.asyncio
+    async def test_authenticated_create_durably_merges_controller_host_key_pin(
+        self, provisioner_disabled, mock_db
+    ):
+        from orchestrator.services.vm_lifecycle_auth import AUTH_FIELD, sign_payload
+
+        secret = b"http-create-host-key-test-secret-at-least-32-bytes"
+        provisioner_disabled._db = mock_db
+        provisioner_disabled._lifecycle_hmac_secret = secret
+        mock_db.get_workspace_network_tier = AsyncMock(return_value="internet-only")
+
+        async def _post(_path, *, json):
+            request_auth = json[AUTH_FIELD]
+            response = MagicMock(status_code=200)
+            response.raise_for_status = MagicMock()
+            response.json.return_value = sign_payload(
+                {
+                    "job_id": "job-host-key",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-host-key",
+                    "vm_uid": "admitted-vm-uid",
+                    "namespace": "agent-vms",
+                    "provision_generation": PROVISION_GENERATION,
+                    "ssh_host_key_fingerprint": TEST_HOST_KEY_FINGERPRINT,
+                },
+                direction="response",
+                operation="create",
+                secret=secret,
+                correlation_id=request_auth["request_id"],
+            )
+            return response
+
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=_post)
+        provisioner_disabled._http_client = client
+
+        result = await provisioner_disabled._create_http(
+            job_id="job-host-key",
+            agent_config="worker_base",
+            vm_image=None,
+            cpu_cores=8,
+            memory="16Gi",
+            description="",
+            provision_generation=PROVISION_GENERATION,
+        )
+
+        assert result["ssh_host_key_fingerprint"] == TEST_HOST_KEY_FINGERPRINT
+        updates = mock_db.merge_vm_context_if_provision_generation.await_args_list[
+            -1
+        ].args[2]
+        assert updates["vm_uid"] == "admitted-vm-uid"
+        assert updates["ssh_host_key_fingerprint"] == TEST_HOST_KEY_FINGERPRINT
+        assert updates["identity_authenticated"] is True
+
+    @pytest.mark.asyncio
     async def test_create_vm_returns_false_when_disabled(self, provisioner_disabled):
         """create_vm() returns False when no backend is available."""
         result = await provisioner_disabled.create_vm(job_id="job-005")
@@ -334,6 +389,7 @@ class TestFreshProvisionReset:
         assert ctx["ssh_probe_attempts"] == 0
         assert ctx["ssh_probe_error"] is None
         assert ctx["ssh_probe_failed_at"] is None
+        assert ctx["ssh_host_key_fingerprint"] is None
         assert ctx["vm_uid"] is None
         assert ctx["rootdisk_pvc_uid"] is None
         assert ctx["golden_wait_started_at"] is None

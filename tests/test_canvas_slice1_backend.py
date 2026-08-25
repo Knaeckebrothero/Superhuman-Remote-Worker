@@ -2862,7 +2862,7 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
     assert updates[-1][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
 
 
-def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None:
+def test_vm_host_key_ownership_modes_leave_canvas_fail_closed() -> None:
     cleanup = Path("docker/agent-vm-base/scripts/cleanup.sh").read_text()
     primary_template = Path("helm/templates/vm-controller/configmap.yaml").read_text()
     remote_template = Path(
@@ -2870,12 +2870,15 @@ def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None
     ).read_text()
     nats_source = Path("orchestrator/services/nats_bridge.py").read_text()
     assert "rm -f /etc/ssh/ssh_host_*" in cleanup
-    for template in (primary_template, remote_template):
-        assert "rm -f /etc/ssh/ssh_host_*" in template
-        assert "ssh-keygen -A" in template
-        assert template.index("ssh-keygen -A") < template.index(
-            "systemctl start management-daemon.service"
-        )
+    # Same-cluster host identity is injected into the per-VM Secret by the
+    # controller. The external/tailnet template keeps guest-side generation.
+    assert "rm -f /etc/ssh/ssh_host_*" not in primary_template
+    assert "ssh-keygen -A" not in primary_template
+    assert "rm -f /etc/ssh/ssh_host_*" in remote_template
+    assert "ssh-keygen -A" in remote_template
+    assert remote_template.index("ssh-keygen -A") < remote_template.index(
+        "systemctl start management-daemon.service"
+    )
     assert "bind_thread_workspace_backing(" not in nats_source
 
 

@@ -22,6 +22,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_ssh_private_key,
+)
 
 from vm.controller.lifecycle_auth import sign_payload
 
@@ -56,6 +62,8 @@ _mock_k8s_exc = types.ModuleType("kubernetes.client.exceptions")
 
 LIFECYCLE_SECRET = b"controller-test-lifecycle-secret-at-least-32-bytes"
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+TEST_HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
+EXISTING_HOST_KEY_FINGERPRINT = "SHA256:" + ("B" * 43)
 
 
 def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
@@ -123,12 +131,71 @@ from vm.controller.controller import (  # noqa: E402
     LIFECYCLE_NONCE_GC_PAGE_LIMIT,
     VM_NAMESPACE,
     VMController,
+    _generate_ssh_host_key,
+    _openssh_sha256_fingerprint,
 )
 
 _restore_k8s_modules()
 
 
 class TestSameClusterContracts:
+    def test_generated_host_key_fingerprint_round_trip(self):
+        material = _generate_ssh_host_key()
+
+        private_key = load_ssh_private_key(material.private_key.encode("ascii"), None)
+        derived_public = (
+            private_key.public_key()
+            .public_bytes(
+                Encoding.OpenSSH,
+                PublicFormat.OpenSSH,
+            )
+            .decode("ascii")
+        )
+
+        assert material.public_key == derived_public
+        assert material.fingerprint == _openssh_sha256_fingerprint(derived_public)
+        assert material.fingerprint.startswith("SHA256:")
+
+    def test_secret_backed_render_injects_host_key_only_into_user_data(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "#cloud-config\nruncmd:\n  - systemctl restart ssh\n"
+        ctrl.template_text = """\
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: agent-vm-${JOB_ID}
+spec:
+  dataVolumeTemplates: []
+  template:
+    spec:
+      domain: {}
+      volumes:
+        - name: cloud-init
+          cloudInitNoCloud:
+            secretRef:
+              name: agent-vm-${JOB_ID}-cloudinit
+"""
+
+        manifest = ctrl.render_template(SAMPLE_JOB_CONFIG)
+        user_data = manifest.pop("_srwCloudInitUserData")
+        fingerprint = manifest.pop("_srwSSHHostKeyFingerprint")
+        cloud_config = yaml.safe_load(user_data)
+
+        assert cloud_config["ssh_deletekeys"] is True
+        assert cloud_config["ssh_genkeytypes"] == []
+        assert cloud_config["ssh_keys"]["ed25519_private"].startswith(
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        )
+        public_key = cloud_config["ssh_keys"]["ed25519_public"]
+        assert fingerprint == _openssh_sha256_fingerprint(public_key)
+        cloud_init = manifest["spec"]["template"]["spec"]["volumes"][0][
+            "cloudInitNoCloud"
+        ]
+        assert cloud_init == {
+            "secretRef": {"name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit"}
+        }
+        assert "PRIVATE KEY" not in yaml.safe_dump(manifest)
+
     def test_render_injects_placement_after_yaml_parse(self):
         ctrl = _make_controller(headscale_available=False)
         with (
@@ -152,19 +219,21 @@ class TestSameClusterContracts:
     def test_payload_network_tier_overrides_env_default(self):
         """The per-project tier sent by the orchestrator beats the chart default."""
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        ctrl.cloud_init_text = "#cloud-config\ntier: ${NETWORK_TIER}\n"
         config = {**SAMPLE_JOB_CONFIG, "network_tier": "home-allowed"}
         with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
             manifest = ctrl.render_template(config)
-        assert manifest.pop("_srwCloudInitUserData") == "tier=home-allowed\n"
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["tier"] == "home-allowed"
 
     def test_env_default_network_tier_applies_when_payload_omits_it(self):
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        ctrl.cloud_init_text = "#cloud-config\ntier: ${NETWORK_TIER}\n"
         config = {k: v for k, v in SAMPLE_JOB_CONFIG.items() if k != "network_tier"}
         with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
             manifest = ctrl.render_template(config)
-        assert manifest.pop("_srwCloudInitUserData") == "tier=internet-only\n"
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["tier"] == "internet-only"
 
     def test_payload_network_tier_is_validated_when_env_default_is_empty(self):
         ctrl = _make_controller(headscale_available=False)
@@ -176,7 +245,8 @@ class TestSameClusterContracts:
     def test_cloud_init_receives_guest_token_url_and_tier(self):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "token=${VM_AUTH_TOKEN}\nurl=${ORCHESTRATOR_URL}\ntier=${NETWORK_TIER}\n"
+            "#cloud-config\ntoken: ${VM_AUTH_TOKEN}\n"
+            "url: ${ORCHESTRATOR_URL}\ntier: ${NETWORK_TIER}\n"
         )
         config = {
             **SAMPLE_JOB_CONFIG,
@@ -191,11 +261,10 @@ class TestSameClusterContracts:
         ):
             manifest = ctrl.render_template(config)
 
-        rendered = manifest.pop("_srwCloudInitUserData")
-        assert "url=http://payload-orchestrator:8085" in rendered
-        assert "tier=home-allowed" in rendered
-        assert "token=" in rendered
-        assert len(rendered.splitlines()[0].removeprefix("token=")) == 64
+        rendered = yaml.safe_load(manifest.pop("_srwCloudInitUserData"))
+        assert rendered["url"] == "http://payload-orchestrator:8085"
+        assert rendered["tier"] == "home-allowed"
+        assert len(rendered["token"]) == 64
 
     @pytest.mark.asyncio
     async def test_capacity_gate_reports_live_vm_count(self):
@@ -262,6 +331,7 @@ class TestSameClusterContracts:
             owner_kind="job",
             generation=PROVISION_GENERATION,
             user_data="#cloud-config\n",
+            host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
         )
         body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
         assert body["stringData"] == {"userdata": "#cloud-config\n"}
@@ -301,7 +371,38 @@ class TestSameClusterContracts:
                 owner_kind="job",
                 generation=PROVISION_GENERATION,
                 user_data="#cloud-config\n",
+                host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
             )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_retry_returns_existing_generation_pin(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.core_api.create_namespaced_secret.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.core_api.read_namespaced_secret.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                labels={
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+                annotations={
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                    "srw.io/ssh-host-key-fingerprint": (EXISTING_HOST_KEY_FINGERPRINT),
+                },
+            )
+        )
+
+        created, fingerprint = await ctrl._ensure_cloud_init_secret(
+            job_id=SAMPLE_JOB_CONFIG["job_id"],
+            owner_kind="job",
+            generation=PROVISION_GENERATION,
+            user_data="#cloud-config\n",
+            host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
+        )
+
+        assert created is False
+        assert fingerprint == EXISTING_HOST_KEY_FINGERPRINT
 
     @pytest.mark.asyncio
     async def test_cloud_init_secret_is_created_before_vm_and_owned_after_admission(
@@ -309,7 +410,8 @@ class TestSameClusterContracts:
     ):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+            "#cloud-config\nssh_authorized_key: ${SSH_AUTHORIZED_KEY}\n"
+            "vm_auth_token: ${VM_AUTH_TOKEN}\n"
         )
         events: list[str] = []
         original_admit = ctrl.k8s_client.create_namespaced_custom_object.side_effect
@@ -343,11 +445,24 @@ class TestSameClusterContracts:
             result = await ctrl._do_create(config)
 
         assert result["status"] == "created"
+        assert result["ssh_host_key_fingerprint"].startswith("SHA256:")
         assert events == ["secret-create", "vm-create", "secret-owner-patch"]
         vm_body = ctrl.k8s_client.create_namespaced_custom_object.call_args.kwargs[
             "body"
         ]
         assert "_srwCloudInitUserData" not in vm_body
+        assert "_srwSSHHostKeyFingerprint" not in vm_body
+        assert "PRIVATE KEY" not in yaml.safe_dump(vm_body)
+        assert "PRIVATE KEY" not in yaml.safe_dump(result)
+        secret_body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
+        secret_cloud_config = yaml.safe_load(secret_body["stringData"]["userdata"])
+        assert secret_cloud_config["ssh_keys"]["ed25519_private"].startswith(
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        )
+        assert (
+            secret_body["metadata"]["annotations"]["srw.io/ssh-host-key-fingerprint"]
+            == result["ssh_host_key_fingerprint"]
+        )
         owner = ctrl.core_api.patch_namespaced_secret.call_args.kwargs["body"][
             "metadata"
         ]["ownerReferences"][0]
@@ -363,7 +478,7 @@ class TestSameClusterContracts:
     @pytest.mark.asyncio
     async def test_create_rejects_empty_rendered_ssh_authorized_key(self):
         ctrl = _make_controller(headscale_available=False)
-        ctrl.cloud_init_text = "key=${SSH_AUTHORIZED_KEY}\n"
+        ctrl.cloud_init_text = "#cloud-config\nkey: ${SSH_AUTHORIZED_KEY}\n"
         with (
             patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
             patch.dict(
@@ -381,7 +496,8 @@ class TestSameClusterContracts:
     async def test_exhausted_vm_create_deletes_new_cloud_init_secret(self):
         ctrl = _make_controller(headscale_available=False)
         ctrl.cloud_init_text = (
-            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+            "#cloud-config\nssh_authorized_key: ${SSH_AUTHORIZED_KEY}\n"
+            "vm_auth_token: ${VM_AUTH_TOKEN}\n"
         )
         ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
             status=409, body="VirtualMachine is being deleted"

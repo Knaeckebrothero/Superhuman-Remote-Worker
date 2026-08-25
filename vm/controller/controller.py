@@ -24,8 +24,10 @@ See knowledge-base/knowledge/features/vm_backend.md (Phase 3) and knowledge-base
 """
 
 import asyncio
+import base64
 from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
@@ -38,6 +40,13 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import yaml
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 
 from headscale_client import HeadscaleClient
 
@@ -214,7 +223,89 @@ MAX_DESCRIPTION_LEN = 200
 
 _OWNER_KINDS = frozenset({"job", "thread"})
 _PROVISION_GENERATION_ANNOTATION = "srw.io/provision-generation"
+_SSH_HOST_KEY_FINGERPRINT_ANNOTATION = "srw.io/ssh-host-key-fingerprint"
 _NETWORK_TIER_PATTERN = re.compile(r"^[a-z0-9-]{1,63}$")
+
+
+@dataclass(frozen=True, repr=False)
+class _SSHHostKeyMaterial:
+    """One ephemeral render-time host identity; never log or serialize it."""
+
+    private_key: str
+    public_key: str
+    fingerprint: str
+
+
+def _openssh_sha256_fingerprint(public_key: str) -> str:
+    """Return the OpenSSH SHA256 fingerprint for an ed25519 public key."""
+
+    fields = public_key.strip().split()
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise ValueError("SSH host public key must be OpenSSH ed25519")
+    try:
+        key_bytes = base64.b64decode(fields[1].encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("SSH host public key has invalid base64") from exc
+    digest = hashlib.sha256(key_bytes).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _ssh_host_key_fingerprint(value: object) -> str | None:
+    """Accept only the canonical OpenSSH SHA256 fingerprint shape."""
+
+    if not isinstance(value, str) or not value.startswith("SHA256:"):
+        return None
+    encoded = value.removeprefix("SHA256:")
+    if len(encoded) != 43:
+        return None
+    try:
+        digest = base64.b64decode((encoded + "=").encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError):
+        return None
+    return value if len(digest) == hashlib.sha256().digest_size else None
+
+
+def _generate_ssh_host_key() -> _SSHHostKeyMaterial:
+    """Generate the controller-owned ed25519 identity for one VM provision."""
+
+    private_key = Ed25519PrivateKey.generate()
+    private_text = private_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.OpenSSH,
+        NoEncryption(),
+    ).decode("ascii")
+    public_text = (
+        private_key.public_key()
+        .public_bytes(
+            Encoding.OpenSSH,
+            PublicFormat.OpenSSH,
+        )
+        .decode("ascii")
+    )
+    return _SSHHostKeyMaterial(
+        private_key=private_text,
+        public_key=public_text,
+        fingerprint=_openssh_sha256_fingerprint(public_text),
+    )
+
+
+def _inject_ssh_host_key(user_data: str) -> tuple[str, str]:
+    """Inject one generated host identity into a cloud-config document."""
+
+    cloud_config = yaml.safe_load(user_data)
+    if not isinstance(cloud_config, dict):
+        raise ValueError("Secret-backed cloud-init must be a cloud-config mapping")
+    key = _generate_ssh_host_key()
+    # Prevent cloud-init from adding a second, unpinned host identity. The
+    # supplied pair is written by cc_ssh before sshd is restarted by runcmd.
+    cloud_config["ssh_deletekeys"] = True
+    cloud_config["ssh_genkeytypes"] = []
+    cloud_config["ssh_keys"] = {
+        "ed25519_private": key.private_key,
+        "ed25519_public": key.public_key,
+    }
+    rendered = yaml.safe_dump(cloud_config, sort_keys=False)
+    return f"#cloud-config\n{rendered}", key.fingerprint
 
 
 def _owner_identity(job_config: dict) -> tuple[str, str]:
@@ -755,8 +846,16 @@ class VMController:
             rendered_cloud_init = cloud_init_text
             for placeholder, value in replacements.items():
                 rendered_cloud_init = rendered_cloud_init.replace(placeholder, value)
-            # Internal hand-off only; removed before the VM is sent to KubeVirt.
+            # Only the same-cluster chart mounts this Secret-backed template.
+            # The parked external/direct template remains inline and therefore
+            # keeps its existing guest-generated host-key behavior for now.
+            rendered_cloud_init, host_key_fingerprint = _inject_ssh_host_key(
+                rendered_cloud_init
+            )
+            # Internal hand-off only; both fields are removed before the VM is
+            # sent to KubeVirt. The private key persists only in the Secret.
             manifest["_srwCloudInitUserData"] = rendered_cloud_init
+            manifest["_srwSSHHostKeyFingerprint"] = host_key_fingerprint
         _stamp_owner_identity(manifest, owner_kind, owner_id)
         if generation:
             _stamp_provision_generation(manifest, generation)
@@ -841,8 +940,9 @@ class VMController:
         owner_kind: str,
         generation: str | None,
         user_data: str,
-    ) -> bool:
-        """Ensure the NoCloud Secret and report whether this call created it."""
+        host_key_fingerprint: str,
+    ) -> tuple[bool, str]:
+        """Ensure the NoCloud Secret and return its durable public identity."""
 
         from kubernetes.client.exceptions import ApiException
 
@@ -855,8 +955,10 @@ class VMController:
                 "srw.io/owner-id": job_id,
             },
         }
+        annotations = {_SSH_HOST_KEY_FINGERPRINT_ANNOTATION: host_key_fingerprint}
         if generation is not None:
-            metadata["annotations"] = {_PROVISION_GENERATION_ANNOTATION: generation}
+            annotations[_PROVISION_GENERATION_ANNOTATION] = generation
+        metadata["annotations"] = annotations
         body = {
             "apiVersion": "v1",
             "kind": "Secret",
@@ -870,7 +972,7 @@ class VMController:
                 namespace=VM_NAMESPACE,
                 body=body,
             )
-            return True
+            return True, host_key_fingerprint
         except ApiException as exc:
             if exc.status != 409:
                 raise
@@ -893,7 +995,18 @@ class VMController:
                 raise RuntimeError(
                     "existing cloud-init Secret belongs to another VM generation"
                 ) from exc
-            return False
+            admitted_fingerprint = _ssh_host_key_fingerprint(
+                annotations.get(_SSH_HOST_KEY_FINGERPRINT_ANNOTATION)
+            )
+            if admitted_fingerprint is None:
+                raise RuntimeError(
+                    "existing cloud-init Secret lacks a valid SSH host-key fingerprint"
+                ) from exc
+            # A lost create response may retry with the same generation after
+            # the Secret already exists. Return that Secret's fingerprint, not
+            # the newly generated but unused render, so the orchestrator pins
+            # the identity the guest will actually receive.
+            return False, admitted_fingerprint
 
     async def _patch_cloud_init_secret_owner(
         self, *, job_id: str, vm_name: str, vm_uid: str
@@ -1046,6 +1159,7 @@ class VMController:
 
         manifest = self.render_template(job_config, tailscale_auth_key)
         cloud_init_user_data = manifest.pop("_srwCloudInitUserData", None)
+        ssh_host_key_fingerprint = manifest.pop("_srwSSHHostKeyFingerprint", None)
         vm_name = manifest["metadata"]["name"]
         if golden_name:
             self._apply_clone_source(manifest, golden_name)
@@ -1058,11 +1172,21 @@ class VMController:
 
         cloud_init_secret_created = False
         if cloud_init_user_data is not None:
-            cloud_init_secret_created = await self._ensure_cloud_init_secret(
+            if (
+                fingerprint := _ssh_host_key_fingerprint(ssh_host_key_fingerprint)
+            ) is None:
+                raise RuntimeError(
+                    "Secret-backed cloud-init lacks a valid SSH host-key fingerprint"
+                )
+            (
+                cloud_init_secret_created,
+                ssh_host_key_fingerprint,
+            ) = await self._ensure_cloud_init_secret(
                 job_id=job_id,
                 owner_kind=owner_kind,
                 generation=generation,
                 user_data=cloud_init_user_data,
+                host_key_fingerprint=fingerprint,
             )
 
         max_retries = 12  # ~60s total
@@ -1195,6 +1319,12 @@ class VMController:
         }
         if admitted_generation is not None:
             result["provision_generation"] = admitted_generation
+        if ssh_host_key_fingerprint is not None:
+            # This public pin rides the same authenticated generation merge as
+            # vm_uid. Although the VM object is now admitted, readiness cannot
+            # pass before the orchestrator durably applies this response: the
+            # same-cluster prober fails closed while the pin is absent.
+            result["ssh_host_key_fingerprint"] = ssh_host_key_fingerprint
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
         return result

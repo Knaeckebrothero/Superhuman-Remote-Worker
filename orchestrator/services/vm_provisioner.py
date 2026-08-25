@@ -1,5 +1,6 @@
 """VM lifecycle management for explicit same-cluster and external modes."""
 
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +78,21 @@ def _safe_vm_uid(value: object) -> str | None:
     ):
         return None
     return value
+
+
+def _safe_ssh_host_key_fingerprint(value: object) -> str | None:
+    """Accept only a canonical OpenSSH SHA256 fingerprint."""
+
+    if not isinstance(value, str) or not value.startswith("SHA256:"):
+        return None
+    encoded = value.removeprefix("SHA256:")
+    if len(encoded) != 43:
+        return None
+    try:
+        digest = base64.b64decode((encoded + "=").encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError):
+        return None
+    return value if len(digest) == 32 else None
 
 
 def _extract_vm_context(job: dict) -> dict:
@@ -1212,6 +1228,16 @@ class VMProvisioner:
                     rootdisk_pvc_uid := _safe_vm_uid(data.get("rootdisk_pvc_uid"))
                 ) is not None:
                     identity_updates["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+                if (
+                    host_key_fingerprint := _safe_ssh_host_key_fingerprint(
+                        data.get("ssh_host_key_fingerprint")
+                    )
+                ) is not None:
+                    # The controller created this pin before the VM and Secret
+                    # admission result crossed the authenticated transport. It
+                    # belongs in this generation-CAS merge with vm_uid so a
+                    # stale response can never arm readiness for a new guest.
+                    identity_updates["ssh_host_key_fingerprint"] = host_key_fingerprint
                 if identity_updates:
                     identity_updates.update(
                         {
@@ -1546,6 +1572,10 @@ class VMProvisioner:
             "ssh_probe_attempts": 0,
             "ssh_probe_error": None,
             "ssh_probe_failed_at": None,
+            # A fresh provision gets a fresh controller-owned keypair. Leave
+            # readiness fail-closed until the admitted controller response
+            # installs the matching public fingerprint for this generation.
+            "ssh_host_key_fingerprint": None,
             # Never let a previous VM incarnation's UID authenticate the next
             # one between create dispatch and the admitted controller result.
             "vm_uid": None,
@@ -1557,8 +1587,9 @@ class VMProvisioner:
             # Opaque incarnation nonce. Controller identities are merged only
             # through a DB-side compare-and-merge against this exact value.
             "provision_generation": str(uuid4()),
-            # Slice 1 does not trust a guest self-reported VM host key. Keep
-            # Canvas closed until the VM provisioner can attest the key.
+            # The provisioner now owns and attests the guest host key. Canvas
+            # remains closed until its separate workspace-generation binding
+            # is implemented; key ownership alone does not enable that gate.
             CANVAS_WORKSPACE_GENERATION_KEY: None,
             # Golden-wait anchor from a previous incarnation must not cap this
             # provision's patience for a cold golden import (dispatcher stamps
