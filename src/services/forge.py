@@ -9,6 +9,7 @@ supports one, unlike GitHub Apps which are GitHub-only.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote, urlparse
@@ -25,6 +26,49 @@ _transport: Optional[httpx.BaseTransport] = None
 
 class ForgeError(RuntimeError):
     """Raised when a forge API call fails or is misconfigured."""
+
+
+def _hostname(value: str) -> str | None:
+    """Return a normalized hostname without ever exposing URL userinfo."""
+
+    raw = str(value or "").strip()
+    prefix, separator, scp_path = raw.partition(":")
+    if "//" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        host = prefix.rsplit("@", 1)[-1]
+    else:
+        host = urlparse(raw).hostname
+    return str(host).casefold().rstrip(".") if host else None
+
+
+def forge_web_url_matches_connector(
+    web_url: str,
+    connection_url: str,
+    forge: str,
+) -> bool:
+    """Whether a forge-returned web URL belongs to the connector's host.
+
+    Most connectors use the same browser and API hostname.  An in-cluster
+    Gitea deployment deliberately does not: agents call ``GITEA_INTERNAL_URL``
+    while Gitea returns links rooted at the browser-facing ``GITEA_URL``.
+    Treat exactly that server-configured pair as aliases.  A connector for any
+    other Gitea instance cannot borrow the deployment-wide public hostname.
+    """
+
+    web_host = _hostname(web_url)
+    connection_host = _hostname(connection_url)
+    if not web_host or not connection_host:
+        return False
+    if web_host == connection_host:
+        return True
+    if str(forge or "").strip().casefold() != "gitea":
+        return False
+
+    internal_host = _hostname(os.environ.get("GITEA_INTERNAL_URL", ""))
+    public_host = _hostname(os.environ.get("GITEA_URL", ""))
+    if not internal_host or not public_host:
+        return False
+    configured_hosts = {internal_host, public_host}
+    return connection_host in configured_hosts and web_host in configured_hosts
 
 
 @dataclass(frozen=True)

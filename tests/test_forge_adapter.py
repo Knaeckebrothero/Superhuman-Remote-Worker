@@ -10,11 +10,51 @@ from src.services.forge import (
     ForgeError,
     ForgeRepo,
     GitHubClient,
+    forge_web_url_matches_connector,
     get_pull_request_status,
     open_pull_request,
     parse_owner_repo,
     resolve_api_base,
 )
+
+
+def test_gitea_web_url_accepts_only_the_server_configured_internal_public_pair(
+    monkeypatch,
+):
+    monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
+    monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
+
+    assert forge_web_url_matches_connector(
+        "https://git.srw.works/acme/widget/pulls/7",
+        "http://srw-gitea:3000/acme/widget.git",
+        "gitea",
+    )
+    assert not forge_web_url_matches_connector(
+        "https://git.srw.works/acme/widget/pulls/7",
+        "https://other-gitea.example/acme/widget.git",
+        "gitea",
+    )
+    assert not forge_web_url_matches_connector(
+        "https://attacker.example/acme/widget/pulls/7",
+        "http://srw-gitea:3000/acme/widget.git",
+        "gitea",
+    )
+
+
+def test_gitea_web_url_alias_fails_closed_without_both_server_urls(monkeypatch):
+    monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
+    monkeypatch.delenv("GITEA_INTERNAL_URL", raising=False)
+
+    assert not forge_web_url_matches_connector(
+        "https://git.srw.works/acme/widget/pulls/7",
+        "http://srw-gitea:3000/acme/widget.git",
+        "gitea",
+    )
+    assert forge_web_url_matches_connector(
+        "https://github.com/acme/widget/pull/7",
+        "https://github.com/acme/widget.git",
+        "github",
+    )
 
 
 def test_parse_owner_repo_handles_url_shapes():
