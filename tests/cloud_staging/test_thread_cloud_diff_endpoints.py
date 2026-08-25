@@ -369,6 +369,50 @@ class TestCloudDiffFile:
                 THREAD_ID, "does-not-exist.txt", fake_request
             )
         assert ei.value.status_code == 404
+        # The code is what lets the review UI say which of the three
+        # situations this is instead of guessing "the session re-staged".
+        assert ei.value.detail["code"] == "not_in_staged_diff"
+
+    @pytest.mark.asyncio
+    async def test_file_404_distinguishes_unreadable_staged_content(self, fake_request):
+        """A path the manifest lists but whose tar cannot be trusted.
+
+        ``_get_tar()`` refuses a tar whose sha256 does not match the
+        manifest's ``tar_sha256`` (the torn manifest/tar pair defence), so
+        ``file()`` returns None for an entry that IS staged. Reported as
+        re-staging, this reads as "your session moved on"; it is actually
+        "the staged copy is unusable", and only a restage fixes it.
+        """
+        user = _make_user()
+        thread = _make_thread()
+        tar_bytes = _build_tar([("upper/mod.txt", b"newv")])
+        entries = [
+            {"path": "mod.txt", "status": "modified", "size": 4, "binary": False}
+        ]
+        manifest = _manifest(entries, tar_bytes=tar_bytes)
+        manifest["tar_sha256"] = "0" * 64  # content binding will fail
+        row = _mount_row(
+            staged_summary={"signature": "sig", "tar_sha256": "irrelevant"}
+        )
+        svc = _snapshot_service(
+            {
+                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(
+                    manifest
+                ).encode(),
+                f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
+            }
+        )
+        stack, _db = _patch_endpoint(
+            user=user,
+            thread=thread,
+            ro_mount_row=row,
+            thread_mounts=[_thread_mounts_row()],
+            snapshot_service=svc,
+        )
+        with stack, pytest.raises(HTTPException) as ei:
+            await main.get_thread_cloud_diff_file(THREAD_ID, "mod.txt", fake_request)
+        assert ei.value.status_code == 404
+        assert ei.value.detail["code"] == "staged_content_unreadable"
 
 
 # --------------------------------------------------------------------------- #

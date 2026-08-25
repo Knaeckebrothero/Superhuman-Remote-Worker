@@ -12,7 +12,15 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Project, ThreadCloudDiffSummary, ThreadStatus } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus } from '../models/api.model';
+// Type + pure derivation only — importing them from the review component
+// would pull it (and Monaco's loader) back into the eager bundle graph and
+// defeat the @defer that keeps the review surface lazy.
+import {
+  folderLinkMatches,
+  ProtectedFolderLink,
+  selectProtectedProjectMount,
+} from '../../views/job-diff-review/protected-folder-link';
 import { FilePreview, ThreadUploadEvent } from '../models/file.model';
 import {
   AssistantTurn,
@@ -823,6 +831,40 @@ export class PersistentChatService {
    *  when nothing is staged (or the summary hasn't loaded yet). */
   readonly cloudStagedAt = signal<string | null>(null);
   readonly cloudDiffPanelOpen = signal(false);
+  /** Remote folders attached to the thread, straight off the thread payload.
+   *  The endpoint has returned these since cloud_collaboration_model.md
+   *  Phase 1; nothing read them until PC-19 needed to name the folder the
+   *  staged diff applies to. */
+  readonly threadMounts = signal<ThreadMount[]>([]);
+  /** A browser link to the protected project folder, or null when it cannot
+   *  be derived with certainty. Consumers must still cross-check it against
+   *  the diff summary's `protected_mount` (`folderLinkMatches`) before
+   *  offering it — see protected-folder-link.ts. */
+  readonly protectedFolderLink = signal<ProtectedFolderLink | null>(null);
+  /**
+   * The project-folder link, cross-checked against the mount the *summary*
+   * says is protected. Only this may be offered as navigation.
+   *
+   * `protectedFolderLink` is a candidate derived from the thread's mount rows,
+   * which the frontend cannot fully verify (`cloud_handle` is not in the REST
+   * projection). The summary reports the mount the backend actually protected,
+   * so an exact match is what turns the candidate into a fact. PC-19 was
+   * caused by exactly the missing check: the header offered a legacy
+   * `sessions/<id>` handle as if it were the project folder.
+   */
+  readonly verifiedProjectFolder = computed<ProtectedFolderLink | null>(() => {
+    const link = this.protectedFolderLink();
+    return folderLinkMatches(link, this.protectedMountName()) ? link : null;
+  });
+  /**
+   * Outcome of the hidden pending-count probe.
+   *
+   * Needed because "no banner" used to mean both "nothing is staged" and "we
+   * never found out". A protected ended session whose first probe failed had
+   * no entry point to the review and no way to ask again — the PC-25 dead end
+   * reached by a different road.
+   */
+  readonly cloudDiffProbe = signal<'idle' | 'loading' | 'ready' | 'error'>('idle');
   private cloudDiffRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly CLOUD_DIFF_REFRESH_DEBOUNCE_MS = 2000;
 
@@ -1225,6 +1267,9 @@ export class PersistentChatService {
       this.protectedMountName.set(null);
       this.cloudStagedAt.set(null);
       this.cloudDiffPanelOpen.set(false);
+      this.threadMounts.set([]);
+      this.protectedFolderLink.set(null);
+      this.cloudDiffProbe.set('idle');
 
       this.threadId.set(threadId);
       await this.loadHistory(threadId, generation);
@@ -1585,9 +1630,13 @@ export class PersistentChatService {
       this.cloudSessionUrl.set(thread.cloud_session_url || null);
       this.threadStatus.set((thread.status as ThreadStatus) || null);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
+      this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
       this._protectedCloud.set(!!thread.metadata?.protected_cloud);
       if (this._protectedCloud()) {
         void this.refreshCloudDiffCount();
+        void this.resolveProtectedFolderLink();
+      } else {
+        this.protectedFolderLink.set(null);
       }
     } catch {
       // Non-fatal — UI will show fallback values
@@ -1719,19 +1768,72 @@ export class PersistentChatService {
   async refreshCloudDiffCount(): Promise<void> {
     const threadId = this.threadId();
     if (!threadId) return;
-    const summary = await firstValueFrom(this.api.getThreadCloudDiff(threadId));
+    this.cloudDiffProbe.set('loading');
+    // The tagged read, not the nullable one: a failure has to be
+    // distinguishable from "nothing staged", or the banner cannot tell the
+    // difference between an empty folder and an unanswered question.
+    const outcome = await firstValueFrom(this.api.getThreadCloudDiffOutcome(threadId));
     if (this.threadId() !== threadId) return; // stale response after a thread switch
-    if (summary) {
+    if (outcome.kind === 'ok') {
+      const summary = outcome.data;
       this.cloudChangesCount.set(cloudCountFromSummary(summary));
       this.protectedMountName.set(summary.protected_mount);
       this.cloudStagedAt.set(summary.staged_at);
+      this.cloudDiffProbe.set('ready');
+      return;
     }
+    // Previous count/mount are deliberately left in place — a transient
+    // failure is not evidence that a staged diff went away.
+    this.cloudDiffProbe.set('error');
   }
 
-  /** Cloud-diff review panel resolved (applied or rejected) — clear the
-   *  badge and close the drawer. */
+  /**
+   * Resolve the protected project folder to a browser URL (PC-19).
+   *
+   * Best-effort and fail-quiet: any missing piece — no eligible mount, no
+   * project record, no `cloud_storage_url` on it — leaves the link null and
+   * the "Open project files" action simply absent. Never falls back to the
+   * legacy session-folder handle, which is the wrong folder for a protected
+   * thread and is what PC-19 is about.
+   */
+  async resolveProtectedFolderLink(): Promise<void> {
+    const threadId = this.threadId();
+    const mount = selectProtectedProjectMount(this.threadMounts());
+    if (!threadId || !mount?.source_ref) {
+      this.protectedFolderLink.set(null);
+      return;
+    }
+    const project = await firstValueFrom(this.api.getProject(mount.source_ref));
+    if (this.threadId() !== threadId) return; // stale response after a switch
+    const url = project?.cloud_storage_url;
+    if (!project || !url) {
+      this.protectedFolderLink.set(null);
+      return;
+    }
+    this.protectedFolderLink.set({
+      url,
+      name: project.name,
+      targetPath: mount.target_path,
+    });
+  }
+
+  /**
+   * Cloud-diff review resolved (applied or rejected).
+   *
+   * The panel is deliberately NOT closed here any more: it now shows the
+   * outcome receipt until the user dismisses it, because a four-second toast
+   * over a closing drawer is exactly how PC-20's owner ended up unable to
+   * tell whether a 34-second apply had landed. The count is re-read from the
+   * server rather than assumed, so a partial failure (which leaves staging
+   * intact) is reflected honestly instead of being zeroed optimistically.
+   */
   onCloudDiffResolved(): void {
     this.cloudChangesCount.set(0);
+    void this.refreshCloudDiffCount();
+  }
+
+  /** Close the review surface (the user dismissed it). */
+  closeCloudReview(): void {
     this.cloudDiffPanelOpen.set(false);
   }
 
@@ -2959,6 +3061,9 @@ export class PersistentChatService {
     this.protectedMountName.set(null);
     this.cloudStagedAt.set(null);
     this.cloudDiffPanelOpen.set(false);
+    this.threadMounts.set([]);
+    this.protectedFolderLink.set(null);
+    this.cloudDiffProbe.set('idle');
     // NOTE: resumedFromEpoch is deliberately NOT cleared here. connect()
     // calls disconnect() first, and a resume sets the watermark *before*
     // connect() — clearing it here would wipe it before the reopened

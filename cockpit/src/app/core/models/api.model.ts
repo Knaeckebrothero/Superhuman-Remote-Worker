@@ -1638,6 +1638,35 @@ export interface PromoteRequest {
 export type ThreadStatus = 'created' | 'active' | 'awaiting_user' | 'suspended' | 'ended';
 
 /**
+ * One remote folder attached to a thread, as projected by
+ * `GET /api/persistent/threads/{id}` (orchestrator/main.py:42778-42788).
+ *
+ * The route has returned this since cloud_collaboration_model.md Phase 1 —
+ * its docstring says it exists "so the Cockpit 'Project files' panel can
+ * render them without a second round-trip" — but nothing read it until the
+ * protected-cloud review needed to name the folder its diff applies to
+ * (PC-19). The projection deliberately omits `cloud_handle`, so a browser
+ * URL still has to come from the project record.
+ *
+ * Row order is the backend's `ORDER BY target_path`, and
+ * `select_protected_mount` takes the *first* eligible row in that order —
+ * so array order here is meaningful, not incidental.
+ */
+export interface ThreadMount {
+  id: string;
+  /** 'project' | 'project_default' | … — `project_default` is the owner's
+   *  personal cloud home and is outside protected mode's safety contract. */
+  mount_kind: string;
+  /** Where the mount lands in the workspace; the diff summary's
+   *  `protected_mount` resolves to this same value. */
+  target_path: string;
+  source_kind: string;
+  /** Project UUID for a project mount. */
+  source_ref: string | null;
+  backend_id: string | null;
+}
+
+/**
  * Persistent agent session thread.
  */
 export interface Thread {
@@ -1658,6 +1687,11 @@ export interface Thread {
   nc_share_id?: number | null;
   cloud_session_url?: string | null;
   metadata?: Record<string, unknown>;
+  /** Attached remote folders, ordered by `target_path`. Absent on the list
+   *  endpoint's projection and on older orchestrators. */
+  mounts?: ThreadMount[];
+  /** Derived: `source_ref` of every `mount_kind === 'project'` row. */
+  project_ids?: string[];
 }
 
 // =============================================================================
@@ -2062,6 +2096,30 @@ export interface JobAcceptPartialFailure {
   errors: string[];
 }
 
+/**
+ * Tagged outcome for the two diff *read* paths (summary and per-file).
+ *
+ * The nullable `Observable<T | null>` forms these replace collapsed every
+ * failure into `null`, which the review panel then rendered as "no changes
+ * to review" — a false statement on a safety surface for a 403 (not the
+ * owner), a 404 (thread gone / not protected), a 5xx, and an offline
+ * browser alike. Each of those needs different copy and a different
+ * affordance, so the read has to carry which one happened.
+ *
+ * `missing` only occurs on a per-file read: the summary listed the path but
+ * the staged set moved underneath us (resolved elsewhere, or re-staged).
+ */
+export type DiffLoadOutcome<T> =
+  | { kind: 'ok'; data: T }
+  | { kind: 'forbidden' }
+  | { kind: 'unavailable' }
+  /** `code` is the backend's reason when it sends one
+   *  (`not_in_staged_diff` / `staged_content_unreadable`). Absent from job
+   *  mode and from orchestrators older than that change, in which case the
+   *  surface uses copy that is true whichever it was. */
+  | { kind: 'missing'; code?: string }
+  | { kind: 'error'; status: number; detail: string };
+
 /** Outcome shape the cockpit uses to drive the diff-review UI state. Shared
  *  between the job-mode (`acceptJobDiff`) and thread-mode
  *  (`applyThreadCloudDiff`) apply calls — see api.model.ts's
@@ -2074,6 +2132,28 @@ export type JobAcceptOutcome =
    *  applied/rejected/restaged since the caller last read the summary. The
    *  component reloads the diff and shows a "changed — reloaded" notice. */
   | { kind: 'stale'; staged_epoch: number }
+  | { kind: 'error'; status: number; detail: string };
+
+/**
+ * Tagged outcome for the two *reject* paths.
+ *
+ * Reject used to return `T | null` and toast its own failures from inside the
+ * service, which left the review surface unable to tell "discarded" from
+ * "refused" — it cleared `submitting`, saw a falsy body, and returned,
+ * leaving the decision controls live over a staged set the backend had just
+ * refused to touch. It needs the same distinctions apply already had:
+ *
+ * - `stale` — 409 `epoch_stale`: someone applied/rejected/restaged since this
+ *   summary was read. Reload; do not leave the old controls armed.
+ * - `nothing_staged` — 409 `nothing_staged`: already resolved elsewhere.
+ *   Reload into the resolved state; this is not an error.
+ * - `error` — everything else, including 422 `invalid_epoch`, carrying a
+ *   message the surface renders itself instead of a detached toast.
+ */
+export type DiffRejectOutcome<T> =
+  | { kind: 'ok'; data: T }
+  | { kind: 'stale'; staged_epoch: number | null }
+  | { kind: 'nothing_staged' }
   | { kind: 'error'; status: number; detail: string };
 
 // =============================================================================
@@ -2124,6 +2204,16 @@ export interface ThreadCloudApplyResult {
   applied: number;
   deleted: number;
   errors: string[];
+  epoch: number;
+  overlay_reset: boolean;
+}
+
+/** Success body of POST .../cloud-diff/reject. `overlay_reset` carries the
+ *  same PC-07 meaning as apply's: false means the agent still holds the
+ *  changes and a resume can stage them again. */
+export interface ThreadCloudRejectResult {
+  thread_id: string;
+  rejected: boolean;
   epoch: number;
   overlay_reset: boolean;
 }

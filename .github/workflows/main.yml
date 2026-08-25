@@ -462,11 +462,15 @@ jobs:
         working-directory: cockpit
         timeout-minutes: 10
         run: npm run test:e2e:canvas:no-build
-      - name: Upload Dynamic Canvas browser report
+      - name: Run protected-cloud review browser gate
+        working-directory: cockpit
+        timeout-minutes: 10
+        run: npm run test:e2e:cloud-review:no-build
+      - name: Upload browser gate reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: canvas-browser-report-main-${{ github.run_attempt }}
+          name: cockpit-browser-reports-main-${{ github.run_attempt }}
           path: |
             cockpit/playwright-report/
             cockpit/test-results/

@@ -311,6 +311,102 @@ describe('cloudCountFromSummary', () => {
   });
 });
 
+describe('PersistentChatService — protected cloud probe', () => {
+  const summary = (over: Record<string, unknown> = {}) => ({
+    thread_id: 't1',
+    epoch: 5,
+    staged_at: '2026-08-24T09:18:00Z',
+    counts: { added: 1, modified: 2, deleted: 1 },
+    protected_mount: 'cloud',
+    files: [],
+    ...over,
+  });
+
+  it('records a successful probe and its summary facts', async () => {
+    const { service, mockApi } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'ok', data: summary() }));
+    service.threadId.set('t1');
+    await service.refreshCloudDiffCount();
+    expect(service.cloudDiffProbe()).toBe('ready');
+    expect(service.cloudChangesCount()).toBe(4);
+    expect(service.protectedMountName()).toBe('cloud');
+  });
+
+  it('distinguishes a failed probe from "nothing staged"', async () => {
+    // Both used to render as no banner at all, which left a protected ended
+    // session with no entry point to the review and no way to ask again.
+    const { service, mockApi } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'error', status: 0, detail: 'offline' }));
+    service.threadId.set('t1');
+    await service.refreshCloudDiffCount();
+    expect(service.cloudDiffProbe()).toBe('error');
+  });
+
+  it('keeps the previous count on a failed probe', async () => {
+    // A transient failure is not evidence that a staged diff went away.
+    const { service, mockApi } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi
+      .fn()
+      .mockReturnValueOnce(of({ kind: 'ok', data: summary() }))
+      .mockReturnValueOnce(of({ kind: 'error', status: 503, detail: 'busy' }));
+    service.threadId.set('t1');
+    await service.refreshCloudDiffCount();
+    await service.refreshCloudDiffCount();
+    expect(service.cloudChangesCount()).toBe(4);
+    expect(service.cloudDiffProbe()).toBe('error');
+  });
+
+  it('ignores a probe that lands after a thread switch', async () => {
+    const { service, mockApi } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi.fn().mockImplementation(() => {
+      service.threadId.set('t2'); // the user moved on mid-request
+      return of({ kind: 'ok', data: summary({ counts: { added: 9, modified: 0, deleted: 0 } }) });
+    });
+    service.threadId.set('t1');
+    await service.refreshCloudDiffCount();
+    expect(service.cloudChangesCount()).toBe(0);
+  });
+
+  it('offers a project folder only once it matches the protected mount', async () => {
+    // PC-19: the frontend cannot see cloud_handle, so its candidate mount is
+    // only provisional. The summary's protected_mount is what proves it.
+    const { service, mockApi } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'ok', data: summary() }));
+    service.threadId.set('t1');
+    await service.refreshCloudDiffCount();
+
+    service.protectedFolderLink.set({
+      url: 'https://cloud.example.invalid/apps/files/?dir=/Docs',
+      name: 'Protected Docs',
+      targetPath: 'somewhere-else',
+    });
+    expect(service.verifiedProjectFolder()).toBeNull();
+
+    service.protectedFolderLink.set({
+      url: 'https://cloud.example.invalid/apps/files/?dir=/Docs',
+      name: 'Protected Docs',
+      targetPath: 'cloud',
+    });
+    expect(service.verifiedProjectFolder()?.name).toBe('Protected Docs');
+  });
+
+  it('offers no project folder before a summary has been read', () => {
+    const { service } = createService();
+    service.protectedFolderLink.set({
+      url: 'https://cloud.example.invalid/apps/files/?dir=/Docs',
+      name: 'Protected Docs',
+      targetPath: 'cloud',
+    });
+    expect(service.verifiedProjectFolder()).toBeNull();
+  });
+});
+
 describe('describeAppliedConfig', () => {
   it('uses connector terminology for live attachment changes', () => {
     expect(describeAppliedConfig({}, { added: ['GitHub'], removed: ['Analytics'] })).toEqual([

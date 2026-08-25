@@ -43888,7 +43888,17 @@ async def get_thread_cloud_diff_file(
     """Protected cloud mode per-file diff content (Task 8).
 
     404 when the path isn't in the staged diff, including "nothing staged at
-    all" — ``UpperdirDiffSource.file()`` returns ``None`` for both.
+    all" and "staged but unreadable" — ``UpperdirDiffSource.file()`` returns
+    ``None`` for all three.
+
+    The 404 body carries a ``code`` distinguishing the last case from the
+    first two, because the review UI has to explain what happened and the
+    three explanations are different: the path left the staged set (the
+    session re-staged, or the diff was resolved elsewhere) versus the staged
+    tar being missing or failing its content-binding check. Cockpit told every
+    reviewer "the session has re-staged", which is wrong for a torn
+    manifest/tar pair. The summary is memoized on the source, so the extra
+    lookup below costs no I/O.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     _require_protected(thread)
@@ -43896,9 +43906,24 @@ async def get_thread_cloud_diff_file(
     _, src, _ = await _thread_cloud_diff_source(thread_id, thread)
     content = await src.file(file_path) if src is not None else None
     if content is None:
+        summary = await src.summary() if src is not None else None
+        listed = summary is not None and any(f.path == file_path for f in summary.files)
         raise HTTPException(
             status_code=404,
-            detail=f"Path '{file_path}' is not in the staged diff.",
+            detail=(
+                {
+                    "code": "staged_content_unreadable",
+                    "message": (
+                        f"Path '{file_path}' is staged but its content could "
+                        "not be read."
+                    ),
+                }
+                if listed
+                else {
+                    "code": "not_in_staged_diff",
+                    "message": f"Path '{file_path}' is not in the staged diff.",
+                }
+            ),
         )
     return {
         "thread_id": thread_id,
