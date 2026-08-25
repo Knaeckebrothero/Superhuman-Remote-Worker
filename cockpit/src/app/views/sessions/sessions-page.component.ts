@@ -172,7 +172,10 @@ interface Project {
           }
 
           @for (thread of filteredThreads(); track thread.id) {
-            <div class="session-card" [class.ended]="thread.status === 'ended'">
+            <div class="session-card"
+                 data-testid="session-card"
+                 [attr.data-thread-id]="thread.id"
+                 [class.ended]="thread.status === 'ended'">
               <div class="session-heading" (click)="openSession(thread)">
                 <span class="session-status-dot" [class]="thread.status"></span>
                 <span class="session-title">

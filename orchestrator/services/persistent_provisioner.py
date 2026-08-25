@@ -97,6 +97,14 @@ class PersistentProvisioner:
             "PERSISTENT_AGENT_IMAGE",
             "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
         )
+        self._agent_image_pull_policy: str = os.environ.get(
+            "PERSISTENT_AGENT_IMAGE_PULL_POLICY", "Always"
+        ).strip()
+        if self._agent_image_pull_policy not in {"Always", "IfNotPresent", "Never"}:
+            raise ValueError(
+                "PERSISTENT_AGENT_IMAGE_PULL_POLICY must be one of "
+                "Always, IfNotPresent, or Never"
+            )
         # Chart labels — without these the database NetworkPolicies (which
         # match app.kubernetes.io/{name,instance} + component=agent) REJECT
         # ingress from these pods: the officer respawn crash-looped on
@@ -776,7 +784,7 @@ class PersistentProvisioner:
                     {
                         "name": "agent",
                         "image": selected_image,
-                        "imagePullPolicy": "Always",
+                        "imagePullPolicy": self._agent_image_pull_policy,
                         "command": [
                             "sh",
                             "-c",
