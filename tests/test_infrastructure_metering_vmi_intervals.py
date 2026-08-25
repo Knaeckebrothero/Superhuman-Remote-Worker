@@ -529,14 +529,15 @@ async def test_shadow_writes_one_customer_row_per_active_vmi_item(
 ) -> None:
     conn = AsyncMock()
     conn.fetch.return_value = [_owner_row()]
+    conn.fetchval.return_value = True
 
     await VMIIntervalReconciler(
         shadow_enabled=True,
         activation=_activation(activation_state),
     ).observe_snapshot(conn, _observation_context(), _item())
 
-    conn.execute.assert_awaited_once()
-    insert = conn.execute.await_args
+    assert conn.execute.await_count == 2
+    insert = conn.execute.await_args_list[0]
     assert "'workspace_vm'" in insert.args[0]
     assert "'vmi'" in insert.args[0]
     assert insert.args[4] == "workspace-vm"
@@ -546,6 +547,58 @@ async def test_shadow_writes_one_customer_row_per_active_vmi_item(
     assert insert.args[8] == "job"
     assert insert.args[9] == JOB_ID
     assert insert.args[12] == "eligible-unpriced"
+
+    comparison = conn.execute.await_args_list[1]
+    assert "resource_inventory_shadow_comparisons" in comparison.args[0]
+    assert "'not-applicable'" in comparison.args[0]
+    assert "'vmi-no-legacy-interval'" in comparison.args[0]
+    assert "ON CONFLICT (snapshot_id,source_uid) DO NOTHING" in comparison.args[0]
+    assert comparison.args[3] == "vmi-uid-one"
+    assert comparison.args[4] == 8000
+    assert comparison.args[5] == 16 * GIB
+    assert comparison.args[6] == datetime(2026, 8, 7, 10, 0, 2, tzinfo=timezone.utc)
+    assert comparison.args[7] == "vmi-scheduled-transition"
+    assert comparison.args[8] == 0
+    assert comparison.args[9] == RECEIVED_AT
+
+
+@pytest.mark.asyncio
+async def test_vmi_snapshot_comparison_replay_is_byte_stable_and_idempotent() -> None:
+    conn = AsyncMock()
+    conn.fetch.return_value = [_owner_row()]
+    conn.fetchval.return_value = True
+    context = _observation_context()
+    item = _item()
+    reconciler = VMIIntervalReconciler(
+        shadow_enabled=True,
+        activation=_activation("shadow"),
+    )
+
+    await reconciler.observe_snapshot(conn, context, item)
+    await reconciler.observe_snapshot(conn, context, item)
+
+    comparisons = [
+        call
+        for call in conn.execute.await_args_list
+        if "resource_inventory_shadow_comparisons" in call.args[0]
+    ]
+    assert len(comparisons) == 2
+    assert comparisons[0].args == comparisons[1].args
+    assert "ON CONFLICT (snapshot_id,source_uid) DO NOTHING" in comparisons[0].args[0]
+    assert conn.fetchval.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_vmi_snapshot_comparison_replay_fails_closed_on_content_drift() -> None:
+    conn = AsyncMock()
+    conn.fetch.return_value = [_owner_row()]
+    conn.fetchval.return_value = False
+
+    with pytest.raises(InventoryConflictError, match="different content"):
+        await VMIIntervalReconciler(
+            shadow_enabled=True,
+            activation=_activation("shadow"),
+        ).observe_snapshot(conn, _observation_context(), _item())
 
 
 @pytest.mark.asyncio

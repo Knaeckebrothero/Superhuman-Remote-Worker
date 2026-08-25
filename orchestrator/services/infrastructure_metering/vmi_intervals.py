@@ -803,6 +803,74 @@ class VMIIntervalReconciler:
                 reason,
                 context.received_at,
             )
+            if item.valid_for_metering:
+                # VMIs have no legacy interval ledger to compare against.  A
+                # stable not-applicable row nevertheless resolves this valid
+                # snapshot item for the generic item-for-item health check.
+                # Keep the row projection-only so a replay cannot change when
+                # application attribution state changes after the LIST.
+                observed_started_at = (
+                    projection.scheduled_transition_timestamp
+                    or projection.creation_timestamp
+                )
+                observed_start_source = (
+                    "vmi-scheduled-transition"
+                    if projection.scheduled_transition_timestamp is not None
+                    else "object-creation-timestamp"
+                    if projection.creation_timestamp is not None
+                    else None
+                )
+                await conn.execute(
+                    "INSERT INTO resource_inventory_shadow_comparisons ("
+                    "snapshot_id,inventory_scope_id,source_uid,owner_kind,"
+                    "owner_id,owner_trusted,observed_cpu_millicores,"
+                    "observed_memory_bytes,observed_started_at,"
+                    "observed_start_time_source,observed_start_uncertainty_us,"
+                    "status,reason_code,explained,comparison_at) VALUES ("
+                    "$1,$2,$3,NULL,NULL,FALSE,$4,$5,$6,$7,$8,"
+                    "'not-applicable','vmi-no-legacy-interval',TRUE,$9) "
+                    "ON CONFLICT (snapshot_id,source_uid) DO NOTHING",
+                    context.snapshot_id,
+                    context.inventory_scope_id,
+                    item.source_uid,
+                    projection.cpu_millicores,
+                    projection.memory_bytes,
+                    observed_started_at,
+                    observed_start_source,
+                    0 if observed_started_at is not None else None,
+                    context.received_at,
+                )
+                comparison_matches = await conn.fetchval(
+                    "SELECT inventory_scope_id=$2 AND owner_kind IS NULL "
+                    "AND owner_id IS NULL AND owner_trusted=FALSE "
+                    "AND legacy_interval_id IS NULL "
+                    "AND legacy_cpu_millicores IS NULL "
+                    "AND legacy_memory_bytes IS NULL "
+                    "AND legacy_started_at IS NULL "
+                    "AND observed_cpu_millicores IS NOT DISTINCT FROM $4 "
+                    "AND observed_memory_bytes IS NOT DISTINCT FROM $5 "
+                    "AND observed_started_at IS NOT DISTINCT FROM $6 "
+                    "AND observed_start_time_source IS NOT DISTINCT FROM $7 "
+                    "AND observed_start_uncertainty_us IS NOT DISTINCT FROM $8 "
+                    "AND start_delta_us IS NULL AND status='not-applicable' "
+                    "AND reason_code='vmi-no-legacy-interval' AND explained=TRUE "
+                    "AND comparison_at=$9 "
+                    "FROM resource_inventory_shadow_comparisons "
+                    "WHERE snapshot_id=$1 AND source_uid=$3",
+                    context.snapshot_id,
+                    context.inventory_scope_id,
+                    item.source_uid,
+                    projection.cpu_millicores,
+                    projection.memory_bytes,
+                    observed_started_at,
+                    observed_start_source,
+                    0 if observed_started_at is not None else None,
+                    context.received_at,
+                )
+                if comparison_matches is not True:
+                    raise InventoryConflictError(
+                        "VMI shadow comparison replayed with different content"
+                    )
         except (asyncpg.UndefinedColumnError, asyncpg.UndefinedTableError):
             # Mixed-version rollout: stay dark and never fall back to legacy
             # workspace billing or an interval/publication side effect.

@@ -2765,6 +2765,9 @@ DECLARE
     scope_namespace        TEXT;
     epoch_recovery_from    UUID;
     epoch_retired_at       TIMESTAMPTZ;
+    epoch_reliable_from    TIMESTAMPTZ;
+    epoch_continuous_since TIMESTAMPTZ;
+    epoch_continuity_health TEXT;
     previous_epoch_id      UUID;
     previous_sequence      BIGINT;
     previous_retired_at    TIMESTAMPTZ;
@@ -2782,8 +2785,12 @@ BEGIN
     END IF;
 
     SELECT epoch.recovery_from_epoch_id, epoch.retired_at,
+           epoch.reliable_from, epoch.continuous_since,
+           epoch.continuity_health,
            scope.api_resource, scope.namespace
     INTO epoch_recovery_from, epoch_retired_at,
+         epoch_reliable_from, epoch_continuous_since,
+         epoch_continuity_health,
          scope_resource, scope_namespace
     FROM public.resource_inventory_scope_epochs AS epoch
     JOIN public.resource_inventory_scopes AS scope
@@ -2835,7 +2842,25 @@ BEGIN
     IF NEW.authority_sequence = 1 THEN
         IF activation_state IS DISTINCT FROM 'shadow'
            OR request_kind IS DISTINCT FROM 'initial-activation'
-           OR epoch_recovery_from IS NOT NULL
+           OR (
+                epoch_recovery_from IS NOT NULL
+                AND (
+                    epoch_continuity_health IS DISTINCT FROM 'healthy'
+                    OR epoch_reliable_from IS NULL
+                    OR epoch_reliable_from > NEW.effective_from
+                    OR epoch_continuous_since IS NULL
+                    OR epoch_continuous_since > NEW.effective_from
+                    OR EXISTS (
+                        SELECT 1
+                        FROM public.resource_inventory_coverage_gaps AS gap
+                        WHERE gap.scope_epoch_id =
+                            NEW.inventory_scope_epoch_id
+                          AND gap.resolution = 'unresolved'
+                          AND gap.reason NOT LIKE
+                              'compute-authority-awaiting-confirmation:%'
+                    )
+                )
+           )
            OR NOT EXISTS (
                 SELECT 1
                 FROM public.compute_metering_scope_requirements AS requirement
@@ -2961,6 +2986,13 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: FUNCTION protect_compute_metering_epoch_authority(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.protect_compute_metering_epoch_authority() IS 'Fail-closed exact-epoch compute authority guard. Initial recovery epochs must prove healthy continuous and reliable coverage through the boundary.';
 
 
 --

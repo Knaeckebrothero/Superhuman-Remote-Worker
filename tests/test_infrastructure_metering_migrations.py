@@ -238,7 +238,11 @@ APP_DELIVERABLE_CONTRACT_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_DELIVERABLE_CONTRACT_AUTHORITY
+APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0183_compute_initial_recovery_epoch_authority.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -300,8 +304,8 @@ def test_migration_discovery_rejects_duplicate_interstitial_version(
 @pytest.fixture(scope="module")
 def app_pg_dsn() -> str:
     testcontainers = pytest.importorskip("testcontainers.postgres")
-    container = testcontainers.PostgresContainer("postgres:16")
     try:
+        container = testcontainers.PostgresContainer("postgres:16")
         container.start()
     except Exception as exc:
         pytest.skip(f"no container runtime for app migration test: {exc}")
@@ -782,6 +786,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current" not in APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION.read_text()
     )
     assert "schema_current" not in APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
     assert (
         "schema_current"
         not in APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
@@ -1155,6 +1160,27 @@ def test_compute_epoch_rollover_is_audited_append_only_and_directly_bound() -> N
     assert (
         "DROP TRIGGER resource_intervals_compute_exact_epoch_lifecycle_guard" in compact
     )
+
+
+def test_initial_compute_authority_accepts_only_proven_recovery_coverage() -> None:
+    raw = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0182_deliverable_contract_authority.sql" in raw
+    assert (
+        "CREATE OR REPLACE FUNCTION public."
+        "protect_compute_metering_epoch_authority()" in sql
+    )
+    assert "epoch_continuity_health IS DISTINCT FROM 'healthy'" in sql
+    assert "epoch_reliable_from IS NULL" in sql
+    assert "epoch_reliable_from > NEW.effective_from" in sql
+    assert "epoch_continuous_since IS NULL" in sql
+    assert "epoch_continuous_since > NEW.effective_from" in sql
+    assert "FROM public.resource_inventory_coverage_gaps AS gap" in sql
+    assert "gap.resolution = 'unresolved'" in sql
+    assert "epoch_recovery_from IS NOT NULL" in sql
+    assert "DROP TRIGGER" not in raw
+    assert "CREATE TABLE" not in raw
 
 
 def test_compute_authority_confirmation_gap_supersedes_deployed_rollover() -> None:
