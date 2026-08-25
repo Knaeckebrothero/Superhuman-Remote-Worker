@@ -126,10 +126,23 @@ class IdeSessionService:
         if vm_ctx.get("status") == "ready":
             ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
             if ssh_host and orchestrator_can_reach(ssh_host):
+                # Routable (same-cluster) VM. The proxy targets code-server on
+                # the pod IP, but the VM image ships code-server disabled until
+                # the live-VM IDE lands, so only advertise a session when
+                # something actually answers there — otherwise the cockpit
+                # shows an "Open IDE" that 502s.
+                if await self._wait_for_code_server(
+                    f"http://{ssh_host}:38080", timeout=2
+                ):
+                    return {
+                        "status": "active",
+                        "code_server_url": _build_code_server_url(job_id),
+                        "source": "live_vm",
+                    }
                 return {
-                    "status": "active",
-                    "code_server_url": _build_code_server_url(job_id),
-                    "source": "live_vm",
+                    "status": "unavailable",
+                    "code_server_url": None,
+                    "error": "code-server is not running on the live VM.",
                 }
             if ssh_host:
                 # Mesh VM (Tailscale ssh_host) the orchestrator cannot reach
