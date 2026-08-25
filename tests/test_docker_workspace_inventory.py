@@ -73,11 +73,18 @@ class _InventoryConnection:
             return (
                 None if workspace is None else {"workspace": copy.deepcopy(workspace)}
             )
-        if sql.startswith("SELECT status FROM jobs"):
+        if sql.startswith("SELECT status, completion_outcome_kind FROM jobs"):
             # Job deletion reads the pre-delete status for the Officer claim
             # audit. This seam models workspace ownership only, so every
             # represented job reports the same terminal status.
-            return None if str(args[0]) not in self.jobs else {"status": "completed"}
+            return (
+                None
+                if str(args[0]) not in self.jobs
+                else {
+                    "status": "completed",
+                    "completion_outcome_kind": None,
+                }
+            )
         if "AS workspace FROM threads" in sql:
             workspace = self.threads.get(str(args[0]))
             return (
