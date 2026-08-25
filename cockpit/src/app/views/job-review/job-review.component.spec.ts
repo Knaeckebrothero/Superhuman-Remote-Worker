@@ -46,7 +46,7 @@ function repository(id: string, connectionUrl: string): Datasource {
   };
 }
 
-function reviewJob(context: Job['context']): Job {
+function reviewJob(context: Job['context'], overrides: Partial<Job> = {}): Job {
   return {
     id: JOB_ID,
     description: 'Design the Hotel Rheinland theme',
@@ -56,6 +56,7 @@ function reviewJob(context: Job['context']): Job {
     repo_name: 'job-29c28492',
     branch_name: null,
     context,
+    ...overrides,
   };
 }
 
@@ -231,8 +232,9 @@ describe('JobReviewComponent delivery section', () => {
     }),
     liveStatus: PullRequestStatus | null = OPEN_STATUS,
     workspaceContract: Job['workspace_contract'] | undefined = undefined,
+    jobOverrides: Partial<Job> = {},
   ): Promise<HTMLElement> {
-    const job = reviewJob(context);
+    const job = reviewJob(context, jobOverrides);
     job.workspace_contract = workspaceContract;
     api = {
       getJob: vi.fn().mockReturnValue(of(job)),
@@ -326,6 +328,20 @@ describe('JobReviewComponent delivery section', () => {
 
     expect(text).toContain('Pull request #1 · Status unavailable');
     expect(fixture.componentInstance.pullRequest()?.url).toBe(PR_URL);
+  });
+
+  it('renders blocked/undelivered as distinct from completed or failed', async () => {
+    const root = await render(
+      {},
+      null,
+      undefined,
+      {status: 'cancelled', completion_outcome_kind: 'blocked_undelivered'},
+    );
+    const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
+
+    expect(text).toContain('Blocked / undelivered');
+    expect(text).not.toContain('Failed');
+    expect(text).not.toContain('Completed');
   });
 
   it('does not mislabel the connector default as the historical job delivery branch', async () => {

@@ -30,6 +30,11 @@ from src.core.deliverables import (  # noqa: E402
     parse_required_deliverables,
     resolve_workspace_deliverable,
 )
+from src.shared.deliverable_contract import (  # noqa: E402
+    DeliverableContractError,
+    cloned_repo_deliverables,
+    parse_required_deliverables as parse_contract,
+)
 from src.core.workspace import WorkspaceManager  # noqa: E402
 from src.tools.core.job import _final_phase_data, create_job_tools  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
@@ -130,6 +135,57 @@ class TestContractBlock:
             "required_deliverables": ["./repo/output/a.md"],
         }
         assert parse_required_deliverables(metadata) == ["output/a.md"]
+
+    def test_pr_contract_is_canonical_and_rendered_as_forge_delivery(self):
+        assert parse_contract([" PR:Acme/Widget ", "pr:acme/widget"], strict=True) == [
+            "pr:acme/widget"
+        ]
+        block = format_deliverable_contract_block(["pr:Acme/Widget"])
+        assert "`pr:acme/widget`" in block
+        assert "repo_open_pr" in block
+        assert "note or local file cannot satisfy" in block
+
+    @pytest.mark.parametrize(
+        "value",
+        ["pr:", "pr:owner", "pr:owner/repo/extra", "pr:owner name/repo"],
+    )
+    def test_malformed_pr_contract_is_rejected_at_admission(self, value):
+        with pytest.raises(DeliverableContractError):
+            parse_contract([value], strict=True)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "repos/Widget/docs/a.md",
+            "./repos/Widget/docs/a.md",
+            "/repos/Widget/docs/a.md",
+            "  ./repos/Widget/docs/a.md  ",
+        ],
+    )
+    def test_external_clone_paths_share_one_canonical_classification(self, value):
+        assert parse_contract([value], strict=True) == ["repos/Widget/docs/a.md"]
+        assert cloned_repo_deliverables([value]) == ["repos/Widget/docs/a.md"]
+
+    def test_job_tree_prefix_remains_distinct_from_attached_clones(self):
+        assert parse_contract(["repo/output/a.md"], strict=True) == ["output/a.md"]
+        assert cloned_repo_deliverables(["repo/output/a.md"]) == []
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "../repos/Widget/a.md",
+            "repos/Widget/../a.md",
+            "repos//Widget/a.md",
+            "//repos/Widget/a.md",
+            r"repos\Widget\a.md",
+            "repo/repos/Widget/a.md",
+        ],
+    )
+    def test_ambiguous_or_traversing_paths_fail_instead_of_crossing_domains(
+        self, value
+    ):
+        with pytest.raises(DeliverableContractError):
+            parse_contract([value], strict=True)
 
 
 # =============================================================================

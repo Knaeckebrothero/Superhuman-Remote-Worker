@@ -343,8 +343,10 @@ async def _jobs_section(
 
         changed: list[str] = []
         new: list[str] = []
+        from src.shared.job_outcome import effective_job_status
+
         for jid, job in by_id.items():
-            status = str(job.get("status") or "unknown")
+            status = effective_job_status(job)
             desc = _truncate(job.get("description") or "", _DESC_CHARS)
             prev_entry = _as_dict(prev_prints.get(jid))
             if jid not in prev_prints:
@@ -352,7 +354,11 @@ async def _jobs_section(
             elif prev_entry.get("status") != status:
                 line = f"- {jid[:8]} {prev_entry.get('status')} → {status} — {desc}"
                 error = (job.get("error_message") or "").strip()
-                if error and status in ("failed", "cancelled"):
+                if error and status in (
+                    "failed",
+                    "cancelled",
+                    "blocked_undelivered",
+                ):
                     line += f" | error: {_truncate(error, 160)}"
                 changed.append(line)
 
@@ -405,7 +411,7 @@ async def _jobs_section(
 
         steady: dict[str, int] = {}
         for jid, job in by_id.items():
-            status = str(job.get("status") or "unknown")
+            status = effective_job_status(job)
             prev_entry = _as_dict(prev_prints.get(jid))
             if jid in prev_prints and prev_entry.get("status") == status:
                 if status not in _ACTIVE_STATUSES:
@@ -443,7 +449,7 @@ async def _jobs_section(
 
         fingerprints = {
             jid: {
-                "status": str(job.get("status") or "unknown"),
+                "status": effective_job_status(job),
                 "steps": steps_by_job.get(jid),
             }
             for jid, job in by_id.items()

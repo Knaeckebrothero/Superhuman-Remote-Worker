@@ -17,7 +17,8 @@ import {JobWatchService} from '../../core/services/job-watch.service';
 import {ApiService} from '../../core/services/api.service';
 import {
     asRecord,
-    canResumeJobStatus,
+    canResumeJob,
+    effectiveJobStatus,
     jobStatusLabelKey,
     isRunningJobStatus,
     isTerminalJobStatus,
@@ -221,7 +222,8 @@ export class JobToolCardPanelComponent {
     });
 
     protected readonly shortId = computed(() => this.entity().id.slice(0, 8));
-    protected readonly tone = computed(() => jobStatusTone(this.job()?.status ?? ''));
+    protected readonly effectiveStatus = computed(() => effectiveJobStatus(this.job()));
+    protected readonly tone = computed(() => jobStatusTone(this.effectiveStatus()));
 
     /**
      * The status in the product's own words — "Pending Review", not
@@ -234,8 +236,8 @@ export class JobToolCardPanelComponent {
      * the locale files, so that gap is real and shows up as `waiting_for_reply`
      * rather than as a bare i18n key.
      */
-    protected readonly statusKey = computed(() => jobStatusLabelKey(this.job()?.status));
-    protected readonly rawStatus = computed(() => this.job()?.status ?? '');
+    protected readonly statusKey = computed(() => jobStatusLabelKey(this.effectiveStatus()));
+    protected readonly rawStatus = computed(() => this.effectiveStatus());
     protected readonly running = computed(() => isRunningJobStatus(this.job()?.status));
 
     /**
@@ -271,7 +273,7 @@ export class JobToolCardPanelComponent {
         () => this.job()?.status === 'pending_review',
     );
     protected readonly canCancel = computed(() => !isTerminalJobStatus(this.job()?.status));
-    protected readonly canResume = computed(() => canResumeJobStatus(this.job()?.status));
+    protected readonly canResume = computed(() => canResumeJob(this.job()));
     protected readonly canOpenDiff = computed(() => {
         const s = this.job()?.diff_status;
         return s === 'pending' || this.job()?.status === 'pending_review';

@@ -361,6 +361,53 @@ class TestApproveJobGate:
         assert excinfo.value.status_code == 403
         assert "not merged" in str(excinfo.value.detail)
 
+    async def test_explicit_pr_contract_must_be_proven_before_merge_policy(self):
+        job = _pending_job()
+        job["context"]["required_deliverables"] = ["pr:knaeckebrothero/kurortengine"]
+        db = _fake_db(can_complete=True)
+        with ExitStack() as stack:
+            self._patch(stack, job, db)
+            proof = stack.enter_context(
+                patch(
+                    "services.deliverable_gate.explicit_pr_delivery_block_reason",
+                    AsyncMock(return_value="the recorded PR is missing"),
+                )
+            )
+            merge_policy = stack.enter_context(
+                patch("main._unmerged_pr_gate_reason", AsyncMock())
+            )
+            with pytest.raises(HTTPException) as excinfo:
+                await main.approve_job(MagicMock(), "job-1", None)
+
+        assert excinfo.value.status_code == 409
+        assert excinfo.value.detail["code"] == "pr_deliverable_unverified"
+        proof.assert_awaited_once_with({**job, "id": "job-1"}, db=db)
+        merge_policy.assert_not_awaited()
+
+    async def test_proven_pr_still_obeys_existing_open_pr_policy(self):
+        job = _pending_job()
+        job["context"]["required_deliverables"] = ["pr:knaeckebrothero/kurortengine"]
+        db = _fake_db(can_complete=False)
+        with ExitStack() as stack:
+            self._patch(stack, job, db)
+            stack.enter_context(
+                patch(
+                    "services.deliverable_gate.explicit_pr_delivery_block_reason",
+                    AsyncMock(return_value=None),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "main._unmerged_pr_gate_reason",
+                    AsyncMock(return_value="pull request #1 is open, not merged"),
+                )
+            )
+            with pytest.raises(HTTPException) as excinfo:
+                await main.approve_job(MagicMock(), "job-1", None)
+
+        assert excinfo.value.status_code == 403
+        assert "not merged" in str(excinfo.value.detail)
+
     async def test_job_without_a_pull_request_is_not_refused(self):
         """Negative control: the overwhelming majority of jobs must be
         completely unaffected by this feature."""

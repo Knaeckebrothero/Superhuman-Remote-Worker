@@ -118,7 +118,7 @@ from database import (  # noqa: E402
 )
 from database.postgres import (  # noqa: E402
     KNOWN_JOB_ORIGINS,
-    KNOWN_JOB_STATUSES,
+    JOB_STATUS_FILTER_VALUES,
     DatasourceCatalogCursorError,
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -7518,6 +7518,13 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     # creation turns the Gitea service into a confused deputy because its
     # repository/revision coordinates would otherwise arrive in caller data.
     "evidence_manifest",
+    # Pull-request evidence and immutable contract provenance are minted only
+    # by server-owned repository/admission paths.
+    "pull_request",
+    "deliverable_contract_provenance",
+    "prior_deliverable_contract",
+    "required_pr_repositories",
+    "required_deliverables",
     "lifecycle_marker",
     "loop_campaign_id",
     "loop_campaign_index",
@@ -7566,6 +7573,11 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
     | _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS
     | {
         "evidence_manifest",
+        "pull_request",
+        "deliverable_contract_provenance",
+        "prior_deliverable_contract",
+        "required_pr_repositories",
+        "required_deliverables",
         WORKSPACE_CONTRACT_CONTEXT_KEY,
         WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
         WORKSPACE_RUNTIME_CONTEXT_KEY,
@@ -10010,48 +10022,30 @@ class JobCreate(BaseModel):
     required_deliverables: list[str] | None = Field(
         None,
         description=(
-            "Deliverable contract (P1-C): workspace-relative artifact paths "
-            "(or 'kb:<slug>' knowledge-note slugs) that must exist on the job "
-            "branch before a completion claiming success may seal. Stored in "
-            "context.required_deliverables; rendered into the worker's task "
-            "brief; enforced by services/deliverable_gate.py at /complete. "
-            "Paths inside a cloned repository datasource (repos/<name>/...) "
-            "are refused — see the validator below."
+            "Immutable deliverable contract: workspace-relative artifact "
+            "paths, 'kb:<slug>' knowledge notes, or exactly one "
+            "'pr:<owner>/<repository>' pull request bound to a writable "
+            "attached repository. Files inside repos/<name>/ are refused and "
+            "the response names the compatible PR contract. Select that "
+            "contract rather than replacing publication with a note."
         ),
     )
 
     @field_validator("required_deliverables")
     @classmethod
-    def _refuse_cloned_repo_deliverables(
-        cls, value: list[str] | None
-    ) -> list[str] | None:
-        """Refuse a contract the platform guarantees cannot be satisfied.
+    def _normalize_deliverables(cls, value: list[str] | None) -> list[str] | None:
+        """Reject malformed entries while deferring repository authority.
 
-        Cloned repository datasources live at ``repos/<name>/`` and are
-        gitignored at seed time on purpose, so the gate — which reads the
-        job's committed tree — can never see them. Accepting such a manifest
-        means the job runs to completion and only then discovers the contract
-        was unsatisfiable, having burned its bounces; job 29c28492 escaped
-        only by moving the nested .git aside and un-ignoring the paths by
-        hand. Refusing at creation costs one 422 instead.
-
-        knowledge-base/knowledge/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md
+        ``repos/<alias>`` cannot be interpreted until project/ticket scope and
+        the exact selected datasource set have been server-resolved. Refusing
+        it in Pydantic used to lose the ticket-generation provenance needed to
+        prevent a subsequent ``kb:`` downgrade.
         """
         if not value:
             return value
-        from services.deliverable_gate import cloned_repo_deliverables
+        from src.shared.deliverable_contract import parse_required_deliverables
 
-        offenders = cloned_repo_deliverables(value)
-        if offenders:
-            raise ValueError(
-                "these deliverables are inside a cloned repository datasource "
-                f"and are never versioned, so they can never be verified: "
-                f"{', '.join(offenders)}. Work delivered to an external "
-                "repository is contracted as the pull request the agent "
-                "opens, not as files in this job's tree; declare the job's "
-                "own artifacts (e.g. output/...) instead."
-            )
-        return value
+        return parse_required_deliverables(value, strict=True)
 
     ticket: str | None = Field(
         None,
@@ -13231,7 +13225,7 @@ async def list_jobs(
         )
 
     statuses = list(dict.fromkeys(status or []))
-    unknown = [value for value in statuses if value not in KNOWN_JOB_STATUSES]
+    unknown = [value for value in statuses if value not in JOB_STATUS_FILTER_VALUES]
     if unknown:
         # 422 rather than an empty page: a typo that silently returns zero
         # rows gets reported as data loss.
@@ -13239,7 +13233,7 @@ async def list_jobs(
             status_code=422,
             detail=(
                 f"Unknown job status(es): {', '.join(sorted(unknown))}. "
-                f"Valid values: {', '.join(KNOWN_JOB_STATUSES)}"
+                f"Valid values: {', '.join(JOB_STATUS_FILTER_VALUES)}"
             ),
         )
 
@@ -13792,9 +13786,11 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             # Deliverable contract (P1-C): normalize + dedupe into context.
             # The dispatcher forwards context to the agent's task brief and the
             # completion gate validates the seal against committed Gitea state.
-            from services.deliverable_gate import parse_required_deliverables
+            from src.shared.deliverable_contract import parse_required_deliverables
 
-            manifest = parse_required_deliverables(job.required_deliverables)
+            manifest = parse_required_deliverables(
+                job.required_deliverables, strict=True
+            )
             if manifest:
                 context["required_deliverables"] = manifest
 
@@ -14392,6 +14388,73 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             creation_path="internal_rest" if internal_call else "user_rest",
         )
 
+        # Bind the caller's semantic contract to the exact authorized
+        # datasource set before insertion.  This is also where the historical
+        # ``repos/<alias>/...`` form becomes a loud PR requirement: Pydantic
+        # cannot do that because project/ticket/datasource authority has not
+        # been resolved at that boundary.
+        from services.deliverable_contracts import (
+            DeliveryContractConflict,
+            prepare_delivery_contract,
+        )
+
+        # Repository binding is needed only for a declared contract. Keep
+        # jobs without deliverables on the historical creation path (and
+        # avoid turning an optional connector read into a new admission
+        # dependency for every job).
+        selected_datasources = []
+        if job.required_deliverables:
+            selected_datasources = await postgres_db.resolve_datasources_for_thread(
+                selected_ds_ids, target_project_ids
+            )
+        try:
+            delivery_plan = prepare_delivery_contract(
+                job.required_deliverables or [],
+                datasources=selected_datasources,
+            )
+        except DeliveryContractConflict as exc:
+            if (
+                exc.code == "external_repository_requires_pr"
+                and officer_admission_preparation is not None
+                and job.ticket
+                and officer_ticket_ready_at is not None
+            ):
+                from services.officer_admission import (
+                    OfficerAdmissionConflict,
+                    record_rejected_ticket_delivery_requirement,
+                )
+
+                try:
+                    await record_rejected_ticket_delivery_requirement(
+                        postgres_db,
+                        preparation=officer_admission_preparation,
+                        ticket_note_id=str(job.ticket),
+                        ticket_ready_at=officer_ticket_ready_at,
+                        required_pr_repositories=list(
+                            exc.fields.get("required_pr_repositories") or []
+                        ),
+                    )
+                except OfficerAdmissionConflict as admission_exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": admission_exc.code,
+                            "message": admission_exc.detail,
+                            **admission_exc.fields,
+                        },
+                    ) from admission_exc
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": exc.message, **exc.fields},
+            ) from exc
+
+        if delivery_plan.deliverables:
+            context["required_deliverables"] = list(delivery_plan.deliverables)
+            delivery_contract_record = delivery_plan.as_database_record()
+        else:
+            context.pop("required_deliverables", None)
+            delivery_contract_record = None
+
         # Session ↔ job backref. `job.thread_id` is authenticated on the
         # internal path (_resolve_internal_job_creation_scope 403s on a thread
         # that is missing or owned by someone else) and forced to None on the
@@ -14453,6 +14516,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 if requested_workspace_backend is not None
                 else "resolved_config"
             ),
+            "delivery_contract": delivery_contract_record,
         }
         if officer_admission_preparation is not None:
             from services.officer_admission import (
@@ -18603,6 +18667,17 @@ async def resume_job(
     user, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobResumeRequest()
+    if job.get("completion_outcome_kind") == "blocked_undelivered":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blocked_undelivered_is_terminal",
+                "message": (
+                    "This job ended blocked/undelivered and cannot be resumed. "
+                    "A newer Officer-ready ticket generation may create a new job."
+                ),
+            },
+        )
     recovery_trip = _redispatch_livelock_trip(job)
     trip_ack_actor: dict[str, Any] | None = None
     if recovery_trip is not None:
@@ -19249,6 +19324,22 @@ async def approve_job(
                     "accept or reject action so cloud delivery is resolved "
                     "before the job becomes terminal."
                 ),
+            )
+        from services.deliverable_gate import explicit_pr_delivery_block_reason
+
+        pr_delivery_block = await explicit_pr_delivery_block_reason(
+            {**job, "id": job_id}, db=postgres_db
+        )
+        if pr_delivery_block is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pr_deliverable_unverified",
+                    "message": (
+                        "This job cannot be completed because its explicit PR "
+                        f"deliverable is unverified: {pr_delivery_block}."
+                    ),
+                },
             )
         unmerged_pr = await _unmerged_pr_gate_reason({**job, "id": job_id}, user=user)
         if unmerged_pr is not None:
@@ -23191,13 +23282,18 @@ async def _record_loop_job_outcome(
     from services.job_records import job_delivered_nothing, persisted_pull_request
     from services.project_loops import is_loop_execution_role, write_loop_retro
 
+    blocked_undelivered = job.get("completion_outcome_kind") == "blocked_undelivered"
     delivery = (ctx or {}).get("loop_cloud_delivery") or {}
     if not isinstance(delivery, dict):
         delivery = {}
     delivery_status = str(
         job.get("merge_status")
         or delivery.get("delivery_status")
-        or ("none" if failed else "no-changes")
+        or (
+            "blocked-undelivered"
+            if blocked_undelivered
+            else ("none" if failed else "no-changes")
+        )
     )
     delivery_sha = delivery.get("delivery_sha")
     delivery_notes = [str(note) for note in (delivery.get("notes") or [])]
@@ -23214,7 +23310,11 @@ async def _record_loop_job_outcome(
     # silently reporting a delivery that may not exist.
     # knowledge-base/knowledge/features/better_resavio_restart_status.md §6a.
     completed_role = (ctx or {}).get("loop_role")
-    if not failed and is_loop_execution_role(completed_role):
+    if (
+        not failed
+        and not blocked_undelivered
+        and is_loop_execution_role(completed_role)
+    ):
         pull_request = persisted_pull_request(job)
         if job_delivered_nothing(job, delivery_status=delivery_status):
             logger.warning(
@@ -23241,7 +23341,7 @@ async def _record_loop_job_outcome(
     # Knowledge is independent of the job execution repo. Refresh the dedicated
     # project vault after every successful member; the up-to-date short-circuit
     # makes a no-op cheap and the leader sweep remains the recovery path.
-    if not failed and loop.get("project_id"):
+    if not failed and not blocked_undelivered and loop.get("project_id"):
 
         async def _kb_reindex_after_job(pid: str) -> None:
             try:
@@ -23271,6 +23371,7 @@ async def _record_loop_job_outcome(
             merge_status=delivery_status,
             merged_sha=str(delivery_sha) if delivery_sha else None,
             failed=failed,
+            outcome_kind=("blocked_undelivered" if blocked_undelivered else None),
             error=last_error,
             merge_notes=delivery_notes,
             vector_db=vector_db,
@@ -27302,9 +27403,11 @@ async def _complete_job_legacy(
         # present at the job branch HEAD (Gitea) before it may seal — or spawn
         # critic/curator work. Missing → bounce back through the P1-A
         # resume-with-feedback lane with the precise missing/present listing
-        # (bounded by the gate's cap; at the cap the seal falls through with
-        # the report stamped in context.deliverable_gate). Gitea-down fails
-        # open. Logic in services/deliverable_gate.py.
+        # (bounded by the gate's cap). At the cap an explicit publication
+        # promise becomes terminal blocked/undelivered; ordinary in-repo
+        # manifests retain their historical review behavior. Forge failure
+        # fails closed for PR contracts and remains fail-open only for ordinary
+        # in-repo evidence. Logic in services/deliverable_gate.py.
         # knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
         from services.completion import apply_deliverable_gate
 
@@ -27333,7 +27436,7 @@ async def _complete_job_legacy(
             )
 
         async def _apply_completion_deliverable_gate() -> dict[str, Any]:
-            status, gate_actions, bounced = await apply_deliverable_gate(
+            gate_decision = await apply_deliverable_gate(
                 job,
                 result,
                 new_status,
@@ -27342,10 +27445,15 @@ async def _complete_job_legacy(
                 queue_resume=_queue_deliverable_gate_resume,
                 vector_db=vector_db,
             )
+            status, gate_actions, bounced = gate_decision
             return {
                 "new_status": status,
                 "actions": list(gate_actions),
                 "bounced": bool(bounced),
+                # Tests and a rolling in-process collaborator may still
+                # return the historical three-tuple. Absence means the old
+                # ordinary outcome, never an inferred blocked result.
+                "outcome_kind": getattr(gate_decision, "outcome_kind", None),
             }
 
         gate_result = await _run_completion_effect(
@@ -27357,6 +27465,7 @@ async def _complete_job_legacy(
         new_status = gate_result["new_status"]
         _gate_actions = list(gate_result["actions"])
         _gate_bounced = bool(gate_result["bounced"])
+        completion_outcome_kind = gate_result.get("outcome_kind")
         actions.extend(_gate_actions)
         if _gate_bounced:
             # Refused seal: the job is already parked paused with
@@ -27370,6 +27479,12 @@ async def _complete_job_legacy(
                 "new_status": "paused",
                 "actions": actions,
             }
+
+        if completion_outcome_kind == "blocked_undelivered":
+            error_message = (
+                "Delivery contract could not be satisfied; work ended "
+                "blocked/undelivered without a verified pull request."
+            )
 
         # 1·evidence (E4, officer_supervision_surface §3.3): a completion
         # CLAIM that survived the gate gets its typed evidence manifest —
@@ -27676,7 +27791,10 @@ async def _complete_job_legacy(
         async def _run_terminal_delivery_effect() -> list[str]:
             # S33 preserves its historical applicability. ``cancelled`` is in
             # the reordered terminal set but has no merge/change-record work.
-            if new_status not in ("completed", "failed"):
+            if new_status not in ("completed", "failed") and not (
+                new_status == "cancelled"
+                and completion_outcome_kind == "blocked_undelivered"
+            ):
                 return []
 
             async def _apply_terminal_merge_and_record() -> dict[str, Any]:
@@ -27707,6 +27825,7 @@ async def _complete_job_legacy(
                         db=postgres_db,
                         vector_db=vector_db,
                         error=error_message,
+                        outcome_kind=completion_outcome_kind,
                         **durable_merge_kwargs,
                     )
                 except Exception as exc:
@@ -27773,6 +27892,8 @@ async def _complete_job_legacy(
 
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
+            if completion_outcome_kind is not None:
+                kwargs["completion_outcome_kind"] = completion_outcome_kind
             had_assigned_agent = False
             fd_row: dict[str, Any] | None = None
             stash_and_clear_freeze = False
@@ -28022,6 +28143,8 @@ async def _complete_job_legacy(
 
             # Update job dict with new status for downstream checks
             job["status"] = new_status
+            if completion_outcome_kind is not None:
+                job["completion_outcome_kind"] = completion_outcome_kind
 
         # 1b. Notify operator for freeze events that require human action
         _NOTIFIABLE_FREEZE_TYPES = {
@@ -28351,6 +28474,8 @@ async def _complete_job_legacy(
 
             async def _spawn_verification_critic() -> dict[str, Any]:
                 effect_actions: list[str] = []
+                if completion_outcome_kind == "blocked_undelivered":
+                    return {"actions": effect_actions}
                 try:
                     await _trigger_verification_on_complete(
                         job,
@@ -28377,6 +28502,13 @@ async def _complete_job_legacy(
             expected_verification_round = len(_verification_rounds(job))
 
             async def _materialize_verification_critic() -> dict[str, Any]:
+                if completion_outcome_kind == "blocked_undelivered":
+                    return {
+                        "applicable": False,
+                        "world_cas_won": True,
+                        "action": "noop",
+                        "actions": [],
+                    }
                 return await _materialize_verification_critic_transactional(
                     job,
                     result,
@@ -28421,6 +28553,7 @@ async def _complete_job_legacy(
             and is_curation_enabled(job)
             and result.get("should_stop")
             and result.get("goal_achieved")
+            and completion_outcome_kind != "blocked_undelivered"
         ):
 
             async def _start_curation_final_pass() -> dict[str, Any]:
@@ -28607,7 +28740,10 @@ async def _complete_job_legacy(
         )
 
         # 7. Archive workspace (snapshot to S3) and clean up VM/container
-        if job.get("status") in ("completed", "failed"):
+        if job.get("status") in ("completed", "failed") or (
+            job.get("status") == "cancelled"
+            and completion_outcome_kind == "blocked_undelivered"
+        ):
             workspace_cleanup = await _run_completion_workspace_teardown(
                 job_id,
                 _effect_runner,
@@ -56731,6 +56867,18 @@ async def list_project_jobs(
 ) -> list[dict[str, Any]]:
     """List jobs belonging to a project."""
     await require_project_member(request, postgres_db, project_id)
+    # Direct service-level callers in the existing test/control seam omit the
+    # FastAPI-injected value and therefore receive the Query marker itself.
+    # HTTP requests are always a string or None.
+    status = status if isinstance(status, str) else None
+    if status is not None and status not in JOB_STATUS_FILTER_VALUES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown job status/outcome: {status}. Valid values: "
+                f"{', '.join(JOB_STATUS_FILTER_VALUES)}"
+            ),
+        )
     try:
         async with postgres_db.acquire() as conn:
             query = (
@@ -56742,8 +56890,17 @@ async def list_project_jobs(
             )
             params: list = [project_id]
             if status:
-                query += " AND js.status = $2"
                 params.append(status)
+                if status == "blocked_undelivered":
+                    query += " AND js.completion_outcome_kind = $2"
+                elif status == "cancelled":
+                    query += (
+                        " AND js.status = $2 AND "
+                        "js.completion_outcome_kind IS DISTINCT FROM "
+                        "'blocked_undelivered'"
+                    )
+                else:
+                    query += " AND js.status = $2"
             query += " ORDER BY js.created_at DESC LIMIT $" + str(len(params) + 1)
             params.append(limit)
             rows = await conn.fetch(query, *params)

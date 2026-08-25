@@ -107,6 +107,7 @@ export interface JobSummary {
   id: string;
   description: string;
   status: string;
+  completion_outcome_kind?: 'blocked_undelivered' | null;
   config_name?: string;
   user_id?: string | null;
   project_id?: string | null;

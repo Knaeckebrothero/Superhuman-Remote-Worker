@@ -25,14 +25,16 @@ Semantics (annex E, each element proven elsewhere):
   resume-with-feedback lane (``queued_feedback`` + ``queued_feedback_reason``
   → the worker's [FEEDBACK_RESUME] banner) with a PRECISE missing/present
   listing, resuming on its own checkpoint. Bounces are capped
-  (:data:`DELIVERABLE_GATE_BOUNCE_CAP`); at the cap the seal falls through —
-  ``completed`` demotes to ``pending_review`` (loop jobs keep ``completed``,
-  the pending_review loop-wedge rule) with the gate report stamped in
-  ``context.deliverable_gate`` so a human sees exactly what's missing.
-  Never an infinite loop.
-* Gitea unavailable / repo unresolvable → fail-open: skip, log, stamp
-  ``{skipped: true, reason}`` (graceful-degradation house rule). ``kb:``
-  entries fail-open individually when the vector store can't answer.
+  (:data:`DELIVERABLE_GATE_BOUNCE_CAP`). At the cap, an explicit external
+  publication contract terminalizes as blocked/undelivered; ordinary in-repo
+  contracts retain the historical review escalation. Never an infinite loop,
+  and never a successful seal for an unproved PR.
+* Gitea unavailable / repo unresolvable → fail-open for ordinary in-repo
+  artifacts: skip, log, stamp ``{skipped: true, reason}``. ``kb:`` entries
+  fail-open individually when the vector store can't answer.
+* Explicit ``pr:`` publication and historical ``repos/`` publication promises
+  never fail open. Missing proof bounces within the cap, then becomes the
+  terminal blocked/undelivered outcome.
 * A bounced seal spawns NO critic/curator subjobs (the /complete handler
   early-returns); a passed gate leaves that flow untouched.
 """
@@ -41,24 +43,44 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+from services.deliverable_contracts import BLOCKED_UNDELIVERED_OUTCOME
+from services.job_delivery import forge_repo_from_datasource
+from src.services.forge import get_pull_request_status
+from src.shared.deliverable_contract import (
+    KB_DELIVERABLE_PREFIX,
+    PR_DELIVERABLE_PREFIX,
+    cloned_repo_deliverables as _cloned_repo_deliverables,
+    is_cloned_repo_deliverable as _is_cloned_repo_deliverable,
+    normalize_deliverable,
+    normalize_repository_identity,
+    parse_required_deliverables as _parse_required_deliverables,
+    pr_repositories,
+)
 
 logger = logging.getLogger(__name__)
 
-# Maximum resume-with-feedback bounces per job before the gate stops bouncing
-# and lets the seal fall through (with the report stamped) for a human.
+# Maximum resume-with-feedback bounces before an ordinary manifest moves to
+# review or an explicit publication contract ends blocked/undelivered.
 DELIVERABLE_GATE_BOUNCE_CAP = 2
 
 # Prefix marking a knowledge-note deliverable (checked against the KB index,
 # not the Gitea tree). Mirrors src/core/deliverables.py agent-side.
-KB_DELIVERABLE_PREFIX = "kb:"
-
 # Statuses (as resolved by determine_job_status) whose seal the gate may
 # intercept. ``reviewing`` is the critic-spawn lane — see module docstring.
 _GATED_STATUSES: frozenset[str] = frozenset(
     {"completed", "pending_review", "reviewing"}
 )
+
+
+def _integer(value: Any, *, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -72,21 +94,7 @@ def normalize_deliverable_path(path: Any) -> str | None:
     Canonical form is workspace-relative WITHOUT the ``repo/`` prefix and
     without ``./``. ``kb:<slug>`` entries keep their prefix.
     """
-    if not isinstance(path, str):
-        return None
-    candidate = path.strip()
-    if not candidate:
-        return None
-    if candidate.startswith(KB_DELIVERABLE_PREFIX):
-        slug = candidate[len(KB_DELIVERABLE_PREFIX) :].strip()
-        return f"{KB_DELIVERABLE_PREFIX}{slug}" if slug else None
-    while candidate.startswith("./"):
-        candidate = candidate[2:]
-    candidate = candidate.lstrip("/")
-    if candidate.startswith("repo/"):
-        candidate = candidate[len("repo/") :]
-    candidate = candidate.strip()
-    return candidate or None
+    return normalize_deliverable(path)
 
 
 # Cloned repository datasources land here, and the platform gitignores the
@@ -96,9 +104,6 @@ def normalize_deliverable_path(path: Any) -> str | None:
 # contentless-gitlink bug b1758f38. Note the single character between this and
 # the F14 ``repo/`` prefix normalized away above: ``repo/`` is the job's OWN
 # tree, ``repos/`` is somebody else's repository, mounted and unversioned.
-CLONED_REPO_PREFIX = "repos/"
-
-
 def is_cloned_repo_deliverable(path: Any) -> bool:
     """True for a manifest entry inside a cloned repository datasource.
 
@@ -108,21 +113,17 @@ def is_cloned_repo_deliverable(path: Any) -> bool:
     teaches the agent that the way to pass is to defeat the .gitignore.
     See knowledge-base/knowledge/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md.
     """
-    if not isinstance(path, str) or path.startswith(KB_DELIVERABLE_PREFIX):
-        return False
-    if not path.startswith(CLONED_REPO_PREFIX):
-        return False
-    remainder = path[len(CLONED_REPO_PREFIX) :].strip("/")
-    return bool(remainder)
+    return _is_cloned_repo_deliverable(path)
 
 
 def cloned_repo_deliverables(manifest: list[str]) -> list[str]:
     """The manifest entries this gate can never verify, in declared order.
 
-    Used by the gate to fail open per entry, and by job creation to refuse
-    the manifest outright — one definition of the rule, two consumers.
+    Job creation refuses these entries and records Officer-ticket publication
+    provenance before admission can claim the ticket. This helper remains the
+    single parser shared with compatibility handling for historical rows.
     """
-    return [p for p in manifest if is_cloned_repo_deliverable(p)]
+    return _cloned_repo_deliverables(manifest)
 
 
 def parse_required_deliverables(context: Any) -> list[str]:
@@ -131,24 +132,25 @@ def parse_required_deliverables(context: Any) -> list[str]:
     Accepts a job ``context`` dict (or its JSON string form) or the raw
     list value. Entries that don't normalize are dropped.
     """
-    value = context
-    if isinstance(context, str):
-        try:
-            value = json.loads(context)
-        except (json.JSONDecodeError, ValueError):
-            return []
-    if isinstance(value, dict):
-        value = value.get("required_deliverables")
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, (list, tuple)):
-        return []
-    out: list[str] = []
-    for entry in value:
-        normalized = normalize_deliverable_path(entry)
-        if normalized and normalized not in out:
-            out.append(normalized)
-    return out
+    return _parse_required_deliverables(context)
+
+
+@dataclass(frozen=True, slots=True)
+class DeliverableGateResult:
+    """Backward-compatible three-value result plus server outcome metadata."""
+
+    status: str | None
+    actions: list[str]
+    bounced: bool
+    outcome_kind: str | None = None
+
+    def __iter__(self) -> Iterator[Any]:
+        # Existing collaborators/tests intentionally keep their historical
+        # three-value unpacking; only the completion authority reads the
+        # server-owned outcome attribute.
+        yield self.status
+        yield self.actions
+        yield self.bounced
 
 
 def _tree_has_path(tree_paths: set[str], canonical: str) -> bool:
@@ -177,7 +179,7 @@ def gate_applies(job: dict[str, Any], result: dict[str, Any], new_status: Any) -
         return False
     if not result.get("should_stop", False):
         return False
-    from services.completion import _parse_freeze_data
+    from services.completion import _parse_context, _parse_freeze_data
 
     fd = _parse_freeze_data(job)
     if not fd:
@@ -189,6 +191,15 @@ def gate_applies(job: dict[str, Any], result: dict[str, Any], new_status: Any) -
                 fd = {}
         if not isinstance(fd, dict):
             fd = {}
+    manifest = parse_required_deliverables(_parse_context(job))
+    if not manifest:
+        return False
+    # An explicit PR promise is an external-publication contract. An honest
+    # worker saying it could not publish must reach the same bounded gate as a
+    # success claim, otherwise ``should_stop`` can bypass proof merely by
+    # avoiding goal_achieved.
+    if pr_repositories(manifest) or cloned_repo_deliverables(manifest):
+        return True
     claimed = (
         bool(result.get("goal_achieved"))
         or fd.get("freeze_type") == "job_complete"
@@ -196,9 +207,7 @@ def gate_applies(job: dict[str, Any], result: dict[str, Any], new_status: Any) -
     )
     if not claimed:
         return False
-    from services.completion import _parse_context
-
-    return bool(parse_required_deliverables(_parse_context(job)))
+    return claimed
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +257,195 @@ async def _kb_note_exists(
                 slug,
             )
         return row is not None
-    except Exception as e:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Deliverable gate: KB lookup failed for note %r (project %s): %s",
             slug,
             project_id,
-            e,
+            exc,
         )
         return None
+
+
+async def _evaluate_pr_deliverable(
+    job: dict[str, Any],
+    *,
+    db: Any,
+    contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Prove one exact immutable PR contract against current forge state."""
+
+    job_id = str(job.get("id") or "")
+    manifest_prs = pr_repositories(parse_required_deliverables(job.get("context")))
+    contract_prs = [
+        normalized
+        for value in list((contract or {}).get("pr_repositories") or [])
+        if (normalized := normalize_repository_identity(value)) is not None
+    ]
+    expected = manifest_prs[0] if len(manifest_prs) == 1 else None
+    if expected is None or contract_prs != [expected]:
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected or 'invalid'}"],
+            "present": [],
+            "unverified": [],
+            "reason": "immutable PR contract authority is missing or mismatched",
+        }
+
+    try:
+        authority = await db.get_job_pull_request_authority(job_id)
+    except Exception as exc:  # noqa: BLE001 - strict unavailable result
+        logger.warning("PR authority read failed for %s: %s", job_id, exc)
+        authority = None
+    if not isinstance(authority, dict):
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "no valid server-recorded pull request exists",
+        }
+    recorded_repo = normalize_repository_identity(authority.get("repository"))
+    if recorded_repo != expected:
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "the recorded pull request names a different repository",
+        }
+
+    try:
+        datasources = await db.resolve_datasources_for_job(
+            job_id,
+            str(job.get("project_id")) if job.get("project_id") else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - strict unavailable result
+        logger.warning("PR deliverable datasource read failed for %s: %s", job_id, exc)
+        datasources = []
+    datasource = next(
+        (
+            item
+            for item in datasources
+            if str(item.get("id") or "") == str(authority.get("datasource_id") or "")
+        ),
+        None,
+    )
+    bindings = (contract or {}).get("pr_bindings")
+    if isinstance(bindings, str):
+        try:
+            bindings = json.loads(bindings)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            bindings = []
+    bindings = bindings if isinstance(bindings, list) else []
+    binding = (
+        bindings[0] if len(bindings) == 1 and isinstance(bindings[0], dict) else {}
+    )
+    if (
+        datasource is None
+        or str(datasource.get("id") or "") != str(binding.get("datasource_id") or "")
+        or normalize_repository_identity(binding.get("repository")) != expected
+        or str(binding.get("forge") or "").strip().lower()
+        != str(authority.get("forge") or "").strip().lower()
+        or _integer(binding.get("policy_revision"))
+        != _integer(datasource.get("policy_revision"), default=0)
+        or _integer(authority.get("policy_revision"))
+        != _integer(datasource.get("policy_revision"), default=0)
+        or bool(datasource.get("read_only") or datasource.get("project_read_only"))
+    ):
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "the exact writable repository connector is detached",
+        }
+
+    try:
+        status = await get_pull_request_status(
+            forge_repo_from_datasource(datasource), int(authority.get("number") or 0)
+        )
+    except Exception as exc:  # noqa: BLE001 - strict fail closed
+        logger.warning("PR deliverable live proof failed for %s: %s", job_id, exc)
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "the pull request could not be verified at its forge",
+        }
+
+    state = str((status or {}).get("state") or "").strip().lower()
+    live_head = str((status or {}).get("head") or "").strip()
+    live_base = str((status or {}).get("base") or "").strip()
+    live_revision = str((status or {}).get("head_sha") or "").strip().lower()
+    if (
+        state not in {"open", "merged", "closed"}
+        or live_head != str(authority.get("head") or "")
+        or live_base != str(authority.get("base") or "")
+        or live_revision != str(authority.get("source_revision") or "").lower()
+    ):
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "the forge returned a different or incomplete PR identity",
+        }
+    if not await db.mark_job_pr_deliverable_verified(
+        job_id,
+        datasource_id=str(datasource.get("id")),
+        repository=expected,
+        number=int(authority.get("number") or 0),
+        record_id=str(authority.get("record_id") or ""),
+        record_generation=_integer(authority.get("record_generation")),
+        head=live_head,
+        base=live_base,
+        head_revision=live_revision,
+        state=state,
+    ):
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+            "present": [],
+            "unverified": [],
+            "reason": "the PR evidence changed while proof was recorded",
+        }
+    return {
+        "passed": True,
+        "strict": True,
+        "missing": [],
+        "present": [f"{PR_DELIVERABLE_PREFIX}{expected}"],
+        "unverified": [],
+        "pr_state": state,
+        "pr_number": int(authority.get("number") or 0),
+    }
+
+
+async def explicit_pr_delivery_block_reason(
+    job: dict[str, Any], *, db: Any
+) -> str | None:
+    """Fail-closed human-approval proof for an explicit PR contract."""
+
+    declared = pr_repositories(parse_required_deliverables(job.get("context")))
+    if not declared:
+        return None
+    try:
+        contract = await db.get_job_deliverable_contract(str(job.get("id")))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PR contract read failed during approval: %s", exc)
+        return "the immutable pull-request contract could not be read"
+    report = await _evaluate_pr_deliverable(job, db=db, contract=contract)
+    if report.get("passed"):
+        return None
+    return str(report.get("reason") or "the declared pull request is not proven")
 
 
 async def evaluate_deliverable_gate(
@@ -280,6 +470,40 @@ async def evaluate_deliverable_gate(
     manifest = parse_required_deliverables(_parse_context(job))
     if not manifest:
         return {"skipped": True, "reason": "no manifest"}
+
+    declared_prs = pr_repositories(manifest)
+    pr_report: dict[str, Any] | None = None
+    if declared_prs:
+        try:
+            contract = await db.get_job_deliverable_contract(str(job.get("id")))
+        except Exception as exc:  # noqa: BLE001 - explicit PR fails closed
+            logger.warning(
+                "Deliverable gate: immutable contract read failed for %s: %s",
+                job.get("id"),
+                exc,
+            )
+            contract = None
+        pr_report = await _evaluate_pr_deliverable(job, db=db, contract=contract)
+        if not pr_report.get("passed"):
+            return pr_report
+
+    historical_external_paths = cloned_repo_deliverables(manifest)
+    if historical_external_paths:
+        # New admissions refuse this legacy contract and name the exact pr:
+        # replacement. Rows admitted by an older replica remain possible
+        # during rollout, so the seal independently fails closed rather than
+        # repeating the historical "unverifiable therefore satisfied" bug.
+        return {
+            "passed": False,
+            "strict": True,
+            "missing": historical_external_paths,
+            "present": [],
+            "unverified": [],
+            "reason": (
+                "an external-repository path is not a verifiable publication "
+                "contract; a matching pr:owner/repository contract is required"
+            ),
+        }
 
     # Nothing reached the repository, so "missing from the repository" says
     # nothing about what the agent produced. The agent sets this when its
@@ -348,6 +572,9 @@ async def evaluate_deliverable_gate(
     present: list[str] = []
     unverified: list[str] = []
     for path in manifest:
+        if path.startswith(PR_DELIVERABLE_PREFIX):
+            present.append(path)
+            continue
         if path.startswith(KB_DELIVERABLE_PREFIX):
             slug = path[len(KB_DELIVERABLE_PREFIX) :]
             found = await _kb_note_exists(vector_db, project_id, slug)
@@ -367,20 +594,6 @@ async def evaluate_deliverable_gate(
             continue
         if _tree_has_path(tree_paths, path):
             present.append(path)
-        elif is_cloned_repo_deliverable(path):
-            # Checked the tree FIRST on purpose: a path that really is
-            # committed (job 29c28492 forced two in by hand) is reported
-            # present, not excused. Fail open only where the gate genuinely
-            # cannot see — the module's standing rule, "never block a seal on
-            # infrastructure the worker cannot fix".
-            logger.warning(
-                "Deliverable gate: %r is inside a cloned repository datasource "
-                "for job %s — unverifiable from the job tree, treating as "
-                "satisfied",
-                path,
-                job.get("id"),
-            )
-            unverified.append(path)
         else:
             missing.append(path)
 
@@ -413,9 +626,14 @@ def _render_bounce_feedback(
     ref = report.get("ref")
     missing = report.get("missing") or []
     present = report.get("present") or []
+    strict_pr = bool(report.get("strict"))
     lines = [
         "DELIVERABLE CONTRACT GATE: this completion was refused because "
-        "required deliverables are missing from the job branch.",
+        + (
+            "the declared pull-request delivery could not be proven."
+            if strict_pr
+            else "required deliverables are missing from the job branch."
+        ),
         "",
         f"Checked at {where}" + (f" on branch `{ref}`" if ref else "") + ":",
         "",
@@ -425,14 +643,26 @@ def _render_bounce_feedback(
     lines.append("")
     lines.append(f"PRESENT ({len(present)}):")
     lines += [f"  - {p}" for p in present] if present else ["  - (none)"]
-    lines += [
-        "",
-        "Produce the MISSING artifacts at exactly these workspace paths "
+    instruction = (
+        "Push your branch and use repo_open_pr for the exact attached "
+        "repository named by the pr: contract. Do not replace the contract "
+        "with a knowledge note."
+        if strict_pr
+        else "Produce the MISSING artifacts at exactly these workspace paths "
         "(`repo/` prefix is accepted either way), commit them, and call "
         "job_complete again. Do NOT redo work that is already present — "
-        "only the missing deliverables block the seal.",
-        f"(Deliverable-gate bounce {bounce}/{cap}: after {cap} bounces the "
-        "job is handed to a human with this report instead.)",
+        "only the missing deliverables block the seal."
+    )
+    lines += [
+        "",
+        instruction,
+        f"(Deliverable-gate bounce {bounce}/{cap}: after {cap} bounces "
+        + (
+            "an unproved publication ends blocked/undelivered."
+            if strict_pr
+            else "the job is handed to a human with this report instead."
+        )
+        + ")",
     ]
     reason = (
         f"deliverable contract gate: {len(missing)} of "
@@ -456,7 +686,7 @@ async def run_deliverable_gate(
     gitea: Any,
     queue_resume: Callable[..., Any],
     vector_db: Any = None,
-) -> tuple[str | None, list[str], bool]:
+) -> DeliverableGateResult:
     """Apply the deliverable-contract gate to a resolved completion status.
 
     Returns ``(new_status, actions, bounced)``:
@@ -467,14 +697,15 @@ async def run_deliverable_gate(
       ``bounced=True`` — the caller must EARLY-RETURN without writing the
       sealed status or spawning critic/curator subjobs;
     * missing at the cap → no bounce; ``completed`` demotes to
-      ``pending_review`` (loop jobs keep a terminal ``completed`` — the
-      pending_review loop-wedge rule), report stamped for the human.
+      ``pending_review`` for an ordinary in-repo contract, while an explicit
+      publication contract becomes terminal blocked/undelivered. The report
+      remains stamped for operator and Officer inspection.
 
     All context writes use the atomic top-level merge (never a context
     read-modify-write).
     """
     if not gate_applies(job, result, new_status):
-        return new_status, [], False
+        return DeliverableGateResult(new_status, [], False)
 
     job_id = str(job.get("id"))
     from services.completion import _parse_context
@@ -513,7 +744,9 @@ async def run_deliverable_gate(
                 "bounces": bounces,
             }
         )
-        return new_status, [f"deliverable gate skipped ({reason})"], False
+        return DeliverableGateResult(
+            new_status, [f"deliverable gate skipped ({reason})"], False
+        )
 
     sha = report.get("commit_sha")
     if report.get("passed"):
@@ -551,7 +784,7 @@ async def run_deliverable_gate(
                 f", {n_unverified} unverifiable {noun} failed open ({', '.join(kinds)})"
             )
         action += ")"
-        return new_status, [action], False
+        return DeliverableGateResult(new_status, [action], False)
 
     missing = report.get("missing") or []
     if bounces < DELIVERABLE_GATE_BOUNCE_CAP:
@@ -570,22 +803,40 @@ async def run_deliverable_gate(
                 "missing": missing,
                 "present": report.get("present"),
                 "unverified": report.get("unverified"),
+                "reason": report.get("reason"),
                 "bounces": bounce_n,
             }
         )
         try:
-            await queue_resume(job_id, feedback, reason=reason)
+            queued = await queue_resume(job_id, feedback, reason=reason)
+            # Existing callbacks conventionally return None on success. An
+            # explicit False is the durable queue CAS saying that no resume
+            # was installed; treating it as success would early-return from
+            # completion while leaving the job in its pre-gate state.
+            if queued is False:
+                raise RuntimeError("resume queue declined the job")
         except Exception as e:  # noqa: BLE001
             # The bounce could not be queued — do NOT strand the job on a
-            # refused-but-unbounced seal. Fall through to the sealed status
-            # with the failed-bounce report stamped.
+            # refused-but-unbounced seal. Strict publication contracts end
+            # blocked/undelivered; ordinary contracts retain the historical
+            # fall-through with the failed-bounce report stamped.
             logger.error(
                 "Deliverable gate: bounce queue failed for %s (%s) — "
                 "sealing with the gate report instead",
                 job_id,
                 e,
             )
-            return (
+            if report.get("strict"):
+                return DeliverableGateResult(
+                    "cancelled",
+                    [
+                        f"deliverable gate: {len(missing)} missing, bounce "
+                        "failed; terminalized blocked/undelivered"
+                    ],
+                    False,
+                    BLOCKED_UNDELIVERED_OUTCOME,
+                )
+            return DeliverableGateResult(
                 new_status,
                 [
                     f"deliverable gate: {len(missing)} missing, bounce "
@@ -601,7 +852,7 @@ async def run_deliverable_gate(
             len(missing),
             sha or "HEAD",
         )
-        return (
+        return DeliverableGateResult(
             None,
             [
                 f"deliverable gate: bounced to feedback-resume "
@@ -611,7 +862,9 @@ async def run_deliverable_gate(
             True,
         )
 
-    # Cap reached: stop bouncing, hand the seal to a human with the report.
+    # Cap reached: stop bouncing. Strict publication contracts become a
+    # truthful terminal blocker; ordinary contracts retain the established
+    # human-review escalation.
     await _stamp(
         {
             "passed": False,
@@ -624,8 +877,12 @@ async def run_deliverable_gate(
             "bounces": bounces,
         }
     )
+    outcome_kind = None
     final_status = new_status
-    if new_status == "completed":
+    if report.get("strict"):
+        final_status = "cancelled"
+        outcome_kind = BLOCKED_UNDELIVERED_OUTCOME
+    elif new_status == "completed":
         from services.project_loops import job_loop_id
         from services.verification_ledger import escalation_status
 
@@ -635,4 +892,4 @@ async def run_deliverable_gate(
         f"{len(missing)} still missing — sealing as {final_status} with report"
     )
     logger.error("Deliverable gate CAP for job %s: %s", job_id, action)
-    return final_status, [action], False
+    return DeliverableGateResult(final_status, [action], False, outcome_kind)

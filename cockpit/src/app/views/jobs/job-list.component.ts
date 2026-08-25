@@ -32,6 +32,7 @@ import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {
+  effectiveJobStatus,
   isTerminalJobStatus,
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
@@ -354,8 +355,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                           {{ 'jobs.status.waiting_approval' | transloco }}
                         </app-badge>
                       } @else {
-                        <app-badge [tone]="jobStatusTone(row.job.status)" size="sm">
-                          {{ 'jobs.status.' + row.job.status | transloco }}
+                        <app-badge [tone]="jobStatusTone(effectiveJobStatus(row.job))" size="sm">
+                          {{ 'jobs.status.' + effectiveJobStatus(row.job) | transloco }}
                         </app-badge>
                       }
                       @if (row.job.status === 'waiting' && row.hasChildren) {
@@ -397,7 +398,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                           <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
                         } @else if (row.job.status === 'processing') {
                           <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
-                        } @else if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
+                        } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                           <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
                         }
                         @if (getWorkspaceUrl(row.job)) {
@@ -495,7 +496,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                       >
                         {{ 'jobs.action.approveRequest' | transloco }}
                       </app-button>
-                    } @else if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
+                    } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                       <app-button
                         variant="success"
                         size="sm"
@@ -1734,6 +1735,14 @@ export class JobListComponent implements OnInit, OnDestroy {
    *  components before the job tool card became the third consumer. */
   jobStatusTone(status: string): BadgeTone {
     return sharedJobStatusTone(status);
+  }
+
+  effectiveJobStatus(job: JobSummary): string {
+    return effectiveJobStatus(job);
+  }
+
+  isBlockedUndelivered(job: JobSummary): boolean {
+    return job.completion_outcome_kind === 'blocked_undelivered';
   }
 
   workspaceContractSummary(job: JobSummary): string {

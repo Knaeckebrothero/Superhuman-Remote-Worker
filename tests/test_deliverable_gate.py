@@ -12,8 +12,9 @@ Covered here:
   - gate pass → seal proceeds, ``context.deliverable_gate`` stamped
   - missing → bounce through the P1-A resume-with-feedback lane with a
     PRECISE missing/present reason; no seal, caller told to early-return
-  - bounce cap → stop bouncing, ``completed`` demotes to ``pending_review``
-    (loop jobs keep ``completed`` — the pending_review loop-wedge rule)
+  - ordinary in-repo bounce cap → ``pending_review`` (loop jobs retain their
+    historical terminal handling); explicit external publication cap →
+    terminal blocked/undelivered, including loop jobs
   - Gitea unavailable / repo unresolvable → fail-open skip with stamp
   - no manifest / no completion claim → no-op
   - ``kb:<slug>`` entries: verified against the knowledge_index when the
@@ -22,7 +23,7 @@ Covered here:
 
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -40,6 +41,11 @@ from orchestrator.services.deliverable_gate import (  # noqa: E402
     parse_required_deliverables,
     run_deliverable_gate,
 )
+from orchestrator.services.deliverable_contracts import (  # noqa: E402
+    BLOCKED_UNDELIVERED_OUTCOME,
+    DeliveryContractConflict,
+    prepare_delivery_contract,
+)
 
 # =============================================================================
 # Fixtures
@@ -47,6 +53,23 @@ from orchestrator.services.deliverable_gate import (  # noqa: E402
 
 JOB_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 SHA = "c0ffee1234deadbeef5678"
+DATASOURCE_ID = "22222222-2222-4222-8222-222222222222"
+PR_RECORD_ID = "33333333-3333-4333-8333-333333333333"
+PR_HEAD_SHA = "d" * 40
+
+
+def repository_datasource(
+    *, read_only: bool = False, project_read_only: bool = False
+) -> dict:
+    return {
+        "id": DATASOURCE_ID,
+        "type": "repository",
+        "connection_url": "https://github.com/Acme/Widget.git",
+        "config": {"forge": "github"},
+        "read_only": read_only,
+        "project_read_only": project_read_only,
+        "policy_revision": 7,
+    }
 
 
 def make_job(
@@ -100,7 +123,61 @@ def make_db():
     db = AsyncMock()
     db.merge_job_context = AsyncMock(return_value=True)
     db.get_job = AsyncMock(return_value=None)
+    db.get_job_deliverable_contract = AsyncMock(return_value=None)
+    db.get_job_pull_request_authority = AsyncMock(return_value=None)
+    db.resolve_datasources_for_job = AsyncMock(return_value=[])
+    db.mark_job_pr_deliverable_verified = AsyncMock(return_value=True)
     return db
+
+
+def make_pr_job(*, repo: str = "acme/widget", with_record: bool = True) -> dict:
+    extra = {}
+    if with_record:
+        extra["pull_request"] = {
+            "forge": "github",
+            "repo": repo,
+            "number": 9,
+            "url": "https://github.com/acme/widget/pull/9",
+            "head": "feature/delivery",
+            "base": "develop",
+        }
+    return make_job(
+        manifest=["pr:acme/widget"],
+        context_extra=extra,
+        project_id="11111111-2222-4333-8444-555555555555",
+    )
+
+
+def configure_pr_contract(db, *, datasource: dict | None = None) -> None:
+    row = datasource or repository_datasource()
+    db.get_job_deliverable_contract = AsyncMock(
+        return_value={
+            "pr_repositories": ["acme/widget"],
+            "pr_bindings": [
+                {
+                    "repository": "acme/widget",
+                    "datasource_id": DATASOURCE_ID,
+                    "forge": "github",
+                    "policy_revision": 7,
+                }
+            ],
+        }
+    )
+    db.get_job_pull_request_authority = AsyncMock(
+        return_value={
+            "record_id": PR_RECORD_ID,
+            "record_generation": 1,
+            "datasource_id": DATASOURCE_ID,
+            "repository": "acme/widget",
+            "forge": "github",
+            "number": 9,
+            "head": "feature/delivery",
+            "base": "develop",
+            "source_revision": PR_HEAD_SHA,
+            "policy_revision": 7,
+        }
+    )
+    db.resolve_datasources_for_job = AsyncMock(return_value=[row])
 
 
 def make_vector_db(existing_slugs: set[str]):
@@ -364,6 +441,219 @@ class TestEvaluate:
         assert report["passed"] is True
         assert report["missing"] == []
         assert sorted(report["unverified"]) == ["kb:absent-note", "kb:present-note"]
+
+
+class TestPullRequestDeliverable:
+    def test_honest_negative_pr_report_still_requires_delivery_proof(self):
+        assert gate_applies(
+            make_pr_job(with_record=False),
+            completion_result(goal_achieved=False),
+            "pending_review",
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_or_wrong_pr_record_fails_closed(self):
+        missing_db = make_db()
+        missing_db.get_job_deliverable_contract = AsyncMock(
+            return_value={"pr_repositories": ["acme/widget"], "pr_bindings": [{}]}
+        )
+        missing = await evaluate_deliverable_gate(
+            make_pr_job(with_record=False), db=missing_db, gitea=make_gitea([])
+        )
+        db = make_db()
+        configure_pr_contract(db)
+        db.get_job_pull_request_authority.return_value = {
+            **db.get_job_pull_request_authority.return_value,
+            "repository": "other/private",
+        }
+        wrong = await evaluate_deliverable_gate(
+            make_pr_job(repo="other/private"), db=db, gitea=make_gitea([])
+        )
+        assert missing["strict"] is True and missing["passed"] is False
+        assert wrong["strict"] is True and wrong["passed"] is False
+        missing_db.mark_job_pr_deliverable_verified.assert_not_awaited()
+        db.mark_job_pr_deliverable_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_detached_or_read_only_connector_fails_closed(self):
+        for datasource in (
+            None,
+            repository_datasource(read_only=True),
+            repository_datasource(project_read_only=True),
+        ):
+            db = make_db()
+            configure_pr_contract(db)
+            db.resolve_datasources_for_job = AsyncMock(
+                return_value=[] if datasource is None else [datasource]
+            )
+            report = await evaluate_deliverable_gate(
+                make_pr_job(), db=db, gitea=make_gitea([])
+            )
+            assert report["strict"] is True and report["passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_unavailable_forge_fails_closed(self):
+        db = make_db()
+        configure_pr_contract(db)
+        with patch(
+            "orchestrator.services.deliverable_gate.get_pull_request_status",
+            side_effect=OSError("forge unavailable"),
+        ):
+            report = await evaluate_deliverable_gate(
+                make_pr_job(), db=db, gitea=make_gitea([])
+            )
+        assert report["strict"] is True and report["passed"] is False
+        assert "could not be verified" in report["reason"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["open", "merged"])
+    async def test_matching_live_pr_is_proven_without_changing_merge_policy(
+        self, state
+    ):
+        db = make_db()
+        configure_pr_contract(db)
+        with patch(
+            "orchestrator.services.deliverable_gate.get_pull_request_status",
+            return_value={
+                "state": state,
+                "head": "feature/delivery",
+                "base": "develop",
+                "head_sha": PR_HEAD_SHA,
+            },
+        ):
+            report = await evaluate_deliverable_gate(
+                make_pr_job(), db=db, gitea=make_gitea([])
+            )
+        assert report["passed"] is True
+        db.mark_job_pr_deliverable_verified.assert_awaited_once_with(
+            JOB_ID,
+            datasource_id=DATASOURCE_ID,
+            repository="acme/widget",
+            number=9,
+            record_id=PR_RECORD_ID,
+            record_generation=1,
+            head="feature/delivery",
+            base="develop",
+            head_revision=PR_HEAD_SHA,
+            state=state,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "live",
+        [
+            {
+                "state": "open",
+                "head": "unrelated",
+                "base": "develop",
+                "head_sha": PR_HEAD_SHA,
+            },
+            {
+                "state": "open",
+                "head": "feature/delivery",
+                "base": "main",
+                "head_sha": PR_HEAD_SHA,
+            },
+            {
+                "state": "open",
+                "head": "feature/delivery",
+                "base": "develop",
+                "head_sha": "e" * 40,
+            },
+        ],
+    )
+    async def test_live_pr_identity_must_match_authoritative_head_and_base(self, live):
+        db = make_db()
+        configure_pr_contract(db)
+        with patch(
+            "orchestrator.services.deliverable_gate.get_pull_request_status",
+            return_value=live,
+        ):
+            report = await evaluate_deliverable_gate(
+                make_pr_job(), db=db, gitea=make_gitea([])
+            )
+        assert report["passed"] is False
+        assert "different or incomplete" in report["reason"]
+        db.mark_job_pr_deliverable_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_strict_bounce_cap_terminalizes_blocked_not_completed(self):
+        job = make_pr_job(with_record=False)
+        job["context"]["deliverable_gate"] = {"bounces": DELIVERABLE_GATE_BOUNCE_CAP}
+        db = make_db()
+        configure_pr_contract(db)
+        result = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(),
+        )
+        assert result.status == "cancelled"
+        assert result.outcome_kind == BLOCKED_UNDELIVERED_OUTCOME
+        assert result.bounced is False
+
+    @pytest.mark.asyncio
+    async def test_strict_loop_bounce_cap_terminalizes_without_review_wedge(self):
+        job = make_pr_job(with_record=False)
+        job["context"].update(
+            {
+                "loop_id": "loop-1",
+                "deliverable_gate": {
+                    "bounces": DELIVERABLE_GATE_BOUNCE_CAP,
+                },
+            }
+        )
+        db = make_db()
+        configure_pr_contract(db)
+
+        result = await run_deliverable_gate(
+            job,
+            completion_result(goal_achieved=False),
+            "pending_review",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(),
+        )
+
+        assert result.status == "cancelled"
+        assert result.outcome_kind == BLOCKED_UNDELIVERED_OUTCOME
+        assert result.bounced is False
+
+    @pytest.mark.asyncio
+    async def test_strict_queue_failure_terminalizes_blocked(self):
+        db = make_db()
+        configure_pr_contract(db)
+        result = await run_deliverable_gate(
+            make_pr_job(with_record=False),
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(side_effect=OSError("queue unavailable")),
+        )
+        assert result.status == "cancelled"
+        assert result.outcome_kind == BLOCKED_UNDELIVERED_OUTCOME
+
+    @pytest.mark.asyncio
+    async def test_strict_queue_cas_refusal_terminalizes_blocked(self):
+        """A false queue result is a failure, not a successfully installed bounce."""
+
+        db = make_db()
+        configure_pr_contract(db)
+        result = await run_deliverable_gate(
+            make_pr_job(with_record=False),
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(return_value=False),
+        )
+
+        assert result.status == "cancelled"
+        assert result.outcome_kind == BLOCKED_UNDELIVERED_OUTCOME
+        assert result.bounced is False
 
 
 # =============================================================================
@@ -666,11 +956,7 @@ class TestCreatePlumbing:
             description="ship it",
             required_deliverables=["repo/output/a.md", "./output/a.md", "kb:note"],
         )
-        assert body.required_deliverables == [
-            "repo/output/a.md",
-            "./output/a.md",
-            "kb:note",
-        ]
+        assert body.required_deliverables == ["output/a.md", "kb:note"]
         # The exact merge the endpoint performs:
         assert parse_required_deliverables(body.required_deliverables) == [
             "output/a.md",
@@ -722,42 +1008,37 @@ class TestClonedRepoPredicate:
         ) == ["repos/K/docs/b.md", "repos/K/e.html"]
 
 
-class TestGateDoesNotBounceOnClonedRepoPaths:
+class TestGateFailsClosedOnHistoricalClonedRepoPaths:
     @pytest.mark.asyncio
-    async def test_unverifiable_is_not_missing(self):
-        """The false negative that made an agent defeat .gitignore."""
+    async def test_unverifiable_external_publication_is_strictly_missing(self):
         job = make_job(manifest=["repos/KurortEngine/docs/design/theme.md"])
         report = await evaluate_deliverable_gate(
             job, db=make_db(), gitea=make_gitea([])
         )
-        assert report["missing"] == []
-        assert report["unverified"] == ["repos/KurortEngine/docs/design/theme.md"]
-        assert report["passed"] is True
+        assert report["missing"] == ["repos/KurortEngine/docs/design/theme.md"]
+        assert report["unverified"] == []
+        assert report["passed"] is False
+        assert report["strict"] is True
 
     @pytest.mark.asyncio
-    async def test_fail_open_is_per_entry_not_a_blanket_amnesty(self):
+    async def test_external_path_makes_the_whole_contract_strict(self):
         job = make_job(manifest=["repos/K/docs/a.md", "output/b.md"])
         report = await evaluate_deliverable_gate(
             job, db=make_db(), gitea=make_gitea([])
         )
-        assert report["missing"] == ["output/b.md"]
-        assert report["unverified"] == ["repos/K/docs/a.md"]
+        assert report["missing"] == ["repos/K/docs/a.md"]
+        assert report["unverified"] == []
         assert report["passed"] is False
 
     @pytest.mark.asyncio
-    async def test_a_path_actually_in_the_tree_is_present_not_unverified(self):
-        """Truthfulness: only fail open when the gate genuinely cannot see it.
-
-        Job 29c28492 forced exactly these paths into the tree by hand. Having
-        done so, the honest report is 'present'.
-        """
+    async def test_copy_in_job_tree_does_not_prove_external_publication(self):
         job = make_job(manifest=["repos/K/docs/a.md"])
         report = await evaluate_deliverable_gate(
             job, db=make_db(), gitea=make_gitea(["repos/K/docs/a.md"])
         )
-        assert report["present"] == ["repos/K/docs/a.md"]
-        assert report["unverified"] == []
-        assert report["passed"] is True
+        assert report["present"] == []
+        assert report["missing"] == ["repos/K/docs/a.md"]
+        assert report["passed"] is False
 
 
 class TestCreationRefusesClonedRepoManifests:
@@ -770,31 +1051,34 @@ class TestCreationRefusesClonedRepoManifests:
     then discovers the contract was unsatisfiable.
     """
 
-    def test_a_cloned_repo_deliverable_is_rejected(self) -> None:
-        import main as orchestrator_main
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError) as exc:
-            orchestrator_main.JobCreate(
-                description="ship it",
-                required_deliverables=["repos/KurortEngine/docs/design/theme.md"],
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            "repos/Widget/docs/design/theme.md",
+            "./repos/Widget/docs/design/theme.md",
+            "/repos/Widget/docs/design/theme.md",
+            "  ./repos/Widget/docs/design/theme.md  ",
+        ],
+    )
+    def test_a_cloned_repo_deliverable_is_rejected_after_binding(
+        self, declared
+    ) -> None:
+        with pytest.raises(DeliveryContractConflict) as exc:
+            prepare_delivery_contract(
+                [declared],
+                datasources=[repository_datasource()],
             )
-        message = str(exc.value)
-        assert "repos/KurortEngine/docs/design/theme.md" in message
+        assert exc.value.code == "external_repository_requires_pr"
+        assert exc.value.fields["required_pr_deliverables"] == ["pr:acme/widget"]
 
     def test_the_refusal_names_the_reason_and_the_alternative(self) -> None:
         """A 422 that does not say WHY just moves the confusion."""
-        import main as orchestrator_main
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError) as exc:
-            orchestrator_main.JobCreate(
-                description="ship it",
-                required_deliverables=["repos/K/a.md"],
+        with pytest.raises(DeliveryContractConflict) as exc:
+            prepare_delivery_contract(
+                ["repos/Widget/a.md"],
+                datasources=[repository_datasource()],
             )
-        message = str(exc.value).lower()
-        assert "never versioned" in message or "not versioned" in message
-        assert "pull request" in message
+        assert "pull request" in exc.value.message.lower()
 
     def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
         import main as orchestrator_main
@@ -803,14 +1087,10 @@ class TestCreationRefusesClonedRepoManifests:
             description="ship it",
             required_deliverables=["output/a.md", "repo/output/b.md", "kb:note"],
         )
-        assert body.required_deliverables == [
-            "output/a.md",
-            "repo/output/b.md",
-            "kb:note",
-        ]
+        assert body.required_deliverables == ["output/a.md", "output/b.md", "kb:note"]
 
 
-class TestFailOpenIsReportedAccurately:
+class TestHistoricalExternalFailureIsReportedAccurately:
     """A fail-open the operator cannot read is a silent pass.
 
     The pass-path action line predated cloned-repo entries and called every
@@ -819,7 +1099,7 @@ class TestFailOpenIsReportedAccurately:
     """
 
     @pytest.mark.asyncio
-    async def test_cloned_repo_failopen_is_not_described_as_kb(self):
+    async def test_cloned_repo_refusal_is_not_described_as_success(self):
         job = make_job(manifest=["repos/K/docs/a.md"], repo_name="job-aaaaaaaa")
         db = make_db()
         _status, actions, _bounced = await run_deliverable_gate(
@@ -830,14 +1110,13 @@ class TestFailOpenIsReportedAccurately:
             gitea=make_gitea([]),
             queue_resume=AsyncMock(),
         )
+        assert _bounced is True
         line = " ".join(actions).lower()
-        assert "passed" in line
-        assert "kb" not in line
-        assert "unverifiable" in line
+        assert "bounced" in line
+        assert "passed" not in line
 
     @pytest.mark.asyncio
-    async def test_the_stamp_names_the_unverified_paths(self):
-        """The human needs the paths, not just a count."""
+    async def test_the_stamp_names_the_missing_external_paths(self):
         job = make_job(manifest=["repos/K/docs/a.md"], repo_name="job-aaaaaaaa")
         db = make_db()
         await run_deliverable_gate(
@@ -848,4 +1127,4 @@ class TestFailOpenIsReportedAccurately:
             gitea=make_gitea([]),
             queue_resume=AsyncMock(),
         )
-        assert stamped(db)["unverified"] == ["repos/K/docs/a.md"]
+        assert stamped(db)["missing"] == ["repos/K/docs/a.md"]

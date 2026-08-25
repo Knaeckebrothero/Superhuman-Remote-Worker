@@ -119,6 +119,20 @@ describe('JobListComponent — server-resolved tree', () => {
   });
   afterEach(() => TestBed.resetTestingModule());
 
+  it('keeps blocked/undelivered distinct from cancellation and non-actionable', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const blocked = job('blocked-1', {
+      status: 'cancelled',
+      completion_outcome_kind: 'blocked_undelivered',
+    }) as JobSummary;
+
+    expect(component.effectiveJobStatus(blocked)).toBe('blocked_undelivered');
+    expect(component.isBlockedUndelivered(blocked)).toBe(true);
+    expect(component.jobStatusTone(component.effectiveJobStatus(blocked))).toBe('warning');
+    expect(en.jobs.status.blocked_undelivered).toBe('Blocked / undelivered');
+  });
+
   it('renders each display root once, with children only when expanded', () => {
     const rows = [
       job('root-1'),

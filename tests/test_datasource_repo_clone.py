@@ -476,6 +476,20 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             "default_branch": None,
         }
 
+    def test_attached_datasource_id_is_retained_for_server_pr_recording(self):
+        ws = make_workspace_manager()
+        datasource_id = "22222222-2222-4222-8222-222222222222"
+        ds = token_ds(
+            id=datasource_id,
+            config={"forge": "github"},
+        )
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([ds], ws)
+
+        assert ws.source_repo_meta["repo"]["datasource_id"] == datasource_id
+
 
 class TestResolveRepoCloneNames:
     """Clone-directory names: upstream repo name, label fallback, suffixes."""

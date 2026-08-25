@@ -803,7 +803,7 @@ async def apply_deliverable_gate(
     gitea: Any,
     queue_resume: Callable[..., Any],
     vector_db: Any = None,
-) -> tuple[str | None, list[str], bool]:
+) -> Any:
     """P1-C deliverable-contract arm of the completion decision.
 
     Sits between ``determine_job_status`` and the status write in the
@@ -815,8 +815,9 @@ async def apply_deliverable_gate(
     Thin hook by design — all gate logic lives in
     ``services.deliverable_gate`` (same extraction pattern as
     ``handle_pod_workspace_recovery`` above). Returns
-    ``(new_status, actions, bounced)``; on ``bounced=True`` the caller must
-    early-return without sealing or spawning critic/curator subjobs.
+    A backward-compatible three-value iterable plus ``outcome_kind``; on
+    ``bounced=True`` the caller must early-return without sealing or spawning
+    critic/curator subjobs.
     """
     from services.deliverable_gate import run_deliverable_gate
 
@@ -840,12 +841,14 @@ async def write_job_change_record(
     error: str | None = None,
     merge_status: str | None = None,
     merged_sha: str | None = None,
+    outcome_kind: str | None = None,
 ) -> bool:
     """General per-job change record — the completion-path hook (§6.5).
 
     Every job leaves exactly one structured database record on reaching a
-    terminal status (``completed`` | ``failed``), including jobs that deliver
-    no files and failed jobs (a failure is information).
+    terminal disposition, including blocked/undelivered work. The latter is
+    written under its presentation outcome rather than as cancellation or a
+    worker failure.
 
     Loop jobs are skipped here: the loop advance records them itself
     (``_record_loop_job_outcome`` → ``write_loop_retro``) with the cloud
@@ -855,6 +858,7 @@ async def write_job_change_record(
 
     ``merge_status`` / ``merged_sha`` carry a legacy merge or current delivery
     outcome; omitted, the writer falls back to whatever the job row carries.
+    ``outcome_kind`` is server-owned and selects the truthful record status.
 
     Thin hook by design — ``changes`` derivation and the insert live in
     ``services.job_records`` (same extraction
@@ -867,10 +871,13 @@ async def write_job_change_record(
 
     if job_loop_id(job):
         return False
+    record_status = (
+        "blocked_undelivered" if outcome_kind == "blocked_undelivered" else new_status
+    )
     return await write_job_record(
         db,
         job,
-        status=new_status,
+        status=record_status,
         error=error,
         vector_db=vector_db,
         merge_status=merge_status,
@@ -996,6 +1003,7 @@ async def apply_terminal_job_side_effects(
     store_merge_intent: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
     | None = None,
     completion_command_id: str | None = None,
+    outcome_kind: str | None = None,
 ) -> dict[str, Any]:
     """Run terminal compatibility delivery and persist structured history.
 
@@ -1034,7 +1042,8 @@ async def apply_terminal_job_side_effects(
         "record_written": False,
         "actions": [],
     }
-    if new_status not in ("completed", "failed"):
+    blocked = new_status == "cancelled" and outcome_kind == "blocked_undelivered"
+    if new_status not in ("completed", "failed") and not blocked:
         return outcome
 
     job_id = str(job.get("id"))
@@ -1104,6 +1113,7 @@ async def apply_terminal_job_side_effects(
             error=error,
             merge_status=outcome["merge_status"],
             merged_sha=outcome["merged_sha"],
+            outcome_kind=outcome_kind,
         ):
             outcome["record_written"] = True
             outcome["actions"].append("job change record written to database")

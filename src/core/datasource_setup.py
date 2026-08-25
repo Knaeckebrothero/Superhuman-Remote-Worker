@@ -1071,7 +1071,7 @@ def clone_repository_datasources(
                     forge = str((ds.get("config") or {}).get("forge") or "").lower()
                     raw_url = ds.get("connection_url", "")
                     owner, repo_slug = parse_owner_repo(raw_url)
-                    workspace_manager.source_repo_meta[repo_name] = {
+                    repo_meta = {
                         "forge": forge,
                         "api_base": resolve_api_base(raw_url, forge),
                         "owner": owner,
@@ -1087,6 +1087,10 @@ def clone_repository_datasources(
                         ),
                         "default_branch": branch,
                     }
+                    datasource_id = str(ds.get("id") or "").strip()
+                    if datasource_id:
+                        repo_meta["datasource_id"] = datasource_id
+                    workspace_manager.source_repo_meta[repo_name] = repo_meta
                 except Exception as e:
                     # A metadata failure must not fail the clone; the repo is
                     # still usable through the shell and the read-only git tools.

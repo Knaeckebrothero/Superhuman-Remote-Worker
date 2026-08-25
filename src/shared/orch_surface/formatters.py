@@ -107,10 +107,12 @@ def _freeze_lines(job: dict[str, Any]) -> list[str]:
 
 def format_job_list_item(job: dict[str, Any]) -> list[str]:
     """Rich per-job list rendering (F5) — description, lineage, freeze, error."""
+    from ..job_outcome import effective_job_status
+
     job_id = job.get("id", "unknown")
     lines = [
         f"--- {job_id} (short: {_short_id(job_id)}) ---",
-        f"  Status: {job.get('status', '?')}",
+        f"  Status: {effective_job_status(job)}",
         f"  Description: {truncate_text(job.get('description'), limit=140)}",
     ]
     if job.get("config_name") or job.get("config"):
@@ -231,11 +233,13 @@ def format_job_detail(job: dict[str, Any]) -> str:
     'Config: N/A' forever), and supervision needs lineage, owner, priority,
     agent, repo/branch, and the freeze type/reason/requires-review facts.
     """
+    from ..job_outcome import effective_job_status
+
     job_id = job.get("id", "unknown")
     lines = [
         f"Job: {job_id}",
         f"Short ID: {_short_id(job_id)}",
-        f"Status: {job.get('status', 'N/A')}",
+        f"Status: {effective_job_status(job)}",
     ]
     if job.get("description"):
         lines.append(f"Description: {truncate_text(job.get('description'), limit=500)}")
@@ -577,6 +581,9 @@ def format_job_summary(job_id: str, envelope: dict[str, Any]) -> str:
     if note:
         lines.append(note)
     elif job:
+        from ..job_outcome import effective_job_status
+
+        display_status = effective_job_status(job)
         status_icon = {
             "created": "📝",
             "processing": "🔄",
@@ -585,8 +592,9 @@ def format_job_summary(job_id: str, envelope: dict[str, Any]) -> str:
             "completed": "✅",
             "failed": "❌",
             "cancelled": "⛔",
-        }.get(job.get("status", ""), "❓")
-        lines.append(f"  {status_icon} Status: {job.get('status', 'N/A')}")
+            "blocked_undelivered": "🚫",
+        }.get(display_status, "❓")
+        lines.append(f"  {status_icon} Status: {display_status}")
         lines.append(
             f"  Config: {job.get('config_name') or job.get('config') or 'N/A'}"
         )
@@ -1577,6 +1585,7 @@ def format_job_stats(data: dict[str, Any]) -> str:
         "completed",
         "failed",
         "cancelled",
+        "blocked_undelivered",
     ):
         count = data.get(status, 0)
         if count or status in ("created", "processing", "completed"):
@@ -1597,9 +1606,11 @@ def format_daily_stats(data: list[dict[str, Any]], days: int) -> str:
         completed = day.get("jobs_completed", 0)
         failed = day.get("jobs_failed", 0)
         cancelled = day.get("jobs_cancelled", 0)
+        blocked = day.get("jobs_blocked_undelivered", 0)
         lines.append(
             f"  {date}  created:{created}  completed:{completed}  "
-            f"failed:{failed}  cancelled:{cancelled}"
+            f"failed:{failed}  cancelled:{cancelled}  "
+            f"blocked/undelivered:{blocked}"
         )
     return "\n".join(lines)
 

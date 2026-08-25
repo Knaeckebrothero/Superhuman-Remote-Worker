@@ -51,6 +51,10 @@ from security.crypto import (
 from utils.db_url import build_postgres_url
 from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
+from src.shared.deliverable_contract import (
+    parse_required_deliverables,
+    pr_repositories,
+)
 from src.shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -266,6 +270,10 @@ KNOWN_JOB_STATUSES: tuple[str, ...] = (
     "paused",
     "reviewing",
     "waiting",
+)
+JOB_STATUS_FILTER_VALUES: tuple[str, ...] = (
+    *KNOWN_JOB_STATUSES,
+    "blocked_undelivered",
 )
 
 #: Where a job came from. Stamped explicitly by every caller of
@@ -1714,7 +1722,7 @@ class PostgresDB:
         OFFSET, a count cap) off ``len(values)``.
 
         Callers validate filter *values*: ``statuses`` is assumed already
-        checked against :data:`KNOWN_JOB_STATUSES`, and the caller is assumed
+        checked against :data:`JOB_STATUS_FILTER_VALUES`, and the caller is assumed
         authorized for every id in ``project_ids``.
         """
         conditions: list[str] = []
@@ -1739,7 +1747,24 @@ class PostgresDB:
             values.extend(vis_values)
 
         if statuses:
-            add_condition("j.status = ANY({param}::text[])", list(statuses))
+            lifecycle = [
+                value
+                for value in statuses
+                if value not in {"cancelled", "blocked_undelivered"}
+            ]
+            status_terms: list[str] = []
+            if lifecycle:
+                values.append(lifecycle)
+                status_terms.append(f"j.status = ANY(${len(values)}::text[])")
+            if "cancelled" in statuses:
+                status_terms.append(
+                    "(j.status = 'cancelled' AND "
+                    "j.completion_outcome_kind IS DISTINCT FROM "
+                    "'blocked_undelivered')"
+                )
+            if "blocked_undelivered" in statuses:
+                status_terms.append("j.completion_outcome_kind = 'blocked_undelivered'")
+            conditions.append("(" + " OR ".join(status_terms) + ")")
 
         if origins:
             add_condition("j.origin = ANY({param}::text[])", list(origins))
@@ -1822,7 +1847,7 @@ class PostgresDB:
 
         Every filter is AND-combined. Callers validate filter *values*; this
         method assumes ``statuses`` has already been checked against
-        :data:`KNOWN_JOB_STATUSES` and that the caller is authorized for every
+        :data:`JOB_STATUS_FILTER_VALUES` and that the caller is authorized for every
         id in ``project_ids``.
 
         Args:
@@ -1951,7 +1976,8 @@ class PostgresDB:
                       FROM subtree
                      GROUP BY root_id
                 )
-                SELECT j.id, j.description, j.status, j.origin,
+                SELECT j.id, j.description, j.status,
+                       j.completion_outcome_kind, j.origin,
                        j.config_name, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
@@ -2064,7 +2090,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT j.id, j.status,
+                SELECT j.id, j.status, j.completion_outcome_kind,
                        j.config_name, j.expert_id, j.config_override, j.resolved_config,
                        j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
@@ -2122,6 +2148,7 @@ class PostgresDB:
         requested_workspace_backend: Any = _WORKSPACE_REQUEST_UNSET,
         workspace_assignment_source: str | None = None,
         authoritative_workspace_context: bool = False,
+        delivery_contract: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -2191,6 +2218,9 @@ class PostgresDB:
                 runtime context for an inheriting child. Raw REST/session/tool
                 callers must never set this; the default strips both runtime
                 context branches before stamping the contract.
+            delivery_contract: Server-prepared immutable contract, including
+                exact attached PR bindings. Raw callers may select semantic
+                deliverables through context, but cannot author this proof.
             conn: Optional caller-owned connection ALREADY inside a transaction.
                 Officer admission needs its stable post lock, ticket-claim
                 check, lineage capacity count and this INSERT to be one atomic
@@ -2248,6 +2278,13 @@ class PostgresDB:
         # merge_job_context deliberately remains able to record the legitimate
         # completion-time manifest.
         context.pop("evidence_manifest", None)
+        # A PR record is created only by the exact repo_open_pr result path on
+        # an existing job. Creation-time copies are model/caller data, never
+        # evidence. The migration trigger repeats this for old replicas.
+        context.pop("pull_request", None)
+        context.pop("deliverable_contract_provenance", None)
+        context.pop("prior_deliverable_contract", None)
+        context.pop("required_pr_repositories", None)
         # Recovery containment is derived only from DB/audit authority. A
         # caller-provided job context may never seed/reset its counter or
         # forge a circuit-trip diagnostic.
@@ -2281,6 +2318,63 @@ class PostgresDB:
             for datasource_id, revision in policy_snapshot.items()
         }
         context["datasource_selection"] = safe_provenance
+
+        normalized_deliverables = parse_required_deliverables(
+            context.get("required_deliverables"), strict=True
+        )
+        if normalized_deliverables:
+            context["required_deliverables"] = normalized_deliverables
+        else:
+            context.pop("required_deliverables", None)
+
+        prepared_contract: dict[str, Any] | None = None
+        if delivery_contract is not None:
+            prepared_contract = dict(delivery_contract)
+            if (
+                list(prepared_contract.get("deliverables") or [])
+                != normalized_deliverables
+            ):
+                raise ValueError(
+                    "prepared deliverable contract does not match job context"
+                )
+        elif normalized_deliverables:
+            declared_prs = pr_repositories(normalized_deliverables)
+            if declared_prs:
+                raise ValueError(
+                    "PR deliverables require server-resolved repository bindings"
+                )
+            payload = json.dumps(
+                {
+                    "deliverables": normalized_deliverables,
+                    "pr_bindings": [],
+                    "version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prepared_contract = {
+                "deliverables": normalized_deliverables,
+                "pr_repositories": [],
+                "pr_bindings": [],
+                "digest": hashlib.sha256(payload.encode()).hexdigest(),
+            }
+        elif authoritative_officer_admission and context.get("ticket_note_id"):
+            # 0182's deferred rolling-version fence requires a receipt proving
+            # that the current server normalized this claimed ticket's
+            # contract. An empty manifest is still a semantic decision: it
+            # distinguishes a new replica from an older writer that cannot
+            # preserve a rejected external-publication requirement.
+            payload = json.dumps(
+                {"deliverables": [], "pr_bindings": [], "version": 1},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prepared_contract = {
+                "deliverables": [],
+                "pr_repositories": [],
+                "pr_bindings": [],
+                "digest": hashlib.sha256(payload.encode()).hexdigest(),
+            }
 
         # Every entry point (REST, MCP, automations, loops, delegation) funnels
         # through here, so normalize once: surrounding whitespace is never
@@ -2352,6 +2446,29 @@ class PostgresDB:
                         for datasource_uuid in datasource_uuids
                     ],
                 )
+            if prepared_contract is not None:
+                await active_conn.execute(
+                    """
+                    INSERT INTO job_deliverable_contracts (
+                        job_id, normalized_deliverables, pr_repositories,
+                        pr_bindings, contract_digest, provenance
+                    ) VALUES ($1, $2::text[], $3::text[], $4::jsonb, $5,
+                              'server_normalized')
+                    ON CONFLICT (job_id) DO UPDATE
+                       SET normalized_deliverables = EXCLUDED.normalized_deliverables,
+                           pr_repositories = EXCLUDED.pr_repositories,
+                           pr_bindings = EXCLUDED.pr_bindings,
+                           contract_digest = EXCLUDED.contract_digest,
+                           provenance = EXCLUDED.provenance
+                     WHERE job_deliverable_contracts.provenance =
+                           'rolling_trigger_backfill'
+                    """,
+                    written["id"],
+                    list(prepared_contract.get("deliverables") or []),
+                    list(prepared_contract.get("pr_repositories") or []),
+                    json.dumps(prepared_contract.get("pr_bindings") or []),
+                    str(prepared_contract.get("digest") or ""),
+                )
             return written
 
         if conn is not None:
@@ -2362,7 +2479,10 @@ class PostgresDB:
         else:
             async with self.acquire() as owned_conn:
                 async with _transaction_if(
-                    owned_conn, bool(datasource_uuids) or authority_user_id is not None
+                    owned_conn,
+                    bool(datasource_uuids)
+                    or authority_user_id is not None
+                    or prepared_contract is not None,
                 ):
                     row = await _write(owned_conn)
 
@@ -2480,7 +2600,8 @@ class PostgresDB:
                     uuid_val,
                 )
                 deleting_job = await conn.fetchrow(
-                    "SELECT status FROM jobs WHERE id = $1 FOR UPDATE",
+                    "SELECT status, completion_outcome_kind "
+                    "FROM jobs WHERE id = $1 FOR UPDATE",
                     uuid_val,
                 )
                 if deleting_job is not None:
@@ -2496,6 +2617,9 @@ class PostgresDB:
                                    job_status_at_delete = COALESCE(
                                        job_status_at_delete, $2
                                    ),
+                                   completion_outcome_kind_at_delete = COALESCE(
+                                       completion_outcome_kind_at_delete, $5
+                                   ),
                                    deletion_actor_user_id = COALESCE(
                                        deletion_actor_user_id, $3
                                    ),
@@ -2507,6 +2631,7 @@ class PostgresDB:
                             str(deleting_job["status"]),
                             actor_uuid,
                             str(deletion_reason or "database_delete"),
+                            deleting_job["completion_outcome_kind"],
                         )
                     )
                 if prepared_stateless:
@@ -3356,6 +3481,7 @@ class PostgresDB:
         completion_finalizing_by: str | None = None,
         completion_control_claim_id: str | None = None,
         consume_completion_decision_tool_call_id: str | None = None,
+        completion_outcome_kind: str | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -3389,6 +3515,9 @@ class PostgresDB:
                 its tool-call identity exactly matches the decision captured
                 by ``completion_command_id`` at admission. A later decision is
                 never consumed by an older command.
+            completion_outcome_kind: Server-owned terminal interpretation.
+                Currently only ``blocked_undelivered`` is valid and it must be
+                written in the same Class-A update as ``status=cancelled``.
 
         Returns:
             True if updated, False if not found
@@ -3437,6 +3566,16 @@ class PostgresDB:
             param_count += 1
             updates.append(f"error_details = ${param_count}::jsonb")
             values.append(json.dumps(error_details))
+
+        if completion_outcome_kind is not None:
+            if (
+                completion_outcome_kind != "blocked_undelivered"
+                or status != "cancelled"
+            ):
+                raise ValueError("invalid completion outcome/status pairing")
+            param_count += 1
+            updates.append(f"completion_outcome_kind = ${param_count}")
+            values.append(completion_outcome_kind)
 
         if workspace_context_updates is not None:
             param_count += 1
@@ -4744,6 +4883,18 @@ class PostgresDB:
             return False
 
         updates = _strip_managed_repository_authority(updates)
+        # These keys have narrow server-owned writers. Generic context merge
+        # is used by tools, sessions, completion auxiliaries and automations;
+        # accepting them here would make any one of those paths capable of
+        # forging PR proof or rewriting the admitted contract.
+        for key in (
+            "pull_request",
+            "required_deliverables",
+            "deliverable_contract_provenance",
+            "prior_deliverable_contract",
+            "required_pr_repositories",
+        ):
+            updates.pop(key, None)
         query = (
             "UPDATE jobs "
             "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
@@ -4753,6 +4904,152 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(updates), uuid_val)
 
+        return result == "UPDATE 1"
+
+    async def get_job_deliverable_contract(self, job_id: str) -> Dict[str, Any] | None:
+        """Read the immutable server-owned contract for one job."""
+
+        try:
+            uuid_val = UUID(str(job_id))
+        except ValueError:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT job_id, normalized_deliverables, pr_repositories,
+                       pr_bindings, contract_digest, provenance, created_at
+                  FROM job_deliverable_contracts
+                 WHERE job_id = $1
+                """,
+                uuid_val,
+            )
+        return dict(row) if row is not None else None
+
+    async def get_job_pull_request_authority(
+        self, job_id: str
+    ) -> Dict[str, Any] | None:
+        """Read the credential-free authoritative PR identity and proof."""
+
+        try:
+            uuid_val = UUID(str(job_id))
+        except ValueError:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT job_id, record_id, record_generation, datasource_id,
+                       repository, forge, number, url, head, base,
+                       source_revision, policy_revision, recorded_at, updated_at,
+                       verified_at, verified_record_id, verified_generation,
+                       verified_state, verified_head, verified_base,
+                       verified_head_revision
+                  FROM job_pull_request_authorities
+                 WHERE job_id = $1
+                """,
+                uuid_val,
+            )
+        return dict(row) if row is not None else None
+
+    async def mark_job_pr_deliverable_verified(
+        self,
+        job_id: str,
+        *,
+        datasource_id: str,
+        repository: str,
+        number: int,
+        record_id: str,
+        record_generation: int,
+        head: str,
+        base: str,
+        head_revision: str,
+        state: str,
+    ) -> bool:
+        """CAS a live forge observation against authoritative PR identity.
+
+        A late result for a replaced record, source branch, policy revision or
+        detached datasource cannot become the proof used by completion.
+        """
+
+        try:
+            uuid_val = UUID(str(job_id))
+            datasource_uuid = UUID(str(datasource_id))
+            record_uuid = UUID(str(record_id))
+        except ValueError:
+            return False
+        canonical = str(repository).strip().casefold()
+        normalized_state = str(state).strip().lower()
+        if (
+            not canonical
+            or number < 1
+            or record_generation < 1
+            or not str(head).strip()
+            or not str(base).strip()
+            or len(str(head_revision)) not in {40, 64}
+            or normalized_state
+            not in {
+                "open",
+                "merged",
+                "closed",
+            }
+        ):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE job_pull_request_authorities AS authority
+                   SET verified_at = now(),
+                       verified_record_id = authority.record_id,
+                       verified_generation = authority.record_generation,
+                       verified_state = $10,
+                       verified_head = authority.head,
+                       verified_base = authority.base,
+                       verified_head_revision = authority.source_revision
+                  FROM job_deliverable_contracts AS contract,
+                       jobs AS job,
+                       job_datasources AS attachment,
+                       datasources AS datasource
+                 WHERE authority.job_id = $1
+                   AND authority.record_id = $5
+                   AND authority.record_generation = $6
+                   AND authority.datasource_id = $2
+                   AND authority.repository = $3
+                   AND authority.number = $4
+                   AND authority.head = $7
+                   AND authority.base = $8
+                   AND authority.source_revision = $9
+                   AND contract.job_id = authority.job_id
+                   AND job.id = authority.job_id
+                   AND attachment.job_id = job.id
+                   AND attachment.datasource_id = $2
+                   AND datasource.id = attachment.datasource_id
+                   AND datasource.type = 'repository'
+                   AND datasource.read_only IS NOT TRUE
+                   AND cardinality(contract.pr_repositories) = 1
+                   AND contract.pr_repositories[1] = $3
+                   AND contract.pr_bindings->0->>'datasource_id' = $2::text
+                   AND contract.pr_bindings->0->>'forge' = authority.forge
+                   AND contract.pr_bindings->0->>'policy_revision' =
+                       datasource.policy_revision::text
+                   AND authority.policy_revision = datasource.policy_revision
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM project_datasources AS project_link
+                        WHERE project_link.project_id = job.project_id
+                          AND project_link.datasource_id = datasource.id
+                          AND project_link.read_only
+                   )
+                """,
+                uuid_val,
+                datasource_uuid,
+                canonical,
+                int(number),
+                record_uuid,
+                int(record_generation),
+                str(head).strip(),
+                str(base).strip(),
+                str(head_revision).strip().lower(),
+                normalized_state,
+            )
         return result == "UPDATE 1"
 
     async def delete_job_context_keys(self, job_id: str, keys: List[str]) -> bool:
@@ -7944,7 +8241,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             job = await conn.fetchrow(
                 """
-                SELECT id, description, status,
+                SELECT id, description, status, completion_outcome_kind,
                        config_name, assigned_agent_id, created_at, updated_at, completed_at
                 FROM jobs WHERE id = $1
                 """,
@@ -7964,6 +8261,7 @@ class PostgresDB:
         return {
             "job_id": str(job["id"]),
             "status": job["status"],
+            "completion_outcome_kind": job["completion_outcome_kind"],
             # Honest nulls: never manufacture 0% / a fake ETA (E1).
             "progress_percent": None,
             "elapsed_seconds": elapsed_seconds,
@@ -8099,7 +8397,14 @@ class PostgresDB:
                     COUNT(*) as jobs_created,
                     COUNT(*) FILTER (WHERE status = 'completed') as jobs_completed,
                     COUNT(*) FILTER (WHERE status = 'failed') as jobs_failed,
-                    COUNT(*) FILTER (WHERE status = 'cancelled') as jobs_cancelled
+                    COUNT(*) FILTER (
+                        WHERE status = 'cancelled'
+                          AND completion_outcome_kind IS DISTINCT FROM
+                              'blocked_undelivered'
+                    ) as jobs_cancelled,
+                    COUNT(*) FILTER (
+                        WHERE completion_outcome_kind = 'blocked_undelivered'
+                    ) as jobs_blocked_undelivered
                 FROM jobs
                 WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
                 {where_extra}
@@ -8178,7 +8483,12 @@ class PostgresDB:
         # UI — "All 147" above "1–25 of 118".
         matched_cte = f"""
             matched AS (
-                SELECT j.id, j.parent_job_id, j.status
+                SELECT j.id, j.parent_job_id,
+                       CASE WHEN j.completion_outcome_kind =
+                                      'blocked_undelivered'
+                            THEN 'blocked_undelivered'
+                            ELSE j.status
+                       END AS status
                   FROM jobs j
                   LEFT JOIN projects p ON p.id = j.project_id
                 {where_clause}
@@ -8228,6 +8538,7 @@ class PostgresDB:
         }
         for status in KNOWN_JOB_STATUSES:
             stats[status] = by_status.get(status, 0)
+        stats["blocked_undelivered"] = by_status.get("blocked_undelivered", 0)
         return stats
 
     async def detect_stuck_jobs(
@@ -10399,7 +10710,8 @@ class PostgresDB:
                  WHERE j.id = s.id
                 RETURNING j.id, j.created_by_thread_id, j.status, j.wake_attempts,
                           j.user_id, j.project_id, j.description, j.expert_id,
-                          j.config_name, j.freeze_data, j.error_message
+                          j.config_name, j.freeze_data, j.error_message,
+                          j.completion_outcome_kind
                 """,
                 float(visibility_timeout_seconds),
                 limit,
@@ -13966,6 +14278,10 @@ class PostgresDB:
                 SELECT claim.job_id AS id,
                        COALESCE(live.status, claim.job_status_at_delete,
                                 'deleted_unknown') AS status,
+                       COALESCE(
+                           live.completion_outcome_kind,
+                           claim.completion_outcome_kind_at_delete
+                       ) AS completion_outcome_kind,
                        claim.claimed_at AS created_at,
                        COALESCE(live.updated_at, claim.job_deleted_at,
                                 claim.claimed_at) AS updated_at,
@@ -14015,6 +14331,10 @@ class PostgresDB:
                            claim.job_id AS id,
                            COALESCE(live.status, claim.job_status_at_delete)
                                AS status,
+                           COALESCE(
+                               live.completion_outcome_kind,
+                               claim.completion_outcome_kind_at_delete
+                           ) AS completion_outcome_kind,
                            claim.claimed_at AS created_at,
                            COALESCE(live.updated_at, claim.job_deleted_at,
                                     claim.claimed_at) AS updated_at,
@@ -14037,6 +14357,11 @@ class PostgresDB:
                        AND claim.officer_slot = $2
                        AND COALESCE(live.status, claim.job_status_at_delete)
                            IN ('completed', 'failed', 'cancelled')
+                       AND COALESCE(
+                               live.completion_outcome_kind,
+                               claim.completion_outcome_kind_at_delete,
+                               ''
+                           ) <> 'blocked_undelivered'
                        AND NOT (
                            COALESCE(
                                live.context->'provisioning_preflight'

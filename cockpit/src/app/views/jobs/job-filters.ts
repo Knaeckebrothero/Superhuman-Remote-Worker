@@ -34,7 +34,7 @@ export interface JobListFilters {
   asOf: string | null;
 }
 
-/** Lifecycle statuses, mirroring the `jobs.status` column vocabulary. */
+/** Lifecycle statuses plus server-owned terminal presentation outcomes. */
 export const KNOWN_JOB_STATUSES: readonly string[] = Object.freeze([
   'created',
   'pending',
@@ -46,6 +46,7 @@ export const KNOWN_JOB_STATUSES: readonly string[] = Object.freeze([
   'paused',
   'reviewing',
   'waiting',
+  'blocked_undelivered',
 ]);
 
 /** Provenance values, mirroring `GET /api/jobs?origin=`. */

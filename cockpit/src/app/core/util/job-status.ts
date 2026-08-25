@@ -30,6 +30,7 @@ const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set([
     'completed',
     'failed',
     'cancelled',
+    'blocked_undelivered',
 ]);
 
 export function isTerminalJobStatus(status: string | null | undefined): boolean {
@@ -48,9 +49,9 @@ export function isRunningJobStatus(status: string | null | undefined): boolean {
  * The rule is "stopped, and will not restart itself": the job is waiting on a
  * person, so replying to it is meaningful.
  *
- * Narrower than the server, deliberately. `POST /api/jobs/{id}/resume` accepts
- * every status except `completed` (main.py:13658), but two of those would be
- * wrong to offer in a transcript card:
+ * Narrower than the server, deliberately. The server accepts stopped jobs but
+ * refuses completed and blocked/undelivered outcomes. Several other statuses
+ * would still be wrong to offer in a transcript card:
  *
  * - **`paused`** is dispatchable-and-unassigned — the dispatcher re-picks it on
  *   its own, and the card is already showing a spinner for it
@@ -65,6 +66,24 @@ export function isRunningJobStatus(status: string | null | undefined): boolean {
  */
 export function canResumeJobStatus(status: string | null | undefined): boolean {
     return status === 'pending_review' || status === 'failed' || status === 'cancelled';
+}
+
+export interface JobOutcomeView {
+    status?: string | null;
+    completion_outcome_kind?: string | null;
+}
+
+/** Presentation status for a job whose storage status stays rolling-safe. */
+export function effectiveJobStatus(job: JobOutcomeView | null | undefined): string {
+    return job?.completion_outcome_kind === 'blocked_undelivered'
+        ? 'blocked_undelivered'
+        : (job?.status ?? '');
+}
+
+/** A blocked/undelivered terminal outcome is intentionally not resumable. */
+export function canResumeJob(job: JobOutcomeView | null | undefined): boolean {
+    return job?.completion_outcome_kind !== 'blocked_undelivered'
+        && canResumeJobStatus(job?.status);
 }
 
 /**
@@ -113,6 +132,7 @@ export function asRecord(value: unknown): Record<string, unknown> | null {
 const LABELLED_JOB_STATUSES: ReadonlySet<string> = new Set([
     'created', 'processing', 'completed', 'failed', 'cancelled',
     'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply',
+    'blocked_undelivered',
 ]);
 
 /** i18n key for a job status, or null when it has no label to fall back from. */
@@ -127,6 +147,7 @@ export function jobStatusTone(status: string): BadgeTone {
             return 'success';
         case 'processing':
         case 'pending_review':
+        case 'blocked_undelivered':
             return 'warning';
         case 'failed':
             return 'danger';

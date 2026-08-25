@@ -52,6 +52,7 @@ async def list_jobs(
         "completed",
         "failed",
         "cancelled",
+        "blocked_undelivered",
         "pending_review",
         "paused",
     ]
@@ -65,7 +66,7 @@ async def list_jobs(
     investigate.
 
     Args:
-        status: Filter by lifecycle status, including pending_review and paused
+        status: Filter by lifecycle status or blocked_undelivered outcome
         limit: Maximum jobs to return (1-500, default 20)
 
     Returns:

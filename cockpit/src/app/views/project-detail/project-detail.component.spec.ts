@@ -5,7 +5,7 @@ import {TranslocoService} from '@jsverse/transloco';
 import {of, Subject, throwError} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 
-import {Datasource, ProjectDatasource} from '../../core/models/api.model';
+import {Datasource, Job, ProjectDatasource} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -256,6 +256,18 @@ describe('ProjectDetailPageComponent connector candidates', () => {
       kb.id,
       {read_only: true},
     );
+  });
+});
+
+describe('ProjectDetailPageComponent job outcomes', () => {
+  it('presents blocked delivery distinctly from its rolling-safe storage status', () => {
+    const {component} = createComponent();
+    const job = {
+      status: 'cancelled',
+      completion_outcome_kind: 'blocked_undelivered',
+    } as Job;
+
+    expect(component.effectiveJobStatus(job)).toBe('blocked_undelivered');
   });
 });
 

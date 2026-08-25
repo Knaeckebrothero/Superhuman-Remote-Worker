@@ -451,6 +451,11 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
                 "officer_admission": {"ticket_claim_source": "forged"},
                 "ticket_ready_at": "2099-01-01T00:00:00Z",
                 "ticket_claim_source": "forged",
+                "pull_request": {"repo": "victim/private", "number": 9},
+                "required_deliverables": ["kb:laundered"],
+                "deliverable_contract_provenance": {"source": "forged"},
+                "prior_deliverable_contract": ["repos/private/report.md"],
+                "required_pr_repositories": ["victim/private"],
             },
         )
     finally:
@@ -467,6 +472,11 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
         "officer_admission",
         "ticket_ready_at",
         "ticket_claim_source",
+        "pull_request",
+        "required_deliverables",
+        "deliverable_contract_provenance",
+        "prior_deliverable_contract",
+        "required_pr_repositories",
     }
 
 

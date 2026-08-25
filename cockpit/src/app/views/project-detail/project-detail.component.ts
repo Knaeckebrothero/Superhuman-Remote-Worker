@@ -4,6 +4,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
+import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -258,8 +259,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     @for (job of jobs(); track job.id) {
                       <tr>
                         <td>
-                          <span class="status-badge" [class]="'status-' + job.status">
-                            {{ formatStatus(job.status) }}
+                          <span class="status-badge" [class]="'status-' + effectiveJobStatus(job)">
+                            {{ 'jobs.status.' + effectiveJobStatus(job) | transloco }}
                           </span>
                         </td>
                         <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
@@ -1360,6 +1361,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .status-failed { background: var(--danger-tint); color: var(--danger); }
     .status-cancelled { background: var(--surface-0); color: var(--text-muted); }
     .status-pending_review { background: var(--warning-tint); color: var(--warning); }
+    .status-blocked_undelivered { background: var(--warning-tint); color: var(--warning); }
 
     /* Merge badges */
     .merge-badge {
@@ -1920,6 +1922,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly errors = inject(ErrorMessageService);
   private readonly destroyRef = inject(DestroyRef);
   protected readonly viewport = inject(ViewportService);
+  readonly effectiveJobStatus = effectiveJobStatus;
 
   readonly project = signal<Project | null>(null);
   /** Which lifecycle change the confirmation dialog is holding, if any. */
@@ -2800,12 +2803,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   truncate(text: string | undefined, max: number): string {
     if (!text) return '';
     return text.length <= max ? text : text.slice(0, max) + '...';
-  }
-
-  /** Humanise a status enum for display (e.g. "pending_review" -> "pending review").
-      The CSS class still uses the raw value; text-transform capitalises the result. */
-  formatStatus(status: string | undefined): string {
-    return (status ?? '').replace(/_/g, ' ');
   }
 
   /** Flatten a note's Markdown to plain prose, then truncate, for the card preview. */

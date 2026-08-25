@@ -1851,7 +1851,16 @@ class JobsNamespace:
         return self.db._row_to_dict(row)
 
     async def merge_context(self, job_id: uuid.UUID, updates: Dict[str, Any]) -> bool:
-        """Atomically merge top-level keys into a job's JSONB context."""
+        """Atomically merge caller-safe top-level keys into job context."""
+        safe_updates = dict(updates or {})
+        for key in (
+            "pull_request",
+            "required_deliverables",
+            "deliverable_contract_provenance",
+            "prior_deliverable_contract",
+            "required_pr_repositories",
+        ):
+            safe_updates.pop(key, None)
         result = await self.db.execute(
             """
             UPDATE jobs
@@ -1859,9 +1868,242 @@ class JobsNamespace:
                 updated_at = NOW()
             WHERE id = $2
             """,
-            json.dumps(updates),
+            json.dumps(safe_updates),
             job_id,
         )
+        return result == "UPDATE 1"
+
+    async def record_pull_request(
+        self,
+        job_id: uuid.UUID,
+        datasource_id: uuid.UUID,
+        pull_request: Dict[str, Any],
+        *,
+        source_revision: str,
+    ) -> bool:
+        """Persist PR authority only for an exact writable job attachment.
+
+        The caller cannot select authority through the record itself: the
+        linked datasource row is loaded first and its server-owned repository
+        identity must match. ``source_revision`` is derived by ``repo_open_pr``
+        only after the checked-out branch and its pushed remote ref agree.
+        This is the sole agent-side PR authority writer.
+        """
+
+        from urllib.parse import urlparse
+
+        from src.services.forge import ForgeError, parse_owner_repo
+        from src.shared.deliverable_contract import normalize_repository_identity
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT datasource.connection_url,
+                           datasource.config,
+                           datasource.read_only,
+                           datasource.policy_revision,
+                           contract.pr_repositories,
+                           contract.pr_bindings,
+                           job.status AS job_status,
+                           COALESCE((
+                               SELECT bool_or(link.read_only)
+                                 FROM project_datasources AS link
+                                WHERE link.project_id = job.project_id
+                                  AND link.datasource_id = datasource.id
+                           ), FALSE) AS project_read_only
+                      FROM job_datasources AS attachment
+                      JOIN jobs AS job ON job.id = attachment.job_id
+                      JOIN datasources AS datasource
+                        ON datasource.id = attachment.datasource_id
+                      LEFT JOIN job_deliverable_contracts AS contract
+                        ON contract.job_id = job.id
+                     WHERE attachment.job_id = $1
+                       AND attachment.datasource_id = $2
+                       AND datasource.type = 'repository'
+                     FOR UPDATE OF job
+                     FOR SHARE OF attachment, datasource
+                    """,
+                    job_id,
+                    datasource_id,
+                )
+                if (
+                    row is None
+                    or row["job_status"] != "processing"
+                    or row["read_only"]
+                    or row["project_read_only"]
+                ):
+                    return False
+                try:
+                    owner, repository = parse_owner_repo(
+                        str(row["connection_url"] or "")
+                    )
+                except ForgeError:
+                    return False
+                expected = normalize_repository_identity(f"{owner}/{repository}")
+                supplied = normalize_repository_identity(pull_request.get("repo"))
+                if expected is None or supplied != expected:
+                    return False
+
+                config = row["config"]
+                if isinstance(config, str):
+                    try:
+                        config = json.loads(config)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        config = {}
+                config = config if isinstance(config, dict) else {}
+                expected_forge = str(config.get("forge") or "").strip().lower()
+                supplied_forge = str(pull_request.get("forge") or "").strip().lower()
+                number = pull_request.get("number")
+                url = pull_request.get("url")
+                head = pull_request.get("head")
+                base = pull_request.get("base")
+                normalized_revision = str(source_revision or "").strip().lower()
+                parsed_url = urlparse(url) if isinstance(url, str) else None
+                connection_url = str(row["connection_url"] or "")
+                parsed_connection = urlparse(connection_url)
+                connection_host = parsed_connection.hostname
+                if connection_host is None and ":" in connection_url:
+                    connection_host = connection_url.partition(":")[0].rsplit("@", 1)[
+                        -1
+                    ]
+                if (
+                    not expected_forge
+                    or supplied_forge != expected_forge
+                    or isinstance(number, bool)
+                    or not isinstance(number, int)
+                    or number < 1
+                    or parsed_url is None
+                    or parsed_url.scheme not in {"http", "https"}
+                    or parsed_url.hostname is None
+                    or parsed_url.username is not None
+                    or parsed_url.password is not None
+                    or not connection_host
+                    or parsed_url.hostname.casefold() != connection_host.casefold()
+                    or not isinstance(head, str)
+                    or not head.strip()
+                    or len(head) > 500
+                    or not isinstance(base, str)
+                    or not base.strip()
+                    or len(base) > 500
+                    or len(url) > 2_000
+                    or len(normalized_revision) not in {40, 64}
+                    or any(
+                        char not in "0123456789abcdef" for char in normalized_revision
+                    )
+                ):
+                    return False
+
+                pr_repositories = list(row["pr_repositories"] or [])
+                bindings = row["pr_bindings"]
+                if isinstance(bindings, str):
+                    try:
+                        bindings = json.loads(bindings)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        bindings = []
+                bindings = bindings if isinstance(bindings, list) else []
+                if pr_repositories:
+                    binding = bindings[0] if len(bindings) == 1 else None
+                    if (
+                        len(pr_repositories) != 1
+                        or pr_repositories[0] != expected
+                        or not isinstance(binding, dict)
+                        or str(binding.get("repository") or "") != expected
+                        or str(binding.get("datasource_id") or "") != str(datasource_id)
+                        or str(binding.get("forge") or "") != expected_forge
+                        or int(binding.get("policy_revision") or -1)
+                        != int(row["policy_revision"])
+                    ):
+                        return False
+
+                # Persist only the fixed, credential-free record produced by
+                # repo_open_pr. Extra caller/result fields never enter durable
+                # context, and the server-derived connector supplies both
+                # repository and forge authority.
+                record = {
+                    "forge": expected_forge,
+                    "repo": expected,
+                    "number": number,
+                    "url": url,
+                    "head": head.strip(),
+                    "base": base.strip(),
+                }
+                semantic = (
+                    datasource_id,
+                    expected,
+                    expected_forge,
+                    number,
+                    url,
+                    head.strip(),
+                    base.strip(),
+                    normalized_revision,
+                    int(row["policy_revision"]),
+                )
+                existing = await conn.fetchrow(
+                    """
+                    SELECT datasource_id, repository, forge, number, url,
+                           head, base, source_revision, policy_revision
+                      FROM job_pull_request_authorities
+                     WHERE job_id = $1
+                     FOR UPDATE
+                    """,
+                    job_id,
+                )
+                existing_semantic = (
+                    tuple(existing.values()) if existing is not None else None
+                )
+                if existing_semantic != semantic:
+                    await conn.execute(
+                        """
+                        INSERT INTO job_pull_request_authorities (
+                            job_id, datasource_id, repository, forge, number,
+                            url, head, base, source_revision, policy_revision
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (job_id) DO UPDATE
+                           SET record_id = gen_random_uuid(),
+                               record_generation =
+                                   job_pull_request_authorities.record_generation + 1,
+                               datasource_id = EXCLUDED.datasource_id,
+                               repository = EXCLUDED.repository,
+                               forge = EXCLUDED.forge,
+                               number = EXCLUDED.number,
+                               url = EXCLUDED.url,
+                               head = EXCLUDED.head,
+                               base = EXCLUDED.base,
+                               source_revision = EXCLUDED.source_revision,
+                               policy_revision = EXCLUDED.policy_revision,
+                               updated_at = now(),
+                               verified_at = NULL,
+                               verified_record_id = NULL,
+                               verified_generation = NULL,
+                               verified_state = NULL,
+                               verified_head = NULL,
+                               verified_base = NULL,
+                               verified_head_revision = NULL
+                        """,
+                        job_id,
+                        *semantic,
+                    )
+
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context = COALESCE(context, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                         'pull_request', $1::jsonb
+                                     ),
+                           updated_at = now()
+                     WHERE id = $2
+                       AND EXISTS (
+                           SELECT 1
+                             FROM job_datasources
+                            WHERE job_id = $2 AND datasource_id = $3
+                       )
+                    """,
+                    json.dumps(record),
+                    job_id,
+                    datasource_id,
+                )
         return result == "UPDATE 1"
 
     async def update_status(

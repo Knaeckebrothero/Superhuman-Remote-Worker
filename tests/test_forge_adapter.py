@@ -102,7 +102,7 @@ async def test_github_pr_status_distinguishes_merged_from_closed(monkeypatch):
             "state": "closed",
             "merged": True,
             "draft": False,
-            "head": {"ref": "feature/review"},
+            "head": {"ref": "feature/review", "sha": "a" * 40},
             "base": {"ref": "develop"},
         }
     )
@@ -120,6 +120,7 @@ async def test_github_pr_status_distinguishes_merged_from_closed(monkeypatch):
         "state": "merged",
         "head": "feature/review",
         "base": "develop",
+        "head_sha": "a" * 40,
         "draft": False,
     }
 
@@ -132,7 +133,7 @@ async def test_gitea_pr_status_normalizes_open(monkeypatch):
             "html_url": "https://git.example.test/acme/widget/pulls/3",
             "state": "open",
             "merged": False,
-            "head": {"ref": "job/abc"},
+            "head": {"ref": "job/abc", "sha": "b" * 40},
             "base": {"ref": "main"},
         }
     )
@@ -158,6 +159,7 @@ async def test_gitlab_pr_status_uses_iid_and_normalizes_locked_as_closed(monkeyp
             "state": "locked",
             "source_branch": "job/abc",
             "target_branch": "main",
+            "sha": "c" * 40,
             "draft": True,
         }
     )
@@ -176,6 +178,7 @@ async def test_gitlab_pr_status_uses_iid_and_normalizes_locked_as_closed(monkeyp
         "state": "closed",
         "head": "job/abc",
         "base": "main",
+        "head_sha": "c" * 40,
         "draft": True,
     }
 

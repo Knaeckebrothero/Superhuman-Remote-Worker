@@ -112,6 +112,10 @@ BEGIN
     UPDATE public.officer_ticket_claims
        SET job_deleted_at = COALESCE(job_deleted_at, statement_timestamp()),
            job_status_at_delete = COALESCE(job_status_at_delete, OLD.status),
+           completion_outcome_kind_at_delete = COALESCE(
+               completion_outcome_kind_at_delete,
+               OLD.completion_outcome_kind
+           ),
            deletion_reason = COALESCE(
                deletion_reason,
                'database_delete_compatibility_trigger'
@@ -126,7 +130,56 @@ $$;
 -- Name: FUNCTION audit_officer_ticket_claim_job_delete(); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION public.audit_officer_ticket_claim_job_delete() IS '0162 rolling-upgrade backstop: any claimed job DELETE records status/time before the operational row disappears.';
+COMMENT ON FUNCTION public.audit_officer_ticket_claim_job_delete() IS '0162 deletion audit extended by 0182 to retain the server-owned terminal outcome used by breaker and claim inspection.';
+
+
+--
+-- Name: capture_job_deliverable_contract(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_job_deliverable_contract() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    normalized TEXT[];
+    pr_repos TEXT[];
+BEGIN
+    IF jsonb_typeof(NEW.context->'required_deliverables') <> 'array' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT COALESCE(array_agg(value ORDER BY ordinal), ARRAY[]::TEXT[])
+      INTO normalized
+      FROM (
+          SELECT DISTINCT ON (btrim(entry.value))
+                 btrim(entry.value) AS value,
+                 entry.ordinality AS ordinal
+            FROM jsonb_array_elements_text(
+                     NEW.context->'required_deliverables'
+                 ) WITH ORDINALITY AS entry(value, ordinality)
+           WHERE btrim(entry.value) <> ''
+           ORDER BY btrim(entry.value), entry.ordinality
+      ) AS values_in_declared_order;
+
+    SELECT COALESCE(array_agg(lower(substr(value, 4))), ARRAY[]::TEXT[])
+      INTO pr_repos
+      FROM unnest(normalized) AS value
+     WHERE lower(value) LIKE 'pr:%';
+
+    INSERT INTO public.job_deliverable_contracts (
+        job_id, normalized_deliverables, pr_repositories, contract_digest,
+        provenance
+    ) VALUES (
+        NEW.id,
+        normalized,
+        pr_repos,
+        md5(array_to_string(normalized, E'\n')),
+        'rolling_trigger_backfill'
+    )
+    ON CONFLICT (job_id) DO NOTHING;
+    RETURN NEW;
+END;
+$$;
 
 
 --
@@ -706,6 +759,298 @@ BEGIN
         RAISE EXCEPTION
             'inventory requirement must begin at UTC midnight or durable cutover'
             USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_job_deliverable_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_job_deliverable_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    contract public.job_deliverable_contracts%ROWTYPE;
+    pr_authority public.job_pull_request_authorities%ROWTYPE;
+    expected_projection JSONB;
+    contract_found BOOLEAN;
+    pr_authority_found BOOLEAN;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        -- Old and new raw creation paths both cross this boundary. A PR record
+        -- exists only after repo_open_pr succeeds on an already-created job.
+        IF NEW.completion_outcome_kind IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'completion_outcome_is_server_owned',
+                MESSAGE = 'A terminal completion outcome cannot be authored at job creation';
+        END IF;
+        NEW.context := COALESCE(NEW.context, '{}'::jsonb)
+            - 'pull_request'
+            - 'deliverable_contract_provenance'
+            - 'prior_deliverable_contract'
+            - 'required_pr_repositories';
+        IF NEW.status = 'completed'
+           AND jsonb_typeof(NEW.context->'required_deliverables') = 'array'
+           AND EXISTS (
+               SELECT 1
+                 FROM jsonb_array_elements_text(
+                     NEW.context->'required_deliverables'
+                ) AS entry(value)
+                WHERE lower(btrim(entry.value)) LIKE 'pr:%'
+                   OR btrim(entry.value) ~ '^(\./)*/*repos/.+'
+                   OR btrim(entry.value) ~ '^(\./)*/*repo/repos/.+'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'pr_deliverable_requires_live_proof',
+                MESSAGE = 'A PR-contracted job cannot insert as completed';
+        END IF;
+    ELSE
+        IF COALESCE(NEW.context, '{}'::jsonb)->'required_deliverables'
+           IS DISTINCT FROM
+           COALESCE(OLD.context, '{}'::jsonb)->'required_deliverables' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'job_deliverable_contract_is_immutable',
+                MESSAGE = 'The admitted deliverable contract is immutable';
+        END IF;
+        IF OLD.completion_outcome_kind = 'blocked_undelivered'
+           AND (
+               NEW.completion_outcome_kind IS DISTINCT FROM
+                   'blocked_undelivered'
+               OR NEW.status <> 'cancelled'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'blocked_undelivered_is_terminal',
+                MESSAGE = 'Blocked/undelivered work cannot be resumed';
+        END IF;
+
+        -- Rolling old replicas may still attempt a generic context merge.
+        -- A projection change is accepted only after the exact authoritative
+        -- row exists in this transaction.  Context alone can never create or
+        -- replace PR evidence.
+        IF COALESCE(NEW.context, '{}'::jsonb)->'pull_request'
+           IS DISTINCT FROM
+           COALESCE(OLD.context, '{}'::jsonb)->'pull_request' THEN
+            SELECT * INTO pr_authority
+              FROM public.job_pull_request_authorities
+             WHERE job_id = NEW.id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'pull_request_projection_requires_authority',
+                    MESSAGE = 'Pull-request context is a server-owned projection';
+            END IF;
+            expected_projection := jsonb_build_object(
+                'forge', pr_authority.forge,
+                'repo', pr_authority.repository,
+                'number', pr_authority.number,
+                'url', pr_authority.url,
+                'head', pr_authority.head,
+                'base', pr_authority.base
+            );
+            IF NEW.context->'pull_request' IS DISTINCT FROM expected_projection THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'pull_request_projection_mismatches_authority',
+                    MESSAGE = 'Pull-request context does not match server authority';
+            END IF;
+        END IF;
+    END IF;
+
+    IF NEW.completion_outcome_kind = 'blocked_undelivered'
+       AND NEW.status <> 'cancelled' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'blocked_undelivered_is_terminal',
+            MESSAGE = 'Blocked/undelivered work must remain terminal';
+    END IF;
+
+    IF NEW.status = 'completed' THEN
+        SELECT * INTO contract
+          FROM public.job_deliverable_contracts
+         WHERE job_id = NEW.id;
+        contract_found := FOUND;
+        SELECT * INTO pr_authority
+          FROM public.job_pull_request_authorities
+         WHERE job_id = NEW.id;
+        pr_authority_found := FOUND;
+        IF contract_found AND (
+            EXISTS (
+                SELECT 1
+                  FROM unnest(contract.normalized_deliverables) AS item(value)
+                 WHERE btrim(item.value) ~ '^(\./)*/*repos/.+'
+                    OR btrim(item.value) ~ '^(\./)*/*repo/repos/.+'
+            )
+            OR (
+                cardinality(contract.pr_repositories) > 0
+                AND (
+                cardinality(contract.pr_repositories) <> 1
+                    OR jsonb_array_length(contract.pr_bindings) <> 1
+                    OR NOT pr_authority_found
+                    OR pr_authority.repository
+                        IS DISTINCT FROM contract.pr_repositories[1]
+                    OR pr_authority.datasource_id::text
+                        IS DISTINCT FROM contract.pr_bindings->0->>'datasource_id'
+                    OR pr_authority.forge
+                        IS DISTINCT FROM contract.pr_bindings->0->>'forge'
+                    OR pr_authority.policy_revision::text
+                        IS DISTINCT FROM contract.pr_bindings->0->>'policy_revision'
+                    OR pr_authority.verified_at IS NULL
+                    OR pr_authority.verified_record_id
+                        IS DISTINCT FROM pr_authority.record_id
+                    OR pr_authority.verified_generation
+                        IS DISTINCT FROM pr_authority.record_generation
+                    OR pr_authority.verified_head
+                        IS DISTINCT FROM pr_authority.head
+                    OR pr_authority.verified_base
+                        IS DISTINCT FROM pr_authority.base
+                    OR pr_authority.verified_head_revision
+                        IS DISTINCT FROM pr_authority.source_revision
+                    OR NOT EXISTS (
+                        SELECT 1
+                          FROM public.job_datasources AS attachment
+                          JOIN public.datasources AS datasource
+                            ON datasource.id = attachment.datasource_id
+                         WHERE attachment.job_id = NEW.id
+                           AND attachment.datasource_id =
+                               pr_authority.datasource_id
+                           AND datasource.type = 'repository'
+                           AND datasource.read_only IS NOT TRUE
+                           AND datasource.policy_revision IS NOT DISTINCT FROM
+                               CASE
+                                   WHEN COALESCE(
+                                       contract.pr_bindings->0->>'policy_revision', ''
+                                   ) ~ '^[0-9]+$'
+                                   THEN (contract.pr_bindings->0->>'policy_revision')::integer
+                                   ELSE NULL
+                               END
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM public.project_datasources AS project_link
+                                WHERE project_link.project_id = NEW.project_id
+                                  AND project_link.datasource_id = datasource.id
+                                  AND project_link.read_only
+                           )
+                    )
+                )
+            )
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'pr_deliverable_requires_live_proof',
+                MESSAGE = 'The pull-request deliverable has not been verified';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: enforce_job_deliverable_contract_row_immutability(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_job_deliverable_contract_row_immutability() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- The INSERT capture trigger necessarily runs before the current writer
+    -- can attach its exact datasource bindings. Permit that single promotion
+    -- only inside the transaction that created the compatibility row. Once
+    -- server-normalized (or once the creating transaction commits), contract
+    -- identity can never change; live PR proof has separate mutable columns.
+    IF OLD.provenance = 'rolling_trigger_backfill'
+       AND NEW.provenance = 'server_normalized'
+       AND OLD.created_at = transaction_timestamp() THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.job_id IS DISTINCT FROM OLD.job_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.normalized_deliverables IS DISTINCT FROM OLD.normalized_deliverables
+       OR NEW.pr_repositories IS DISTINCT FROM OLD.pr_repositories
+       OR NEW.pr_bindings IS DISTINCT FROM OLD.pr_bindings
+       OR NEW.contract_digest IS DISTINCT FROM OLD.contract_digest
+       OR NEW.provenance IS DISTINCT FROM OLD.provenance THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'job_deliverable_contract_row_is_immutable',
+            MESSAGE = 'The normalized deliverable contract cannot change after admission';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_job_pull_request_authority_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_job_pull_request_authority_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    contract public.job_deliverable_contracts%ROWTYPE;
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.job_id IS DISTINCT FROM OLD.job_id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'job_pull_request_authority_job_is_immutable',
+            MESSAGE = 'Pull-request authority cannot move between jobs';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+          FROM public.jobs AS job
+          JOIN public.job_datasources AS attachment
+            ON attachment.job_id = job.id
+          JOIN public.datasources AS datasource
+            ON datasource.id = attachment.datasource_id
+         WHERE job.id = NEW.job_id
+           AND attachment.datasource_id = NEW.datasource_id
+           AND datasource.type = 'repository'
+           AND datasource.read_only IS NOT TRUE
+           AND datasource.policy_revision = NEW.policy_revision
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM public.project_datasources AS project_link
+                WHERE project_link.project_id = job.project_id
+                  AND project_link.datasource_id = datasource.id
+                  AND project_link.read_only
+           )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'job_pull_request_authority_requires_writable_attachment',
+            MESSAGE = 'Pull-request authority requires the exact writable attachment';
+    END IF;
+
+    SELECT * INTO contract
+      FROM public.job_deliverable_contracts
+     WHERE job_id = NEW.job_id;
+    IF FOUND AND cardinality(contract.pr_repositories) > 0 AND (
+        cardinality(contract.pr_repositories) <> 1
+        OR jsonb_array_length(contract.pr_bindings) <> 1
+        OR contract.pr_repositories[1] IS DISTINCT FROM NEW.repository
+        OR contract.pr_bindings->0->>'repository'
+            IS DISTINCT FROM NEW.repository
+        OR contract.pr_bindings->0->>'datasource_id'
+            IS DISTINCT FROM NEW.datasource_id::text
+        OR contract.pr_bindings->0->>'forge' IS DISTINCT FROM NEW.forge
+        OR contract.pr_bindings->0->>'policy_revision'
+            IS DISTINCT FROM NEW.policy_revision::text
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'job_pull_request_authority_mismatches_contract',
+            MESSAGE = 'Pull-request authority does not match the immutable contract';
     END IF;
     RETURN NEW;
 END;
@@ -1705,6 +2050,34 @@ $$;
 --
 
 COMMENT ON FUNCTION public.enforce_officer_ticket_claim_job_integrity() IS '0162 rolling-upgrade backstop: a ticket-bearing jobs row must match a durable claim already visible in the same transaction; legacy_unversioned rows remain non-authoritative cutover barriers.';
+
+
+--
+-- Name: enforce_officer_ticket_delivery_writer(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_officer_ticket_delivery_writer() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM public.officer_ticket_claims AS claim
+         WHERE claim.job_id = NEW.id
+    ) AND NOT EXISTS (
+        SELECT 1
+          FROM public.job_deliverable_contracts AS contract
+         WHERE contract.job_id = NEW.id
+           AND contract.provenance = 'server_normalized'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'officer_ticket_delivery_writer_is_current',
+            MESSAGE = 'Officer ticket admission requires current deliverable authority';
+    END IF;
+    RETURN NULL;
+END;
+$$;
 
 
 --
@@ -6875,6 +7248,30 @@ COMMENT ON TABLE public.job_datasources IS 'Explicit datasource selection for a 
 
 
 --
+-- Name: job_deliverable_contracts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_deliverable_contracts (
+    job_id uuid NOT NULL,
+    normalized_deliverables text[] NOT NULL,
+    pr_repositories text[] DEFAULT ARRAY[]::text[] NOT NULL,
+    pr_bindings jsonb DEFAULT '[]'::jsonb NOT NULL,
+    contract_digest text NOT NULL,
+    provenance text DEFAULT 'server_normalized'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT job_deliverable_contract_pr_shape CHECK ((jsonb_typeof(pr_bindings) = 'array'::text)),
+    CONSTRAINT job_deliverable_contract_provenance CHECK ((provenance = ANY (ARRAY['server_normalized'::text, 'rolling_trigger_backfill'::text])))
+);
+
+
+--
+-- Name: TABLE job_deliverable_contracts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_deliverable_contracts IS 'Server-normalized immutable job delivery contract. Pull-request identity and proof live separately from mutable jobs.context.';
+
+
+--
 -- Name: job_message_routes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6943,6 +7340,44 @@ COMMENT ON COLUMN public.job_message_routes.transitions IS 'Append-only [{at, fr
 
 
 --
+-- Name: job_pull_request_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_pull_request_authorities (
+    job_id uuid NOT NULL,
+    record_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    record_generation bigint DEFAULT 1 NOT NULL,
+    datasource_id uuid NOT NULL,
+    repository text NOT NULL,
+    forge text NOT NULL,
+    number integer NOT NULL,
+    url text NOT NULL,
+    head text NOT NULL,
+    base text NOT NULL,
+    source_revision text NOT NULL,
+    policy_revision integer NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    verified_at timestamp with time zone,
+    verified_record_id uuid,
+    verified_generation bigint,
+    verified_state text,
+    verified_head text,
+    verified_base text,
+    verified_head_revision text,
+    CONSTRAINT job_pull_request_authority_identity CHECK (((record_generation > 0) AND (number > 0) AND (repository ~ '^[a-z0-9][a-z0-9._-]{0,99}/[a-z0-9][a-z0-9._-]{0,99}$'::text) AND (forge <> ''::text) AND (length(forge) <= 32) AND (head <> ''::text) AND (length(head) <= 500) AND (base <> ''::text) AND (length(base) <= 500) AND (source_revision ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'::text) AND (length(url) <= 2000) AND (url !~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/]*@'::text))),
+    CONSTRAINT job_pull_request_authority_proof CHECK ((((verified_at IS NULL) AND (verified_record_id IS NULL) AND (verified_generation IS NULL) AND (verified_state IS NULL) AND (verified_head IS NULL) AND (verified_base IS NULL) AND (verified_head_revision IS NULL)) OR ((verified_at IS NOT NULL) AND (verified_record_id = record_id) AND (verified_generation = record_generation) AND (verified_state = ANY (ARRAY['open'::text, 'merged'::text, 'closed'::text])) AND (verified_head = head) AND (verified_base = base) AND (verified_head_revision = source_revision))))
+);
+
+
+--
+-- Name: TABLE job_pull_request_authorities; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_pull_request_authorities IS 'Server-owned PR identity written only after repo_open_pr verifies the exact pushed source branch. jobs.context.pull_request is a trigger-checked safe projection and never completion authority.';
+
+
+--
 -- Name: jobs; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6996,6 +7431,7 @@ CREATE TABLE public.jobs (
     origin text DEFAULT 'user'::text NOT NULL,
     wake_delivery_id uuid,
     wake_delivery_claim_attempt integer,
+    completion_outcome_kind text,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
@@ -7131,7 +7567,8 @@ CREATE VIEW public.job_summary AS
     j.total_tokens_used,
     j.total_requests,
     j.error_message,
-    j.runner_kind
+    j.runner_kind,
+    j.completion_outcome_kind
    FROM public.jobs j;
 
 
@@ -7579,6 +8016,7 @@ CREATE TABLE public.officer_ticket_claims (
     job_status_at_delete text,
     deletion_actor_user_id uuid,
     deletion_reason text,
+    completion_outcome_kind_at_delete text,
     CONSTRAINT officer_ticket_claim_authority_shape CHECK ((((source = 'legacy_unversioned'::text) AND (ready_generation_at IS NULL) AND (officer_incarnation IS NULL) AND (admission_config_fingerprint IS NULL) AND (admission_lineage_size IS NULL)) OR ((source <> 'legacy_unversioned'::text) AND (ready_generation_at IS NOT NULL) AND (officer_thread_id IS NOT NULL) AND (officer_incarnation IS NOT NULL) AND (admission_config_fingerprint IS NOT NULL) AND (admission_lineage_size IS NOT NULL)))),
     CONSTRAINT officer_ticket_claim_fingerprint_valid CHECK (((admission_config_fingerprint IS NULL) OR (admission_config_fingerprint ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT officer_ticket_claim_generation_finite CHECK (((ready_generation_at IS NULL) OR isfinite(ready_generation_at))),
@@ -7622,6 +8060,31 @@ COMMENT ON COLUMN public.officer_ticket_claims.job_id IS 'Durable job identity w
 --
 
 COMMENT ON COLUMN public.officer_ticket_claims.job_status_at_delete IS 'Status observed under the jobs row lock immediately before deletion. A non-terminal value remains a later-generation admission blocker.';
+
+
+--
+-- Name: officer_ticket_deliverable_requirements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.officer_ticket_deliverable_requirements (
+    project_id uuid NOT NULL,
+    ticket_note_id text NOT NULL,
+    ready_generation_at timestamp with time zone NOT NULL,
+    required_pr_repositories text[] NOT NULL,
+    source_kind text DEFAULT 'rejected_cloned_repository_path'::text NOT NULL,
+    officer_thread_id uuid NOT NULL,
+    officer_incarnation integer NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT officer_ticket_delivery_requirement_nonempty CHECK ((cardinality(required_pr_repositories) > 0)),
+    CONSTRAINT officer_ticket_delivery_requirement_source CHECK ((source_kind = 'rejected_cloned_repository_path'::text))
+);
+
+
+--
+-- Name: TABLE officer_ticket_deliverable_requirements; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.officer_ticket_deliverable_requirements IS 'Monotonic per-ready-generation PR requirement recorded before a rejected Officer external-repository contract returns; prevents kb: laundering.';
 
 
 --
@@ -10950,11 +11413,43 @@ ALTER TABLE ONLY public.job_datasources
 
 
 --
+-- Name: job_deliverable_contracts job_deliverable_contracts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_deliverable_contracts
+    ADD CONSTRAINT job_deliverable_contracts_pkey PRIMARY KEY (job_id);
+
+
+--
 -- Name: job_message_routes job_message_routes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.job_message_routes
     ADD CONSTRAINT job_message_routes_pkey PRIMARY KEY (route_id);
+
+
+--
+-- Name: job_pull_request_authorities job_pull_request_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_pull_request_authorities
+    ADD CONSTRAINT job_pull_request_authorities_pkey PRIMARY KEY (job_id);
+
+
+--
+-- Name: job_pull_request_authorities job_pull_request_authorities_record_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_pull_request_authorities
+    ADD CONSTRAINT job_pull_request_authorities_record_id_key UNIQUE (record_id);
+
+
+--
+-- Name: jobs jobs_completion_outcome_kind; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.jobs
+    ADD CONSTRAINT jobs_completion_outcome_kind CHECK (((completion_outcome_kind IS NULL) OR (completion_outcome_kind = 'blocked_undelivered'::text))) NOT VALID;
 
 
 --
@@ -11158,11 +11653,27 @@ ALTER TABLE ONLY public.officer_floor_wake_episodes
 
 
 --
+-- Name: officer_ticket_claims officer_ticket_claim_delete_outcome_kind; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.officer_ticket_claims
+    ADD CONSTRAINT officer_ticket_claim_delete_outcome_kind CHECK (((completion_outcome_kind_at_delete IS NULL) OR (completion_outcome_kind_at_delete = 'blocked_undelivered'::text))) NOT VALID;
+
+
+--
 -- Name: officer_ticket_claims officer_ticket_claims_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.officer_ticket_claims
     ADD CONSTRAINT officer_ticket_claims_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: officer_ticket_deliverable_requirements officer_ticket_deliverable_requirements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_deliverable_requirements
+    ADD CONSTRAINT officer_ticket_deliverable_requirements_pkey PRIMARY KEY (project_id, ticket_note_id, ready_generation_at);
 
 
 --
@@ -14535,6 +15046,34 @@ CREATE TRIGGER trg_canvas_revoke_user_admission AFTER UPDATE OF is_approved ON p
 
 
 --
+-- Name: jobs trg_capture_job_deliverable_contract; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.capture_job_deliverable_contract();
+
+
+--
+-- Name: jobs trg_job_deliverable_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_job_deliverable_authority BEFORE INSERT OR UPDATE OF context, status, completion_outcome_kind ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_job_deliverable_authority();
+
+
+--
+-- Name: job_deliverable_contracts trg_job_deliverable_contract_row_immutability; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_job_deliverable_contract_row_immutability BEFORE UPDATE OF job_id, normalized_deliverables, pr_repositories, pr_bindings, contract_digest, provenance, created_at ON public.job_deliverable_contracts FOR EACH ROW EXECUTE FUNCTION public.enforce_job_deliverable_contract_row_immutability();
+
+
+--
+-- Name: job_pull_request_authorities trg_job_pull_request_authority_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_job_pull_request_authority_scope BEFORE INSERT OR UPDATE ON public.job_pull_request_authorities FOR EACH ROW EXECUTE FUNCTION public.enforce_job_pull_request_authority_scope();
+
+
+--
 -- Name: jobs trg_job_wake_requires_execution_admission; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -14602,6 +15141,13 @@ CREATE TRIGGER trg_managed_thread_repository_cleanup BEFORE DELETE ON public.thr
 --
 
 CREATE TRIGGER trg_managed_thread_repository_url_authority BEFORE INSERT OR UPDATE OF metadata, agent_id ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_thread_repository_url_authority();
+
+
+--
+-- Name: jobs trg_officer_ticket_delivery_writer; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER trg_officer_ticket_delivery_writer AFTER INSERT ON public.jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_ticket_delivery_writer();
 
 
 --
@@ -15187,6 +15733,14 @@ ALTER TABLE ONLY public.job_datasources
 
 
 --
+-- Name: job_deliverable_contracts job_deliverable_contracts_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_deliverable_contracts
+    ADD CONSTRAINT job_deliverable_contracts_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
 -- Name: job_message_routes job_message_routes_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15216,6 +15770,14 @@ ALTER TABLE ONLY public.job_message_routes
 
 ALTER TABLE ONLY public.job_message_routes
     ADD CONSTRAINT job_message_routes_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_pull_request_authorities job_pull_request_authorities_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_pull_request_authorities
+    ADD CONSTRAINT job_pull_request_authorities_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
 
 
 --
@@ -15416,6 +15978,14 @@ ALTER TABLE ONLY public.officer_floor_wake_episodes
 
 ALTER TABLE ONLY public.officer_ticket_claims
     ADD CONSTRAINT officer_ticket_claims_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: officer_ticket_deliverable_requirements officer_ticket_deliverable_requirements_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_deliverable_requirements
+    ADD CONSTRAINT officer_ticket_deliverable_requirements_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
 
 
 --

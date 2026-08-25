@@ -233,6 +233,50 @@ async def test_live_session_receives_the_input_as_role_event():
 
 
 @pytest.mark.asyncio
+async def test_blocked_outcome_uses_one_truthful_officer_dedup_identity():
+    row = _claim_row(
+        status="cancelled",
+        completion_outcome_kind="blocked_undelivered",
+        project_id="project-1",
+    )
+    thread = _thread(metadata={"config_override": {"officer": {"enabled": True}}})
+    db = _db(claimed=[row], thread=thread, agent=_agent())
+    db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+
+    db.enqueue_session_wake_event.assert_awaited_once()
+    kwargs = db.enqueue_session_wake_event.await_args.kwargs
+    assert kwargs["dedup_key"] == f"{JOB_ID[:8]}:blocked_undelivered"
+    assert kwargs["payload"]["status"] == "blocked_undelivered"
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "cancelled")
+    assert _FakeAsyncClient.posts == []
+
+
+@pytest.mark.asyncio
+async def test_completion_hook_and_outbox_share_blocked_officer_dedup_key(
+    monkeypatch,
+):
+    db = _db()
+    db.get_job = AsyncMock(
+        return_value={
+            **_claim_row(
+                status="cancelled",
+                completion_outcome_kind="blocked_undelivered",
+                project_id="project-1",
+            )
+        }
+    )
+    db.route_project_officer_job_transition = AsyncMock(return_value={"enqueued": True})
+    monkeypatch.setattr(session_wake, "kick_event_drain", lambda _db: None)
+
+    assert await session_wake._notify_project_officer_of_job(db, JOB_ID, "cancelled")
+    kwargs = db.route_project_officer_job_transition.await_args.kwargs
+    assert kwargs["status"] == "blocked_undelivered"
+    assert kwargs["dedup_key"] == f"{JOB_ID[:8]}:blocked_undelivered"
+
+
+@pytest.mark.asyncio
 async def test_live_inject_uses_a_split_timeout_not_a_flat_one():
     """A flat 30s against a black-holed pod IP burns 30s inside the drain."""
     db = _db(claimed=[_claim_row()], thread=_thread(), agent=_agent())

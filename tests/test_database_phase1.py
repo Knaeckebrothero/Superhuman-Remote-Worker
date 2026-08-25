@@ -78,7 +78,7 @@ class TestPostgresDB:
         assert not db.is_connected
 
     @pytest.mark.asyncio
-    async def test_jobs_merge_context_is_an_atomic_top_level_jsonb_merge(self):
+    async def test_jobs_merge_context_strips_server_owned_pull_request(self):
         db = PostgresDB(connection_string="postgresql://test")
         db.execute = AsyncMock(return_value="UPDATE 1")
         job_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -92,9 +92,7 @@ class TestPostgresDB:
         sql, payload, bound_job_id = db.execute.await_args.args
         normalized_sql = " ".join(sql.split())
         assert "COALESCE(context, '{}'::jsonb) || $1::jsonb" in normalized_sql
-        assert json.loads(payload) == {
-            "pull_request": {"number": 9, "url": "https://gh/pr/9"}
-        }
+        assert json.loads(payload) == {}
         assert bound_job_id == job_id
 
 
