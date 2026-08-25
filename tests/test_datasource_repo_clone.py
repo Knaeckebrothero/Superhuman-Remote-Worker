@@ -8,7 +8,9 @@ credentials and repos onto the agent pod (no_workspace_agent_mode.md §9.4).
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from src.core.datasource_setup import (
     clone_repository_datasources,
@@ -345,6 +347,88 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         assert meta["repo"] == "Superhuman-Remote-Worker"
         assert meta["token"] == "tok123"
         assert meta["read_only"] is False
+
+    def test_real_payload_carries_server_owned_datasource_identity(self):
+        datasource_id = "22222222-2222-4222-8222-222222222222"
+        payload = agent_payload(
+            token_ds(
+                id=datasource_id,
+                config={"forge": "github"},
+                project_read_only=False,
+            )
+        )
+
+        assert payload[0]["datasource_id"] == datasource_id
+        assert "id" not in payload[0]
+
+        ws = make_workspace_manager()
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources(payload, ws)
+
+        assert ws.source_repo_meta["repo"]["datasource_id"] == datasource_id
+
+    @pytest.mark.asyncio
+    async def test_resolved_row_reaches_the_pr_authority_writer(self):
+        """Resolved DB row -> payload -> clone -> tool retains one exact UUID."""
+
+        from src.tools.context import ToolContext
+        from src.tools.repo import create_repo_tools
+
+        datasource_id = "22222222-2222-4222-8222-222222222222"
+        payload = agent_payload(
+            token_ds(
+                id=datasource_id,
+                name="Widget",
+                url="https://github.com/acme/widget.git",
+                config={"forge": "github"},
+                project_read_only=False,
+            )
+        )
+        ws = make_workspace_manager()
+        git_mgr = MagicMock()
+        git_mgr.current_branch.return_value = "job/exact-authority"
+        git_mgr.rev_parse.return_value = "a" * 40
+        with patch("src.managers.git_manager.GitManager.clone", return_value=git_mgr):
+            clone_repository_datasources(payload, ws)
+
+        context = ToolContext(workspace_manager=ws)
+        context.job_id = "11111111-1111-4111-8111-111111111111"
+        context.postgres_db = MagicMock()
+        context.postgres_db.jobs.record_pull_request = AsyncMock(return_value=True)
+        tool = next(
+            candidate
+            for candidate in create_repo_tools(context)
+            if candidate.name == "repo_open_pr"
+        )
+
+        with (
+            patch(
+                "src.tools.repo.repo_tools.open_pull_request",
+                return_value={"number": 7, "url": "https://github.test/pr/7"},
+            ),
+            patch(
+                "src.tools.repo.repo_tools.get_pull_request_status",
+                return_value={
+                    "number": 7,
+                    "url": "https://github.test/pr/7",
+                    "state": "open",
+                    "head": "job/exact-authority",
+                    "base": "main",
+                    "head_sha": "a" * 40,
+                    "draft": False,
+                },
+            ),
+        ):
+            result = await tool.ainvoke(
+                {"repo": "widget", "title": "Exact", "base": "main"}
+            )
+
+        assert "Opened #7" in result
+        call = context.postgres_db.jobs.record_pull_request.await_args
+        assert str(call.args[0]) == context.job_id
+        assert str(call.args[1]) == datasource_id
 
     def test_clone_from_real_payload_honours_project_read_only(self):
         """Guard for the key-name gap: the payload says

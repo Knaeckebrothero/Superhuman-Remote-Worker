@@ -246,6 +246,17 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
                 f"Repository {repo!r} has no forge recorded, so its API cannot be "
                 "called. Set 'forge' on the connector and re-run the job."
             )
+        try:
+            datasource_id = UUID(str(meta.get("datasource_id") or ""))
+        except (TypeError, ValueError, AttributeError):
+            # The datasource binding is server-supplied runtime metadata, not
+            # a model argument.  Refuse before the non-idempotent forge call if
+            # an old/malformed payload cannot name the exact attached row.
+            return (
+                f"Repository {repo!r} has no valid server-recorded datasource "
+                "authority, so a pull request cannot be opened. Re-attach the "
+                "repository and retry."
+            )
 
         checked_out = git_mgr.current_branch()
         requested_head = head.strip() if isinstance(head, str) else None
@@ -315,7 +326,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
             if context.postgres_db is not None and context.job_id:
                 recorded = await context.postgres_db.jobs.record_pull_request(
                     UUID(str(context.job_id)),
-                    UUID(str(meta.get("datasource_id") or "")),
+                    datasource_id,
                     pull_request,
                     source_revision=source_revision,
                 )

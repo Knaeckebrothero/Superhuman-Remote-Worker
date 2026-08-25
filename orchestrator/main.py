@@ -31249,6 +31249,14 @@ def _build_datasources_payload(
             # read-only binding for the same notes.
             entry["config"] = _normalize_kb_config(ds.get("config"), stored=True)
         if ds_type == "repository":
+            # Repository identity is server-owned runtime authority.  Keep the
+            # raw database ``id`` out of the payload, but carry its exact value
+            # under the dedicated internal key consumed by the clone/tool
+            # binding.  ``resolved_ds`` comes from the authorization query;
+            # callers and models never select this field.
+            datasource_id = ds.get("id")
+            if datasource_id is not None:
+                entry["datasource_id"] = str(datasource_id)
             # The clone reads config["forge"] to resolve the forge API base;
             # without it every repository records forge="" and repo_open_pr
             # can never be used. _datasource_row_to_dict already parsed the
