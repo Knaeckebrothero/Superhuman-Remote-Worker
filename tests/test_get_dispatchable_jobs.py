@@ -68,6 +68,7 @@ async def db(pg_dsn):
                 -- Gate 1: the legacy dispatcher serves pinned jobs only.
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 branch_name text,
+                repo_name text,
                 context jsonb,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 freeze_data jsonb
@@ -144,6 +145,9 @@ async def test_dispatchable_set_and_ordering(db):
     assert ids == [str(_u(2)), str(_u(1)), str(_u(8)), str(_u(10))], (
         "clean pinned jobs dispatch in priority order; stateless jobs stay out"
     )
+    # The managed repository authority keys on repo_name; a projection that
+    # drops it dispatches every job with a credential-less remote.
+    assert all("repo_name" in dict(r) for r in got)
 
 
 @pytest.mark.asyncio

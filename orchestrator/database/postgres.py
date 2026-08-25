@@ -16381,7 +16381,10 @@ class PostgresDB:
                 SELECT j.id, j.description, j.status, j.config_name,
                        j.config_override, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
-                       j.execution_lane, j.branch_name, j.context, j.created_at
+                       j.execution_lane, j.branch_name, j.context, j.created_at,
+                       -- The managed repository authority keys on repo_name;
+                       -- a row without it dispatches a credential-less remote.
+                       j.repo_name
                 FROM jobs j
                 -- These three terms are the partial index idx_jobs_dispatchable
                 -- (0046). Statuses MUST stay literal (see docstring); the
