@@ -1,0 +1,177 @@
+# Hermetic values for the owned application E2E cluster. Runtime image tags and
+# credentials are generated separately by harness.py; this file contains no
+# secret material and is safe to render in diagnostics.
+license:
+  acceptTerms: true
+
+fullnameOverride: srw-e2e
+
+global:
+  domain: srw-e2e.test
+
+image:
+  orchestrator:
+    repository: srw-e2e-orchestrator
+    tag: replace-at-runtime
+    pullPolicy: IfNotPresent
+  agent:
+    repository: srw-e2e-agent
+    tag: replace-at-runtime
+    pullPolicy: IfNotPresent
+  cockpit:
+    repository: srw-e2e-cockpit
+    tag: replace-at-runtime
+    pullPolicy: IfNotPresent
+
+auth:
+  bff:
+    cookieSecure: "0"
+    cookieDomain: ""
+    cookieSamesite: lax
+    sameOriginApi: true
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false
+    issuerName: ""
+
+externalSecrets:
+  enabled: false
+
+secrets:
+  create: false
+  existingSecret: srw-e2e-app-secrets
+  existingVmSshKeySecret: srw-e2e-vm-ssh-key
+
+sessionRouter:
+  ingressClass: traefik
+  ingressHost: srw-e2e.test
+  jwtSecretName: srw-e2e-app-secrets
+  jwtSecretKey: SESSION_JWT_SECRET
+
+orchestrator:
+  replicas: 1
+  resources:
+    requests: {memory: 256Mi, cpu: 100m}
+    limits: {memory: 1Gi, cpu: 750m}
+
+cockpit:
+  replicas: 1
+  resources:
+    requests: {memory: 96Mi, cpu: 50m}
+    limits: {memory: 384Mi, cpu: 250m}
+
+agent:
+  pool:
+    minAgents: "0"
+    buffer: "0"
+    reservedSessionSlots: "0"
+    reservedJobSlots: "0"
+    maxAgents: "2"
+  resources:
+    requests: {memory: 384Mi, cpu: 150m}
+    limits: {memory: 1536Mi, cpu: 1000m}
+  networkPolicy:
+    enabled: true
+    extraEgress:
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: srw-e2e-model-fixture
+        ports:
+          - protocol: TCP
+            port: 8000
+
+# Only the databases required by auth, orchestration, transcript persistence,
+# and the current 4,096-dimensional embedding store remain enabled.
+databases:
+  postgres:
+    storageSize: 2Gi
+  vector:
+    storageSize: 2Gi
+  audit:
+    enabled: false
+  gitea:
+    enabled: false
+  keycloak:
+    storageSize: 1Gi
+  neo4j:
+    enabled: false
+
+gitea:
+  enabled: false
+
+mcp:
+  enabled: false
+
+nextcloud:
+  enabled: false
+
+opencloud:
+  enabled: false
+
+cloud:
+  externalBackend: ""
+  externalUrl: ""
+
+garage:
+  enabled: false
+
+virtualWorkspace:
+  rclone:
+    type: memory
+    root: ""
+
+workspace:
+  storageSize: 1Gi
+  # k3d's local-path provisioner is RWO-only. This shared mount is still used
+  # by the orchestrator even when dynamic workspace PVCs are disabled below.
+  accessMode: ReadWriteOnce
+  pvcEnabled: false
+  prewarm:
+    enabled: false
+  networkPolicy:
+    enabled: false
+
+reloader:
+  enabled: false
+
+pgadmin:
+  enabled: false
+
+dozzle:
+  enabled: false
+
+codexProxy:
+  enabled: false
+
+nats:
+  internal: false
+  url: ""
+
+vm:
+  mode: "off"
+
+llm:
+  seed:
+    enabled: true
+    systemEndpoints:
+      - label: SRW deterministic E2E fixture
+        baseUrl: http://srw-e2e-model-fixture.srw-e2e.svc.cluster.local:8000/v1
+        apiKeyRef:
+          secretName: srw-e2e-model-fixture
+          key: inference-api-key
+        models:
+          - id: e2e-chat
+            displayName: E2E Chat
+            family: e2e
+            # Large enough for the real session prompt/tool schema. P0 is a
+            # workflow gate, not a context-compaction limit test.
+            contextWindow: 128000
+            capabilities: [chat, auxiliary]
+          - id: e2e-embedding
+            displayName: E2E Embedding
+            family: e2e
+            capabilities: [embedding]

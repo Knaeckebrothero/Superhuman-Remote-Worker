@@ -1,0 +1,31 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  # Replaced by the harness before creation. A committed, fixed cluster name
+  # would make it too easy to target a developer's long-lived cluster.
+  name: __CLUSTER_NAME__
+servers: 1
+agents: 1
+image: rancher/k3s:v1.31.5-k3s1
+# Configure the internal server load balancer for HTTP while asking Docker for
+# a dynamic host port. The browser runs on this cluster's private bridge and
+# uses port 80 directly; host port 80 may belong to a developer cluster.
+ports:
+  - port: "0:80"
+    nodeFilters:
+      - loadbalancer
+options:
+  k3d:
+    wait: true
+    timeout: 180s
+    disableLoadbalancer: false
+    disableImageVolume: false
+  kubeconfig:
+    updateDefaultKubeconfig: false
+    switchCurrentContext: false
+  runtime:
+    labels:
+      - label: srw.io/e2e-owned=true
+        nodeFilters:
+          - server:*
+          - agent:*
