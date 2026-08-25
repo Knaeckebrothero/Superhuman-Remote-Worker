@@ -171,6 +171,53 @@ class TestChangedTests:
         assert "tests/test_brand_new.py" in sel(["tests/test_brand_new.py"], repo)
 
 
+class TestNonTestFilesUnderTests:
+    """Only ``test_*.py`` may be handed to pytest as a target.
+
+    Everything else under ``tests/`` — helpers, package inits, the fixture
+    container's entrypoint — is a dependency. Emitting one makes CI import a
+    module nobody wrote to be collected, and the run dies at collection with a
+    ModuleNotFoundError that has nothing to do with the change.
+    """
+
+    @pytest.fixture
+    def repo(self, repo: Path) -> Path:
+        (repo / "tests" / "support").mkdir()
+        (repo / "tests" / "__init__.py").write_text("")
+        (repo / "tests" / "support" / "__init__.py").write_text("")
+        (repo / "tests" / "support" / "harness.py").write_text("HARNESS = 1\n")
+        # Runs only inside its own image, where `harness` is top-level.
+        (repo / "tests" / "support" / "run.py").write_text(
+            "from harness import HARNESS\n"
+        )
+        (repo / "tests" / "test_harness.py").write_text(
+            "from tests.support.harness import HARNESS\n\ndef test_x(): assert HARNESS\n"
+        )
+        return repo
+
+    def test_a_changed_helper_selects_its_importers_not_itself(self, repo: Path):
+        got = sel(["tests/support/harness.py"], repo)
+        assert "tests/support/harness.py" not in got
+        assert "tests/test_harness.py" in got
+
+    def test_a_helper_nobody_imports_is_never_a_target(self, repo: Path):
+        """run.py's own import only resolves inside its image, never under pytest."""
+        assert "tests/support/run.py" not in sel(["tests/support/run.py"], repo)
+
+    def test_a_changed_package_init_selects_the_tests_that_import_through_it(
+        self, repo: Path
+    ):
+        got = sel(["tests/support/__init__.py"], repo)
+        assert "tests/support/__init__.py" not in got
+        assert "tests/test_harness.py" in got
+
+    def test_a_source_package_init_selects_its_dependents(self, repo: Path):
+        (repo / "src" / "core" / "__init__.py").write_text("")
+        got = sel(["src/core/__init__.py"], repo)
+        assert "tests/test_leaf.py" in got
+        assert "tests/test_hub.py" in got  # via src.tools.hub -> src.core.mid
+
+
 class TestGraphInternals:
     def test_relative_imports_resolve_within_a_package(self, tmp_path: Path):
         (tmp_path / "src" / "pkg").mkdir(parents=True)
@@ -250,6 +297,33 @@ class TestAgainstTheRealRepo:
             f"a leaf module selected {len(got)}/{total} test files; if even leaf "
             f"changes cannot narrow, the graph is not buying anything"
         )
+
+    def test_never_emits_a_path_pytest_cannot_collect(self):
+        """The 2026-08-25 CI break: the e2e fixture's entrypoint was a target.
+
+        ``tests/e2e/app/deterministic_provider/run.py`` imports ``provider`` as
+        its container image lays it out, so importing it from the repo root
+        raises ModuleNotFoundError and takes the whole run down at collection.
+        """
+        got = select(
+            [
+                "tests/e2e/__init__.py",
+                "tests/e2e/app/harness.py",
+                "tests/e2e/app/deterministic_provider/provider.py",
+                "tests/e2e/app/deterministic_provider/run.py",
+            ],
+            REPO,
+        )
+        assert got != ALL
+        assert "tests/e2e/app/deterministic_provider/run.py" not in got
+        uncollectable = [p for p in got if not Path(p).name.startswith("test_")]
+        assert not uncollectable, (
+            f"selector emitted paths pytest will not collect on its own: "
+            f"{uncollectable}"
+        )
+        # The helper's own tests still run — this narrows, it does not drop.
+        assert "tests/e2e/app/test_harness.py" in got
+        assert "tests/e2e/app/deterministic_provider/test_provider.py" in got
 
     def test_the_always_run_tripwires_are_always_present(self):
         got = select(["src/tools/workspace/files.py"], REPO)
