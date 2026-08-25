@@ -535,6 +535,9 @@ approval request in the cockpit; approve it and the command runs.
 | `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart sets access modes explicitly |
 | VM `Stopped` after the guest powered off | KubeVirt does not restart a voluntary shutdown; the orchestrator recovers the job with the kept root disk |
 | `sudo` inside the VM is denied with "orchestrator unreachable" | the guest daemon cannot reach the orchestrator Service on 8085 — check the workspace NetworkPolicy and that `vm.mode` is `same-cluster` |
+| the agent logs `the final git push did NOT land` and the job's Gitea repo stays at "Initial commit" | the workspace was handed a remote it cannot authenticate. The orchestrator logs `Dispatch: repository transport for job …` at every dispatch: it must name an `ssh://srw-repo-…` alias with `1 managed credential(s)`; a plain `http://…` with `0 managed credential(s)` means the job row reached dispatch without `repo_name` or the managed repository authority could not be proven (a `No managed repository authority for job …` warning precedes it) |
+| the job page reports the IDE as `unavailable: code-server is not running on the live VM` | expected: the VM image ships `code-server.service` disabled and the live-VM IDE is not wired yet; the snapshot-based IDE still works after the job ends |
+| the orchestrator logs `VM controller rejected delete … persistentvolumeclaims … is forbidden` after a job completes | a chart older than 2026-08-25 granted the controller only `get,list` on PersistentVolumeClaims; the captured teardown deletes the exact rootdisk PVC by UID and needs `delete`. Upgrade the chart |
 
 ### Network isolation
 
