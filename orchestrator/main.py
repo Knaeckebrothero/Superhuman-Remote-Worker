@@ -141,6 +141,7 @@ from security.auth import (  # noqa: E402
 from security.access import (  # noqa: E402
     PROJECT_ARCHIVED_DETAIL,
     externalize_gitea_url,
+    vm_workspaces_on_pod_network,
     filter_visible_datasources,
     is_internal_call,
     log_security_event,
@@ -4300,13 +4301,14 @@ async def _build_job_start_request(
                 return None
 
         if workspace_decision.effective_backend == "vm":
-            if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
-                git_remote_url = externalize_gitea_url(git_remote_url)
-            for repository in repositories_payload or []:
-                if not repository.get("is_managed") and repository.get("repo_url"):
-                    repository["repo_url"] = externalize_gitea_url(
-                        repository["repo_url"]
-                    )
+            if not vm_workspaces_on_pod_network():
+                if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
+                    git_remote_url = externalize_gitea_url(git_remote_url)
+                for repository in repositories_payload or []:
+                    if not repository.get("is_managed") and repository.get("repo_url"):
+                        repository["repo_url"] = externalize_gitea_url(
+                            repository["repo_url"]
+                        )
             logger.info(
                 "Dispatch: injected attested VM workspace config for job %s",
                 job_id,
@@ -4883,13 +4885,14 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             )
             return False
         if workspace_decision.effective_backend == "vm":
-            if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
-                git_remote_url = externalize_gitea_url(git_remote_url)
-            for repository in repositories_payload or []:
-                if not repository.get("is_managed") and repository.get("repo_url"):
-                    repository["repo_url"] = externalize_gitea_url(
-                        repository["repo_url"]
-                    )
+            if not vm_workspaces_on_pod_network():
+                if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
+                    git_remote_url = externalize_gitea_url(git_remote_url)
+                for repository in repositories_payload or []:
+                    if not repository.get("is_managed") and repository.get("repo_url"):
+                        repository["repo_url"] = externalize_gitea_url(
+                            repository["repo_url"]
+                        )
 
         # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
         # sudo with the operator's reason instead of re-freezing into a new
@@ -37336,7 +37339,7 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
                 status_code=503,
                 detail="Workspace repository authority is unavailable",
             ) from exc
-    if runtime_repository_backend == "vm":
+    if runtime_repository_backend == "vm" and not vm_workspaces_on_pod_network():
         for repository in repositories_payload or []:
             if not repository.get("is_managed") and repository.get("repo_url"):
                 repository["repo_url"] = externalize_gitea_url(repository["repo_url"])

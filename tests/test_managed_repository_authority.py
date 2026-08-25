@@ -986,3 +986,33 @@ async def test_ambiguous_credentialed_primary_url_never_reaches_runtime() -> Non
         )
 
     assert exc.value.code == "credentialed_repository_transport_refused"
+
+
+def test_same_cluster_vm_transport_uses_the_internal_ssh_endpoint(monkeypatch) -> None:
+    """A same-cluster VM sits on the pod network: it reaches the internal Gitea
+    SSH service like a container, and the routed endpoint may not exist."""
+    authority = _authority()
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setenv("GITEA_INTERNAL_URL", "http://gitea:3000")
+    monkeypatch.setenv("GITEA_SSH_INTERNAL_HOST", "gitea")
+    monkeypatch.setenv("GITEA_SSH_INTERNAL_PORT", "2222")
+    monkeypatch.delenv("GITEA_SSH_EXTERNAL_HOST", raising=False)
+
+    credential = runtime_credential(authority, backend="vm")
+
+    assert credential.ssh_host == "gitea"
+    assert credential.ssh_port == 2222
+
+
+def test_external_vm_transport_still_requires_the_routed_endpoint(monkeypatch) -> None:
+    authority = _authority()
+    monkeypatch.setenv("VM_MODE", "external")
+    monkeypatch.setenv("GITEA_INTERNAL_URL", "http://gitea:3000")
+    monkeypatch.setenv("GITEA_SSH_INTERNAL_HOST", "gitea")
+    monkeypatch.delenv("GITEA_SSH_EXTERNAL_HOST", raising=False)
+
+    with pytest.raises(ManagedRepositoryAuthorityError) as exc:
+        runtime_credential(authority, backend="vm")
+
+    assert exc.value.code == "repository_ssh_endpoint_unavailable"
+

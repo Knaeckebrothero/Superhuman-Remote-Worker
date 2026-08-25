@@ -797,7 +797,10 @@ async def authorize_thread_repository_transport(
 
 
 def _runtime_ssh_endpoint(*, backend: str) -> tuple[str, int]:
-    if backend == "vm":
+    # A same-cluster VM is on the pod network and reaches the internal SSH
+    # service exactly like a workspace container; only a tailnet VM needs the
+    # externally routed endpoint (which may not exist on that cluster at all).
+    if backend == "vm" and not vm_workspaces_on_pod_network():
         host = os.environ.get("GITEA_SSH_EXTERNAL_HOST", "").strip()
         port_raw = os.environ.get("GITEA_SSH_EXTERNAL_PORT", "22")
     else:

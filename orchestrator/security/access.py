@@ -991,6 +991,18 @@ def redact_datasources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # =============================================================================
 
 
+def vm_workspaces_on_pod_network() -> bool:
+    """True when VM workspaces run on this cluster (``vm.mode=same-cluster``).
+
+    Such a VM sits on the pod network like a workspace container, so it reaches
+    the cluster-internal Gitea HTTP and SSH endpoints directly — and the
+    externally-routed ones may not exist at all (k3d) or not resolve from
+    inside the guest. Only the cross-cluster topology (``external``, VMs on a
+    tailnet) needs the externalised addresses.
+    """
+    return os.environ.get("VM_MODE", "").strip().lower() == "same-cluster"
+
+
 def externalize_gitea_url(url: str | None) -> str | None:
     """Rewrite a cluster-internal Gitea URL to its externally-reachable form.
 

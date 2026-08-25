@@ -12311,6 +12311,20 @@ async def _poll_workspace_ready(
             thread_id, raise_on_denied=raise_on_denied
         )
         if not ws:
+            # The client collapses every non-200 to None. For a vm-tier
+            # session that includes a transient 5xx from the orchestrator
+            # (a restart, or a repository authority that is briefly
+            # unavailable) and bailing here mis-reports a booting VM as
+            # "never became ready" while releasing the pinned agent — the
+            # VM budget bounds the retry instead.
+            if require_vm:
+                logger.warning(
+                    "Thread %s: workspace status unavailable — retrying within "
+                    "the VM budget.",
+                    thread_id,
+                )
+                await asyncio.sleep(poll_interval)
+                continue
             return None
 
         # SSH key: orchestrator sends the path it resolved (dev compose
