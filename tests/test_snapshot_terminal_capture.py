@@ -609,3 +609,43 @@ async def test_snapshot_delete_requires_empty_prefix_after_batch() -> None:
 
     assert await service.delete_snapshot("thread-id", entity_type="threads") is False
     service._set_snapshot_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_recapture_keeps_an_available_snapshot() -> None:
+    """A retried terminal teardown re-captures against a VM that is already
+    going away. That failure must not downgrade the snapshot the first attempt
+    uploaded — the artifact is still in S3 and restorable."""
+    service = SnapshotService()
+    service._available = True
+    service._db = AsyncMock()
+    service._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-recapture",
+            "context": {"snapshot": {"status": "available", "checksum_sha256": "abc"}},
+        }
+    )
+    service._set_snapshot_context = AsyncMock()
+    service.upload_snapshot = AsyncMock(return_value=True)
+    failed = _capture_process(stdout=[], returncode=255)
+
+    with patch(
+        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=failed),
+    ):
+        captured = await service.capture_vm_snapshot(
+            job_id="job-recapture",
+            ssh_host="10.42.0.47",
+            ssh_port=22,
+            source_type="vm",
+        )
+
+    assert captured is False
+    service.upload_snapshot.assert_not_awaited()
+    for call in service._set_snapshot_context.await_args_list:
+        assert call.args[1].get("status") != "capture_failed"
+    # "capturing" is written before the SSH step; the failure must hand the
+    # earlier snapshot back by restoring "available", not leave "capturing".
+    last = service._set_snapshot_context.await_args_list[-1].args[1]
+    assert last["status"] == "available"
+    assert "rc=255" in last["last_capture_error"]

@@ -750,6 +750,9 @@ class SnapshotService:
 
         import tempfile
 
+        # Remembered before "capturing" overwrites it: a failed re-capture must
+        # hand an existing snapshot back rather than bury it under an error.
+        had_available_snapshot = await self._snapshot_is_available(job_id, entity_type)
         await self._set_snapshot_context(
             job_id, {"status": "capturing"}, entity_type=entity_type
         )
@@ -1006,13 +1009,11 @@ class SnapshotService:
                     total_bytes,
                     stderr[:500],
                 )
-                await self._set_snapshot_context(
+                await self._record_capture_failure(
                     job_id,
-                    {
-                        "status": "capture_failed",
-                        "error": f"SSH tar/zstd failed (rc={process.returncode})",
-                    },
+                    f"SSH tar/zstd failed (rc={process.returncode})",
                     entity_type=entity_type,
+                    previously_available=had_available_snapshot,
                 )
                 return False
             if strict_terminal:
@@ -2030,6 +2031,70 @@ class SnapshotService:
     # =========================================================================
     # Helpers
     # =========================================================================
+
+    async def _snapshot_is_available(self, entity_id: str, entity_type: str) -> bool:
+        """True when the entity already carries an ``available`` snapshot."""
+        try:
+            if entity_type == "threads":
+                row = await self._db.get_thread(entity_id)
+                container = (row or {}).get("metadata")
+            else:
+                row = await self._db.get_job(entity_id)
+                container = (row or {}).get("context")
+            if isinstance(container, str):
+                container = json.loads(container)
+            snapshot = (container or {}).get("snapshot") or {}
+            return snapshot.get("status") == "available"
+        except Exception:
+            logger.debug(
+                "Could not read snapshot context for %s %s",
+                entity_type.rstrip("s"),
+                entity_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _record_capture_failure(
+        self,
+        entity_id: str,
+        error: str,
+        *,
+        entity_type: str = "jobs",
+        previously_available: bool = False,
+    ) -> None:
+        """Stamp a capture failure without downgrading a snapshot that exists.
+
+        A retried terminal teardown re-captures against a VM that is already
+        going away. The first attempt's archive is still in S3 and restorable,
+        so a later failure must not flip it to ``capture_failed`` — that would
+        hide a good snapshot behind an error while keeping its checksum.
+        ``previously_available`` is the state observed before this capture
+        wrote ``capturing`` over it; the manifest fields survive the merge, so
+        restoring ``available`` hands the earlier snapshot back intact.
+        """
+        if previously_available:
+            logger.warning(
+                "Snapshot re-capture failed for %s %s but an earlier snapshot "
+                "is available; keeping it: %s",
+                entity_type.rstrip("s"),
+                entity_id,
+                error,
+            )
+            await self._set_snapshot_context(
+                entity_id,
+                {
+                    "status": "available",
+                    "last_capture_error": error,
+                    "last_capture_failed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                entity_type=entity_type,
+            )
+            return
+        await self._set_snapshot_context(
+            entity_id,
+            {"status": "capture_failed", "error": error},
+            entity_type=entity_type,
+        )
 
     async def _set_snapshot_context(
         self, entity_id: str, updates: dict, entity_type: str = "jobs"
