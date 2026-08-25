@@ -1,0 +1,11 @@
+# Keep the repository's browser/OS pin while restoring the Node 22 runtime
+# used by Cockpit CI. The upstream Playwright v1.59 image itself ships a newer
+# Node major; copying one exact Node distribution prevents that ambient major
+# from silently changing the application gate.
+FROM node:22.22.0-bookworm-slim AS node22
+FROM mcr.microsoft.com/playwright:v1.59.0-noble
+
+COPY --from=node22 /usr/local/ /usr/local/
+
+RUN node -e "if (process.versions.node.split('.')[0] !== '22') process.exit(1)" \
+    && npm --version
