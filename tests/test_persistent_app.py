@@ -6200,3 +6200,31 @@ class TestSessionBackendIsVm:
     def test_non_dict_is_not_vm(self):
         assert _session_backend_is_vm(None) is False
         assert _session_backend_is_vm("vm") is False
+
+
+@pytest.mark.asyncio
+async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
+    """A vm-tier attach must not mis-report a booting VM as 'never became
+    ready' because one workspace call collapsed to None (a 5xx during an
+    orchestrator restart, or a briefly unavailable repository authority)."""
+    from unittest.mock import AsyncMock
+
+    from src.api.persistent_app import _poll_workspace_ready
+
+    client = AsyncMock()
+    client.get_thread_workspace = AsyncMock(
+        side_effect=[
+            {"vm_status": "created"},
+            None,
+            {"vm_status": "ready", "vm_ssh_host": "10.42.0.78", "vm_ssh_port": 22},
+        ]
+    )
+
+    result = await _poll_workspace_ready(
+        client, "tid", timeout=10, poll_interval=0.01, require_vm=True
+    )
+
+    assert result is not None
+    assert result["backend"] == "vm"
+    assert result["remote"]["host"] == "10.42.0.78"
+    assert client.get_thread_workspace.call_count == 3
