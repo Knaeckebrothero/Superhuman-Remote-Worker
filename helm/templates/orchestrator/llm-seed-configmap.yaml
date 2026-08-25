@@ -38,7 +38,14 @@ data:
           {{- range $ep.models }}
           - id: {{ required "model.id is required" .id | quote }}
             displayName: {{ default .id .displayName | quote }}
+            {{- with .capabilities }}
+            capabilities:
+              {{- range . }}
+              - {{ . | quote }}
+              {{- end }}
+            {{- else }}
             capability: {{ default "chat" .capability | quote }}
+            {{- end }}
             {{- with .family }}
             family: {{ . | quote }}
             {{- end }}
@@ -48,6 +55,9 @@ data:
             {{- if hasKey . "reasoningLevel" }}
             reasoningLevel: {{ .reasoningLevel | quote }}
             {{- end }}
+            {{- if hasKey . "multimodal" }}
+            multimodal: {{ .multimodal }}
+            {{- end }}
             enabled: {{ default true .enabled }}
           {{- end }}
       {{- end }}
@@ -56,7 +66,14 @@ data:
       - provider: {{ required "llm.seed.systemModels[].provider is required" .provider | quote }}
         id: {{ required "llm.seed.systemModels[].id is required" .id | quote }}
         displayName: {{ default .id .displayName | quote }}
+        {{- with .capabilities }}
+        capabilities:
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+        {{- else }}
         capability: {{ default "chat" .capability | quote }}
+        {{- end }}
         {{- with .family }}
         family: {{ . | quote }}
         {{- end }}
@@ -65,6 +82,9 @@ data:
         {{- end }}
         {{- if hasKey . "reasoningLevel" }}
         reasoningLevel: {{ .reasoningLevel | quote }}
+        {{- end }}
+        {{- if hasKey . "multimodal" }}
+        multimodal: {{ .multimodal }}
         {{- end }}
         enabled: {{ default true .enabled }}
       {{- end }}

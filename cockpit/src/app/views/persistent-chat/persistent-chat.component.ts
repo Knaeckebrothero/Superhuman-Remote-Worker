@@ -1266,7 +1266,10 @@ export function clearDraft(threadId: string | null): void {
       }
 
       <!-- Messages -->
-      <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
+      <div class="messages"
+           #messagesContainer
+           (scroll)="onMessagesScroll()"
+           [attr.data-testid]="chat.isStartingSession() ? 'chat-startup' : null">
         <!-- Centered reading column: caps prose line length while the scrollbar
              stays at the pane edge. .jump-latest is kept OUTSIDE this wrapper so
              it floats over the scroll container (sticky + align-self:center). -->
@@ -1306,6 +1309,7 @@ export function clearDraft(threadId: string | null): void {
               @let queued = chat.outboxIds().has(turn.id);
               @let stalled = queued && chat.outboxStalled();
               <div class="message message-user"
+                   data-testid="chat-message-user"
                    [class.historical]="turn.historical"
                    [class.queued]="queued"
                    [class.stalled]="stalled"
@@ -1418,6 +1422,7 @@ export function clearDraft(threadId: string | null): void {
               @let last = lastTextEvent(turn);
               @let streaming = turn.status === 'streaming';
               <div class="message message-assistant turn-bubble"
+                   data-testid="chat-message-assistant"
                    [class.historical]="turn.historical"
                    [class.streaming]="streaming"
                    [class.collapsed]="isCollapsed"
@@ -1929,7 +1934,7 @@ export function clearDraft(threadId: string | null): void {
       <!-- Error banner -->
       @if (chat.error(); as err) {
         @if (!isShowingReconnectBanner()) {
-          <div class="error-banner">
+          <div class="error-banner" data-testid="chat-error" role="alert">
             <app-icon size="sm" class="error-icon">error</app-icon>
             {{ err }}
             <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
@@ -2085,6 +2090,7 @@ export function clearDraft(threadId: string | null): void {
             <textarea
               #inputEl
               class="chat-input"
+              data-testid="chat-composer"
               [(ngModel)]="inputText"
               (ngModelChange)="onInputChange($event)"
               (input)="autoResizeInput()"
@@ -2093,6 +2099,7 @@ export function clearDraft(threadId: string | null): void {
               (focus)="inputFocused.set(true)"
               (blur)="inputFocused.set(false)"
               [placeholder]="inputPlaceholder()"
+              [attr.aria-label]="'chat.input.defaultMobile' | transloco"
               [disabled]="!canCompose()"
               rows="1"
             ></textarea>
@@ -2166,10 +2173,12 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="send"
+                data-testid="chat-send"
                 [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
                 [class.interrupting]="chat.isInterrupting()"
                 [class.pending]="isPendingSend()"
                 [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+                [attr.aria-label]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
                 (pointerdown)="$event.preventDefault()"
                 (click)="chat.isStreaming() ? chat.interrupt() : send()"
                 [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"

@@ -457,6 +457,21 @@ class TestPodManifest:
         )
         assert m["spec"]["containers"][0]["image"] == "my-registry/agent:v2"
 
+    def test_image_pull_policy_from_env(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE_PULL_POLICY", "IfNotPresent")
+
+        manifest = self._build()
+
+        assert manifest["spec"]["containers"][0]["imagePullPolicy"] == "IfNotPresent"
+
+    def test_invalid_image_pull_policy_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE_PULL_POLICY", "Sometimes")
+
+        with pytest.raises(
+            ValueError, match="PERSISTENT_AGENT_IMAGE_PULL_POLICY must be one of"
+        ):
+            PersistentProvisioner()
+
 
 # =============================================================================
 # 7.8: K8s interaction (mocked API)

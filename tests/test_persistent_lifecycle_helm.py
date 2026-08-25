@@ -70,6 +70,54 @@ def test_flag_renders_through_configmap_and_orchestrator_environment() -> None:
     )
 
 
+def test_agent_pull_policy_reaches_dynamic_persistent_pods() -> None:
+    if shutil.which("helm") is None:
+        pytest.skip("helm is not installed")
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "pull-policy-proof",
+            str(CHART),
+            "-f",
+            str(CHART / "ci" / "test-values.yaml"),
+            "--set",
+            "image.agent.pullPolicy=IfNotPresent",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    documents = [doc for doc in yaml.safe_load_all(rendered) if doc]
+    configmap = next(
+        doc
+        for doc in documents
+        if doc.get("kind") == "ConfigMap"
+        and "PERSISTENT_AGENT_IMAGE_PULL_POLICY" in (doc.get("data") or {})
+    )
+    assert configmap["data"]["PERSISTENT_AGENT_IMAGE_PULL_POLICY"] == "IfNotPresent"
+
+    deployment = next(
+        doc
+        for doc in documents
+        if doc.get("kind") == "Deployment"
+        and any(
+            container.get("name") == "orchestrator"
+            for container in doc["spec"]["template"]["spec"]["containers"]
+        )
+    )
+    orchestrator = next(
+        container
+        for container in deployment["spec"]["template"]["spec"]["containers"]
+        if container.get("name") == "orchestrator"
+    )
+    env = {entry["name"]: entry for entry in orchestrator.get("env") or []}
+    assert (
+        env["PERSISTENT_AGENT_IMAGE_PULL_POLICY"]["valueFrom"]["configMapKeyRef"]["key"]
+        == "PERSISTENT_AGENT_IMAGE_PULL_POLICY"
+    )
+
+
 def test_runtime_verification_flag_renders_dark_and_can_be_enabled_explicitly() -> None:
     if shutil.which("helm") is None:
         pytest.skip("helm is not installed")

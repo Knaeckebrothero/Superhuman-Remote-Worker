@@ -1313,6 +1313,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: PERSISTENT_AGENT_IMAGE
                   optional: true
+            - name: PERSISTENT_AGENT_IMAGE_PULL_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PERSISTENT_AGENT_IMAGE_PULL_POLICY
+                  optional: true
             - name: PERSISTENT_AGENT_RECONCILIATION_ENABLED
               valueFrom:
                 configMapKeyRef:

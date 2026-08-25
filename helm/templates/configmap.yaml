@@ -775,6 +775,7 @@ data:
   # Agent pods (on-demand via AgentProvisioner)
   AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
   PERSISTENT_AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
+  PERSISTENT_AGENT_IMAGE_PULL_POLICY: {{ .Values.image.agent.pullPolicy | quote }}
 
   # Agent pool sizing (AgentProvisioner)
   MAX_AGENTS: {{ .Values.agent.pool.maxAgents | quote }}

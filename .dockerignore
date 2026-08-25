@@ -19,10 +19,27 @@ env/
 *.swp
 *.swo
 
+# Local agent/tool configuration (may contain tokens or private endpoints)
+.ai/
+.claude/
+.codex/
+.agents/
+.junie/
+.mcp.json
+.playwright-mcp/
+
 # Environment and secrets
+.env
 .env.txt
 .env.*
 !.env.example
+deployment/values-local.yaml
+docker/certs/
+.dev/
+.local-ssh/
+docker/vpn/config
+docker/vpn/cluster.conf
+docker/vpn/research.conf
 
 # Workspace data (runtime, not build-time)
 workspace/
@@ -35,6 +52,9 @@ output/
 .coverage
 coverage.xml
 htmlcov/
+cockpit/test-results/
+cockpit/playwright-report/
+cockpit/blob-report/
 
 # Python bytecode
 __pycache__/
@@ -58,6 +78,15 @@ project_documentation/
 
 # Advanced-LLM-Chat subproject (separate deployment)
 Advanced-LLM-Chat/
+CitationEngine/
+
+# Private/external repositories cloned into this checkout
+HomeLab/
+srw-cloud/
+KurortEngine/
+KurortEngine-salvage/
+KurortEngine-extracted/
+BetterResavio-KB/
 
 # VM/containerDisk build outputs (not needed by app image builds)
 docker/agent-vm-base/
