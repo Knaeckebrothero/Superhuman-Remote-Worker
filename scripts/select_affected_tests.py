@@ -19,11 +19,23 @@ Two edge types
 --------------
 1. **Import edges** — AST-parsed, resolved against this repo's two import roots
    (the repo root and ``orchestrator/``, mirroring ``tests/conftest.py``), then
-   closed transitively.
+   closed transitively. Resolution yields the leaf module, so the package
+   ``__init__.py`` files Python runs on the way there are added as edges too:
+   ``from tests.e2e.app import harness`` executes three package bodies before
+   ``harness``, and a break in any of them fails the importing test.
 2. **Data edges** — many tests assert on files rather than code: YAML under
    ``config/``, the app-guide markdown, ``cockpit/angular.json``, Helm templates.
    String literals that look like repo paths become dependencies too, so editing
    a config file selects the tests that read it.
+
+Targets vs dependencies
+-----------------------
+What this prints is a pytest argument list, so only ``tests/**/test_*.py`` may
+appear in it. Every other file — source, config, and the helpers, package inits
+and fixture entrypoints that also live under ``tests/`` — is a dependency:
+changing it selects the tests that reach it. Naming a non-test module as a
+target makes pytest import a file nobody wrote to be collected, which is a
+collection error rather than a test failure and takes the whole run with it.
 
 Bias
 ----
@@ -96,6 +108,11 @@ ALWAYS_RUN = (
     "tests/test_tool_grant_classification.py",
     "tests/test_config_tool_names_are_registered.py",
 )
+
+
+def _is_test_module(rel: str) -> bool:
+    """True for a path pytest collects on its own: ``tests/**/test_*.py``."""
+    return rel.startswith("tests/") and Path(rel).name.startswith("test_")
 
 
 def _module_candidates(path: Path, repo: Path) -> list[str]:
@@ -200,6 +217,23 @@ class Graph:
                 return hit
         return None
 
+    @lru_cache(maxsize=None)
+    def _package_inits(self, path: Path) -> frozenset[Path]:
+        """``__init__.py`` files Python executes when it imports ``path``.
+
+        ``from tests.e2e.app import harness`` runs three package bodies before
+        ``harness`` itself. Resolution only ever yields the leaf module, so
+        without this edge a broken package init selects nothing.
+        """
+        out: set[Path] = set()
+        for parent in path.parents:
+            if parent == self.repo or not parent.is_relative_to(self.repo):
+                break
+            init = parent / "__init__.py"
+            if init != path and init.is_file():
+                out.add(init)
+        return frozenset(out)
+
     def _build(self) -> None:
         for path in _python_files(self.repo):
             try:
@@ -213,6 +247,11 @@ class Graph:
                 for name in _imported_names(tree, own)
                 if (target := self._resolve(name)) is not None and target != path
             }
+            # Importing the module runs its own package chain, and each import
+            # it makes runs that target's chain.
+            for anchor in (path, *tuple(deps)):
+                deps |= self._package_inits(anchor)
+            deps.discard(path)
             self.imports[path] = deps
             self.literals[path] = _path_literals(tree)
 
@@ -229,11 +268,11 @@ class Graph:
         return frozenset(seen)
 
     def test_files(self) -> list[Path]:
-        tests = self.repo / "tests"
         return sorted(
             p
             for p in self.imports
-            if p.is_relative_to(tests) and p.name.startswith("test_")
+            if p.is_relative_to(self.repo)
+            and _is_test_module(p.relative_to(self.repo).as_posix())
         )
 
     def reaches(self, test: Path, target: Path) -> bool:
@@ -278,11 +317,16 @@ def select(changed: Iterable[str], repo: Path) -> list[str] | str:
     for rel in changed:
         abs_path = repo / rel
         if rel.endswith(".py"):
-            if rel.startswith("tests/"):
+            if _is_test_module(rel):
                 # A changed test runs itself even if nothing imports it.
                 if abs_path.exists():
                     selected.add(abs_path)
                 continue
+            # Anything else under tests/ — helpers, fixtures, package inits,
+            # container entrypoints — is a dependency, not a target. Handing it
+            # to pytest imports a module that was never written to be collected
+            # (tests/e2e/app/deterministic_provider/run.py imports `provider`
+            # the way its own image lays it out) and the run dies at collection.
             if not abs_path.exists():
                 # Deleted or moved source: the graph cannot say who used it.
                 return ALL
