@@ -115,6 +115,7 @@ async def db(pg_dsn):
                 description text,
                 config_name text DEFAULT 'worker_base',
                 status text NOT NULL,
+                completion_outcome_kind text,
                 user_id uuid,
                 project_id uuid,
                 expert_id uuid,
