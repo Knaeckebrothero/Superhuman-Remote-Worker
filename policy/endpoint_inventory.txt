@@ -189,6 +189,10 @@ POST   /api/internal/mcp-token-verify                                           
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       gated:require_thread_owner
 GET    /api/internal/persistent/threads/{thread_id}/canvases/main                       gated:require_thread_owner
 POST   /api/internal/persistent/threads/{thread_id}/canvases/main/set                   gated:require_thread_owner
+POST   /api/internal/vm/{entity_id}/heartbeat                                           internal:require_vm_guest
+POST   /api/internal/vm/{entity_id}/register                                            internal:require_vm_guest
+POST   /api/internal/vm/{entity_id}/sudo                                                internal:require_vm_guest
+GET    /api/internal/vm/{entity_id}/sudo/{request_id}                                   internal:require_vm_guest
 GET    /api/jobs                                                                        gated:require_approved_user
 POST   /api/jobs                                                                        gated:require_project_member
 DELETE /api/jobs/{job_id}                                                               gated:require_job_access
@@ -256,6 +260,7 @@ GET    /api/jobs/{job_id}/sources/search                                        
 GET    /api/jobs/{job_id}/sources/{source_id}/annotations                               gated:require_job_access
 GET    /api/jobs/{job_id}/sources/{source_id}/tags                                      gated:require_job_access
 POST   /api/jobs/{job_id}/subjob-merge                                                  internal:require_internal
+GET    /api/jobs/{job_id}/subjobs                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/todos                                                         gated:require_job_access
 GET    /api/jobs/{job_id}/todos/archives                                                gated:require_job_access
 GET    /api/jobs/{job_id}/todos/archives/{filename}                                     gated:require_job_access
@@ -405,9 +410,9 @@ GET    /api/stats/daily                                                         
 GET    /api/stats/jobs                                                                  gated:require_approved_user
 GET    /api/stats/session-wakes                                                         admin:_require_admin
 GET    /api/stats/stuck                                                                 gated:require_approved_user
-GET    /api/sudo/events                                                                 gated:user_can_access_job
+GET    /api/sudo/events                                                                 gated:user_can_access_job_or_thread
 GET    /api/sudo/requests                                                               gated:require_job_access
-GET    /api/sudo/requests/{request_id}                                                  gated:user_can_access_job
+GET    /api/sudo/requests/{request_id}                                                  gated:user_can_access_job_or_thread
 POST   /api/sudo/requests/{request_id}/approve                                          gated:require_sudo_request_authority
 POST   /api/sudo/requests/{request_id}/approve-upgrade                                  gated:require_sudo_request_authority
 POST   /api/sudo/requests/{request_id}/deny                                             gated:require_sudo_request_authority
