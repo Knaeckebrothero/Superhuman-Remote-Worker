@@ -460,6 +460,16 @@ def test_same_cluster_vmi_metering_defaults_to_release_authority() -> None:
     assert deployment["metadata"]["namespace"] == RELEASE_NAMESPACE
     assert env["INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID"] == "stable-main"
     assert env["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
+    # Same-cluster collectors talk to this release's orchestrator Service; the
+    # remote-cluster `orchestratorUrl` knob does not exist in this chart, and
+    # an empty URL would leave the collector unable to ingest anything.
+    assert (
+        env["INFRASTRUCTURE_METERING_ORCHESTRATOR_URL"]
+        == "http://t-superhuman-remote-worker-orchestrator:8085"
+    )
+    # Helm hands large YAML integers to templates as float64; without `int64`
+    # the byte cap renders as 6.7108864e+07 and the collector refuses to start.
+    assert env["INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES"] == "67108864"
     orchestrator_config = next(
         doc
         for doc in documents(rendered)
@@ -473,6 +483,37 @@ def test_same_cluster_vmi_metering_defaults_to_release_authority() -> None:
     assert (
         orchestrator_config["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
     )
+
+
+def test_same_cluster_storage_metering_targets_release_orchestrator() -> None:
+    rendered = render_chart(
+        MAIN,
+        "vm.preflight.enabled=true",
+        "infrastructureMetering.collectorEnabled=true",
+        "infrastructureMetering.vmPvcInventoryEnabled=true",
+        "infrastructureMetering.stableClusterId=stable-main",
+        "infrastructureMetering.vmStorageIngestionSecretName=vm-storage-ingestion",
+        "infrastructureMetering.networkPolicy.allowUnrestrictedEgress=true",
+    )
+    deployment = next(
+        doc
+        for doc in documents(rendered)
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["name"].endswith("-storage-metering")
+    )
+    env = {
+        item["name"]: item.get("value")
+        for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert deployment["metadata"]["namespace"] == RELEASE_NAMESPACE
+    assert (
+        env["INFRASTRUCTURE_METERING_ORCHESTRATOR_URL"]
+        == "http://t-superhuman-remote-worker-orchestrator:8085"
+    )
+    # Helm hands large YAML integers to templates as float64; without `int64`
+    # the byte cap renders as 6.7108864e+07 and the collector refuses to start.
+    assert env["INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES"] == "67108864"
+    assert env["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == RELEASE_NAMESPACE
 
 
 def test_same_cluster_metering_rejects_double_pvc_inventory() -> None:

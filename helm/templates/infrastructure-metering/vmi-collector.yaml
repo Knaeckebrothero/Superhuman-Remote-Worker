@@ -93,7 +93,7 @@ spec:
             - name: INFRASTRUCTURE_METERING_COLLECTOR_ID
               value: "kubevirt-vmis"
             - name: INFRASTRUCTURE_METERING_ORCHESTRATOR_URL
-              value: {{ .Values.infrastructureMetering.orchestratorUrl | quote }}
+              value: {{ printf "http://%s-orchestrator:8085" (include "srw.fullname" .) | quote }}
             - name: INFRASTRUCTURE_METERING_INGESTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -160,7 +160,7 @@ spec:
             - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
               value: {{ .Values.infrastructureMetering.maxSnapshotItems | quote }}
             - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
-              value: {{ .Values.infrastructureMetering.maxSnapshotBytes | quote }}
+              value: {{ .Values.infrastructureMetering.maxSnapshotBytes | int64 | quote }}
           resources:
             {{- toYaml .Values.infrastructureMetering.resources | nindent 12 }}
           securityContext:

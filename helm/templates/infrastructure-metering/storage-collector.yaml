@@ -132,7 +132,7 @@ spec:
             - name: INFRASTRUCTURE_METERING_COLLECTOR_ID
               value: "kubevirt-storage"
             - name: INFRASTRUCTURE_METERING_ORCHESTRATOR_URL
-              value: {{ $metering.orchestratorUrl | quote }}
+              value: {{ printf "http://%s-orchestrator:8085" (include "srw.fullname" .) | quote }}
             - name: INFRASTRUCTURE_METERING_INGESTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -218,7 +218,7 @@ spec:
             - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
               value: {{ $metering.maxSnapshotItems | quote }}
             - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
-              value: {{ $metering.maxSnapshotBytes | quote }}
+              value: {{ $metering.maxSnapshotBytes | int64 | quote }}
           resources:
             {{- toYaml $metering.resources | nindent 12 }}
           securityContext:
