@@ -36,6 +36,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from security.access import project_is_archived
@@ -55,7 +56,12 @@ from services.officer_admission import (
 from services.officer_slots import roster_from_meta
 from services.officer_preflight import ensure_officer_job_activated
 from services.job_liveness import JobLivenessPolicy, get_liveness_policy
-from services.project_backlog import BacklogCursor, fetch_backlog, fetch_ticket_state
+from services.project_backlog import (
+    BacklogCursor,
+    fetch_backlog,
+    fetch_ready_backlog_candidates,
+    fetch_ticket_state,
+)
 from services.work_categories import (
     EXECUTOR,
     category_block,
@@ -98,6 +104,24 @@ FLOOR_WAKE_DEBOUNCE_HOURS = float(os.getenv("OFFICER_FLOOR_WAKE_HOURS", "6"))
 # has proved exhaustion.
 _BACKLOG_SCAN_PAGE_SIZE = 100
 
+# Ready-depth is a control-plane observation, not a data export.  Keep the
+# three-query batch bounded even if a project accidentally tags an enormous
+# fraction of its vault ready.  The extra row distinguishes a truthful exact
+# result from an unavailable over-ceiling result; it is never rendered as a
+# truncated depth.
+_READY_DEPTH_MAX_CANDIDATES = max(
+    1, int(os.getenv("OFFICER_READY_DEPTH_MAX_CANDIDATES", "50000"))
+)
+_READY_DEPTH_BATCH_VERSION = 1
+
+# Viewer polls commonly arrive together.  Share only a computation that is
+# still running; completed observations are removed immediately, so this does
+# not turn stale backlog state into a cache hit.
+_READY_DEPTH_INFLIGHT: dict[
+    tuple[int, int, str, tuple[str, ...], datetime | None],
+    asyncio.Task["ReadyDepthObservation"],
+] = {}
+
 ProvisionFn = Callable[..., Awaitable[None]]
 GrantsFn = Callable[..., Awaitable[None]]
 
@@ -113,6 +137,19 @@ class EligibilityScan:
     unavailable: bool = False
     pages: int = 0
     rows_scanned: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ReadyDepthObservation:
+    """One versioned, bounded cross-store ready-depth observation."""
+
+    depths_by_category: dict[str, int]
+    observed_at: datetime
+    state: str
+    rows_scanned: int
+    query_count: int
+    elapsed_ms: float
     error: str | None = None
 
 
@@ -443,6 +480,103 @@ async def _scan_eligible_tickets(
         cursor = next_cursor
 
 
+async def _observe_ready_depth_categories(
+    db: Any,
+    vector_db: Any,
+    project_id: str,
+    categories: tuple[str, ...],
+    observed_at: datetime,
+) -> ReadyDepthObservation:
+    """Measure all requested categories with three bounded SQL statements."""
+    started = perf_counter()
+    query_count = 1
+    try:
+        rows = await fetch_ready_backlog_candidates(
+            vector_db,
+            project_id,
+            list(categories),
+            limit=_READY_DEPTH_MAX_CANDIDATES + 1,
+        )
+    except Exception as exc:
+        return ReadyDepthObservation(
+            depths_by_category={},
+            observed_at=observed_at,
+            state="unavailable",
+            rows_scanned=0,
+            query_count=query_count,
+            elapsed_ms=(perf_counter() - started) * 1000,
+            error=f"KB backlog read failed: {type(exc).__name__}",
+        )
+
+    rows_scanned = len(rows)
+    if rows_scanned > _READY_DEPTH_MAX_CANDIDATES:
+        return ReadyDepthObservation(
+            depths_by_category={},
+            observed_at=observed_at,
+            state="unavailable",
+            rows_scanned=rows_scanned,
+            query_count=query_count,
+            elapsed_ms=(perf_counter() - started) * 1000,
+            error="candidate ceiling exceeded",
+        )
+
+    note_ids = [str(row.get("note_id") or "") for row in rows]
+    claims: dict[str, Any] = {}
+    unresolved: set[str] = set()
+    if note_ids:
+        try:
+            query_count += 1
+            claims = await db.ticket_claim_states(project_id, note_ids)
+            unresolved_reader = getattr(db, "unresolved_knowledge_note_ids", None)
+            if callable(unresolved_reader):
+                query_count += 1
+                unresolved_result = await unresolved_reader(project_id, note_ids)
+            else:
+                unresolved_result = set()
+            unresolved = (
+                {str(note_id) for note_id in unresolved_result}
+                if isinstance(unresolved_result, (set, list, tuple))
+                else set()
+            )
+        except Exception as exc:
+            return ReadyDepthObservation(
+                depths_by_category={},
+                observed_at=observed_at,
+                state="unavailable",
+                rows_scanned=rows_scanned,
+                query_count=query_count,
+                elapsed_ms=(perf_counter() - started) * 1000,
+                error=f"app-state read failed: {type(exc).__name__}",
+            )
+
+    eligible_rows = [
+        row for row in rows if str(row.get("note_id") or "") not in unresolved
+    ]
+    ready, _notes = eligible_tickets(eligible_rows, claims, observed_at)
+    depths = {category: 0 for category in categories}
+    for row in ready:
+        classification = row.get("classification")
+        category = getattr(classification, "category", None)
+        if category in depths:
+            depths[category] += 1
+    return ReadyDepthObservation(
+        depths_by_category=depths,
+        observed_at=observed_at,
+        state="exact",
+        rows_scanned=rows_scanned,
+        query_count=query_count,
+        elapsed_ms=(perf_counter() - started) * 1000,
+    )
+
+
+def _forget_ready_depth_task(
+    key: tuple[int, int, str, tuple[str, ...], datetime | None],
+    task: asyncio.Task[ReadyDepthObservation],
+) -> None:
+    if _READY_DEPTH_INFLIGHT.get(key) is task:
+        _READY_DEPTH_INFLIGHT.pop(key, None)
+
+
 async def ready_depth_by_pool(
     db: Any,
     vector_db: Any,
@@ -450,37 +584,83 @@ async def ready_depth_by_pool(
     pools: dict[str, dict[str, Any]],
     *,
     now: Optional[datetime] = None,
+    caller: str = "unspecified",
 ) -> dict[str, int]:
     """How many tickets each pool could actually take right now.
 
-    Deliberately the tick's OWN read path — ``fetch_backlog`` →
-    ``ticket_claim_states`` → :func:`eligible_tickets` — rather than a cheaper
-    count of everything wearing a ``ready`` tag. The officer steers by this
-    number, and a "ready 4" that the tick reads as zero (because all four are
-    claimed, or ambiguous, or lost their ``ready_at``) is worse than showing
-    nothing: it would have him waiting for dispatches that are never coming.
+    This deliberately preserves the tick's OWN eligibility functions rather
+    than using a cheaper count of everything wearing a ``ready`` tag.  The
+    vector candidates, durable claims and unresolved materialization intents
+    are each read once for the whole roster.  Concurrent viewer polls share
+    only that in-progress observation; no completed result is cached.
 
-    Returns ``{}` on any read failure — the caller renders capacity without
-    depth rather than asserting a zero it did not measure.
+    Returns ``{}`` on any read failure or bounded-scan overflow — the caller
+    renders capacity without depth rather than asserting a zero it did not
+    measure.
     """
-    now = now or _now()
-    depths: dict[str, int] = {}
+    pool_categories: dict[str, str] = {}
     for pool, spec in pools.items():
-        category = str(spec.get("category") or "")
+        category = str(spec.get("category") or "").strip().lower()
         if not category:
             continue
-        scan = await _scan_eligible_tickets(
-            db, vector_db, project_id, category, now, minimum=None
-        )
-        if scan.unavailable or not scan.exhausted:
-            logger.warning(
-                "officer backlog: ready-depth unavailable for pool %s (%s)",
-                pool,
-                scan.error or "incomplete scan",
+        pool_categories[str(pool)] = category
+    categories = tuple(sorted(set(pool_categories.values())))
+    if not categories:
+        return {}
+
+    observed_at = now or _now()
+    # Explicit historical/test observations do not coalesce with a live poll;
+    # live concurrent viewers intentionally share the creator's timestamp.
+    observation_key = observed_at if now is not None else None
+    key = (id(db), id(vector_db), str(project_id), categories, observation_key)
+    task = _READY_DEPTH_INFLIGHT.get(key)
+    shared = task is not None
+    if task is None:
+        task = asyncio.create_task(
+            _observe_ready_depth_categories(
+                db, vector_db, str(project_id), categories, observed_at
             )
-            continue
-        depths[pool] = len(scan.tickets)
-    return depths
+        )
+        _READY_DEPTH_INFLIGHT[key] = task
+        task.add_done_callback(lambda done: _forget_ready_depth_task(key, done))
+
+    try:
+        observation = await asyncio.shield(task)
+    except Exception:
+        logger.warning(
+            "officer backlog: ready-depth batch failed caller=%s version=%s",
+            caller,
+            _READY_DEPTH_BATCH_VERSION,
+            exc_info=True,
+        )
+        return {}
+    finally:
+        if task.done():
+            _forget_ready_depth_task(key, task)
+
+    if not shared:
+        log = logger.info if observation.state == "exact" else logger.warning
+        log(
+            "officer backlog: ready-depth caller=%s version=%s state=%s "
+            "queries=%s rows=%s pools=%s categories=%s elapsed_ms=%.2f "
+            "observed_at=%s%s",
+            caller,
+            _READY_DEPTH_BATCH_VERSION,
+            observation.state,
+            observation.query_count,
+            observation.rows_scanned,
+            len(pool_categories),
+            len(categories),
+            observation.elapsed_ms,
+            observation.observed_at.isoformat(),
+            f" error={observation.error}" if observation.error else "",
+        )
+    if observation.state != "exact":
+        return {}
+    return {
+        pool: observation.depths_by_category.get(category, 0)
+        for pool, category in pool_categories.items()
+    }
 
 
 def pool_status_lines(

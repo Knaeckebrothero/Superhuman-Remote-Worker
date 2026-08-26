@@ -11,6 +11,7 @@ rather than refused — but never silently contradicted, which would leave the
 worker reading one contract while occupying a slot that means another.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -228,10 +229,7 @@ class TestPoolStatusLines:
 # =============================================================================
 
 
-def _vector_db(rows):
-    conn = MagicMock()
-    # fetch_backlog issues two queries: the row window, then the counts-by-rank.
-    conn.fetch = AsyncMock(side_effect=[rows, []])
+def _vector_db_from_conn(conn):
     acq = MagicMock()
     acq.__aenter__ = AsyncMock(return_value=conn)
     acq.__aexit__ = AsyncMock(return_value=False)
@@ -240,7 +238,181 @@ def _vector_db(rows):
     return vector_db
 
 
+def _vector_db(rows):
+    conn = MagicMock()
+    # The BP-12 summary path reads every requested category in one statement.
+    conn.fetch = AsyncMock(return_value=rows)
+    return _vector_db_from_conn(conn)
+
+
 class TestReadyDepth:
+    @pytest.mark.asyncio
+    async def test_empty_vector_result_is_exact_zero_with_one_query(self):
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        db = AsyncMock()
+
+        depth = await ready_depth_by_pool(
+            db, _vector_db_from_conn(conn), str(uuid.uuid4()), POOLS, now=NOW
+        )
+
+        assert depth == {"researchers": 0, "executors": 0}
+        assert conn.fetch.await_count == 1
+        db.ticket_claim_states.assert_not_awaited()
+        db.unresolved_knowledge_note_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_max_roster_is_one_three_query_batch_independent_of_pool_count(self):
+        categories = ("researcher", "tester", "executor")
+        pools = {
+            f"pool-{index:02d}": {
+                "count": 20,
+                "category": categories[index % len(categories)],
+            }
+            for index in range(8)
+        }
+        rows = [
+            {
+                "note_id": f"{category}-{index}",
+                "tags": ["ready", f"category:{category}"],
+                "ready_at": NOW,
+            }
+            for category in categories
+            for index in range(2)
+        ]
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=rows)
+        db = AsyncMock()
+        db.ticket_claim_states.return_value = {}
+        db.unresolved_knowledge_note_ids.return_value = set()
+
+        depth = await ready_depth_by_pool(
+            db, _vector_db_from_conn(conn), str(uuid.uuid4()), pools, now=NOW
+        )
+
+        assert depth == {pool: 2 for pool in pools}
+        assert conn.fetch.await_count == 1
+        assert db.ticket_claim_states.await_count == 1
+        assert db.unresolved_knowledge_note_ids.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_preserves_claim_ambiguity_and_materialization_semantics(self):
+        rows = [
+            {
+                "note_id": "research-ok",
+                "tags": ["ready", "category:researcher"],
+                "ready_at": NOW,
+            },
+            {
+                "note_id": "test-claimed",
+                "tags": ["ready", "category:tester"],
+                "ready_at": NOW - timedelta(hours=2),
+            },
+            {
+                "note_id": "ambiguous",
+                "tags": [
+                    "ready",
+                    "category:researcher",
+                    "category:tester",
+                ],
+                "ready_at": NOW,
+            },
+            {
+                "note_id": "executor-pending-sync",
+                "tags": ["ready", "category:executor"],
+                "ready_at": NOW,
+            },
+        ]
+        db = AsyncMock()
+        db.ticket_claim_states.return_value = {
+            "test-claimed": {
+                "ready_generation_at": NOW - timedelta(hours=1),
+                "has_non_terminal": False,
+            }
+        }
+        db.unresolved_knowledge_note_ids.return_value = {"executor-pending-sync"}
+
+        depth = await ready_depth_by_pool(
+            db, _vector_db(rows), str(uuid.uuid4()), POOLS, now=NOW
+        )
+
+        assert depth == {"researchers": 1, "executors": 0}
+
+    @pytest.mark.asyncio
+    async def test_candidate_ceiling_is_unavailable_not_a_truncated_depth(
+        self, monkeypatch
+    ):
+        import services.officer_backlog as module
+
+        monkeypatch.setattr(module, "_READY_DEPTH_MAX_CANDIDATES", 2)
+        rows = [
+            {
+                "note_id": f"ticket-{index}",
+                "tags": ["ready", "category:researcher"],
+                "ready_at": NOW,
+            }
+            for index in range(3)
+        ]
+        db = AsyncMock()
+
+        depth = await ready_depth_by_pool(
+            db,
+            _vector_db(rows),
+            str(uuid.uuid4()),
+            {"researchers": POOLS["researchers"]},
+            now=NOW,
+        )
+
+        assert depth == {}
+        db.ticket_claim_states.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_viewers_share_only_the_inflight_observation(self):
+        fetch_started = asyncio.Event()
+        release_fetch = asyncio.Event()
+        conn = MagicMock()
+
+        async def _fetch(*_args):
+            fetch_started.set()
+            await release_fetch.wait()
+            return [
+                {
+                    "note_id": "ticket-a",
+                    "tags": ["ready", "category:researcher"],
+                    "ready_at": NOW,
+                }
+            ]
+
+        conn.fetch = AsyncMock(side_effect=_fetch)
+        vector_db = _vector_db_from_conn(conn)
+        db = AsyncMock()
+        db.ticket_claim_states.return_value = {}
+        db.unresolved_knowledge_note_ids.return_value = set()
+        project_id = str(uuid.uuid4())
+        pool = {"researchers": POOLS["researchers"]}
+
+        viewers = [
+            asyncio.create_task(
+                ready_depth_by_pool(
+                    db, vector_db, project_id, pool, caller="officer_summary"
+                )
+            )
+            for _ in range(12)
+        ]
+        await fetch_started.wait()
+        await asyncio.sleep(0)
+        release_fetch.set()
+        results = await asyncio.gather(*viewers)
+
+        assert results == [{"researchers": 1}] * 12
+        assert conn.fetch.await_count == 1
+        assert db.ticket_claim_states.await_count == 1
+        assert db.unresolved_knowledge_note_ids.await_count == 1
+
+        # Once complete, the observation is not retained as a stale cache.
+        await ready_depth_by_pool(db, vector_db, project_id, pool)
+        assert conn.fetch.await_count == 2
+
     @pytest.mark.asyncio
     async def test_more_than_twenty_five_candidates_are_counted_exactly(self):
         rows = [

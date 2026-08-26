@@ -686,7 +686,12 @@ async def _capacity_section(
         pools = pools_from_meta(officer_meta)
         if pools and vector_db is not None and project_id:
             ready_by_pool = await ready_depth_by_pool(
-                db, vector_db, str(project_id), pools, now=now
+                db,
+                vector_db,
+                str(project_id),
+                pools,
+                now=now,
+                caller="sitrep",
             )
         if signals is not None:
             from services.officer_slots import below_floor_pools

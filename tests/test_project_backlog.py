@@ -590,6 +590,33 @@ def _fake_vector_db(conn):
 
 class TestFetchBacklog:
     @pytest.mark.asyncio
+    async def test_ready_depth_candidate_query_batches_category_overlap(self):
+        from orchestrator.services.project_backlog import (
+            fetch_ready_backlog_candidates,
+        )
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+
+        rows = await fetch_ready_backlog_candidates(
+            _fake_vector_db(conn),
+            "p-1",
+            ["tester", "researcher", "researcher"],
+            limit=50001,
+        )
+
+        assert rows == []
+        assert conn.fetch.await_count == 1
+        call = conn.fetch.await_args
+        sql = " ".join(call.args[0].split())
+        assert "tags @> $2::text[]" in sql
+        assert "tags && $3::text[]" in sql
+        assert "LIMIT $4" in sql
+        assert call.args[2] == ["ready"]
+        assert call.args[3] == ["category:researcher", "category:tester"]
+        assert call.args[4] == 50001
+
+    @pytest.mark.asyncio
     async def test_keyset_cursor_binds_the_complete_stable_order(self):
         from datetime import datetime, timezone
 

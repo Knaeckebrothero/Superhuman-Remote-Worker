@@ -38167,7 +38167,13 @@ async def get_project_officer_summary(
 
     _pools = pools_from_meta(officer_meta)
     if _pools and vector_db is not None:
-        ready_by_pool = await _ready_depth(postgres_db, vector_db, project_id, _pools)
+        ready_by_pool = await _ready_depth(
+            postgres_db,
+            vector_db,
+            project_id,
+            _pools,
+            caller="officer_summary",
+        )
 
     post_block["kit"] = _kit_view(
         officer_meta.get("slots") or row_officer_cfg.get("slots")

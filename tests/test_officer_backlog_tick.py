@@ -696,9 +696,11 @@ class TestTickOfficer:
             }
         ]
         cursors = []
+        include_counts = []
 
         async def _fetch(_vector, _project, *, after=None, **_kwargs):
             cursors.append(after)
+            include_counts.append(_kwargs.get("include_counts"))
             return (first if after is None else tail), {}
 
         monkeypatch.setattr(module, "fetch_backlog", _fetch)
@@ -710,6 +712,7 @@ class TestTickOfficer:
         assert ids == [f"ticket-{index:03d}" for index in range(101)]
         assert len(ids) == len(set(ids))
         assert cursors[1].note_id == "ticket-099"
+        assert include_counts == [False, False]
         assert scan.exhausted is True
 
     @pytest.mark.asyncio
