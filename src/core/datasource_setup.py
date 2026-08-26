@@ -1087,7 +1087,14 @@ def clone_repository_datasources(
                         ),
                         "default_branch": branch,
                     }
-                    datasource_id = str(ds.get("id") or "").strip()
+                    # Current orchestrators deliberately omit the raw DB
+                    # ``id`` and send the resolved, server-owned identity as
+                    # ``datasource_id``.  The ``id`` fallback is retained only
+                    # for older in-process/internal callers that passed a
+                    # resolved row directly to this shared clone helper.
+                    datasource_id = str(
+                        ds.get("datasource_id") or ds.get("id") or ""
+                    ).strip()
                     if datasource_id:
                         repo_meta["datasource_id"] = datasource_id
                     workspace_manager.source_repo_meta[repo_name] = repo_meta

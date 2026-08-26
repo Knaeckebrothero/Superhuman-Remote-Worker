@@ -82,7 +82,12 @@ async def db(pg_dsn, _schema_applied):
         await store.close()
 
 
-async def _seed_repository_job(db: PostgresDB) -> tuple[UUID, UUID, UUID, int]:
+async def _seed_repository_job(
+    db: PostgresDB,
+    *,
+    forge: str = "github",
+    connection_url: str = "https://github.com/acme/widget",
+) -> tuple[UUID, UUID, UUID, int]:
     project_id = uuid4()
     datasource_id = uuid4()
     job_id = uuid4()
@@ -97,14 +102,12 @@ async def _seed_repository_job(db: PostgresDB) -> tuple[UUID, UUID, UUID, int]:
                 INSERT INTO datasources (
                     id, name, type, connection_url, config, read_only,
                     policy_revision
-                ) VALUES (
-                    $1, $2, 'repository',
-                    'https://github.com/acme/widget',
-                    '{"forge":"github"}'::jsonb, FALSE, 7
-                )
+                ) VALUES ($1, $2, 'repository', $3, $4::jsonb, FALSE, 7)
                 """,
                 datasource_id,
                 f"Widget-{str(datasource_id)[:8]}",
+                connection_url,
+                json.dumps({"forge": forge}),
             )
             await conn.execute(
                 "INSERT INTO project_datasources "
@@ -161,7 +164,7 @@ async def _seed_repository_job(db: PostgresDB) -> tuple[UUID, UUID, UUID, int]:
                         {
                             "repository": "acme/widget",
                             "datasource_id": str(datasource_id),
-                            "forge": "github",
+                            "forge": forge,
                             "policy_revision": policy_revision,
                         }
                     ]
@@ -577,6 +580,50 @@ async def test_repo_open_pr_writer_requires_exact_writable_attachment(db, pg_dsn
         )
     finally:
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_gitea_writer_accepts_only_configured_public_internal_host_pair(
+    db, pg_dsn, monkeypatch
+):
+    monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
+    monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
+    _project_id, datasource_id, job_id, _revision = await _seed_repository_job(
+        db,
+        forge="gitea",
+        connection_url="http://srw-gitea:3000/acme/widget.git",
+    )
+    record = {
+        "forge": "gitea",
+        "repo": "acme/widget",
+        "number": 9,
+        "url": "https://git.srw.works/acme/widget/pulls/9",
+        "head": "feature/delivery",
+        "base": "develop",
+    }
+    writer = AgentPostgresDB(pg_dsn, min_connections=1, max_connections=2)
+    await writer.connect()
+    try:
+        assert not await writer.jobs.record_pull_request(
+            job_id,
+            datasource_id,
+            {**record, "url": "https://attacker.example/acme/widget/pulls/9"},
+            source_revision=PR_REVISION,
+        )
+        assert await writer.jobs.record_pull_request(
+            job_id,
+            datasource_id,
+            record,
+            source_revision=PR_REVISION,
+        )
+    finally:
+        await writer.close()
+
+    authority = await db.get_job_pull_request_authority(str(job_id))
+    assert authority is not None
+    assert authority["datasource_id"] == datasource_id
+    assert authority["forge"] == "gitea"
+    assert authority["url"] == record["url"]
 
 
 @pytest.mark.asyncio

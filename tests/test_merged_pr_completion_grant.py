@@ -144,6 +144,70 @@ def _status(state):
 
 
 class TestUnmergedPrBlockReason:
+    async def test_configured_gitea_public_url_matches_internal_connector(
+        self, monkeypatch
+    ):
+        from services import job_delivery
+
+        monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
+        monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
+        datasource = {
+            "id": "ds-1",
+            "type": "repository",
+            "config": {"forge": "gitea"},
+            "connection_url": "http://srw-gitea:3000/acme/widget.git",
+            "credentials": {"token": "t"},
+        }
+        job = _job()
+        job["context"]["pull_request"].update(
+            {
+                "forge": "gitea",
+                "repo": "acme/widget",
+                "url": "https://git.srw.works/acme/widget/pulls/1",
+            }
+        )
+        monkeypatch.setattr(
+            job_delivery,
+            "get_pull_request_status",
+            AsyncMock(return_value=_status("merged")),
+        )
+
+        assert (
+            await job_delivery.unmerged_pr_block_reason(job, datasources=[datasource])
+            is None
+        )
+
+    async def test_global_gitea_public_url_cannot_alias_a_foreign_connector(
+        self, monkeypatch
+    ):
+        from services import job_delivery
+
+        monkeypatch.setenv("GITEA_INTERNAL_URL", "http://srw-gitea:3000")
+        monkeypatch.setenv("GITEA_URL", "https://git.srw.works")
+        datasource = {
+            "id": "ds-1",
+            "type": "repository",
+            "config": {"forge": "gitea"},
+            "connection_url": "https://foreign.example/acme/widget.git",
+            "credentials": {"token": "t"},
+        }
+        job = _job()
+        job["context"]["pull_request"].update(
+            {
+                "forge": "gitea",
+                "repo": "acme/widget",
+                "url": "https://git.srw.works/acme/widget/pulls/1",
+            }
+        )
+        status = AsyncMock(return_value=_status("merged"))
+        monkeypatch.setattr(job_delivery, "get_pull_request_status", status)
+
+        reason = await job_delivery.unmerged_pr_block_reason(
+            job, datasources=[datasource]
+        )
+        assert reason is not None
+        status.assert_not_awaited()
+
     async def test_job_without_a_pull_request_is_never_blocked(self, monkeypatch):
         """The accepted hole, pinned so it stays deliberate: a job that never
         opened a PR must approve exactly as it does today."""

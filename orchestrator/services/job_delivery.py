@@ -9,6 +9,7 @@ from src.services.forge import (
     SUPPORTED_FORGES,
     ForgeError,
     ForgeRepo,
+    forge_web_url_matches_connector,
     get_pull_request_status,
     parse_owner_repo,
     resolve_api_base,
@@ -100,7 +101,6 @@ def find_pull_request_repository(
 ) -> dict[str, Any] | None:
     """Find the attached connector named by the persisted delivery record."""
     wanted = pull_request.repo.casefold()
-    wanted_host = repository_host(pull_request.url)
     for datasource in datasources:
         if datasource.get("type") != "repository":
             continue
@@ -111,7 +111,11 @@ def find_pull_request_repository(
         connection_url = datasource.get("connection_url")
         if not isinstance(connection_url, str) or not connection_url:
             continue
-        if repository_host(connection_url) != wanted_host:
+        if not forge_web_url_matches_connector(
+            pull_request.url,
+            connection_url,
+            pull_request.forge,
+        ):
             continue
         try:
             owner, repo = parse_owner_repo(connection_url)

@@ -303,6 +303,35 @@ async def test_repo_open_pr_calls_the_forge_adapter():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("datasource_id", [None, "not-a-uuid"])
+async def test_repo_open_pr_refuses_invalid_datasource_authority_before_forge(
+    datasource_id,
+):
+    context, _ = make_context()
+    context.job_id = "11111111-1111-1111-1111-111111111111"
+    context.postgres_db = MagicMock()
+    context.postgres_db.jobs.record_pull_request = AsyncMock(return_value=True)
+    if datasource_id is None:
+        context.workspace_manager.source_repo_meta["widget"].pop("datasource_id")
+    else:
+        context.workspace_manager.source_repo_meta["widget"]["datasource_id"] = (
+            datasource_id
+        )
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with (
+        patch("src.tools.repo.repo_tools.open_pull_request") as mock_open,
+        patch("src.tools.repo.repo_tools.get_pull_request_status") as mock_status,
+    ):
+        out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
+
+    assert "valid server-recorded datasource authority" in out
+    mock_open.assert_not_awaited()
+    mock_status.assert_not_awaited()
+    context.postgres_db.jobs.record_pull_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_repo_open_pr_persists_structured_delivery_against_the_job():
     context, _ = make_context()
     git_mgr = context.workspace_manager.source_repos["widget"]

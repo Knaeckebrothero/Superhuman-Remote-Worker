@@ -1892,7 +1892,11 @@ class JobsNamespace:
 
         from urllib.parse import urlparse
 
-        from src.services.forge import ForgeError, parse_owner_repo
+        from src.services.forge import (
+            ForgeError,
+            forge_web_url_matches_connector,
+            parse_owner_repo,
+        )
         from src.shared.deliverable_contract import normalize_repository_identity
 
         async with self.db.acquire() as conn:
@@ -1961,12 +1965,6 @@ class JobsNamespace:
                 normalized_revision = str(source_revision or "").strip().lower()
                 parsed_url = urlparse(url) if isinstance(url, str) else None
                 connection_url = str(row["connection_url"] or "")
-                parsed_connection = urlparse(connection_url)
-                connection_host = parsed_connection.hostname
-                if connection_host is None and ":" in connection_url:
-                    connection_host = connection_url.partition(":")[0].rsplit("@", 1)[
-                        -1
-                    ]
                 if (
                     not expected_forge
                     or supplied_forge != expected_forge
@@ -1978,8 +1976,11 @@ class JobsNamespace:
                     or parsed_url.hostname is None
                     or parsed_url.username is not None
                     or parsed_url.password is not None
-                    or not connection_host
-                    or parsed_url.hostname.casefold() != connection_host.casefold()
+                    or not forge_web_url_matches_connector(
+                        url,
+                        connection_url,
+                        expected_forge,
+                    )
                     or not isinstance(head, str)
                     or not head.strip()
                     or len(head) > 500
