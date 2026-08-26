@@ -197,6 +197,30 @@ def _patch_worker_attestation(monkeypatch, orch_main, *attestations):
     return attest
 
 
+def _vm_worker_attestation(orch_main, **overrides):
+    return _worker_attestation(
+        orch_main,
+        backing_id=f"k8s-vmi:{WORKSPACE_RUNTIME}",
+        host="10.42.1.23",
+        pod_ip="10.42.1.23",
+        port=22,
+        **overrides,
+    )
+
+
+def _patch_vm_worker_attestation(monkeypatch, orch_main, *attestations):
+    if not attestations:
+        exact = _vm_worker_attestation(orch_main)
+        attestations = (exact, exact)
+    attest = AsyncMock(side_effect=attestations)
+    monkeypatch.setattr(
+        orch_main.vm_provisioner,
+        "attest_workspace_runtime",
+        attest,
+    )
+    return attest
+
+
 def _worker_job_context(container, **extra):
     return {
         "_workspace_contract": {
@@ -211,6 +235,37 @@ def _worker_job_context(container, **extra):
         },
         **extra,
     }
+
+
+def _worker_vm_context(vm, **extra):
+    return {
+        "_workspace_contract": {
+            "version": 1,
+            "requested_backend": "vm",
+            "assigned_backend": "vm",
+            "assignment_source": "test",
+        },
+        "vm": vm,
+        **extra,
+    }
+
+
+def _ready_worker_vm(**overrides):
+    vm = {
+        "status": "ready",
+        "provision_generation": WORKSPACE_GENERATION,
+        "identity_authenticated": True,
+        "identity_provision_generation": WORKSPACE_GENERATION,
+        "vm_uid": "admitted-vm-uid",
+        "active_pod_uid": WORKSPACE_RUNTIME,
+        "ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "ssh_ready_source": "provisioner_probe",
+        "ssh_host": "10.42.1.22",
+        "pod_ip": "10.42.1.22",
+        "ssh_port": 22,
+    }
+    vm.update(overrides)
+    return vm
 
 
 def _adopted_worker_container(orch_main, **overrides):
@@ -571,6 +626,133 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
             "min_wall_seconds": 300.0,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_vm_bundle_uses_attested_endpoint_and_stamps_host_key_pin(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": _worker_vm_context(
+            _ready_worker_vm(),
+            worker_batch_target_wall_seconds=420,
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="vm work")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    attest = _patch_vm_worker_attestation(monkeypatch, orch_main)
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    assert attest.await_count == 2
+    assert all(call.args == (UNIT_ID,) for call in attest.await_args_list)
+    attested_job = builder.await_args.args[0]
+    exact_vm = attested_job["context"]["vm"]
+    assert exact_vm["ssh_host"] == "10.42.1.23"
+    assert exact_vm["pod_ip"] == "10.42.1.23"
+    assert exact_vm["ssh_port"] == 22
+    assert exact_vm["provision_generation"] == WORKSPACE_GENERATION
+    assert exact_vm["active_pod_uid"] == WORKSPACE_RUNTIME
+    assert exact_vm["ssh_host_key_fingerprint"] == WORKSPACE_FINGERPRINT
+    remote = attested_job["config_override"]["workspace"]["remote"]
+    assert remote["host"] == "10.42.1.23"
+    assert remote["port"] == 22
+    assert out["job"]["workspace_generation"] == WORKSPACE_GENERATION
+    assert out["job"]["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
+    assert out["job"]["workspace_ssh_host_key_fingerprint"] == WORKSPACE_FINGERPRINT
+    assert out["batch"]["target_wall_seconds"] == 420.0
+
+
+@pytest.mark.asyncio
+async def test_worker_vm_bundle_refuses_external_topology(monkeypatch):
+    from orchestrator import main as orch_main
+
+    monkeypatch.setenv("VM_MODE", "external")
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": _worker_vm_context(_ready_worker_vm()),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock()
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job workspace contract is not stateless-compatible"
+    builder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "vm_updates",
+    [
+        {"identity_authenticated": False},
+        {"ssh_host_key_fingerprint": None},
+    ],
+    ids=["not-ready-identity", "absent-pin"],
+)
+async def test_worker_vm_bundle_refuses_incomplete_ready_context(
+    monkeypatch, vm_updates
+):
+    from orchestrator import main as orch_main
+
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": _worker_vm_context(_ready_worker_vm(**vm_updates)),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock()
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    attest = _patch_vm_worker_attestation(monkeypatch, orch_main)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Stateless worker VM workspace is not Kubernetes-ready"
+    attest.assert_not_awaited()
+    builder.assert_not_awaited()
 
 
 @pytest.mark.asyncio

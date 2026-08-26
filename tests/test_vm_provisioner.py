@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+LAUNCHER_POD_UID = "00000000-0000-4000-8000-000000000002"
 TEST_HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
@@ -183,6 +184,154 @@ def test_connect_logs_mode(mock_db, caplog):
         provisioner.connect(mock_db)
     assert provisioner._db is mock_db
     assert "VM_MODE=off" in caplog.text
+
+
+# =============================================================================
+# Test: exact same-cluster runtime attestation
+# =============================================================================
+
+
+class TestVmWorkspaceRuntimeAttestation:
+    @staticmethod
+    def _context(**overrides):
+        context = {
+            "status": "ready",
+            "provision_generation": PROVISION_GENERATION,
+            "identity_authenticated": True,
+            "identity_provision_generation": PROVISION_GENERATION,
+            "vm_uid": "admitted-vm-uid",
+            "active_pod_uid": LAUNCHER_POD_UID,
+            "ssh_host_key_fingerprint": TEST_HOST_KEY_FINGERPRINT,
+            "ssh_ready_source": "provisioner_probe",
+            "ssh_host": "10.42.1.23",
+            "ssh_port": 22,
+        }
+        context.update(overrides)
+        return context
+
+    @staticmethod
+    def _status(**overrides):
+        status = {
+            "_identity_authenticated": True,
+            "provision_generation": PROVISION_GENERATION,
+            "vm_uid": "admitted-vm-uid",
+            "active_pod_uid": LAUNCHER_POD_UID,
+            "pod_ip": "10.42.1.23",
+            "ready": True,
+            "phase": "Running",
+        }
+        status.update(overrides)
+        return status
+
+    @staticmethod
+    def _provisioner(mock_db, context, status):
+        from orchestrator.services.vm_provisioner import VMProvisioner
+
+        provisioner = VMProvisioner()
+        provisioner._controller_url = "http://vm-controller:8080"
+        provisioner._http_client = MagicMock()
+        provisioner._lifecycle_hmac_secret = b"attestation-secret-at-least-32-bytes"
+        provisioner._db = mock_db
+        mock_db.get_job.return_value = {"context": {"vm": context}}
+        provisioner._query_http = AsyncMock(return_value=status)
+        return provisioner
+
+    @pytest.mark.asyncio
+    async def test_matching_live_incarnation_returns_endpoint_pair_and_pin(
+        self, mock_db
+    ):
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db,
+                self._context(),
+                self._status(),
+            )
+            attested = await provisioner.attest_workspace_runtime("job-1")
+
+        assert attested.backing_id == f"k8s-vmi:{LAUNCHER_POD_UID}"
+        assert attested.workspace_generation == PROVISION_GENERATION
+        assert attested.runtime_incarnation == LAUNCHER_POD_UID
+        assert attested.ssh_host_key_fingerprint == TEST_HOST_KEY_FINGERPRINT
+        assert attested.host == "10.42.1.23"
+        assert attested.pod_ip == "10.42.1.23"
+        assert attested.port == 22
+        provisioner._query_http.assert_awaited_once_with(
+            "job-1",
+            provision_generation=PROVISION_GENERATION,
+        )
+
+    @pytest.mark.asyncio
+    async def test_launcher_pod_uid_mismatch_is_refused(self, mock_db):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db,
+                self._context(),
+                self._status(active_pod_uid="00000000-0000-4000-8000-000000000003"),
+            )
+            with pytest.raises(WorkspaceRuntimeAuthorityError, match="Pod UID changed"):
+                await provisioner.attest_workspace_runtime("job-1")
+
+    @pytest.mark.asyncio
+    async def test_provision_generation_mismatch_is_refused(self, mock_db):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db,
+                self._context(),
+                self._status(
+                    provision_generation=("00000000-0000-4000-8000-000000000004")
+                ),
+            )
+            with pytest.raises(
+                WorkspaceRuntimeAuthorityError, match="generation changed"
+            ):
+                await provisioner.attest_workspace_runtime("job-1")
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_context_is_refused(self, mock_db):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db,
+                self._context(identity_authenticated=False),
+                self._status(),
+            )
+            with pytest.raises(WorkspaceRuntimeAuthorityError, match="unauthenticated"):
+                await provisioner.attest_workspace_runtime("job-1")
+        provisioner._query_http.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fingerprint",
+        [None, "SHA256:not-a-canonical-fingerprint"],
+        ids=["missing", "malformed"],
+    )
+    async def test_missing_or_malformed_pin_is_refused(self, mock_db, fingerprint):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db,
+                self._context(ssh_host_key_fingerprint=fingerprint),
+                self._status(),
+            )
+            with pytest.raises(
+                WorkspaceRuntimeAuthorityError, match="fingerprint is malformed"
+            ):
+                await provisioner.attest_workspace_runtime("job-1")
+        provisioner._query_http.assert_not_awaited()
 
 
 # =============================================================================

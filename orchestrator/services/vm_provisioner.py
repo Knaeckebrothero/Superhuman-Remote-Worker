@@ -4,6 +4,7 @@ import base64
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import ipaddress
 import json
 import logging
 import os
@@ -15,7 +16,11 @@ import httpx
 
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 
-from .container_provisioner import DEFAULT_NETWORK_TIER
+from .container_provisioner import (
+    DEFAULT_NETWORK_TIER,
+    WorkspaceRuntimeAttestation,
+    WorkspaceRuntimeAuthorityError,
+)
 from .nats_bridge import nats_bridge
 from .vm_lifecycle_auth import (
     AUTH_FIELD,
@@ -376,6 +381,107 @@ class VMProvisioner:
     # =========================================================================
     # Public API
     # =========================================================================
+
+    async def attest_workspace_runtime(
+        self, job_id: str
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest one same-cluster VM endpoint and exact live incarnation.
+
+        The co-located controller is the Kubernetes authority here instead of
+        a second direct custom-object client in the orchestrator. Its status
+        operation freshly reads the VM and VMI (including ``activePods`` and
+        the pod IP), while the correlated HMAC response binds that observation
+        to this provision generation. Keeping KubeVirt RBAC and VMI parsing in
+        the controller also avoids two subtly different launcher-pod rules.
+        """
+
+        if (
+            not self._http_available
+            or self._http_client is None
+            or self._lifecycle_hmac_secret is None
+            or self._db is None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "VM Kubernetes authority is unavailable"
+            )
+
+        try:
+            row = await self._db.get_job(job_id)
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "VM workspace context probe failed"
+            ) from exc
+        if not isinstance(row, dict):
+            raise WorkspaceRuntimeAuthorityError("VM workspace job is unavailable")
+        context = _extract_vm_context(row)
+
+        generation = _provision_generation(context.get("provision_generation"))
+        if generation is None:
+            raise WorkspaceRuntimeAuthorityError("VM provision generation is malformed")
+        if (
+            context.get("identity_authenticated") is not True
+            or _provision_generation(context.get("identity_provision_generation"))
+            != generation
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "VM workspace identity is unauthenticated"
+            )
+        expected_vm_uid = _safe_vm_uid(context.get("vm_uid"))
+        if expected_vm_uid is None:
+            raise WorkspaceRuntimeAuthorityError("VM UID is unavailable")
+        expected_launcher_uid = _provision_generation(context.get("active_pod_uid"))
+        if expected_launcher_uid is None:
+            raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID is malformed")
+        fingerprint = _safe_ssh_host_key_fingerprint(
+            context.get("ssh_host_key_fingerprint")
+        )
+        if fingerprint is None:
+            raise WorkspaceRuntimeAuthorityError(
+                "VM SSH host-key fingerprint is malformed"
+            )
+
+        # Do not use query_status(): it intentionally strips the authenticated
+        # response marker and persists selected telemetry. Claim attestation is
+        # read-only and must see the transport's proof directly.
+        observed = await self._query_http(
+            job_id,
+            provision_generation=generation,
+        )
+        if not isinstance(observed, Mapping) or (
+            observed.get("_identity_authenticated") is not True
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "VM controller status is unauthenticated"
+            )
+        if _provision_generation(observed.get("provision_generation")) != generation:
+            raise WorkspaceRuntimeAuthorityError("VM provision generation changed")
+        if _safe_vm_uid(observed.get("vm_uid")) != expected_vm_uid:
+            raise WorkspaceRuntimeAuthorityError("VM UID changed")
+        if observed.get("ready") is not True:
+            raise WorkspaceRuntimeAuthorityError("VM is not Kubernetes-ready")
+
+        launcher_uid = _provision_generation(observed.get("active_pod_uid"))
+        if launcher_uid != expected_launcher_uid:
+            raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
+        pod_ip = observed.get("pod_ip")
+        if not isinstance(pod_ip, str) or not pod_ip or pod_ip != pod_ip.strip():
+            raise WorkspaceRuntimeAuthorityError("VM pod IP is unavailable")
+        try:
+            canonical_pod_ip = str(ipaddress.ip_address(pod_ip))
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError("VM pod IP is malformed") from exc
+        if canonical_pod_ip != pod_ip:
+            raise WorkspaceRuntimeAuthorityError("VM pod IP is malformed")
+
+        return WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-vmi:{launcher_uid}",
+            workspace_generation=generation,
+            runtime_incarnation=launcher_uid,
+            ssh_host_key_fingerprint=fingerprint,
+            host=pod_ip,
+            pod_ip=pod_ip,
+            port=22,
+        )
 
     async def create_vm(
         self,

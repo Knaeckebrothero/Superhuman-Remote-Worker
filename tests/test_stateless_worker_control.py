@@ -60,19 +60,18 @@ def test_omitted_lane_defaults_stateless_when_fully_capable(monkeypatch):
     )
 
 
-def test_omitted_lane_default_keeps_vm_jobs_pinned(monkeypatch):
+@pytest.mark.parametrize("requested_lane", [None, "stateless", "pinned"])
+def test_external_vm_jobs_stay_pinned_across_lane_arms(monkeypatch, requested_lane):
     from orchestrator import main
 
+    monkeypatch.setenv("VM_MODE", "external")
     monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
     monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
     monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
 
-    # Omitted child lanes normally inherit their parent's lane in create_job,
-    # but an explicit VM requirement must override a stateless parent before
-    # persistence because this worker pool has no mesh sidecar.
     assert (
         main._resolve_requested_job_execution_lane(
-            None,
+            requested_lane,
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
@@ -80,10 +79,38 @@ def test_omitted_lane_default_keeps_vm_jobs_pinned(monkeypatch):
         == "pinned"
     )
 
-    # The explicit stateless VM behavior is unchanged by defaulting.
+
+def test_same_cluster_vm_is_stateless_for_explicit_and_default_arms(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    # VM admission is backed by the authenticated VM controller, not the
+    # container provisioner capability used by the sandbox arm.
+    monkeypatch.setattr(main.container_provisioner, "_k8s_available", False)
+    monkeypatch.setattr(main.container_provisioner, "_in_cluster", False)
+
     assert (
         main._resolve_requested_job_execution_lane(
             "stateless",
+            default_stateless=True,
+            needs_vm=True,
+            needs_sandbox=False,
+        )
+        == "stateless"
+    )
+    assert (
+        main._resolve_requested_job_execution_lane(
+            None,
+            default_stateless=True,
+            needs_vm=True,
+            needs_sandbox=False,
+        )
+        == "stateless"
+    )
+    assert (
+        main._resolve_requested_job_execution_lane(
+            "pinned",
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
@@ -204,7 +231,10 @@ def test_omitted_lane_stays_unchanged_when_default_is_off(monkeypatch):
             True,
             False,
             422,
-            "Stateless workers currently require a Kubernetes sandbox workspace",
+            (
+                "Stateless workers currently require a Kubernetes sandbox or "
+                "same-cluster VM workspace"
+            ),
         ),
     ],
 )
@@ -895,6 +925,11 @@ async def test_admission_rechecks_exact_k8s_ready_evidence_after_enqueue():
             assert "context->'vm'->>'requested'" in normalized
             assert "inherits_parent_workspace" in normalized
             assert "parent.id = jobs.parent_job_id" in normalized
+            assert "ssh_ready_source" in normalized
+            assert "identity_authenticated" in normalized
+            assert "active_pod_uid" in normalized
+            assert "ssh_host_key_fingerprint" in normalized
+            assert _args[1] is False
             return {"id": UUID(JOB_ID)}
         raise AssertionError(normalized)
 
@@ -904,6 +939,37 @@ async def test_admission_rechecks_exact_k8s_ready_evidence_after_enqueue():
     admitted, status = await db.admit_stateless_worker_job(
         JOB_ID, fair_key=None, priority=5
     )
+    assert admitted is True
+    assert status == "inserted"
+
+
+@pytest.mark.asyncio
+async def test_admission_vm_arm_is_explicitly_topology_capability_bound():
+    conn = MagicMock()
+    conn.transaction.return_value = _AsyncCM()
+
+    async def fetchrow(sql, *_args):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("WITH cur AS"):
+            return {"old_state": None, "new_state": "queued"}
+        if normalized.startswith("SELECT id FROM jobs"):
+            assert "assigned_backend' = 'vm'" in normalized
+            assert "identity_provision_generation" in normalized
+            assert "provision_generation" in normalized
+            assert _args[1] is True
+            return {"id": UUID(JOB_ID)}
+        raise AssertionError(normalized)
+
+    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    db = _db_with_conn(conn)
+
+    admitted, status = await db.admit_stateless_worker_job(
+        JOB_ID,
+        fair_key=None,
+        priority=5,
+        allow_vm_workspace=True,
+    )
+
     assert admitted is True
     assert status == "inserted"
 
@@ -942,7 +1008,8 @@ async def test_stateless_dispatch_refusal_cannot_overwrite_winning_control(
         JOB_ID,
         status="failed",
         error_message=(
-            "Stateless workers currently require a Kubernetes sandbox workspace"
+            "Stateless workers currently require a Kubernetes sandbox or "
+            "same-cluster VM workspace"
         ),
         expected_status="created",
     )
@@ -1088,6 +1155,78 @@ async def test_vm_lane_repair_losing_status_cas_does_not_close_queue(monkeypatch
     await main._try_dispatch_pending_jobs()
 
     conn.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
+    monkeypatch,
+):
+    from orchestrator import main
+
+    generation = "33333333-3333-4333-8333-333333333333"
+    launcher_uid = "44444444-4444-4444-8444-444444444444"
+    job = {
+        "id": JOB_ID,
+        "status": "created",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "priority": 3,
+        "user_id": None,
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": {
+            "_workspace_contract": {
+                "version": 1,
+                "requested_backend": "vm",
+                "assigned_backend": "vm",
+                "assignment_source": "test",
+            },
+            "vm": {
+                "status": "ready",
+                "provision_generation": generation,
+                "identity_authenticated": True,
+                "identity_provision_generation": generation,
+                "active_pod_uid": launcher_uid,
+                "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
+                "ssh_ready_source": "provisioner_probe",
+                "ssh_host": "10.42.1.23",
+                "pod_ip": "10.42.1.23",
+                "ssh_port": 22,
+            },
+        },
+    }
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_admittable_stateless_jobs",
+        AsyncMock(return_value=[job]),
+    )
+    monkeypatch.setattr(
+        main,
+        "_prepare_job_workspace_runtime",
+        AsyncMock(return_value=("proceed", job, None)),
+    )
+    monkeypatch.setattr(main, "_check_vm_permission", AsyncMock())
+    monkeypatch.setattr(
+        main, "vm_provisioning_decision", MagicMock(return_value="ready")
+    )
+    monkeypatch.setattr(
+        main,
+        "_prepare_job_repository_before_claim",
+        AsyncMock(return_value=True),
+    )
+    admitted = AsyncMock(return_value=(True, "inserted"))
+    monkeypatch.setattr(main.postgres_db, "admit_stateless_worker_job", admitted)
+
+    await main._try_dispatch_pending_jobs()
+
+    admitted.assert_awaited_once_with(
+        JOB_ID,
+        fair_key=None,
+        priority=3,
+        allow_vm_workspace=True,
+    )
 
 
 @pytest.mark.asyncio

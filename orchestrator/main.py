@@ -6660,21 +6660,24 @@ def _resolve_requested_job_execution_lane(
     needs_vm: bool,
     needs_sandbox: bool,
 ) -> Literal["pinned", "stateless"] | None:
-    """Apply the default-off, k8s-sandbox-only worker admission gate.
+    """Apply the default-off, pod-network-workspace worker admission gate.
 
     ``None`` is preserved unless a capable omitted root opts into defaulting,
     so Postgres can still distinguish authoritative child-lane inheritance.
     """
-    if needs_vm:
-        # This is a capability decision, not a silent arbitrary lane flip: the
-        # first stateless worker pool intentionally has no VM mesh sidecar.
+    same_cluster_vm = needs_vm and vm_workspaces_on_pod_network()
+    if needs_vm and not same_cluster_vm:
+        # External VMs still require the registered agent's mesh sidecar. The
+        # shared executor Deployment deliberately has no tailnet identity.
         return "pinned"
     if requested_lane is None and default_stateless:
-        if (
-            STATELESS_WORKER_ENABLED
-            and container_provisioner.is_available
-            and container_provisioner.in_cluster
-            and needs_sandbox
+        if STATELESS_WORKER_ENABLED and (
+            same_cluster_vm
+            or (
+                container_provisioner.is_available
+                and container_provisioner.in_cluster
+                and needs_sandbox
+            )
         ):
             return "stateless"
         return None
@@ -6684,7 +6687,9 @@ def _resolve_requested_job_execution_lane(
         raise HTTPException(
             status_code=409, detail="Stateless worker admission is disabled"
         )
-    if not (container_provisioner.is_available and container_provisioner.in_cluster):
+    if not same_cluster_vm and not (
+        container_provisioner.is_available and container_provisioner.in_cluster
+    ):
         raise HTTPException(
             status_code=503,
             detail=(
@@ -6692,11 +6697,12 @@ def _resolve_requested_job_execution_lane(
                 "workspace provisioner"
             ),
         )
-    if not needs_sandbox:
+    if not (needs_sandbox or same_cluster_vm):
         raise HTTPException(
             status_code=422,
             detail=(
-                "Stateless workers currently require a Kubernetes sandbox workspace"
+                "Stateless workers currently require a Kubernetes sandbox or "
+                "same-cluster VM workspace"
             ),
         )
     return "stateless"
@@ -6745,6 +6751,38 @@ async def _attest_stateless_worker_workspace(
     except Exception as exc:
         logger.warning(
             "Stateless worker workspace attestation failed for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+            exc_info=True,
+        )
+    raise HTTPException(
+        status_code=409,
+        detail="Stateless worker workspace authority unavailable",
+    )
+
+
+async def _attest_stateless_worker_vm_workspace(
+    owner: WorkspaceOwner,
+) -> WorkspaceRuntimeAttestation:
+    """Return one exact same-cluster VM identity or a generic refusal."""
+
+    try:
+        if owner.kind != "job":
+            raise WorkspaceRuntimeAuthorityError(
+                "stateless worker VM owner is not a job"
+            )
+        return await vm_provisioner.attest_workspace_runtime(owner.id)
+    except WorkspaceRuntimeAuthorityError as exc:
+        logger.warning(
+            "Stateless worker VM workspace attestation refused for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stateless worker VM workspace attestation failed for %s %s: %s",
             owner.kind,
             owner.id,
             exc,
@@ -8875,10 +8913,19 @@ async def _try_dispatch_pending_jobs() -> None:
                     )
                     continue
 
-                # Defense for inherited/operator-created rows. An explicit VM
-                # request is the one supported plane transition: pin it before
-                # provisioning so the VM-mesh registered-agent path owns it.
-                if stateless_worker and _job_needs_vm(job):
+                job_needs_vm = _job_needs_vm(job)
+                stateless_same_cluster_vm = bool(
+                    stateless_worker and job_needs_vm and vm_workspaces_on_pod_network()
+                )
+
+                # Defense for inherited/operator-created rows. External VMs
+                # still belong to the mesh-enabled registered-agent plane; a
+                # same-cluster VM remains on the pool lane below.
+                if (
+                    stateless_worker
+                    and job_needs_vm
+                    and not vm_workspaces_on_pod_network()
+                ):
                     moved_to_pinned = False
                     async with postgres_db.acquire() as conn:
                         async with conn.transaction():
@@ -8931,10 +8978,12 @@ async def _try_dispatch_pending_jobs() -> None:
                     )
                 )
                 if stateless_worker and not (
-                    _job_needs_sandbox(job) or _stateless_has_k8s_workspace
+                    stateless_same_cluster_vm
+                    or _job_needs_sandbox(job)
+                    or _stateless_has_k8s_workspace
                 ):
                     logger.error(
-                        "Dispatcher: refusing stateless job %s without a sandbox "
+                        "Dispatcher: refusing stateless job %s without a compatible "
                         "workspace",
                         job_id,
                     )
@@ -8943,14 +8992,18 @@ async def _try_dispatch_pending_jobs() -> None:
                         status="failed",
                         error_message=(
                             "Stateless workers currently require a Kubernetes "
-                            "sandbox workspace"
+                            "sandbox or same-cluster VM workspace"
                         ),
                         expected_status=str(job.get("status")),
                     )
                     continue
-                if stateless_worker and not (
-                    container_provisioner.is_available
-                    and container_provisioner.in_cluster
+                if (
+                    stateless_worker
+                    and not stateless_same_cluster_vm
+                    and not (
+                        container_provisioner.is_available
+                        and container_provisioner.in_cluster
+                    )
                 ):
                     logger.warning(
                         "Dispatcher: stateless job %s waiting for the in-cluster "
@@ -8959,7 +9012,7 @@ async def _try_dispatch_pending_jobs() -> None:
                     )
                     continue
 
-                if _job_needs_vm(job):
+                if job_needs_vm:
                     # Admin-gated permission check (kill-switch + per-user grant).
                     # Re-verified here in case a grant was revoked or the
                     # kill-switch flipped after the job was submitted. Already
@@ -9496,6 +9549,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         job_id,
                         fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                         priority=int(job.get("priority") or 0),
+                        allow_vm_workspace=vm_workspaces_on_pod_network(),
                         **_completion_dispatch_guard_kwargs(),
                     )
                     if not admitted:
@@ -14214,8 +14268,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     "for a capable root job"
                 )
             else:
-                if needs_vm:
-                    fallback_reason = "VM jobs require pinned workers"
+                if needs_vm and not vm_workspaces_on_pod_network():
+                    fallback_reason = "external VM jobs require pinned workers"
                 elif not STATELESS_WORKER_ENABLED:
                     fallback_reason = "stateless worker admission is disabled"
                 elif not container_provisioner.is_available:
@@ -14234,7 +14288,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 )
         if job.execution_lane == "stateless" and execution_lane == "pinned":
             logger.info(
-                "Job create: VM request keeps job on pinned lane "
+                "Job create: external VM request keeps job on pinned lane "
                 "(stateless worker opt-in ignored)"
             )
 
@@ -46874,9 +46928,15 @@ async def internal_unit_claim_bundle(
                 detail="Job workspace authority is not ready",
             )
         workspace_decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
+        assigned_backend = (
+            workspace_decision.contract.assigned_backend
+            if workspace_decision.contract is not None
+            else None
+        )
         if (
             workspace_decision.contract is None
-            or workspace_decision.contract.assigned_backend != "sandbox"
+            or assigned_backend not in {"sandbox", "vm"}
+            or (assigned_backend == "vm" and not vm_workspaces_on_pod_network())
         ):
             raise HTTPException(
                 status_code=409,
@@ -46902,23 +46962,11 @@ async def internal_unit_claim_bundle(
                 detail="Stateless worker parent workspace is not ready",
             )
 
-        container_ctx = _get_container_context(job)
-        if not (
-            container_ctx.get("status") == "ready"
-            and container_ctx.get("provisioner") == "k8s"
-            and bool(container_ctx.get("host") or container_ctx.get("pod_ip"))
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Stateless worker workspace is not Kubernetes-ready",
-            )
-
         # Job context is only a lifecycle hint. Bind this claim to the exact
         # live Kubernetes objects and SSH host key, using the parent owner for
         # children that share its workspace. The attested endpoint replaces
         # any stale copied/persisted host in this in-memory bundle only.
         workspace_owner = _stateless_worker_workspace_owner(job)
-        initial_attestation = await _attest_stateless_worker_workspace(workspace_owner)
         attested_job = dict(job)
         raw_context = job.get("context") or {}
         if isinstance(raw_context, str):
@@ -46929,19 +46977,6 @@ async def internal_unit_claim_bundle(
         if not isinstance(raw_context, dict):
             raw_context = {}
         attested_context = copy.deepcopy(raw_context)
-        exact_container_ctx = copy.deepcopy(container_ctx)
-        exact_container_ctx.update(
-            {
-                "status": "ready",
-                "provisioner": "k8s",
-                "host": initial_attestation.host,
-                "pod_ip": initial_attestation.pod_ip,
-                "port": initial_attestation.port,
-                "_runtime_incarnation": (initial_attestation.runtime_incarnation),
-            }
-        )
-        attested_context["workspace_container"] = exact_container_ctx
-        attested_job["context"] = attested_context
 
         raw_override = job.get("config_override")
         if isinstance(raw_override, str):
@@ -46949,11 +46984,81 @@ async def internal_unit_claim_bundle(
                 raw_override = json.loads(raw_override)
             except (json.JSONDecodeError, TypeError):
                 raw_override = None
-        attested_job["config_override"] = _inject_container_workspace_config(
-            copy.deepcopy(raw_override) if isinstance(raw_override, dict) else None,
-            exact_container_ctx,
-            replace_endpoint=True,
+        exact_override = (
+            copy.deepcopy(raw_override) if isinstance(raw_override, dict) else None
         )
+
+        if assigned_backend == "vm":
+            vm_ctx = _get_vm_context(job)
+            if not (
+                vm_ctx.get("status") == "ready"
+                and vm_ctx.get("ssh_ready_source") == "provisioner_probe"
+                and vm_ctx.get("identity_authenticated") is True
+                and vm_ctx.get("identity_provision_generation")
+                == vm_ctx.get("provision_generation")
+                and bool(vm_ctx.get("active_pod_uid"))
+                and bool(vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip"))
+                and bool(vm_ctx.get("ssh_host_key_fingerprint"))
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stateless worker VM workspace is not Kubernetes-ready",
+                )
+            initial_attestation = await _attest_stateless_worker_vm_workspace(
+                workspace_owner
+            )
+            exact_vm_ctx = copy.deepcopy(vm_ctx)
+            exact_vm_ctx.update(
+                {
+                    "status": "ready",
+                    "ssh_host": initial_attestation.host,
+                    "pod_ip": initial_attestation.pod_ip,
+                    "ssh_port": initial_attestation.port,
+                    "provision_generation": (initial_attestation.workspace_generation),
+                    "active_pod_uid": initial_attestation.runtime_incarnation,
+                    "ssh_host_key_fingerprint": (
+                        initial_attestation.ssh_host_key_fingerprint
+                    ),
+                }
+            )
+            attested_context["vm"] = exact_vm_ctx
+            attested_job["config_override"] = _inject_vm_workspace_config(
+                exact_override,
+                exact_vm_ctx,
+                replace_endpoint=True,
+            )
+        else:
+            container_ctx = _get_container_context(job)
+            if not (
+                container_ctx.get("status") == "ready"
+                and container_ctx.get("provisioner") == "k8s"
+                and bool(container_ctx.get("host") or container_ctx.get("pod_ip"))
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stateless worker workspace is not Kubernetes-ready",
+                )
+            initial_attestation = await _attest_stateless_worker_workspace(
+                workspace_owner
+            )
+            exact_container_ctx = copy.deepcopy(container_ctx)
+            exact_container_ctx.update(
+                {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "host": initial_attestation.host,
+                    "pod_ip": initial_attestation.pod_ip,
+                    "port": initial_attestation.port,
+                    "_runtime_incarnation": (initial_attestation.runtime_incarnation),
+                }
+            )
+            attested_context["workspace_container"] = exact_container_ctx
+            attested_job["config_override"] = _inject_container_workspace_config(
+                exact_override,
+                exact_container_ctx,
+                replace_endpoint=True,
+            )
+        attested_job["context"] = attested_context
 
         job_start = await _build_job_start_request(
             attested_job,
@@ -46979,9 +47084,14 @@ async def internal_unit_claim_bundle(
         # control-plane + host-key attestation so a Pod/PVC/Service replacement
         # during that window never crosses the response boundary under stale
         # workspace authority.
-        confirmed_attestation = await _attest_stateless_worker_workspace(
-            workspace_owner
-        )
+        if assigned_backend == "vm":
+            confirmed_attestation = await _attest_stateless_worker_vm_workspace(
+                workspace_owner
+            )
+        else:
+            confirmed_attestation = await _attest_stateless_worker_workspace(
+                workspace_owner
+            )
         if confirmed_attestation != initial_attestation:
             logger.warning(
                 "Stateless worker workspace authority changed during bundle "
@@ -47017,7 +47127,7 @@ async def internal_unit_claim_bundle(
             or final_action != "proceed"
             or final_job.get("execution_lane") != LANE_STATELESS
             or final_contract != workspace_decision.contract
-            or final_contract.assigned_backend != "sandbox"
+            or final_contract.assigned_backend != assigned_backend
             or workspace_runtime_authority_digest(
                 final_job, vm_mode=vm_provisioner.mode
             )

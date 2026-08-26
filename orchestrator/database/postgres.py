@@ -16846,9 +16846,10 @@ class PostgresDB:
         *,
         fair_key: str | None,
         priority: int,
+        allow_vm_workspace: bool = False,
         completion_commands_enabled: bool = False,
     ) -> tuple[bool, str | None]:
-        """Atomically expose a verified k8s-ready stateless job to workers.
+        """Atomically expose a verified pod-network stateless job to workers.
 
         The queue row is locked/created first, matching worker claim and all
         control verbs. The jobs-row predicate is then checked under lock in the
@@ -16937,10 +16938,33 @@ class PostgresDB:
                                        context->'vm'->>'requested', 'false'
                                    ) <> 'true'
                                )
+                               OR (
+                                   $2::boolean
+                                   AND jsonb_typeof(
+                                       context->'_workspace_contract'
+                                   ) = 'object'
+                                   AND context->'_workspace_contract'
+                                           ->>'version' = '1'
+                                   AND context->'_workspace_contract'
+                                           ->>'assigned_backend' = 'vm'
+                                   AND CASE lower(COALESCE(
+                                       config_override->'workspace'->>'backend',
+                                       'sandbox'
+                                   ))
+                                       WHEN 'container' THEN 'sandbox'
+                                       WHEN 'remote' THEN 'vm'
+                                       ELSE lower(COALESCE(
+                                           config_override->'workspace'->>'backend',
+                                           'sandbox'
+                                       ))
+                                   END = 'vm'
+                               )
                            )
                            {completion_exclusion}
                            {control_guard}
-                           AND CASE
+                           AND (
+                           (
+                           CASE
                                WHEN COALESCE(
                                    context->>'inherits_parent_workspace',
                                    'false'
@@ -16978,9 +17002,96 @@ class PostgresDB:
                                    ) IS NOT NULL
                                )
                            END
+                           AND CASE lower(COALESCE(
+                               config_override->'workspace'->>'backend',
+                               'sandbox'
+                           ))
+                               WHEN 'container' THEN 'sandbox'
+                               WHEN 'remote' THEN 'vm'
+                               ELSE lower(COALESCE(
+                                   config_override->'workspace'->>'backend',
+                                   'sandbox'
+                               ))
+                           END = 'sandbox'
+                           )
+                           OR (
+                               $2::boolean
+                               AND CASE
+                                   WHEN COALESCE(
+                                       context->>'inherits_parent_workspace',
+                                       'false'
+                                   ) = 'true'
+                                   THEN EXISTS (
+                                       SELECT 1
+                                         FROM jobs parent
+                                        WHERE parent.id = jobs.parent_job_id
+                                          AND parent.execution_lane = 'stateless'
+                                          AND parent.context->'vm'
+                                                ->>'status' = 'ready'
+                                          AND parent.context->'vm'
+                                                ->>'ssh_ready_source'
+                                                = 'provisioner_probe'
+                                          AND parent.context->'vm'
+                                                ->>'identity_authenticated'
+                                                = 'true'
+                                          AND parent.context->'vm'
+                                                ->>'identity_provision_generation'
+                                                = parent.context->'vm'
+                                                    ->>'provision_generation'
+                                          AND NULLIF(
+                                              parent.context->'vm'
+                                                  ->>'active_pod_uid',
+                                              ''
+                                          ) IS NOT NULL
+                                          AND NULLIF(
+                                              parent.context->'vm'
+                                                  ->>'ssh_host_key_fingerprint',
+                                              ''
+                                          ) IS NOT NULL
+                                          AND NULLIF(
+                                              COALESCE(
+                                                  parent.context->'vm'
+                                                      ->>'ssh_host',
+                                                  parent.context->'vm'
+                                                      ->>'pod_ip'
+                                              ),
+                                              ''
+                                          ) IS NOT NULL
+                                   )
+                                   ELSE (
+                                       context->'vm'->>'status' = 'ready'
+                                       AND context->'vm'
+                                            ->>'ssh_ready_source'
+                                            = 'provisioner_probe'
+                                       AND context->'vm'
+                                            ->>'identity_authenticated' = 'true'
+                                       AND context->'vm'
+                                            ->>'identity_provision_generation'
+                                            = context->'vm'
+                                                ->>'provision_generation'
+                                       AND NULLIF(
+                                           context->'vm'->>'active_pod_uid', ''
+                                       ) IS NOT NULL
+                                       AND NULLIF(
+                                           context->'vm'
+                                               ->>'ssh_host_key_fingerprint',
+                                           ''
+                                       ) IS NOT NULL
+                                       AND NULLIF(
+                                           COALESCE(
+                                               context->'vm'->>'ssh_host',
+                                               context->'vm'->>'pod_ip'
+                                           ),
+                                           ''
+                                       ) IS NOT NULL
+                                   )
+                               END
+                           )
+                           )
                          FOR UPDATE
                         """,
                         job_uuid,
+                        bool(allow_vm_workspace),
                     )
                     if row is None:
                         raise _AdmissionCASLostError
