@@ -52,6 +52,7 @@ from orchestrator.services.infrastructure_metering.sealer import (
     InfrastructureUsageDaySealer,
 )
 from orchestrator.services.usage_ledger import StrictUsagePublishResult
+from src.shared.persistent_input_delivery import message_row_id, persist_input_delivery
 
 
 ROOT = Path(__file__).parents[1]
@@ -846,6 +847,15 @@ def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None
     assert delivery_lock in sql
     assert sql.index(thread_lock) < sql.index(queue_lock) < sql.index(delivery_lock)
     assert "ADD COLUMN execution_lane TEXT NOT NULL DEFAULT 'pinned'" in sql
+    assert "stateless_input_delivery_history_ambiguous" in sql
+    assert "SET execution_lane = thread.execution_lane" not in sql
+    assert "SET execution_lane = 'stateless'" in sql
+    assert "delivery.state = 'persisted'" in sql
+    assert "delivery.claim_generation = 0" in sql
+    assert sql.count("message.turn_number IS NULL") == 3
+    assert (
+        "SET turn_number = (eligible.base_turn + eligible.turn_offset)::integer" in sql
+    )
     assert sql.count("NOT VALID") == 3
     assert "ADD COLUMN input_delivery_capable_lease_token BIGINT" in sql
     assert "trg_input_delivery_lane_authority" in sql
@@ -865,7 +875,7 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
     app_pg_dsn: str,
     tmp_path: Path,
 ) -> None:
-    """A genuine 0184 delivery cannot cross the lane-backfill boundary."""
+    """Genuine 0184 pending and terminal history keep distinct authority."""
 
     dbname = f"stateless_delivery_0185_{uuid4().hex[:12]}"
     admin = await asyncpg.connect(app_pg_dsn)
@@ -888,8 +898,13 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
         await run_migrations(pool, through_0184)
 
         thread_id = uuid4()
-        message_id = uuid4()
         delivery_id = uuid4()
+        message_id = message_row_id(delivery_id)
+        terminal_thread_id = uuid4()
+        terminal_message_id = uuid4()
+        terminal_delivery_id = uuid4()
+        terminal_agent_id = uuid4()
+        terminal_runtime_generation = uuid4()
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO threads (id,status,execution_lane,config_name) "
@@ -899,7 +914,7 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
             await conn.execute(
                 "INSERT INTO thread_messages "
                 "(id,thread_id,role,content,turn_number) "
-                "VALUES ($1,$2,'event','genuine pre-0185 wake',1)",
+                "VALUES ($1,$2,'event','genuine pre-0185 wake',NULL)",
                 message_id,
                 thread_id,
             )
@@ -913,6 +928,40 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
                 delivery_id,
                 thread_id,
                 message_id,
+            )
+            # This is the other genuine predecessor shape: a pinned runtime
+            # admitted and settled its delivery, after which the detached
+            # thread moved to stateless. The current thread lane must never
+            # rewrite that immutable pinned execution receipt.
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','pinned','default',2)",
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','settled pinned wake',2)",
+                terminal_message_id,
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation,"
+                " admitted_turn_number,admitted_at,settled_at) "
+                "VALUES ($1,$2,$3,'officer_wake','settled',1,$4,'old-pod',$5,"
+                " 2,now(),now())",
+                terminal_delivery_id,
+                terminal_thread_id,
+                terminal_message_id,
+                terminal_agent_id,
+                terminal_runtime_generation,
+            )
+            await conn.execute(
+                "UPDATE threads SET execution_lane='stateless' WHERE id=$1",
+                terminal_thread_id,
             )
 
         blocker = await asyncpg.connect(dsn)
@@ -958,10 +1007,12 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
 
         row = await observer.fetchrow(
             "SELECT thread.execution_lane AS thread_lane, "
-            "delivery.execution_lane AS delivery_lane, delivery.state "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "message.turn_number, thread.total_turns "
             "FROM threads AS thread "
             "JOIN thread_input_deliveries AS delivery "
             "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
             "WHERE delivery.delivery_id=$1",
             delivery_id,
         )
@@ -969,6 +1020,49 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
             "thread_lane": "stateless",
             "delivery_lane": "stateless",
             "state": "persisted",
+            "turn_number": 1,
+            "total_turns": 1,
+        }
+        async with observer.transaction():
+            replay = await persist_input_delivery(
+                observer,
+                thread_id=thread_id,
+                delivery_id=delivery_id,
+                role="event",
+                content="genuine pre-0185 wake",
+                source="officer_wake",
+                turn_number=None,
+            )
+        assert replay["transcript_inserted"] is False
+        assert replay["execution_lane"] == "stateless"
+        assert replay["state"] == "queued"
+        assert replay["turn_number"] == 1
+        assert (
+            await observer.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1", thread_id
+            )
+            == "queued"
+        )
+        terminal = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "delivery.claim_generation, delivery.owner_agent_id, "
+            "message.turn_number, thread.total_turns "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
+            "WHERE delivery.delivery_id=$1",
+            terminal_delivery_id,
+        )
+        assert dict(terminal) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "pinned",
+            "state": "settled",
+            "claim_generation": 1,
+            "owner_agent_id": terminal_agent_id,
+            "turn_number": 2,
+            "total_turns": 2,
         }
         assert await observer.fetchval(
             "SELECT success FROM schema_migrations WHERE filename=$1",
@@ -1001,6 +1095,166 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
             await updater.close()
         if observer is not None:
             await observer.close()
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Do not guess that a pinned predecessor claim became stateless work."""
+
+    dbname = f"stateless_delivery_0185_ambiguous_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "ambiguous-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','claimed predecessor wake',NULL)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','owned',1,$4,'old-pod',$5)",
+                uuid4(),
+                thread_id,
+                message_id,
+                uuid4(),
+                uuid4(),
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0185 stateless input history is ambiguous",
+        ):
+            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+
+        async with pool.acquire() as conn:
+            # Transactional failure rolls every 0185 catalog mutation back.
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+            failure = await conn.fetchrow(
+                "SELECT success, error FROM schema_migrations WHERE filename=$1",
+                APP_STATELESS_INPUT_DELIVERIES.name,
+            )
+            assert failure is not None
+            assert failure["success"] is False
+            assert (
+                "stateless input history is ambiguous" in str(failure["error"]).lower()
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename=$1)",
+                APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """A numbered predecessor input is not the known durable-wake shape."""
+
+    dbname = f"stateless_delivery_0185_numbered_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "numbered-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','stateless','default',7)",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','numbered predecessor wake',7)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted',0)",
+                uuid4(),
+                thread_id,
+                message_id,
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0185 stateless input history is ambiguous",
+        ):
+            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+    finally:
         await pool.close()
         admin = await asyncpg.connect(app_pg_dsn)
         try:
