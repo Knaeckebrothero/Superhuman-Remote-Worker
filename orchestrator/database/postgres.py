@@ -29129,6 +29129,407 @@ class PostgresDB:
         return count or 0
 
     # =========================================================================
+    # Notifications (unified feed) — feature:unified-notifications
+    # knowledge-base/knowledge/features/unified_notification_system.md
+    # =========================================================================
+
+    _NOTIFICATION_STATUS_CLAUSES = {
+        "pending": "resolved_at IS NULL AND archived_at IS NULL",
+        "resolved": "resolved_at IS NOT NULL AND archived_at IS NULL",
+        "unread": "read_at IS NULL AND archived_at IS NULL",
+        "unseen": "seen_at IS NULL AND archived_at IS NULL",
+        "archived": "archived_at IS NOT NULL",
+        "all": "archived_at IS NULL",
+    }
+
+    @staticmethod
+    def _notification_row(row: Any) -> Dict[str, Any]:
+        """asyncpg hands JSONB back as a string on some paths — normalise."""
+        data = dict(row)
+        for key, empty in (("actions", []), ("payload", {})):
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def insert_notification_once(
+        self,
+        *,
+        notification_id: str,
+        recipient_kind: str,
+        recipient_id: str,
+        category: str,
+        severity: str,
+        subject: str,
+        body: str,
+        source_kind: Optional[str],
+        source_id: Optional[str],
+        dedup_key: str,
+        actions: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Insert one feed row plus its ``in_app`` delivery, validating any replay.
+
+        Returns ``True`` only for the inserting caller — a journal-replayed
+        completion effect or a dual-leader retry lands on the deterministic
+        primary key, re-reads the row, checks that its identity fields match,
+        and returns ``False`` so the SSE frame is broadcast exactly once.
+        Subject/body drift on replay is tolerated (identity is the dedup key);
+        a different category or source is a caller bug and raises.
+        """
+        nid = UUID(str(notification_id))
+        rid = UUID(str(recipient_id))
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                inserted = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    INSERT INTO notifications (
+                        id, recipient_kind, recipient_id, category, severity,
+                        subject, body, source_kind, source_id, dedup_key,
+                        actions, payload
+                    ) VALUES (
+                        $1::uuid, $2::text, $3::uuid, $4::text, $5::text,
+                        $6::text, $7::text, $8::text, $9::text, $10::text,
+                        $11::jsonb, $12::jsonb
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING TRUE
+                    """,
+                    nid,
+                    recipient_kind,
+                    rid,
+                    category,
+                    severity,
+                    subject,
+                    body,
+                    source_kind,
+                    source_id,
+                    dedup_key,
+                    json.dumps(actions),
+                    json.dumps(payload),
+                )
+                if inserted:
+                    await conn.execute(
+                        """
+                        -- feature:unified-notifications
+                        INSERT INTO notification_deliveries
+                            (notification_id, channel, state, settled_at)
+                        VALUES ($1::uuid, 'in_app', 'sent', now())
+                        ON CONFLICT DO NOTHING
+                        """,
+                        nid,
+                    )
+                    return True
+            # Separate statement on purpose: if ON CONFLICT waited on a
+            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
+            # and can see the row whose conflict it observed.
+            async with self.acquire() as conn:
+                matches = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    SELECT category = $2::text
+                       AND source_kind IS NOT DISTINCT FROM $3::text
+                       AND source_id IS NOT DISTINCT FROM $4::text
+                       AND recipient_kind = $5::text
+                       AND recipient_id = $6::uuid
+                    FROM notifications
+                    WHERE id = $1::uuid
+                    """,
+                    nid,
+                    category,
+                    source_kind,
+                    source_id,
+                    recipient_kind,
+                    rid,
+                )
+        if not matches:
+            raise RuntimeError(
+                "notification replay identity matched a different payload"
+            )
+        return False
+
+    async def claim_notification_delivery(
+        self,
+        *,
+        notification_id: str,
+        channel: str,
+        recipient_address: Optional[str] = None,
+    ) -> Optional[str]:
+        """Insert-as-claim BEFORE sending. ``None`` means a live pending/sent
+        row already holds the (notification, channel) slot — skip the send.
+        A ``failed`` row does not hold the slot, so the next attempt claims."""
+        nid = UUID(str(notification_id))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                INSERT INTO notification_deliveries
+                    (notification_id, channel, state, recipient_address, attempt)
+                VALUES (
+                    $1::uuid, $2::text, 'pending', $3::text,
+                    COALESCE((
+                        SELECT max(attempt) FROM notification_deliveries
+                        WHERE notification_id = $1::uuid AND channel = $2::text
+                    ), 0) + 1
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """,
+                nid,
+                channel,
+                recipient_address,
+            )
+        return str(row["id"]) if row else None
+
+    async def settle_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        state: str,
+        provider_msg_id: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        if state not in ("sent", "failed", "suppressed"):
+            raise ValueError(f"cannot settle a delivery to {state!r}")
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_deliveries
+                   SET state = $2::text,
+                       settled_at = now(),
+                       provider_msg_id = COALESCE($3::text, provider_msg_id),
+                       error = $4::text
+                 WHERE id = $1::uuid AND state = 'pending'
+                """,
+                UUID(str(delivery_id)),
+                state,
+                provider_msg_id,
+                (error or None) and str(error)[:2000],
+            )
+        return result == "UPDATE 1"
+
+    async def get_notification(self, notification_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            nid = UUID(str(notification_id))
+        except ValueError:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "-- feature:unified-notifications\n"
+                "SELECT * FROM notifications WHERE id = $1::uuid",
+                nid,
+            )
+        return self._notification_row(row) if row else None
+
+    async def list_notifications_page(
+        self,
+        *,
+        recipient_kind: str,
+        recipient_id: str,
+        before: Optional[str] = None,
+        limit: int = 50,
+        categories: Optional[List[str]] = None,
+        status: str = "all",
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Keyset page, newest first. ``before`` is ``"{created_at_iso}|{id}"``
+        from a previous page; returns ``(rows, next_before)`` with the cursor
+        set only when a ``limit + 1`` probe row proved there is more."""
+        status_clause = self._NOTIFICATION_STATUS_CLAUSES.get(status)
+        if status_clause is None:
+            raise ValueError(f"unknown notification status filter {status!r}")
+        params: List[Any] = [recipient_kind, UUID(str(recipient_id))]
+        where = ["recipient_kind = $1", "recipient_id = $2", status_clause]
+        if categories:
+            params.append([str(c) for c in categories])
+            where.append(f"category = ANY(${len(params)}::text[])")
+        if before:
+            ts_text, _, id_text = before.partition("|")
+            params.append(datetime.fromisoformat(ts_text))
+            params.append(UUID(id_text))
+            where.append(
+                f"(created_at, id) < (${len(params) - 1}::timestamptz, ${len(params)}::uuid)"
+            )
+        params.append(limit + 1)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                -- feature:unified-notifications
+                SELECT * FROM notifications
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        has_more = len(rows) > limit
+        page = [self._notification_row(r) for r in rows[:limit]]
+        next_before = None
+        if has_more and page:
+            last = page[-1]
+            next_before = f"{last['created_at'].isoformat()}|{last['id']}"
+        return page, next_before
+
+    async def get_notification_counts(
+        self, *, recipient_kind: str, recipient_id: str
+    ) -> Dict[str, Any]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT category,
+                       count(*) FILTER (WHERE seen_at IS NULL)     AS unseen,
+                       count(*) FILTER (WHERE read_at IS NULL)     AS unread,
+                       count(*) FILTER (WHERE resolved_at IS NULL) AS pending
+                  FROM notifications
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND archived_at IS NULL
+                 GROUP BY category
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        counts: Dict[str, Any] = {
+            "unseen": 0,
+            "unread": 0,
+            "pending": 0,
+            "by_category": {},
+        }
+        for row in rows:
+            counts["unseen"] += int(row["unseen"] or 0)
+            counts["unread"] += int(row["unread"] or 0)
+            counts["pending"] += int(row["pending"] or 0)
+            counts["by_category"][row["category"]] = {
+                "pending": int(row["pending"] or 0),
+                "unseen": int(row["unseen"] or 0),
+            }
+        return counts
+
+    async def mark_notifications_seen(
+        self, *, recipient_kind: str, recipient_id: str, ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Stamp ``seen_at`` once; never regresses an earlier stamp."""
+        if not ids:
+            return []
+        uuids = [UUID(str(i)) for i in ids]
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET seen_at = now()
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND id = ANY($3::uuid[]) AND seen_at IS NULL
+                RETURNING id, seen_at
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+                uuids,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_notification_read_v2(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Idempotent: returns the row whether or not this call changed it."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def stamp_notification_interacted(
+        self, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET interacted_at = COALESCE(interacted_at, now()),
+                       read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notification(
+        self, notification_id: str, *, resolved_by: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET resolved_at = COALESCE(resolved_at, now()),
+                       resolved_by = COALESCE(resolved_by, $2::text)
+                 WHERE id = $1::uuid
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                resolved_by,
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notifications_by_source(
+        self, *, source_kind: str, source_id: str, resolved_by: str
+    ) -> List[Dict[str, Any]]:
+        """Settle every open row about one source, whoever the recipient is.
+        Returns the rows this call flipped (empty on a repeat)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET resolved_at = now(), resolved_by = $3::text
+                 WHERE source_kind = $1::text AND source_id = $2::text
+                   AND resolved_at IS NULL
+                RETURNING *
+                """,
+                source_kind,
+                str(source_id),
+                resolved_by,
+            )
+        return [self._notification_row(r) for r in rows]
+
+    async def archive_notification(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET archived_at = COALESCE(archived_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    # =========================================================================
     # SYSTEM SETTINGS (Phase 4)
     # --- Capability grants (Slice 2) ---
 

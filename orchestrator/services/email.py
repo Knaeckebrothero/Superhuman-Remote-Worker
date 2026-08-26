@@ -241,6 +241,65 @@ class EmailService:
             body_html=body_html,
         )
 
+    async def send_notification_email(
+        self,
+        to: str,
+        to_name: str,
+        subject: str,
+        body_md: str,
+        *,
+        cockpit_path: str,
+    ) -> tuple[bool, str | None]:
+        """One delivery of a feed notification (unified notification system).
+
+        Not job-shaped: the header is neutral and the single call to action is
+        the feed row's own deep link (``/inbox?n=<id>``), so the mail always
+        leads back to the notification center — never to a job that may not
+        exist. Returns ``(sent, message_id)``; the Message-ID is stored on the
+        delivery row for reply routing and read-state correlation.
+        """
+        full_subject = f"[SRW] {subject}"
+        domain = self.mail_domain or "srw.local"
+        email_msg_id = f"<{uuid_mod.uuid4().hex}@{domain}>"
+        cockpit_link = f"{self.cockpit_url}{cockpit_path}"
+
+        body_text = (
+            f"SRW Notification\n"
+            f"{'=' * 50}\n\n"
+            f"{body_md}\n\n"
+            f"{'=' * 50}\n"
+            f"Open in Cockpit: {cockpit_link}\n"
+        )
+        message_html = (
+            body_md.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+        body_html = f"""\
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #cdd6f4; background: #1e1e2e;">
+  <div style="border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
+    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
+      <h2 style="margin: 0; color: #cba6f7; font-size: 16px;">SRW Notification</h2>
+    </div>
+    <div style="padding: 20px; font-size: 14px; line-height: 1.6; color: #cdd6f4;">
+      {message_html}
+    </div>
+    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
+      <a href="{cockpit_link}" style="display: inline-block; background: #cba6f7; color: #1e1e2e; padding: 10px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Open in Cockpit</a>
+    </div>
+  </div>
+</div>"""
+
+        success = await self._send(
+            to,
+            full_subject,
+            body_text,
+            body_html,
+            message_id=email_msg_id,
+        )
+        return success, email_msg_id if success else None
+
     async def send_agent_message(
         self,
         to: str,

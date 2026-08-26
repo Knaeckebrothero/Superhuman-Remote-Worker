@@ -242,7 +242,12 @@ APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0183_compute_initial_recovery_epoch_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY
+APP_NOTIFICATIONS_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0191_notifications.sql"
+)
+# Unified notification feed (slice 1) — the head after the 0184-0190
+# managed-repository / stateless-input lane; bump when the next lands.
+APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATIONS_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

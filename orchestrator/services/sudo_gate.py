@@ -581,6 +581,9 @@ class SudoGateService:
                     await self._nats_reply(reply_subject, False, "approval timed out")
                 count += 1
 
+                await self._resolve_notification_source(
+                    req_id, resolved_by="system:sudo_expired"
+                )
                 await self._broadcast_sse(
                     "request_decided",
                     {
@@ -1078,8 +1081,29 @@ class SudoGateService:
             except Exception as e:
                 logger.error("Failed to finalize sudo request %s: %s", request_id, e)
 
+        await self._resolve_notification_source(
+            request_id, resolved_by=f"sudo_{status}:{decided_by}"
+        )
         approved = status in ("approved", "auto_approved")
         await self._nats_reply(nats_reply_subject, approved, reason)
+
+    @staticmethod
+    async def _resolve_notification_source(
+        request_id: str, *, resolved_by: str
+    ) -> None:
+        """Settle every feed row about this request (unified notification
+        system, D6). Best-effort — the decision is already committed."""
+        try:
+            from services.notification_service import notification_service
+
+            if notification_service.is_available:
+                await notification_service.resolve_source(
+                    "sudo_request", str(request_id), resolved_by=resolved_by
+                )
+        except Exception as e:
+            logger.warning(
+                "notification resolve failed for sudo request %s: %s", request_id, e
+            )
 
     async def _nats_reply(
         self, reply_subject: Optional[str], approved: bool, reason: str = ""

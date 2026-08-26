@@ -1,27 +1,46 @@
-"""Unified notification dispatcher for agent-human communication.
+"""Unified notification service.
 
-Orchestrates delivery across all configured channels (email, Ntfy, Slack,
-Discord) while respecting user channel preferences and quiet hours.
+Two generations live side by side while the cutover runs
+(knowledge-base/knowledge/features/unified_notification_system.md):
 
-Sits between the send endpoint and individual transports::
+* ``record()`` — the new front door (D1: callers *record* what happened and
+  who has a stake; they never choose a channel). It writes one durable feed
+  row per recipient (D2/D3), broadcasts the ``notification`` SSE frame once,
+  and performs the zero-delay channel deliveries of the row's severity class
+  with a claim-before-send ledger so a replayed completion effect or a
+  dual-leader retry can never send twice (D10).
 
-    send_agent_message() → notification_service.dispatch()
-                              ├── email_service.send_agent_message()
-                              ├── ntfy_transport.send()
-                              ├── slack_transport.send()
-                              ├── discord_transport.send()
-                              └── notification_feed.broadcast() (SSE)
+* ``dispatch()`` and the ``notify_*`` helpers — the legacy fan-out (email +
+  webhooks + a transient ``new_message`` frame, no durable row). Still used by
+  the producers slice 3 migrates; every remaining call site is enumerated in
+  ``policy/notification_producers.txt`` and the count may only go down.
 
-Follows the NatsBridge graceful degradation pattern: fully optional,
-all operations are no-ops when unconfigured.
+Follows the NatsBridge graceful degradation pattern: fully optional, all
+operations are no-ops when unconfigured.
 """
+
+from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, time
+from dataclasses import dataclass
+from datetime import datetime, time, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from services.notification_catalog import (
+    RECIPIENT_KINDS,
+    WEBHOOK_CHANNELS,
+    ActionContext,
+    action_handler,
+    bypasses_quiet_hours,
+    category_spec,
+    normalize_severity,
+    notification_id as mint_notification_id,
+    serialize_actions,
+    serialize_notification,
+    steps_for,
+)
 from services.webhook_transports import (
     DiscordWebhookTransport,
     NotificationPayload,
@@ -30,6 +49,26 @@ from services.webhook_transports import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class NotificationNotFound(LookupError):
+    """No such row for this recipient (the endpoint answers 404)."""
+
+
+class ActionNotDeclared(ValueError):
+    """The row does not carry that action (400)."""
+
+
+class ActionUnregistered(RuntimeError):
+    """The category declares the action but nothing handles it — a wiring bug
+    that must be loud, like ``_run_completion_effect``'s registry gate (500)."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecordResult:
+    notification_id: str
+    inserted: bool
+    deliveries: dict[str, Any]
 
 
 class NotificationService:
@@ -89,6 +128,495 @@ class NotificationService:
         self._notification_feed = notification_feed
         self._available = True
         logger.info("NotificationService initialized")
+
+    # =========================================================================
+    # The unified feed (record / act / engagement / resolution)
+    # =========================================================================
+
+    async def record(
+        self,
+        *,
+        recipient_id: str,
+        category: str,
+        dedup_key: str,
+        subject: str,
+        body: str = "",
+        recipient_kind: str = "user",
+        source_kind: str | None = None,
+        source_id: str | None = None,
+        severity: str | None = None,
+        actions: list[dict[str, Any]] | None = None,
+        action_params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> RecordResult:
+        """Record that something happened that ``recipient`` has a stake in.
+
+        Idempotent on ``(recipient_kind, recipient_id, dedup_key)``: a replay
+        finds the existing row, broadcasts nothing, and re-attempts only the
+        channel deliveries that never got a ``sent`` claim. Callers never see
+        or influence delivery beyond the returned outcome dict (D1).
+        """
+        if not self._available:
+            raise RuntimeError("NotificationService not initialized")
+        if recipient_kind not in RECIPIENT_KINDS:
+            raise ValueError(f"unknown recipient_kind {recipient_kind!r}")
+        if not dedup_key:
+            raise ValueError("dedup_key is required")
+        if (source_kind is None) != (source_id is None):
+            raise ValueError("source_kind and source_id go together")
+        spec = category_spec(category)
+        resolved_severity = normalize_severity(spec, severity)
+
+        nid = str(mint_notification_id(recipient_kind, str(recipient_id), dedup_key))
+        row: dict[str, Any] = {
+            "id": nid,
+            "recipient_kind": recipient_kind,
+            "recipient_id": str(recipient_id),
+            "category": category,
+            "severity": resolved_severity,
+            "subject": subject,
+            "body": body or "",
+            "source_kind": source_kind,
+            "source_id": str(source_id) if source_id is not None else None,
+            "dedup_key": dedup_key,
+            "actions": (
+                list(actions)
+                if actions is not None
+                else serialize_actions(spec, action_params)
+            ),
+            "payload": dict(payload or {}),
+            # Provisional: the DB default is authoritative; the cockpit upserts
+            # by id and the next feed load corrects the millisecond drift.
+            "created_at": datetime.now(timezone.utc),
+            "seen_at": None,
+            "read_at": None,
+            "interacted_at": None,
+            "resolved_at": None,
+            "resolved_by": None,
+            "archived_at": None,
+        }
+
+        stored_id, inserted = await self._persist_notification(row)
+        row["id"] = stored_id
+        if inserted:
+            self._broadcast_notification(row)
+        deliveries = await self._deliver_immediate(row, spec, inserted=inserted)
+        logger.info(
+            "notification %s %s for %s:%s (%s/%s)",
+            stored_id[:8],
+            "recorded" if inserted else "replayed",
+            recipient_kind,
+            str(recipient_id)[:8],
+            category,
+            resolved_severity,
+        )
+        return RecordResult(stored_id, inserted, deliveries)
+
+    async def act(
+        self,
+        *,
+        notification_id: str,
+        user: dict[str, Any],
+        action_type: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run a declared action through its registered handler and stamp the
+        row. The center posts ``{action_type, params}`` and knows nothing
+        else; category meaning lives entirely in the handler (D7)."""
+        row = await self._db.get_notification(notification_id)
+        if (
+            not row
+            or row.get("recipient_kind") != "user"
+            or str(row.get("recipient_id")) != str(user.get("id"))
+        ):
+            raise NotificationNotFound(notification_id)
+        declared = next(
+            (a for a in row.get("actions") or [] if a.get("type") == action_type),
+            None,
+        )
+        if declared is None:
+            raise ActionNotDeclared(action_type)
+        handler = action_handler(row["category"], action_type)
+        if handler is None:
+            raise ActionUnregistered(f"{row['category']}/{action_type}")
+
+        # Server-declared params win over anything the client sends; the
+        # client contributes only the collected input (feedback, reason, …).
+        merged = dict(params or {})
+        merged.update(declared.get("params") or {})
+        context = ActionContext(notification=row, user=user, params=merged, db=self._db)
+        result = await handler(context)
+
+        updated = await self._db.stamp_notification_interacted(row["id"])
+        if result.resolve:
+            updated = await self._db.resolve_notification(
+                row["id"], resolved_by=result.resolved_by or f"user:{user.get('id')}"
+            )
+        updated = updated or row
+        self._broadcast_update(
+            str(updated["recipient_id"]),
+            {
+                "id": str(updated["id"]),
+                **{
+                    k: serialize_notification(updated)[k]
+                    for k in (
+                        "seen_at",
+                        "read_at",
+                        "interacted_at",
+                        "resolved_at",
+                        "resolved_by",
+                    )
+                },
+            },
+        )
+        return {
+            "result": result.result,
+            "notification": serialize_notification(updated),
+        }
+
+    async def mark_seen(
+        self, *, recipient_kind: str, recipient_id: str, ids: list[str]
+    ) -> list[str]:
+        stamped = await self._db.mark_notifications_seen(
+            recipient_kind=recipient_kind, recipient_id=recipient_id, ids=ids
+        )
+        for entry in stamped:
+            seen_at = entry.get("seen_at")
+            self._broadcast_update(
+                str(recipient_id),
+                {
+                    "id": str(entry["id"]),
+                    "seen_at": seen_at.isoformat() if seen_at else None,
+                },
+            )
+        return [str(entry["id"]) for entry in stamped]
+
+    async def mark_read(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> dict[str, Any] | None:
+        row = await self._db.mark_notification_read_v2(
+            recipient_kind=recipient_kind,
+            recipient_id=recipient_id,
+            notification_id=notification_id,
+        )
+        if row is None:
+            return None
+        wire = serialize_notification(row)
+        self._broadcast_update(
+            str(recipient_id),
+            {"id": wire["id"], "seen_at": wire["seen_at"], "read_at": wire["read_at"]},
+        )
+        return wire
+
+    async def archive(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> dict[str, Any] | None:
+        row = await self._db.archive_notification(
+            recipient_kind=recipient_kind,
+            recipient_id=recipient_id,
+            notification_id=notification_id,
+        )
+        if row is None:
+            return None
+        wire = serialize_notification(row)
+        self._broadcast_update(
+            str(recipient_id), {"id": wire["id"], "archived_at": wire["archived_at"]}
+        )
+        return wire
+
+    async def resolve_source(
+        self, source_kind: str, source_id: str, *, resolved_by: str
+    ) -> list[str]:
+        """The underlying thing was settled — by a user, the officer, or a
+        sweeper. Stamp every open row about it, whoever it belongs to (D6).
+        Best-effort by design: called from state-change hooks that must not
+        fail because the feed did."""
+        if not self._available or not self._db:
+            return []
+        try:
+            rows = await self._db.resolve_notifications_by_source(
+                source_kind=source_kind,
+                source_id=str(source_id),
+                resolved_by=resolved_by,
+            )
+        except Exception as e:
+            logger.warning(
+                "resolve_source(%s, %s) failed: %s", source_kind, source_id, e
+            )
+            return []
+        for row in rows:
+            wire = serialize_notification(row)
+            self._broadcast_update(
+                str(row["recipient_id"]),
+                {
+                    "id": wire["id"],
+                    "resolved_at": wire["resolved_at"],
+                    "resolved_by": wire["resolved_by"],
+                },
+            )
+        return [str(row["id"]) for row in rows]
+
+    async def get_feed_page(
+        self,
+        *,
+        recipient_kind: str,
+        recipient_id: str,
+        before: str | None = None,
+        limit: int = 50,
+        categories: list[str] | None = None,
+        status: str = "all",
+    ) -> dict[str, Any]:
+        rows, next_before = await self._db.list_notifications_page(
+            recipient_kind=recipient_kind,
+            recipient_id=recipient_id,
+            before=before,
+            limit=limit,
+            categories=categories,
+            status=status,
+        )
+        counts = await self._db.get_notification_counts(
+            recipient_kind=recipient_kind, recipient_id=recipient_id
+        )
+        return {
+            "items": [serialize_notification(r) for r in rows],
+            "next_before": next_before,
+            "counts": counts,
+        }
+
+    async def get_counts(
+        self, *, recipient_kind: str, recipient_id: str
+    ) -> dict[str, Any]:
+        return await self._db.get_notification_counts(
+            recipient_kind=recipient_kind, recipient_id=recipient_id
+        )
+
+    # --- stubbable seams (tests build NotificationService.__new__ and replace these) ---
+
+    async def _persist_notification(self, row: dict[str, Any]) -> tuple[str, bool]:
+        inserted = await self._db.insert_notification_once(
+            notification_id=row["id"],
+            recipient_kind=row["recipient_kind"],
+            recipient_id=row["recipient_id"],
+            category=row["category"],
+            severity=row["severity"],
+            subject=row["subject"],
+            body=row["body"],
+            source_kind=row["source_kind"],
+            source_id=row["source_id"],
+            dedup_key=row["dedup_key"],
+            actions=row["actions"],
+            payload=row["payload"],
+        )
+        return row["id"], bool(inserted)
+
+    async def _claim_delivery(
+        self, notification_id: str, channel: str, *, address: str | None
+    ) -> str | None:
+        return await self._db.claim_notification_delivery(
+            notification_id=notification_id, channel=channel, recipient_address=address
+        )
+
+    async def _settle_delivery(
+        self,
+        delivery_id: str,
+        *,
+        state: str,
+        provider_msg_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        await self._db.settle_notification_delivery(
+            delivery_id, state=state, provider_msg_id=provider_msg_id, error=error
+        )
+
+    async def _record_suppressed(
+        self, notification_id: str, channel: str, reason: str
+    ) -> None:
+        """A channel that was deliberately not attempted still gets a row, so
+        "why did no mail go out" is answerable. A suppressed row does not hold
+        the claim slot."""
+        try:
+            claim = await self._claim_delivery(notification_id, channel, address=None)
+            if claim:
+                await self._settle_delivery(claim, state="suppressed", error=reason)
+        except Exception as e:
+            logger.debug("suppressed-delivery row failed (%s): %s", channel, e)
+
+    async def _get_user(self, user_id: str) -> dict[str, Any] | None:
+        if not self._db:
+            return None
+        try:
+            return await self._db.get_user(str(user_id))
+        except Exception:
+            return None
+
+    def _broadcast_notification(self, row: dict[str, Any]) -> None:
+        if not self._notification_feed or row.get("recipient_kind") != "user":
+            return
+        try:
+            self._notification_feed.broadcast(
+                user_id=str(row["recipient_id"]),
+                event_type="notification",
+                data={"notification": serialize_notification(row)},
+            )
+        except Exception as e:
+            logger.debug("notification SSE broadcast failed: %s", e)
+
+    def _broadcast_update(self, recipient_id: str, patch: dict[str, Any]) -> None:
+        if not self._notification_feed:
+            return
+        try:
+            self._notification_feed.broadcast(
+                user_id=str(recipient_id),
+                event_type="notification.updated",
+                data=patch,
+            )
+        except Exception as e:
+            logger.debug("notification.updated SSE broadcast failed: %s", e)
+
+    def _channel_deliverable(self, channel: str) -> bool:
+        """Is there any transport behind this channel at all? Channels with
+        nothing behind them get no delivery rows — a suppressed row answers
+        "why did this not go out", and "the operator never configured Slack"
+        is not a per-notification question."""
+        if channel == "email":
+            return self._email_service is not None and bool(
+                getattr(self._email_service, "is_configured", True)
+            )
+        if channel in WEBHOOK_CHANNELS:
+            transport = self._transports.get(channel)
+            return bool(transport and transport.is_configured)
+        return False  # 'push' has no v1 transport (non-goal)
+
+    async def _deliver_immediate(
+        self, row: dict[str, Any], spec: Any, *, inserted: bool
+    ) -> dict[str, Any]:
+        """Run the zero-delay channel steps of the row's severity class.
+
+        Always runs — including on replay — because a crash between a send
+        and the completion journal's mark replays the callback; the claim
+        ledger decides per channel whether anything is actually sent. Rows
+        that were deliberately not attempted (preference off, quiet hours,
+        no address) are recorded as ``suppressed`` only by the inserting call
+        so a replay does not pile up duplicates.
+        """
+        results: dict[str, Any] = {"in_app": True}
+        steps = [step for step in steps_for(spec, row["severity"]) if step.immediate]
+        if not steps or row["recipient_kind"] != "user":
+            return results
+
+        nid = row["id"]
+        recipient_id = row["recipient_id"]
+        deliverable = [s for s in steps if self._channel_deliverable(s.channel)]
+        if not deliverable:
+            return results
+        channels = await self._get_user_channels(recipient_id)
+        settings = await self._get_user_settings(recipient_id)
+        wanted = [s for s in deliverable if channels.get(s.channel, True)]
+        if inserted:
+            for step in deliverable:
+                if step not in wanted:
+                    await self._record_suppressed(nid, step.channel, "preference")
+        if not wanted:
+            return results
+
+        if not bypasses_quiet_hours(spec, row["severity"]) and self._is_in_quiet_hours(
+            settings
+        ):
+            results["queued"] = True
+            if inserted:
+                for step in wanted:
+                    await self._record_suppressed(nid, step.channel, "quiet_hours")
+                # Legacy morning digest keeps working until slice 2 replaces
+                # it with delayed steps. Only the inserting call queues.
+                payload = row.get("payload") or {}
+                await self._queue_notification(
+                    user_id=recipient_id,
+                    job_id=payload.get("job_id") or row.get("source_id") or nid,
+                    thread_id=payload.get("thread_id"),
+                    subject=row["subject"],
+                    message=row["body"],
+                    channels=channels,
+                )
+            return results
+        results["queued"] = False
+
+        user = await self._get_user(recipient_id)
+        cockpit_path = f"/inbox?n={nid}"
+        payload = row.get("payload") or {}
+        for step in wanted:
+            channel = step.channel
+            if channel == "email":
+                address = (user or {}).get("email")
+                if not address:
+                    if inserted:
+                        await self._record_suppressed(nid, "email", "no_email")
+                    continue
+                claim = await self._claim_delivery(nid, "email", address=address)
+                if claim is None:
+                    results["email"] = "already_delivered"
+                    continue
+                ok, msg_id, error = False, None, None
+                try:
+                    ok, msg_id = await self._email_service.send_notification_email(
+                        to=address,
+                        to_name=(user or {}).get("display_name") or "User",
+                        subject=row["subject"],
+                        body_md=row["body"],
+                        cockpit_path=cockpit_path,
+                    )
+                    if not ok:
+                        error = "send returned False"
+                except Exception as e:
+                    error = str(e)
+                    logger.warning("notification email failed (%s): %s", nid[:8], e)
+                await self._settle_delivery(
+                    claim,
+                    state="sent" if ok else "failed",
+                    provider_msg_id=msg_id,
+                    error=error,
+                )
+                results["email"] = bool(ok)
+                if msg_id:
+                    results["email_message_id"] = msg_id
+            else:
+                transport = self._transports[channel]
+                claim = await self._claim_delivery(nid, channel, address=None)
+                if claim is None:
+                    results[channel] = "already_delivered"
+                    continue
+                ok, error = False, None
+                try:
+                    ok = bool(
+                        await transport.send(
+                            NotificationPayload(
+                                subject=row["subject"],
+                                body_text=row["body"],
+                                job_id=str(
+                                    payload.get("job_id") or row.get("source_id") or ""
+                                ),
+                                job_description=str(
+                                    payload.get("job_description") or ""
+                                ),
+                                config_name=str(payload.get("config_name") or ""),
+                                thread_id=payload.get("thread_id"),
+                                cockpit_url=f"{self._cockpit_url}{cockpit_path}",
+                            )
+                        )
+                    )
+                    if not ok:
+                        error = "send returned False"
+                except Exception as e:
+                    error = str(e)
+                    logger.warning("notification %s transport failed: %s", channel, e)
+                await self._settle_delivery(
+                    claim, state="sent" if ok else "failed", error=error
+                )
+                results[channel] = ok
+        return results
+
+    # =========================================================================
+    # Legacy fan-out — retired in slice 3; every caller is in the manifest
+    # =========================================================================
 
     async def dispatch(
         self,
