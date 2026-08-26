@@ -12407,6 +12407,8 @@ class PostgresDB:
                 SELECT po.project_id,
                        p.name AS project_name,
                        po.thread_id,
+                       po.config_override AS post_config_override,
+                       t.project_id AS thread_project_id,
                        t.status AS thread_status,
                        t.metadata,
                        (SELECT MIN(w.fire_at)
@@ -12687,11 +12689,12 @@ class PostgresDB:
         the same durable row.
 
         ``expected_post_config_override`` is used by the explicit commission
-        flow after external thread provisioning.  A concurrent post edit makes
-        registration lose cleanly instead of overwriting the newer kit with
-        the provisioning snapshot. Direct legacy creates omit it and retain
-        the established behavior of stamping their validated kit onto a vacant
-        post.
+        flow after external thread provisioning. A concurrent post edit makes
+        registration lose cleanly. The durable Post is never overwritten from
+        ``config_override``: generic registration is a link operation, not an
+        alternate configuration authority. New production commissions must
+        provide the exact snapshot; the optional argument remains only for
+        legacy/test callers whose candidate cannot acquire Post-owned values.
 
         Explicit commission sets ``commission_continuity``. Registration,
         durable state restore, while-vacant drain, and commission-wake INSERT
@@ -12781,15 +12784,63 @@ class PostgresDB:
                     and current_config != expected_post_config_override
                 ):
                     return None
-                durable_config = (
-                    current_config
-                    if expected_post_config_override is not None
-                    else (
-                        config_override
-                        if config_override is not None
-                        else current_config
-                    )
-                )
+                if expected_post_config_override is not None:
+                    candidate_metadata = candidate["metadata"]
+                    if isinstance(candidate_metadata, str):
+                        try:
+                            candidate_metadata = json.loads(candidate_metadata)
+                        except (TypeError, ValueError):
+                            candidate_metadata = {}
+                    if not isinstance(candidate_metadata, dict):
+                        return None
+                    candidate_config = candidate_metadata.get("config_override") or {}
+                    if not isinstance(candidate_config, dict):
+                        return None
+
+                    def _post_owned_projection(
+                        config: Dict[str, Any],
+                    ) -> Optional[Dict[str, Any]]:
+                        officer = config.get("officer") or {}
+                        if not isinstance(officer, dict):
+                            return None
+                        auto_pull = officer.get("auto_pull", False)
+                        if type(auto_pull) is not bool:
+                            return None
+                        worker_ceiling = officer.get("worker_spend_ceiling_daily")
+                        if worker_ceiling is not None and (
+                            isinstance(worker_ceiling, bool)
+                            or not isinstance(worker_ceiling, (int, float))
+                            or not math.isfinite(float(worker_ceiling))
+                            or float(worker_ceiling) <= 0
+                        ):
+                            return None
+                        slots = officer.get("slots")
+                        if slots is not None:
+                            from services.officer_slots import validate_slots_spec
+
+                            try:
+                                slots = validate_slots_spec(slots)
+                            except ValueError:
+                                return None
+                        return {
+                            "auto_pull": auto_pull,
+                            "worker_spend_ceiling_daily": worker_ceiling,
+                            "slots": slots,
+                        }
+
+                    # The private snapshot is not merely compared with the
+                    # Post: the candidate runtime must contain the same
+                    # canonical unattended/spend projection before the link is
+                    # committed under Post -> thread locks.
+                    candidate_projection = _post_owned_projection(candidate_config)
+                    current_projection = _post_owned_projection(current_config)
+                    if (
+                        candidate_projection is None
+                        or current_projection is None
+                        or candidate_projection != current_projection
+                    ):
+                        return None
+                durable_config = current_config
                 row = await conn.fetchrow(
                     """
                     UPDATE project_officers

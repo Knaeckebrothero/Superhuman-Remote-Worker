@@ -215,11 +215,13 @@ def test_auto_pull_release_flag_renders_dark_and_can_be_enabled_explicitly() -> 
             for container in deployment["spec"]["template"]["spec"]["containers"]
             if container.get("name") == "orchestrator"
         )
-        return configmap, {
-            entry["name"]: entry for entry in orchestrator.get("env") or []
-        }
+        return (
+            configmap,
+            {entry["name"]: entry for entry in orchestrator.get("env") or []},
+            deployment["spec"]["template"]["metadata"]["annotations"],
+        )
 
-    dark, dark_env = _render()
+    dark, dark_env, dark_annotations = _render()
     assert dark["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "false"
     assert (
         dark_env["OFFICER_AUTO_PULL_RELEASE_ENABLED"]["valueFrom"]["configMapKeyRef"][
@@ -227,5 +229,15 @@ def test_auto_pull_release_flag_renders_dark_and_can_be_enabled_explicitly() -> 
         ]
         == "OFFICER_AUTO_PULL_RELEASE_ENABLED"
     )
-    enabled, _ = _render("--set", "orchestrator.officerAutoPullReleaseEnabled=true")
+    enabled, _, enabled_annotations = _render(
+        "--set", "orchestrator.officerAutoPullReleaseEnabled=true"
+    )
     assert enabled["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "true"
+    checksum_key = "checksum/officer-auto-pull-release"
+    assert dark_annotations[checksum_key]
+    assert enabled_annotations[checksum_key]
+    assert dark_annotations[checksum_key] != enabled_annotations[checksum_key]
+    # The checksum lives on the Pod template itself, independent of the
+    # optional Reloader deployment annotation.
+    _, _, dark_without_reloader = _render("--set", "reloader.enabled=false")
+    assert dark_without_reloader[checksum_key] == dark_annotations[checksum_key]

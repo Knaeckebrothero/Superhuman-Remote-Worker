@@ -584,20 +584,48 @@ class TestConferenceConfig:
         )
         assert cleaned == {"conference": True}
 
-    def test_sanitizer_admits_typed_auto_pull_and_century_ceiling(self):
+    @pytest.mark.parametrize(
+        "field,value",
+        [("auto_pull", False), ("worker_spend_ceiling_daily", 12.5)],
+    )
+    def test_generic_sanitizer_rejects_post_owned_authority(self, field, value):
+        from fastapi import HTTPException
+
         import main
 
-        cleaned = main._validated_session_officer_override(
+        with pytest.raises(HTTPException, match="Unknown officer override"):
+            main._validated_session_officer_override({"officer": {field: value}})
+
+    def test_generic_sanitizer_rejects_slot_spend_authority(self):
+        from fastapi import HTTPException
+
+        import main
+
+        with pytest.raises(HTTPException, match="owned by the Officer Post"):
+            main._validated_session_officer_override(
+                {
+                    "officer": {
+                        "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}}
+                    }
+                }
+            )
+
+    def test_private_post_snapshot_materializes_safe_exact_authority(self):
+        import main
+
+        cleaned = main._validated_post_owned_officer_create_fragment(
             {
                 "officer": {
-                    "auto_pull": False,
+                    "auto_pull": True,
                     "worker_spend_ceiling_daily": 12.5,
+                    "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}},
                 }
             }
         )
         assert cleaned == {
-            "auto_pull": False,
+            "auto_pull": True,
             "worker_spend_ceiling_daily": 12.5,
+            "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}},
         }
 
     @pytest.mark.parametrize("value", [1, "true", None])

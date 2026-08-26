@@ -1043,10 +1043,12 @@ class TestCommissionEndpoint:
             communication_policy_patch=None,
             expected_vacant_updated_at=original["updated_at"],
         )
-        officer = create.await_args.args[0].config_override["officer"]
-        assert officer["auto_pull"] is True
-        assert officer["worker_spend_ceiling_daily"] == 20.0
-        assert officer["slots"]["research"]["spend_ceiling_daily"] == 8.5
+        create_request = create.await_args.args[0]
+        officer = create_request.config_override["officer"]
+        assert "auto_pull" not in officer
+        assert "worker_spend_ceiling_daily" not in officer
+        assert "slots" not in officer
+        assert create_request._officer_post_config_snapshot == commissioned_config
 
     @pytest.mark.asyncio
     async def test_bad_kit_400s_before_any_create(
@@ -1144,7 +1146,10 @@ class TestCommissionEndpoint:
         officer_frag = req.config_override["officer"]
         assert officer_frag["enabled"] is True
         assert "conference" not in officer_frag
-        assert officer_frag["slots"]["line"]["count"] == 2
+        assert "slots" not in officer_frag
+        assert req._officer_post_config_snapshot["officer"]["slots"]["line"] == {
+            "count": 2
+        }
         assert req.config_override["workspace"] == {"backend": "sandbox"}
 
         # Continuity was already restored/drained/enqueued inside registration's

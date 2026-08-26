@@ -33,7 +33,9 @@ def _row(**over) -> dict:
         "project_id": PROJECT_A,
         "project_name": "Better Resavio",
         "thread_id": THREAD_A,
+        "thread_project_id": PROJECT_A,
         "thread_status": "active",
+        "post_config_override": {"officer": {"auto_pull": False}},
         "metadata": {
             "config_override": {
                 "llm": {"model": "gpt-5.6-sol"},
@@ -88,6 +90,9 @@ async def test_the_roster_reports_the_post_at_a_glance(db, as_user, monkeypatch)
     assert officer["pages_today"] == 2
     assert officer["digest_waiting"] == 2
     assert officer["model"] == "gpt-5.6-sol"
+    assert officer["auto_pull_durable"] is False
+    assert officer["auto_pull_runtime"] is False
+    assert officer["auto_pull_mirror_consistent"] is True
 
 
 @pytest.mark.asyncio
@@ -138,9 +143,97 @@ async def test_an_admin_sees_every_post_without_materializing_ids(
         orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
     )
 
-    await list_officers(MagicMock())
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    result = await list_officers(MagicMock())
 
     assert db.list_project_officer_posts.await_args.args[0] is None
+    assert result["auto_pull_downgrade"] == {
+        "scope": "all_projects",
+        "safe": True,
+        "release_fence_closed": True,
+        "durable_enabled": 0,
+        "runtime_enabled": 0,
+        "invalid_values": 0,
+        "mirror_mismatches": 0,
+        "reason": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_admin_downgrade_readiness_requires_the_release_fence_closed(
+    db, as_user, monkeypatch
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+
+    readiness = (await list_officers(MagicMock()))["auto_pull_downgrade"]
+
+    assert readiness["safe"] is False
+    assert readiness["release_fence_closed"] is False
+    assert readiness["reason"] == "release_fence_open"
+
+
+@pytest.mark.asyncio
+async def test_visible_project_readiness_is_never_global_downgrade_proof(
+    db, as_user, monkeypatch
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+
+    readiness = (await list_officers(MagicMock()))["auto_pull_downgrade"]
+
+    assert readiness["scope"] == "visible_projects"
+    assert readiness["safe"] is False
+    assert readiness["reason"] == "all_projects_admin_scope_required"
+
+
+@pytest.mark.asyncio
+async def test_malformed_commissioned_mirror_fails_downgrade_readiness(
+    db, as_user, monkeypatch
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(return_value=[_row(metadata=None)])
+
+    result = await list_officers(MagicMock())
+
+    assert result["officers"][0]["auto_pull_runtime_valid"] is False
+    assert result["auto_pull_downgrade"]["safe"] is False
+    assert result["auto_pull_downgrade"]["invalid_values"] == 1
+    assert result["auto_pull_downgrade"]["mirror_mismatches"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ended_but_linked_true_mirror_blocks_downgrade(db, as_user, monkeypatch):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    metadata = _row()["metadata"]
+    metadata["config_override"]["officer"]["auto_pull"] = True
+    db.list_project_officer_posts = AsyncMock(
+        return_value=[
+            _row(
+                thread_status="ended",
+                metadata=metadata,
+                post_config_override={"officer": {"auto_pull": False}},
+            )
+        ]
+    )
+
+    result = await list_officers(MagicMock())
+
+    assert result["officers"][0]["commissioned"] is False
+    assert result["officers"][0]["auto_pull_runtime"] is True
+    assert result["auto_pull_downgrade"]["safe"] is False
+    assert result["auto_pull_downgrade"]["runtime_enabled"] == 1
+    assert result["auto_pull_downgrade"]["mirror_mismatches"] == 1
 
 
 @pytest.mark.asyncio

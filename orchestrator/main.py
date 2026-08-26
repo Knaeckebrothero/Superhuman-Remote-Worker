@@ -6050,17 +6050,23 @@ def _validated_reasoning_level(value: Any) -> str:
 _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
     {
         "enabled",
-        "auto_pull",
         "sleep_min_minutes",
         "sleep_max_minutes",
         "max_concurrent_workers",
         "max_pages_per_day",
         "max_actions_per_wake",
         "daily_token_ceiling",
-        "worker_spend_ceiling_daily",
         "slots",
         "conference",
     }
+)
+
+# These values authorize unattended work or bound its money spend. They are
+# owned by the durable Officer Post and must never be accepted from the generic
+# session-create/config surfaces. Explicit commission carries them through the
+# non-model-selectable ``_officer_post_config_snapshot`` seam below.
+_OFFICER_POST_OWNED_CREATE_KEYS = frozenset(
+    {"auto_pull", "worker_spend_ceiling_daily", "slots"}
 )
 
 
@@ -6077,7 +6083,10 @@ def _validated_session_officer_override(
     from validated fragments only, so without this validator the officer block
     is silently dropped (found by the S1 k3d smoke). Admits exactly the known
     officer keys: ``enabled`` coerced to a real bool, everything else
-    non-negative ints. Raises HTTPException(400) on unknown keys or bad types.
+    non-negative ints. Auto-pull and spend authority are deliberately absent:
+    they are Post-owned and reach a commissioned runtime only through the
+    server-private snapshot seam. Raises HTTPException(400) on unknown keys or
+    bad types.
     """
     officer = (
         config_override.get("officer") if isinstance(config_override, dict) else None
@@ -6098,15 +6107,19 @@ def _validated_session_officer_override(
         # (charter injection) without officer lifecycle — enabled stays false
         # on conference threads, so the watchdog/drain never touch them.
         cleaned["conference"] = officer["conference"] in (True, "true", "True", 1)
-    if "auto_pull" in officer:
-        # This is new money-spending authority, unlike the historical
-        # enabled/conference compatibility inputs. Accept only a JSON bool.
-        if not isinstance(officer["auto_pull"], bool):
-            raise HTTPException(
-                status_code=400, detail="officer.auto_pull must be a boolean"
-            )
-        cleaned["auto_pull"] = officer["auto_pull"]
     if "slots" in officer:
+        raw_slots = officer["slots"]
+        if isinstance(raw_slots, dict) and any(
+            isinstance(spec, dict) and "spend_ceiling_daily" in spec
+            for spec in raw_slots.values()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "officer slot spend ceilings are owned by the Officer Post; "
+                    "use the project Officer endpoint"
+                ),
+            )
         # Typed worker roster (officer_slots.py). Validated hard at provision
         # so a typo'd kit fails HERE with a 400, not silently at the
         # officer's first dispatch.
@@ -6120,10 +6133,8 @@ def _validated_session_officer_override(
         _SESSION_OFFICER_OVERRIDE_KEYS
         - {
             "enabled",
-            "auto_pull",
             "slots",
             "conference",
-            "worker_spend_ceiling_daily",
         }
     ):
         if key in officer:
@@ -6134,27 +6145,60 @@ def _validated_session_officer_override(
                     status_code=400,
                     detail=f"officer.{key} must be an integer",
                 ) from exc
-    if "worker_spend_ceiling_daily" in officer:
-        value = officer["worker_spend_ceiling_daily"]
-        if isinstance(value, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
-            )
-        try:
-            ceiling = float(value)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
-            ) from exc
-        if not math.isfinite(ceiling) or ceiling <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
-            )
-        cleaned["worker_spend_ceiling_daily"] = ceiling
     return cleaned or None
+
+
+def _validated_post_owned_officer_create_fragment(
+    snapshot: Any,
+) -> dict[str, Any] | None:
+    """Derive the Post-owned runtime fields from a server-private snapshot.
+
+    ``ThreadCreateRequest._officer_post_config_snapshot`` is a Pydantic
+    ``PrivateAttr`` and therefore cannot be populated by JSON or by a model.
+    Explicit commission sets it only after the owner/release checks and after
+    the durable Post update.  Materialize safe absent values as well so an
+    account/expert default cannot re-introduce unattended or spend authority
+    while the commission request is resolved.
+    """
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("Officer Post config snapshot must be an object")
+    officer = snapshot.get("officer") or {}
+    if not isinstance(officer, dict):
+        raise HTTPException(status_code=400, detail="Officer Post config is malformed")
+
+    post_body = {
+        key: officer[key] for key in _OFFICER_POST_OWNED_CREATE_KEYS if key in officer
+    }
+    fragment, _policy, _effects = _validated_officer_post_patch(post_body)
+    cleaned = dict(fragment.get("officer") or {})
+    cleaned.setdefault("auto_pull", False)
+    cleaned.setdefault("worker_spend_ceiling_daily", None)
+    cleaned.setdefault("slots", None)
+    return cleaned
+
+
+def _effective_officer_post_owned_refusal(effective_config: Any) -> str | None:
+    """Return the Post-owned field inherited by an untrusted Officer create."""
+    if not isinstance(effective_config, dict):
+        return None
+    officer = effective_config.get("officer")
+    if not isinstance(officer, dict):
+        return None
+    if "auto_pull" in officer:
+        auto_pull = officer.get("auto_pull")
+        if type(auto_pull) is not bool or auto_pull:
+            return "auto_pull"
+    if officer.get("worker_spend_ceiling_daily") is not None:
+        return "worker_spend_ceiling_daily"
+    slots = officer.get("slots")
+    if isinstance(slots, dict) and any(
+        isinstance(spec, dict) and "spend_ceiling_daily" in spec
+        for spec in slots.values()
+    ):
+        return "slots.*.spend_ceiling_daily"
+    return None
 
 
 _SESSION_TOOL_DISABLED_MARKERS = {
@@ -37920,26 +37964,95 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
     """One roster line from a ``project_officers`` join row."""
     from services.officer_backlog import auto_pull_enabled
 
-    metadata = row.get("metadata") or {}
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata or {}
+    metadata_shape_valid = isinstance(metadata, dict)
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
+            metadata_shape_valid = isinstance(metadata, dict)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
+            metadata_shape_valid = False
     config_override = metadata.get("config_override") or {}
+    config_override_shape_valid = isinstance(config_override, dict)
+    if not config_override_shape_valid:
+        config_override = {}
     officer_cfg = config_override.get("officer") or {}
+    officer_cfg_shape_valid = isinstance(officer_cfg, dict)
+    if not officer_cfg_shape_valid:
+        officer_cfg = {}
+    raw_post_config_override = row.get("post_config_override")
+    post_config_override = raw_post_config_override or {}
+    post_config_shape_valid = isinstance(post_config_override, dict)
+    if isinstance(post_config_override, str):
+        try:
+            post_config_override = json.loads(post_config_override)
+            post_config_shape_valid = isinstance(post_config_override, dict)
+        except (json.JSONDecodeError, TypeError):
+            post_config_override = {}
+            post_config_shape_valid = False
+    if not post_config_shape_valid:
+        post_config_override = {}
+    durable_officer_cfg = post_config_override.get("officer") or {}
+    durable_officer_shape_valid = isinstance(durable_officer_cfg, dict)
+    if not durable_officer_shape_valid:
+        durable_officer_cfg = {}
     officer_state = metadata.get("officer_state") or {}
     pages = officer_state.get("pages") or {}
     today = datetime.now(timezone.utc).date().isoformat()
     thread_id = row.get("thread_id")
     thread_status = row.get("thread_status")
     digest = officer_state.get("digest")
+    linked = bool(thread_id)
+    commissioned = linked and thread_status not in (None, "ended")
+
+    def _strict_auto_pull(config: dict[str, Any]) -> tuple[bool | None, bool]:
+        if "auto_pull" not in config:
+            return False, True
+        value = config.get("auto_pull")
+        if type(value) is bool:
+            return value, True
+        # A legacy string/number is not evidence that a downgrade is safe.
+        # Do not let Python's ``1.0 == True`` equality collapse it into an
+        # apparently valid boolean.
+        return None, False
+
+    durable_auto_pull, durable_auto_pull_scalar_valid = _strict_auto_pull(
+        durable_officer_cfg
+    )
+    durable_auto_pull_valid = (
+        post_config_shape_valid
+        and durable_officer_shape_valid
+        and durable_auto_pull_scalar_valid
+    )
+    if linked:
+        runtime_auto_pull, runtime_auto_pull_scalar_valid = _strict_auto_pull(
+            officer_cfg
+        )
+        runtime_auto_pull_valid = (
+            commissioned
+            and str(row.get("thread_project_id") or "")
+            == str(row.get("project_id") or "")
+            and metadata_shape_valid
+            and config_override_shape_valid
+            and officer_cfg_shape_valid
+            and officer_cfg.get("enabled") is True
+            and runtime_auto_pull_scalar_valid
+        )
+    else:
+        runtime_auto_pull, runtime_auto_pull_valid = None, True
+    mirror_consistent = (
+        durable_auto_pull_valid
+        and runtime_auto_pull_valid
+        and (runtime_auto_pull is None or runtime_auto_pull == durable_auto_pull)
+    )
     return {
         "project_id": str(row.get("project_id")),
         "project_name": row.get("project_name"),
         "thread_id": str(thread_id) if thread_id else None,
         "thread_status": thread_status,
-        "commissioned": bool(thread_id) and thread_status != "ended",
+        "commissioned": commissioned,
         "held": officer_cfg.get("hold") or None,
         "next_wake_at": _iso_or_none(row.get("next_wake_at")),
         "pending_events": int(row.get("pending_events") or 0),
@@ -37948,7 +38061,20 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
             int(pages.get("count") or 0) if pages.get("date") == today else 0
         ),
         "digest_waiting": len(digest) if isinstance(digest, list) else 0,
-        "auto_pull": auto_pull_enabled(officer_cfg),
+        "auto_pull": (
+            auto_pull_enabled(officer_cfg)
+            if linked
+            else auto_pull_enabled(durable_officer_cfg)
+        ),
+        # Safe, credential-free rollout evidence. A system administrator's
+        # all-project roster is the supported downgrade preflight: pre-BP-01
+        # binaries must not return until every durable value and every current
+        # runtime mirror is false and mutually consistent.
+        "auto_pull_durable": durable_auto_pull,
+        "auto_pull_durable_valid": durable_auto_pull_valid,
+        "auto_pull_runtime": runtime_auto_pull,
+        "auto_pull_runtime_valid": runtime_auto_pull_valid,
+        "auto_pull_mirror_consistent": mirror_consistent,
         "auto_pull_enable_available": OFFICER_AUTO_PULL_RELEASE_ENABLED,
         "model": (config_override.get("llm") or {}).get("model"),
         "last_activity_at": _iso_or_none(row.get("last_agent_activity")),
@@ -37974,12 +38100,66 @@ async def list_officers(request: Request) -> dict[str, Any]:
     user = await require_approved_user(request, postgres_db)
     visible = await user_visible_project_ids(user, postgres_db)
     if visible != "all" and not visible:
-        return {"officers": [], "total": 0}
+        return {
+            "officers": [],
+            "total": 0,
+            "auto_pull_downgrade": {
+                "scope": "visible_projects",
+                "safe": False,
+                "release_fence_closed": not OFFICER_AUTO_PULL_RELEASE_ENABLED,
+                "durable_enabled": 0,
+                "runtime_enabled": 0,
+                "invalid_values": 0,
+                "mirror_mismatches": 0,
+                "reason": "all_projects_admin_scope_required",
+            },
+        }
     rows = await postgres_db.list_project_officer_posts(
         None if visible == "all" else sorted(str(pid) for pid in visible)
     )
     officers = [_roster_officer_view(row) for row in rows]
-    return {"officers": officers, "total": len(officers)}
+    all_projects = visible == "all"
+    durable_enabled = sum(bool(row["auto_pull_durable"]) for row in officers)
+    runtime_enabled = sum(row["auto_pull_runtime"] is True for row in officers)
+    invalid_values = sum(
+        not row["auto_pull_durable_valid"] or not row["auto_pull_runtime_valid"]
+        for row in officers
+    )
+    mirror_mismatches = sum(not row["auto_pull_mirror_consistent"] for row in officers)
+    downgrade_safe = (
+        all_projects
+        and not OFFICER_AUTO_PULL_RELEASE_ENABLED
+        and durable_enabled == 0
+        and runtime_enabled == 0
+        and invalid_values == 0
+        and mirror_mismatches == 0
+    )
+    return {
+        "officers": officers,
+        "total": len(officers),
+        "auto_pull_downgrade": {
+            "scope": "all_projects" if all_projects else "visible_projects",
+            "safe": downgrade_safe,
+            "release_fence_closed": not OFFICER_AUTO_PULL_RELEASE_ENABLED,
+            "durable_enabled": durable_enabled,
+            "runtime_enabled": runtime_enabled,
+            "invalid_values": invalid_values,
+            "mirror_mismatches": mirror_mismatches,
+            "reason": (
+                None
+                if downgrade_safe
+                else (
+                    "all_projects_admin_scope_required"
+                    if not all_projects
+                    else (
+                        "release_fence_open"
+                        if OFFICER_AUTO_PULL_RELEASE_ENABLED
+                        else "auto_pull_not_fully_disabled"
+                    )
+                )
+            ),
+        },
+    }
 
 
 async def _can_manage_project_officer(user: dict[str, Any], project_id: str) -> bool:
@@ -39040,7 +39220,14 @@ async def commission_project_officer(
         for k, v in row_officer.items()
         # Nulls are cleared fields (PATCH null-as-clear) — an omitted key is
         # how the funnel spells "default", so they must not travel.
-        if k in _SESSION_OFFICER_OVERRIDE_KEYS and k != "conference" and v is not None
+        # Auto-pull, the century spend ceiling, and the complete roster travel
+        # only through the private durable-snapshot seam. Keeping them out of
+        # this public-shaped payload makes an accidental future direct call to
+        # the generic validator fail closed instead of acquiring Post authority.
+        if k in _SESSION_OFFICER_OVERRIDE_KEYS
+        and k not in _OFFICER_POST_OWNED_CREATE_KEYS
+        and k != "conference"
+        and v is not None
     }
     officer_fragment["enabled"] = True
     create_override: dict[str, Any] = {"officer": officer_fragment}
@@ -41936,6 +42123,14 @@ async def create_thread(
         req_officer = _validated_session_officer_override(request_body.config_override)
         if req_officer:
             config_override.setdefault("officer", {}).update(req_officer)
+        trusted_post_officer = _validated_post_owned_officer_create_fragment(
+            request_body._officer_post_config_snapshot
+        )
+        if trusted_post_officer is not None:
+            # The only bridge for unattended/spend authority into a runtime.
+            # It is derived from the exact durable snapshot whose generation is
+            # revalidated under the Post lock at registration below.
+            config_override.setdefault("officer", {}).update(trusted_post_officer)
 
         # Resolve the complete create-time policy view.  This is also the source
         # for infrastructure-affecting values and grants, preventing the create
@@ -41953,6 +42148,33 @@ async def create_thread(
         )
         effective_create_config = create_capture["merged_fragment"]
 
+        effective_class = _materialized_session_class_override(effective_create_config)
+        if effective_class["enabled"]:
+            effective_officer = effective_create_config.get("officer") or {}
+            effective_auto_pull = (
+                effective_officer.get("auto_pull")
+                if isinstance(effective_officer, dict)
+                else None
+            )
+            if effective_auto_pull not in (None, False):
+                # This check is intentionally on the fully resolved config, so
+                # an account, expert, or project default cannot bypass the
+                # deployment release fence.
+                _enforce_officer_auto_pull_release(effective_auto_pull)
+            if request_body._officer_post_config_snapshot is None:
+                refusal = _effective_officer_post_owned_refusal(effective_create_config)
+                if refusal is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"officer.{refusal} is owned by the durable Officer "
+                            "Post; use the project Officer endpoint"
+                        ),
+                    )
+                # Materialize the safe value in the request layer. This keeps
+                # a later attach from acquiring a mutable inherited setting.
+                config_override.setdefault("officer", {})["auto_pull"] = False
+
         # A workspace tier is physical session state. Materialize the resolved
         # choice once so later edits to an expert/account default cannot make the
         # persisted runtime disagree with the workspace already provisioned.
@@ -41965,9 +42187,7 @@ async def create_thread(
         # just like the physical workspace tier above. Later expert/account
         # edits can still update ordinary config, but cannot silently move an
         # existing stateless thread onto a different wake plane.
-        config_override.setdefault("officer", {}).update(
-            _materialized_session_class_override(effective_create_config)
-        )
+        config_override.setdefault("officer", {}).update(effective_class)
 
         # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
         # effective class, not only the user's explicit fragment. An expert or
@@ -42014,6 +42234,22 @@ async def create_thread(
             "enabled"
         ) is True
         if _officer_requested and primary_project_id:
+            if not await _can_manage_project_officer(user, primary_project_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Project owner role required to commission an Officer; "
+                        "use the project Officer endpoint"
+                    ),
+                )
+            if request_body._officer_post_config_snapshot is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "A project Officer can only be commissioned through the "
+                        "durable project Officer endpoint"
+                    ),
+                )
             _standing = await postgres_db.get_officer_thread_for_project(
                 primary_project_id
             )
