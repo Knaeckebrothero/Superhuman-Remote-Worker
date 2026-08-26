@@ -74,7 +74,7 @@ from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Awaitable, Callable, Coroutine, Mapping  # noqa: E402
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5  # noqa: E402
+from uuid import UUID, uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
@@ -586,7 +586,23 @@ from services.email import email_service  # noqa: E402
 from services import headless_notifications  # noqa: E402
 from services.brand import TRAVERTINE as _BRAND  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
-from services.notification_service import notification_service  # noqa: E402
+from services.notification_service import (  # noqa: E402
+    ActionNotDeclared,
+    ActionUnregistered,
+    NotificationNotFound,
+    RecordResult,
+    notification_service,
+)
+from services.notification_catalog import (  # noqa: E402
+    ActionContext,
+    ActionResult,
+    register_action,
+    register_source_loader,
+    register_source_probe,
+    serialize_notification,
+    source_loader,
+)
+from services.notification_steps import notification_steps_loop  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_audit_reader, set_postgres_db  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -2512,62 +2528,6 @@ async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Snapshot GC sweeper stopped")
-
-
-async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
-    """Background task that flushes queued notifications when quiet hours end.
-
-    Runs every 5 minutes. For each user whose quiet hours have ended and
-    who has pending notifications, sends a batched digest.
-    """
-    while not shutdown_event.is_set():
-        try:
-            users = await postgres_db.get_users_exiting_quiet_hours(
-                check_window_minutes=5
-            )
-            for user_data in users:
-                user_id = str(user_data["user_id"])
-                user_settings = user_data.get("settings") or {}
-
-                # Only process if quiet hours actually ended (not still in them)
-                if notification_service._is_in_quiet_hours(user_settings):
-                    continue
-
-                # Atomically claim the pending set before sending. Two digest
-                # loops in the transient dual-leader window otherwise both read
-                # the same pending rows and both send the digest; claiming
-                # (delivered_at NULL → NOW, RETURNING) lets exactly one win.
-                # Release the claim if dispatch fails so it retries next cycle.
-                claimed = await postgres_db.claim_pending_notifications(user_id)
-                if not claimed:
-                    continue
-
-                try:
-                    await notification_service.dispatch_digest(
-                        user_id=user_id,
-                        notifications=[dict(n) for n in claimed],
-                    )
-                except Exception:
-                    await postgres_db.unmark_notifications_delivered(
-                        [str(n["id"]) for n in claimed]
-                    )
-                    raise
-
-                logger.info(
-                    "Digest sent to user %s: %d notification(s)",
-                    user_id[:8],
-                    len(claimed),
-                )
-        except Exception as e:
-            logger.error(f"Quiet hours digest loop error: {e}")
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=300)  # 5 minutes
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Quiet hours digest loop stopped")
 
 
 async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
@@ -6071,7 +6031,6 @@ _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
         "sleep_min_minutes",
         "sleep_max_minutes",
         "max_concurrent_workers",
-        "max_pages_per_day",
         "max_actions_per_wake",
         "daily_token_ceiling",
         "slots",
@@ -11011,6 +10970,37 @@ class UserSettingsUpdate(BaseModel):
                     f"communication.channels.{name} must be a boolean, "
                     f"got {type(enabled).__name__}"
                 )
+        # D9 preference matrix: categories[category][channel] = bool overrides
+        # the channel-type default above. Same strict-bool rule, same reason.
+        categories = v.get("categories")
+        if categories is not None:
+            if not isinstance(categories, dict):
+                raise ValueError("communication.categories must be an object")
+            for category, cells in categories.items():
+                if not isinstance(cells, dict):
+                    raise ValueError(
+                        f"communication.categories.{category} must be an object"
+                    )
+                for channel, enabled in cells.items():
+                    if not isinstance(enabled, bool):
+                        raise ValueError(
+                            f"communication.categories.{category}.{channel} must be "
+                            f"a boolean, got {type(enabled).__name__}"
+                        )
+        # How long a `normal` notification waits for someone to look before it
+        # mails, when no project officer owns the wait. Minutes; bounded so a
+        # typo cannot mean "never" or "instantly".
+        minutes = v.get("escalation_minutes")
+        if minutes is not None:
+            from services.notification_catalog import ESCALATION_MINUTES_BOUNDS
+
+            lo, hi = ESCALATION_MINUTES_BOUNDS
+            if isinstance(minutes, bool) or not isinstance(minutes, int):
+                raise ValueError("communication.escalation_minutes must be an integer")
+            if not lo <= minutes <= hi:
+                raise ValueError(
+                    f"communication.escalation_minutes must be between {lo} and {hi}"
+                )
         return v
 
     @field_validator("language")
@@ -12223,6 +12213,11 @@ async def lifespan(app: FastAPI):
         return await _dispatch_officer_page(
             thread,
             thread_id,
+            category="officer_runtime",
+            dedup_key=(
+                f"officer_recycle:{thread_id}:{failure_class}:"
+                f"{datetime.now(timezone.utc).date().isoformat()}"
+            ),
             subject="Officer runtime recycle requires attention",
             message_md=(
                 "The dedicated Officer runtime is held while its bounded "
@@ -12267,6 +12262,8 @@ async def lifespan(app: FastAPI):
         email_service=email_service,
         notification_feed=notification_feed,
     )
+    # Unified feed: bind (category, action) handlers and source loaders.
+    _register_notification_actions()
 
     # Initialize IMAP poller for email reply routing (graceful if unconfigured)
     async def _imap_reply_handler(
@@ -12537,8 +12534,15 @@ async def lifespan(app: FastAPI):
     )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))
-    digest_task = asyncio.create_task(
-        run_when_leader(quiet_hours_digest_loop, _shutdown_event)
+    # Unified feed: run the deferred channel steps ("mail after the officer's
+    # window unless seen/resolved", quiet-hours deferrals, batched digests).
+    notification_steps_task = asyncio.create_task(
+        run_when_leader(
+            lambda stop: notification_steps_loop(
+                stop, postgres_db, notification_service
+            ),
+            _shutdown_event,
+        )
     )
     delegation_timeout_task = asyncio.create_task(
         run_when_leader(delegation_timeout_sweeper, _shutdown_event)
@@ -12799,7 +12803,7 @@ async def lifespan(app: FastAPI):
     await ide_settings_sweeper_task
     await gc_sweeper_task
     await imap_task
-    await digest_task
+    await notification_steps_task
     await delegation_timeout_task
     await llm_outage_task
     await infra_transient_task
@@ -13226,15 +13230,18 @@ async def debug_email_preview(name: str) -> str:
             reply_to_addr="reply@example.com",
         )
     if name == "permission":
-        _text, html = headless_notifications._build_permission_email_bodies(
-            tool_name="run_command",
-            tool_args_preview='{"command": "rm -rf ./build"}',
-            approve_url=f"{link}/approve",
-            deny_url=f"{link}/deny",
-            cockpit_link=link,
-            request_age_minutes=4,
+        # A permission gate is a feed notification now; its mail is the
+        # notification template with the magic links as labeled bare URLs.
+        body = (
+            "**run_command** is waiting for your approval in session "
+            "**Nightly build** (requested 4 min ago).\n\n"
+            '```\n{"command": "rm -rf ./build"}\n```\n\n'
+            f"Approve: {link}/magic/approve/preview-approve\n"
+            f"Deny: {link}/magic/approve/preview-deny\n\n"
+            "These links need no sign-in and expire in 30 minutes. "
+            f"Session: {link}/sessions/preview"
         )
-        return html
+        return email_service.render_notification_html(body, f"{link}/inbox?n=preview")
     raise HTTPException(status_code=404, detail="unknown email preview")
 
 
@@ -15076,6 +15083,7 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
             claim_retained = False
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        await _resolve_job_notifications(job_id, user=caller, hook="delete")
         return {
             "status": "deleted",
             "ticket_claim_retained": claim_retained,
@@ -15593,6 +15601,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 await maybe_wake_session(postgres_db, job_id, "cancelled")
                 _kick_session_wake_drain(postgres_db)
                 _trigger_dispatch()
+                await _resolve_job_notifications(job_id, user=None, hook="cancel")
                 return {"status": "cancelled"}
 
         if COMPLETION_COMMANDS_ENABLED and job.get("execution_lane") == "pinned":
@@ -15721,6 +15730,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
 
         # Agent is being freed — trigger dispatcher for queued jobs
         _trigger_dispatch()
+        await _resolve_job_notifications(job_id, user=None, hook="cancel")
 
         return {"status": "cancelled"}
     except HTTPException:
@@ -16103,18 +16113,30 @@ async def _send_officer_routed_message(
             },
         }
 
-    async def _dispatch_user_leg() -> dict[str, Any]:
-        return await notification_service.dispatch(
+    async def _dispatch_user_leg(
+        *, message_log_id: str | None, blocking: bool
+    ) -> dict[str, Any]:
+        # The feed row is the user leg (D1); the ledger row id rides in the
+        # payload so the (possibly deferred) email's Message-ID lands on
+        # message_log for In-Reply-To routing.
+        result = await notification_service.record_agent_message(
             user_id=user_id,
+            job={
+                **job,
+                "config_name": canonical_config_name(
+                    job.get("config_name") or "worker_base"
+                ),
+            },
             job_id=job_id,
+            thread_id=thread_id,
+            sequence=sequence,
             subject=request.subject,
             message_md=request.message,
-            job_description=job.get("description", "")[:100],
-            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
-            thread_id=thread_id,
-            recipient_email=recipient_email,
-            recipient_name=recipient_name,
+            blocking=blocking,
+            message_log_id=message_log_id,
+            deliver_to=(recipient_email, recipient_name),
         )
+        return result.as_dispatch()
 
     # Claim the non-idempotent side of this generation before creating a
     # route. A concurrent retry can reserve the same quota row, but cannot
@@ -16271,7 +16293,10 @@ async def _send_officer_routed_message(
         dispatch: dict[str, Any] | None = None
         if state == "pending_both":
             try:
-                dispatch = await _dispatch_user_leg()
+                dispatch = await _dispatch_user_leg(
+                    message_log_id=str(created["originating_message_id"]),
+                    blocking=True,
+                )
             except Exception:
                 await routing_svc.settle_delivery_attempt(
                     postgres_db,
@@ -16330,6 +16355,7 @@ async def _send_officer_routed_message(
         # No wake either: async items coalesce into the officer's next
         # inbox/SITREP section instead of costing a paid wake each.
         try:
+            # notification-ledger: the officer-only leg's outbound record (no user notification by policy)
             log_row = await postgres_db.log_message(
                 job_id=job_id,
                 user_id=user_id,
@@ -16402,6 +16428,7 @@ async def _send_officer_routed_message(
     # route in his next inbox/SITREP.
     # Persist the Officer inbox route before invoking the user notifier. The
     # reconciler can therefore repair a crash at every later fault point.
+    # notification-ledger: prelogged before the feed row so its Message-ID can be stamped
     log_row = await postgres_db.log_message(
         job_id=job_id,
         user_id=user_id,
@@ -16442,7 +16469,9 @@ async def _send_officer_routed_message(
         )
         return None
     try:
-        dispatch = await _dispatch_user_leg()
+        dispatch = await _dispatch_user_leg(
+            message_log_id=(str(log_row["id"]) if log_row else None), blocking=False
+        )
     except Exception:
         await routing_svc.settle_delivery_attempt(
             postgres_db,
@@ -16676,6 +16705,7 @@ async def send_agent_message(
                 return intent
             limit_name = str(intent.get("limit") or "message_quota")
             retry_after = int(intent.get("retry_after_seconds") or 3600)
+            # notification-ledger: durable intent row logged before any provider I/O
             await postgres_db.log_message(
                 job_id=job_id,
                 thread_id=thread_id,
@@ -16893,6 +16923,7 @@ async def send_agent_message(
             # accepts the notification immediately before this process dies
             # must not leave the durable ledger as the only operator-visible
             # account of what was sent.
+            # notification-ledger: prelogged before the feed row so its Message-ID can be stamped
             direct_message = await postgres_db.log_message(
                 job_id=job_id,
                 user_id=user_id,
@@ -16924,19 +16955,26 @@ async def send_agent_message(
         # the route/freeze unit) exists.  Attempt and settlement are separate
         # durable facts so provider failure never masquerades as acceptance.
         try:
-            dispatch_results = await notification_service.dispatch(
+            record_result = await notification_service.record_agent_message(
                 user_id=user_id,
+                job={
+                    **job,
+                    "config_name": canonical_config_name(
+                        job.get("config_name") or "worker_base"
+                    ),
+                },
                 job_id=job_id,
+                thread_id=thread_id,
+                sequence=sequence,
                 subject=request.subject,
                 message_md=request.message,
-                job_description=job.get("description", "")[:100],
-                config_name=canonical_config_name(
-                    job.get("config_name") or "worker_base"
-                ),
-                thread_id=thread_id,
-                recipient_email=recipient_email,
-                recipient_name=recipient_name,
+                blocking=request.mode == "blocking",
+                message_log_id=direct_message_id,
+                # A named contact (no user row) still gets the mail; the feed
+                # row belongs to the owner, who is the party with the stake.
+                deliver_to=(recipient_email, recipient_name),
             )
+            dispatch_results = record_result.as_dispatch()
         except Exception:
             await _routing_svc.settle_delivery_attempt(
                 postgres_db,
@@ -17094,29 +17132,50 @@ def _format_freeze_notification(
     return subject, message_md
 
 
+# freeze_type → feed category. Anything unlisted is an incident: it reached a
+# human because something went wrong, not because a decision is queued.
+_FREEZE_CATEGORY = {
+    "job_complete": "review_queue",
+    "vm_upgrade_required": "vm_upgrade",
+    "budget_exceeded": "budget_exceeded",
+    "llm_unavailable": "incident",
+}
+
+
+async def _resolve_job_notifications(
+    job_id: str, *, user: dict[str, Any] | None, hook: str
+) -> None:
+    """The job left its frozen/pending state — settle every feed row about it,
+    whoever it belongs to (unified notification system, D6). Best-effort."""
+    resolved_by = f"user:{user['id']}" if user and user.get("id") else f"system:{hook}"
+    await notification_service.resolve_source(
+        "job", str(job_id), resolved_by=resolved_by
+    )
+
+
 async def _notify_operator_freeze(
     job: dict[str, Any],
     job_id: str,
     freeze_type: str,
     freeze_data: dict[str, Any],
     sudo_request_id: str | None = None,
-) -> None:
-    """Send operator notification when a job freezes for human action."""
+    *,
+    dedup_key: str,
+) -> RecordResult | None:
+    """Record the operator-facing notification for a freeze event.
+
+    ``dedup_key`` is the caller's idempotency key — inside a completion effect
+    that is the command id, so a journal replay lands on the same feed row and
+    sends nothing twice. Delivery (email, webhooks, later the escalation
+    ladder) is the notification system's business, not this function's.
+    """
     user_id = str(job["user_id"]) if job.get("user_id") else None
     if not user_id:
         logger.debug(f"Job {job_id} has no user_id — skipping freeze notification")
-        return
+        return None
 
-    user = await postgres_db.get_user(user_id)
-    if not user:
-        logger.debug(f"User {user_id} not found — skipping freeze notification")
-        return
-
-    recipient_email = user.get("email")
-    recipient_name = user.get("display_name", "User")
     config_name = canonical_config_name(job.get("config_name") or "worker_base")
     description = (job.get("description") or "")[:100]
-
     subject, message_md = _format_freeze_notification(
         freeze_type=freeze_type,
         freeze_data=freeze_data,
@@ -17125,18 +17184,41 @@ async def _notify_operator_freeze(
         description=description,
     )
 
-    await notification_service.dispatch(
-        user_id=user_id,
-        job_id=job_id,
+    category = _FREEZE_CATEGORY.get(freeze_type, "incident")
+    if category == "vm_upgrade" and sudo_request_id:
+        source_kind, source_id = "sudo_request", str(sudo_request_id)
+    else:
+        source_kind, source_id = "job", str(job_id)
+    action_params: dict[str, Any] = {"job_id": str(job_id)}
+    if sudo_request_id:
+        action_params["request_id"] = str(sudo_request_id)
+
+    result = await notification_service.record(
+        recipient_id=user_id,
+        category=category,
+        dedup_key=dedup_key,
         subject=subject,
-        message_md=message_md,
-        job_description=description,
-        config_name=config_name,
-        recipient_email=recipient_email,
-        recipient_name=recipient_name,
-        sudo_request_id=sudo_request_id,
+        body=message_md,
+        source_kind=source_kind,
+        source_id=source_id,
+        action_params=action_params,
+        payload={
+            "job_id": str(job_id),
+            "config_name": config_name,
+            "job_description": description,
+            "freeze_type": freeze_type,
+            "phase_number": (freeze_data or {}).get("phase_number"),
+            "sudo_request_id": str(sudo_request_id) if sudo_request_id else None,
+        },
     )
-    logger.info(f"Freeze notification sent for job {job_id} ({freeze_type})")
+    logger.info(
+        "Freeze notification %s for job %s (%s → %s)",
+        "recorded" if result.inserted else "replayed",
+        job_id,
+        freeze_type,
+        category,
+    )
+    return result
 
 
 # Fallback reason for interrupt-style replies that could not ride the
@@ -17275,6 +17357,17 @@ async def _route_inbound_reply(
     if not job:
         raise ValueError(f"Job '{job_id}' not found")
     await _guard_completion_control(job_id, source="inbound_reply")
+    # Any answer — cockpit, mail, officer — settles the thread's feed rows
+    # (D6): the deferred "nobody answered" mail must never go out after this.
+    await notification_service.resolve_source(
+        "message_thread",
+        thread_id,
+        resolved_by=(
+            f"{resolver_kind}:{resolver_id}"
+            if resolver_id
+            else f"{resolver_kind}:reply"
+        ),
+    )
 
     async def _resume_reply_or_conflict(
         *, reason: str, route_id: str | None = None
@@ -18231,43 +18324,55 @@ async def get_pending_actions(request: Request) -> dict[str, Any]:
 # =============================================================================
 
 
+class NotificationSeenRequest(BaseModel):
+    ids: list[str]
+
+
+class NotificationActRequest(BaseModel):
+    action_type: str
+    params: dict[str, Any] = {}
+
+
 @app.get("/api/notifications")
 async def list_notifications(
     request: Request,
+    before: str | None = Query(None),
     limit: int = Query(50, le=200),
-    unread_only: bool = Query(False),
+    category: list[str] | None = Query(None),
+    status: str = Query("all"),
+    source_kind: str | None = Query(None),
+    source_id: str | None = Query(None),
 ) -> dict[str, Any]:
-    """List notifications for the current user."""
+    """The current user's notification feed (unified notification system).
+
+    ``items`` is the durable feed: keyset-paged newest first (``before`` is
+    the ``next_before`` cursor of the previous page), filterable by
+    ``category`` (repeatable), ``status`` (pending | resolved | unread |
+    unseen | archived | all) and a ``source_kind`` + ``source_id`` pair
+    (e.g. the officer card listing the pages about one officer thread).
+    ``counts`` drives the bell. The feed is the only store: every producer
+    records here, so there is no legacy view to merge any more.
+    """
     try:
         user = await require_approved_user(request, postgres_db)
-        user_id = str(user["id"])
-        notifications = await postgres_db.get_user_notifications(
-            user_id,
-            limit=limit,
-            unread_only=unread_only,
-        )
-        unread_count = await postgres_db.get_unread_count(user_id)
-
-        return {
-            "notifications": [
-                {
-                    "id": str(n["id"]),
-                    "job_id": str(n["job_id"]) if n.get("job_id") else None,
-                    "thread_id": n.get("thread_id"),
-                    "subject": n.get("subject"),
-                    "message": (n.get("message") or "")[:200],
-                    "job_description": (n.get("job_description") or "")[:80],
-                    "config_name": n.get("config_name"),
-                    "status": n.get("status"),
-                    "read_at": n["read_at"].isoformat() if n.get("read_at") else None,
-                    "created_at": n["created_at"].isoformat()
-                    if n.get("created_at")
-                    else None,
-                }
-                for n in notifications
-            ],
-            "unread_count": unread_count,
-        }
+        if (source_kind is None) != (source_id is None):
+            raise HTTPException(
+                status_code=400, detail="source_kind and source_id go together"
+            )
+        try:
+            page = await notification_service.get_feed_page(
+                recipient_kind="user",
+                recipient_id=str(user["id"]),
+                before=before,
+                limit=limit,
+                categories=category or None,
+                status=status,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return page
     except HTTPException:
         raise
     except Exception as e:
@@ -18275,25 +18380,23 @@ async def list_notifications(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.patch("/api/notifications/{notification_id}")
-async def mark_notification_read(
-    notification_id: str,
-    request: Request,
+@app.post("/api/notifications/seen")
+async def mark_notifications_seen(
+    request: Request, body: NotificationSeenRequest
 ) -> dict[str, Any]:
-    """Mark a notification as read."""
+    """Batch seen-stamp — the cockpit posts the ids that rendered in the feed.
+    Never regresses an earlier stamp; unknown or foreign ids are ignored."""
     try:
         user = await require_approved_user(request, postgres_db)
-        user_id = str(user["id"])
-        updated = await postgres_db.mark_notification_read(notification_id, user_id)
-        if not updated:
-            raise HTTPException(
-                status_code=404, detail="Notification not found or already read"
-            )
-        return {"status": "read"}
+        ids = [str(i) for i in body.ids][:200]
+        updated = await notification_service.mark_seen(
+            recipient_kind="user", recipient_id=str(user["id"]), ids=ids
+        )
+        return {"updated": updated}
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Failed to mark notification read: {e}")
+        logger.exception(f"Failed to mark notifications seen: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -18341,6 +18444,626 @@ async def notification_sse_events(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# Registered AFTER /api/notifications/events on purpose: FastAPI matches in
+# declaration order, and a `{notification_id}` segment would otherwise
+# swallow the SSE path.
+@app.get("/api/notifications/{notification_id}")
+async def get_notification_detail(
+    request: Request, notification_id: str
+) -> dict[str, Any]:
+    """One feed row plus its source's presentation payload (the detail pane).
+    The source loader is registered per ``source_kind``; the center never
+    learns what a job or a sudo request is."""
+    try:
+        user = await require_approved_user(request, postgres_db)
+        row = await postgres_db.get_notification(notification_id)
+        if (
+            not row
+            or row.get("recipient_kind") != "user"
+            or str(row.get("recipient_id")) != str(user["id"])
+        ):
+            raise HTTPException(status_code=404, detail="Notification not found")
+        source = None
+        loader = source_loader(row.get("source_kind"))
+        if loader is not None:
+            try:
+                source = await loader(postgres_db, str(row.get("source_id")), user)
+            except HTTPException:
+                source = None
+            except Exception:
+                logger.debug(
+                    "source loader failed for notification %s",
+                    notification_id,
+                    exc_info=True,
+                )
+        # The row's deferred channel steps ("email in 12 min unless you look
+        # or someone settles it") — the detail pane can say what will happen.
+        try:
+            steps = await notification_service.describe_steps(str(row["id"]))
+        except Exception:
+            logger.debug("step listing failed for %s", notification_id, exc_info=True)
+            steps = []
+        return {
+            "notification": serialize_notification(row),
+            "source": source,
+            "steps": steps,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to load notification {notification_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+async def mark_notification_read_v2(
+    request: Request, notification_id: str
+) -> dict[str, Any]:
+    """Explicit read stamp (also stamps seen). Idempotent."""
+    try:
+        user = await require_approved_user(request, postgres_db)
+        row = await notification_service.mark_read(
+            recipient_kind="user",
+            recipient_id=str(user["id"]),
+            notification_id=notification_id,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        return {"notification": row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to mark notification read: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/notifications/{notification_id}/archive")
+async def archive_notification(
+    request: Request, notification_id: str
+) -> dict[str, Any]:
+    """Hide a row from the feed without touching its resolution. Idempotent."""
+    try:
+        user = await require_approved_user(request, postgres_db)
+        row = await notification_service.archive(
+            recipient_kind="user",
+            recipient_id=str(user["id"]),
+            notification_id=notification_id,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        return {"notification": row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to archive notification: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/notifications/{notification_id}/act")
+async def act_on_notification(
+    request: Request, notification_id: str, body: NotificationActRequest
+) -> dict[str, Any]:
+    """Run one of the row's declared actions through its registered handler.
+
+    404 when the row is not this user's; 400 when the row does not declare
+    the action; 500 when the category declares it but nothing handles it —
+    loud, like ``_run_completion_effect``'s registry gate, because a silent
+    no-op here would look exactly like a working button.
+    """
+    try:
+        user = await require_approved_user(request, postgres_db)
+        try:
+            outcome = await notification_service.act(
+                notification_id=notification_id,
+                user=user,
+                action_type=body.action_type,
+                params=body.params,
+            )
+        except NotificationNotFound:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        except ActionNotDeclared as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Action {e} is not declared on this notification",
+            )
+        except ActionUnregistered as e:
+            logger.error("unregistered notification action %s", e)
+            raise HTTPException(
+                status_code=500, detail=f"unregistered notification action {e}"
+            )
+        return {"status": "ok", **outcome}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Notification action failed for {notification_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _completion_effect_dedup_key(
+    effect_runner: Any, effect_name: str, job_id: str
+) -> str:
+    """Idempotency key for a notification recorded inside a completion effect.
+
+    With the durable journal the command id is stable across restarts AND
+    across retries of the same command, so a replayed callback lands on the
+    same feed row and sends nothing twice. On the runner-less legacy route
+    nothing replays, and a job can legitimately freeze the same way twice
+    (budget_exceeded per phase), so each call gets a fresh key.
+    """
+    command_id = (
+        getattr(effect_runner, "command_id", None)
+        if effect_runner is not None
+        else None
+    )
+    if command_id:
+        return f"{effect_name}:{command_id}"
+    return f"{effect_name}:{job_id}:{uuid4()}"
+
+
+def _notification_jsonable(value: Any) -> Any:
+    """Source-loader payloads cross the wire as-is; coerce the asyncpg types."""
+    if isinstance(value, dict):
+        return {k: _notification_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_notification_jsonable(v) for v in value]
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _register_notification_actions() -> None:
+    """Bind the unified feed's declared actions to server-side effects and
+    register the per-source detail-pane loaders.
+
+    Runs once at startup after ``notification_service.connect()``;
+    re-registration replaces, so a reload is harmless. This is the only place
+    that knows what a job, a sudo request or an officer *is* — the center
+    renders declared actions and POSTs them back (D7). Handlers call the
+    request-free ``*_internal`` helpers rather than re-entering endpoint
+    coroutines; ``act()`` has already proven the caller is the recipient.
+    """
+
+    def _actor(user: dict[str, Any]) -> str:
+        return str(user.get("email") or user.get("id") or "operator")
+
+    def _navigate(path: str) -> ActionResult:
+        return ActionResult(result={"navigate": path})
+
+    async def _owned_job(ctx: ActionContext) -> tuple[str, dict[str, Any]]:
+        # record() addressed the row to jobs.user_id and act() verified the
+        # caller is that recipient, so the caller is the job owner.
+        job_id = str(ctx.params.get("job_id") or "")
+        job = await postgres_db.get_job(job_id) if job_id else None
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        return job_id, job
+
+    async def _sudo_row(ctx: ActionContext) -> tuple[str, dict[str, Any]]:
+        request_id = str(ctx.params.get("request_id") or "")
+        row = await sudo_gate._get_request(request_id) if request_id else None
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"Sudo request '{request_id}' not found"
+            )
+        return request_id, dict(row)
+
+    async def _resume(ctx: ActionContext) -> ActionResult:
+        job_id, job = await _owned_job(ctx)
+        result = await _resume_job_internal(
+            job_id,
+            user=ctx.user,
+            job=job,
+            request=JobResumeRequest(feedback=ctx.params.get("feedback") or None),
+        )
+        await _resolve_job_notifications(job_id, user=ctx.user, hook="resume")
+        return ActionResult(result=dict(result))
+
+    async def _open_job(ctx: ActionContext) -> ActionResult:
+        return _navigate(f"/jobs/{ctx.params.get('job_id')}")
+
+    # --- review_queue -----------------------------------------------------
+    @register_action("review_queue", "approve")
+    async def _review_approve(ctx: ActionContext) -> ActionResult:
+        job_id, job = await _owned_job(ctx)
+        result = await _approve_job_internal(
+            job_id,
+            user=ctx.user,
+            job=job,
+            request=JobApproveRequest(notes=ctx.params.get("notes") or None),
+        )
+        await _resolve_job_notifications(job_id, user=ctx.user, hook="approve")
+        return ActionResult(result=dict(result))
+
+    register_action("review_queue", "resume")(_resume)
+    register_action("review_queue", "open")(_open_job)
+
+    # --- budget_exceeded / incident ---------------------------------------
+    register_action("budget_exceeded", "resume")(_resume)
+    register_action("budget_exceeded", "open")(_open_job)
+    register_action("incident", "open")(_open_job)
+
+    # --- vm_upgrade ----------------------------------------------------------
+    @register_action("vm_upgrade", "approve_upgrade")
+    async def _vm_approve(ctx: ActionContext) -> ActionResult:
+        request_id, row = await _sudo_row(ctx)
+        result = await _apply_vm_upgrade_decision(
+            request_id,
+            row,
+            approve=True,
+            upgrade=True,
+            reason="",
+            decided_by=_actor(ctx.user),
+        )
+        return ActionResult(result=dict(result))
+
+    @register_action("vm_upgrade", "resume_without_vm")
+    async def _vm_resume_without(ctx: ActionContext) -> ActionResult:
+        request_id, row = await _sudo_row(ctx)
+        result = await _apply_vm_upgrade_decision(
+            request_id,
+            row,
+            approve=True,
+            upgrade=False,
+            reason=str(ctx.params.get("reason") or ""),
+            decided_by=_actor(ctx.user),
+        )
+        return ActionResult(result=dict(result))
+
+    @register_action("vm_upgrade", "deny")
+    async def _vm_deny(ctx: ActionContext) -> ActionResult:
+        reason = str(ctx.params.get("reason") or "").strip()
+        if not reason:
+            # Reason-less denials demonstrably cause agent retry loops.
+            raise HTTPException(status_code=400, detail="A reason is required to deny")
+        request_id, row = await _sudo_row(ctx)
+        result = await _apply_vm_upgrade_decision(
+            request_id,
+            row,
+            approve=False,
+            upgrade=False,
+            reason=reason,
+            decided_by=_actor(ctx.user),
+        )
+        return ActionResult(result=dict(result))
+
+    # --- officer -------------------------------------------------------------
+    @register_action("officer_question", "reply")
+    async def _officer_reply(ctx: ActionContext) -> ActionResult:
+        """The one-off reply the officer lane was waiting on: the existing
+        Legate note, reached from the notification instead of the card."""
+        message = str(ctx.params.get("message") or "").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message must not be empty")
+        if len(message) > OFFICER_NOTE_MAX_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"message must be at most {OFFICER_NOTE_MAX_CHARS} characters",
+            )
+        project_id = ctx.params.get("project_id")
+        if not project_id:
+            raise HTTPException(
+                status_code=409, detail="This officer notification has no project"
+            )
+        user_id = str(ctx.user.get("id"))
+        is_admin = bool(ctx.user.get("real_is_admin") or ctx.user.get("is_admin"))
+        if not is_admin:
+            role = await postgres_db.get_user_role_in_project(str(project_id), user_id)
+            if role != "owner":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the project owner may send the officer orders",
+                )
+        officer = await postgres_db.get_officer_thread_for_project(str(project_id))
+        if not officer:
+            raise HTTPException(
+                status_code=409,
+                detail="The post is vacant — commission an officer before replying",
+            )
+        text = _format_legate_note(ctx.user, message)
+        delivered = await _deliver_officer_note(postgres_db, officer, text)
+        if delivered == "queued":
+            _kick_officer_event_drain(postgres_db)
+        return ActionResult(
+            result={"delivered": delivered, "thread_id": str(officer["id"])},
+            resolve=True,
+            resolved_by=f"user:{user_id}",
+        )
+
+    async def _open_conference(ctx: ActionContext) -> ActionResult:
+        project_id = ctx.params.get("project_id")
+        thread_id = ctx.params.get("thread_id")
+        if project_id:
+            return ActionResult(
+                result={"navigate": f"/projects/{project_id}", "hint": "officer"}
+            )
+        return _navigate(f"/sessions/{thread_id}")
+
+    register_action("officer_question", "open_conference")(_open_conference)
+    register_action("officer_runtime", "open_conference")(_open_conference)
+
+    # --- source loaders (detail pane payloads) --------------------------------
+    @register_source_loader("job")
+    async def _load_job(db: Any, job_id: str, user: dict[str, Any]) -> dict | None:
+        job = await db.get_job(job_id)
+        if not job:
+            return None
+        freeze_data = job.get("freeze_data")
+        if isinstance(freeze_data, str):
+            try:
+                freeze_data = json.loads(freeze_data)
+            except (TypeError, ValueError):
+                freeze_data = None
+        keep = (
+            "id",
+            "status",
+            "description",
+            "config_name",
+            "project_id",
+            "parent_job_id",
+            "created_at",
+            "updated_at",
+            "completed_at",
+            "error_message",
+        )
+        return _notification_jsonable(
+            {
+                "kind": "job",
+                "job": {k: job.get(k) for k in keep},
+                "freeze_data": freeze_data,
+            }
+        )
+
+    @register_source_loader("sudo_request")
+    async def _load_sudo(db: Any, request_id: str, user: dict[str, Any]) -> dict | None:
+        row = await sudo_gate._get_request(request_id)
+        if not row:
+            return None
+        return _notification_jsonable({"kind": "sudo_request", "request": dict(row)})
+
+    @register_source_loader("thread")
+    async def _load_thread(
+        db: Any, thread_id: str, user: dict[str, Any]
+    ) -> dict | None:
+        thread = await db.get_thread(thread_id)
+        if not thread:
+            return None
+        keep = ("id", "title", "project_id", "config_name", "status", "created_at")
+        return _notification_jsonable(
+            {"kind": "thread", "thread": {k: thread.get(k) for k in keep}}
+        )
+
+    # --- source probes (slice 2: `not_resolved` asks the live source) ---------
+    # The resolve hooks stamp rows when they run; the probe is what makes an
+    # un-enumerated writer (a sweeper, a future endpoint, a direct DB edit)
+    # unable to cause a stale mail. "Resolved" means: nobody is waiting on a
+    # human any more.
+
+    @register_source_probe("job")
+    async def _probe_job(db: Any, job_id: str) -> bool:
+        job = await db.get_job(job_id)
+        if not job:
+            return True  # deleted: nothing left to decide
+        return str(job.get("status")) not in ("pending_review", "paused", "reviewing")
+
+    @register_source_probe("sudo_request")
+    async def _probe_sudo(db: Any, request_id: str) -> bool:
+        row = await sudo_gate._get_request(request_id)
+        if not row:
+            return True
+        return str(row["status"]) != "pending"
+
+    @register_source_probe("thread")
+    async def _probe_thread(db: Any, thread_id: str) -> bool:
+        # An officer question has no state machine to consult; only an
+        # explicit reply/resolve settles it.
+        return False
+
+    # --- the producers migrated in slice 3 ------------------------------------
+
+    @register_action("agent_message", "reply")
+    async def _message_reply(ctx: ActionContext) -> ActionResult:
+        message = str(ctx.params.get("message") or "").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message must not be empty")
+        job_id = str(ctx.params.get("job_id") or "")
+        thread_id = str(ctx.params.get("thread_id") or "")
+        try:
+            strategy, sequence = await _route_inbound_reply(
+                job_id=job_id,
+                thread_id=thread_id,
+                message=message,
+                resolver_kind="user",
+                resolver_id=str(ctx.user.get("id") or ""),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return ActionResult(
+            result={"delivery_strategy": strategy, "sequence": sequence},
+            resolve=True,
+        )
+
+    register_action("agent_message", "open")(_open_job)
+
+    async def _open_session(ctx: ActionContext) -> ActionResult:
+        return _navigate(f"/sessions/{ctx.params.get('thread_id')}")
+
+    register_action("session_wake", "open_session")(_open_session)
+
+    @register_action("loop_event", "open")
+    async def _open_loop(ctx: ActionContext) -> ActionResult:
+        project_id = ctx.params.get("project_id")
+        if project_id:
+            return _navigate(f"/projects/{project_id}")
+        return _navigate(f"/jobs/{ctx.params.get('job_id')}")
+
+    @register_action("automation_disabled", "open")
+    async def _open_automations(ctx: ActionContext) -> ActionResult:
+        return _navigate("/automations")
+
+    @register_action("user_registered", "open")
+    async def _open_admin_users(ctx: ActionContext) -> ActionResult:
+        return _navigate("/admin/users")
+
+    async def _permission_decision(ctx: ActionContext, decision: str) -> ActionResult:
+        # act() proved the caller is the row's recipient, i.e. the thread
+        # owner the sweeper addressed it to.
+        thread_id = str(ctx.params.get("thread_id") or "")
+        request_id = str(ctx.params.get("request_id") or "")
+        outcome = await _decide_permission_request(
+            thread_id,
+            request_id,
+            decision,
+            decided_by=str(ctx.user.get("id") or "rest_client"),
+        )
+        await notification_service.resolve_source(
+            "permission_request", request_id, resolved_by=f"user:{ctx.user.get('id')}"
+        )
+        return ActionResult(result=dict(outcome), resolve=True)
+
+    @register_action("session_permission", "approve")
+    async def _permission_approve(ctx: ActionContext) -> ActionResult:
+        return await _permission_decision(ctx, "approve")
+
+    @register_action("session_permission", "deny")
+    async def _permission_deny(ctx: ActionContext) -> ActionResult:
+        return await _permission_decision(ctx, "deny")
+
+    register_action("session_permission", "open_session")(_open_session)
+
+    async def _sudo_decision(ctx: ActionContext, *, approve: bool) -> ActionResult:
+        request_id, _row = await _sudo_row(ctx)
+        decide = sudo_gate.approve_request if approve else sudo_gate.deny_request
+        result = await decide(
+            request_id,
+            reason=str(ctx.params.get("reason") or ""),
+            decided_by=_actor(ctx.user),
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Sudo request not found")
+        if result.get("error"):
+            raise HTTPException(status_code=409, detail=str(result["error"]))
+        # _finalize_request resolves the row through the sudo_request hook.
+        return ActionResult(result=dict(result))
+
+    @register_action("sudo_request", "approve")
+    async def _sudo_approve(ctx: ActionContext) -> ActionResult:
+        return await _sudo_decision(ctx, approve=True)
+
+    @register_action("sudo_request", "deny")
+    async def _sudo_deny(ctx: ActionContext) -> ActionResult:
+        return await _sudo_decision(ctx, approve=False)
+
+    @register_action("sudo_request", "open")
+    async def _open_sudo_source(ctx: ActionContext) -> ActionResult:
+        if ctx.params.get("thread_id"):
+            return _navigate(f"/sessions/{ctx.params.get('thread_id')}")
+        return _navigate(f"/jobs/{ctx.params.get('job_id')}")
+
+    @register_source_loader("message_thread")
+    async def _load_message_thread(
+        db: Any, thread_id: str, user: dict[str, Any]
+    ) -> dict | None:
+        async with db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, job_id, direction, subject, message, mode, status, "
+                "       read_at, created_at "
+                "FROM message_log WHERE thread_id = $1 "
+                "ORDER BY created_at ASC LIMIT 200",
+                thread_id,
+            )
+        if not rows:
+            return None
+        return _notification_jsonable(
+            {
+                "kind": "message_thread",
+                "thread_id": thread_id,
+                "job_id": rows[0]["job_id"],
+                "messages": [dict(r) for r in rows],
+            }
+        )
+
+    @register_source_loader("loop")
+    async def _load_loop(db: Any, loop_id: str, user: dict[str, Any]) -> dict | None:
+        loop = await db.get_project_loop(loop_id)
+        if not loop:
+            return None
+        keep = ("id", "project_id", "name", "title", "status", "created_at")
+        return _notification_jsonable(
+            {"kind": "loop", "loop": {k: loop.get(k) for k in keep if k in loop}}
+        )
+
+    @register_source_loader("automation")
+    async def _load_automation(
+        db: Any, automation_id: str, user: dict[str, Any]
+    ) -> dict | None:
+        row = await db.get_automation(automation_id)
+        if not row:
+            return None
+        keep = ("id", "name", "enabled", "disabled_reason", "created_at")
+        return _notification_jsonable(
+            {"kind": "automation", "automation": {k: row.get(k) for k in keep}}
+        )
+
+    @register_source_loader("user")
+    async def _load_user(db: Any, user_id: str, user: dict[str, Any]) -> dict | None:
+        row = await db.get_user(user_id)
+        if not row:
+            return None
+        keep = ("id", "email", "display_name", "is_approved", "created_at")
+        return _notification_jsonable(
+            {"kind": "user", "user": {k: row.get(k) for k in keep}}
+        )
+
+    @register_source_loader("permission_request")
+    async def _load_permission_request(
+        db: Any, request_id: str, user: dict[str, Any]
+    ) -> dict | None:
+        async with db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, thread_id, tool_name, tool_args, status, requested_at, "
+                "       decided_at, decided_by "
+                "FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+        if not row:
+            return None
+        return _notification_jsonable(
+            {"kind": "permission_request", "request": dict(row)}
+        )
+
+    @register_source_probe("message_thread")
+    async def _probe_message_thread(db: Any, thread_id: str) -> bool:
+        # Answered = the thread's latest message came from the human.
+        async with db.acquire() as conn:
+            direction = await conn.fetchval(
+                "SELECT direction FROM message_log WHERE thread_id = $1 "
+                "ORDER BY created_at DESC LIMIT 1",
+                thread_id,
+            )
+        return direction == "inbound"
+
+    @register_source_probe("automation")
+    async def _probe_automation(db: Any, automation_id: str) -> bool:
+        row = await db.get_automation(automation_id)
+        return True if not row else bool(row.get("enabled"))
+
+    @register_source_probe("user")
+    async def _probe_user(db: Any, user_id: str) -> bool:
+        row = await db.get_user(user_id)
+        return True if not row else bool(row.get("is_approved"))
+
+    @register_source_probe("permission_request")
+    async def _probe_permission_request(db: Any, request_id: str) -> bool:
+        async with db.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+        return status is None or str(status) != "pending"
 
 
 # =============================================================================
@@ -19000,6 +19723,25 @@ async def resume_job(
         Status message indicating resume result
     """
     user, job = await require_internal_or_job_access(req, postgres_db, job_id)
+    result = await _resume_job_internal(
+        job_id, user=user, job=job, request=request, req=req
+    )
+    await _resolve_job_notifications(job_id, user=user, hook="resume")
+    return result
+
+
+async def _resume_job_internal(
+    job_id: str,
+    *,
+    user: dict[str, Any] | None,
+    job: dict[str, Any],
+    request: JobResumeRequest | None = None,
+    req: Request | None = None,
+) -> dict[str, str]:
+    """Core of :func:`resume_job` after the access gate — request-free so the
+    notification ``review_queue.resume`` / ``budget_exceeded.resume`` handlers
+    can call it directly. ``req`` is only needed on the internal-actor branch
+    (no ``user``), which a notification action never takes."""
     if request is None:
         request = JobResumeRequest()
     if job.get("completion_outcome_kind") == "blocked_undelivered":
@@ -19025,7 +19767,7 @@ async def resume_job(
             }
         else:
             project_id = str(job["project_id"]) if job.get("project_id") else None
-            if project_id is None:
+            if project_id is None or req is None:
                 raise HTTPException(
                     status_code=403,
                     detail=(
@@ -19637,6 +20379,20 @@ async def approve_job(
     5. Updates DB status to 'completed' with completed_at timestamp
     """
     user, job = await require_internal_or_job_access(req, postgres_db, job_id)
+    result = await _approve_job_internal(job_id, user=user, job=job, request=request)
+    await _resolve_job_notifications(job_id, user=user, hook="approve")
+    return result
+
+
+async def _approve_job_internal(
+    job_id: str,
+    *,
+    user: dict[str, Any] | None,
+    job: dict[str, Any],
+    request: JobApproveRequest | None = None,
+) -> dict[str, Any]:
+    """Core of :func:`approve_job` after the access gate — request-free so the
+    notification ``review_queue.approve`` handler can call it directly."""
     if request is None:
         request = JobApproveRequest()
     await _guard_completion_control(job_id, source="public_approve")
@@ -20155,6 +20911,7 @@ async def _upgrade_job_to_vm_internal(
 
         # 7. Trigger dispatcher — it will provision a VM and dispatch
         _trigger_dispatch()
+        await _resolve_job_notifications(job_id, user=None, hook="vm_upgrade")
 
         return {
             "status": "approved_vm_upgrade",
@@ -20415,6 +21172,9 @@ async def _resume_job_without_vm_internal(
         f"command={command!r})"
     )
     _trigger_dispatch()
+    await _resolve_job_notifications(
+        job_id, user=None, hook="vm_denied" if denied else "resumed_without_vm"
+    )
 
     return {
         "status": "denied_vm_upgrade" if denied else "resumed_without_vm",
@@ -20630,7 +21390,7 @@ async def _escalate_target(job_id: str, job: dict[str, Any], reason: str) -> str
     user_id = job.get("user_id")
     if not is_loop_job and user_id:
         try:
-            await notification_service.notify_review_returned_to_manual(
+            await notification_service.record_review_returned(
                 user_id=str(user_id),
                 job_id=job_id,
                 config_name=job.get("config_name") or "",
@@ -21431,8 +22191,14 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
                     except (ValueError, TypeError):
                         fd = {}
                 try:
+                    # fail_llm_outage_job is a CAS that fires once per job,
+                    # so the job id alone is a stable idempotency key here.
                     await _notify_operator_freeze(
-                        job, job_id, "llm_unavailable", fd or {}
+                        job,
+                        job_id,
+                        "llm_unavailable",
+                        fd or {},
+                        dedup_key=f"llm_unavailable:sweeper:{job_id}",
                     )
                 except Exception as e:
                     logger.warning(f"give-up alert failed for {job_id}: {e}")
@@ -21956,7 +22722,7 @@ async def _run_critic_verdict_followups(
         user_id = (target_job or {}).get("user_id")
         if target_job and not job_loop_id(target_job) and user_id:
             try:
-                await notification_service.notify_review_returned_to_manual(
+                await notification_service.record_review_returned(
                     user_id=str(user_id),
                     job_id=target_job_id,
                     config_name=str(target_job.get("config_name") or ""),
@@ -23016,7 +23782,7 @@ async def _run_verification_critic_handoff(
     user_id = target_job.get("user_id")
     if not job_loop_id(target_job) and user_id:
         try:
-            await notification_service.notify_review_returned_to_manual(
+            await notification_service.record_review_returned(
                 user_id=str(user_id),
                 job_id=target_job_id,
                 config_name=str(target_job.get("config_name") or ""),
@@ -23395,18 +24161,23 @@ async def _notify_loop_event(
     note_id: str | None = None,
     authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
-    """Surface a loop event to the loop's owner — notification bell + SSE.
+    """Surface a loop event to the loop's owner as an in-app feed row.
 
-    Persists an outbound ``message_log`` row (the bell's backing store; the
-    list view joins the job for description/config) and broadcasts the SSE
-    event kind for connected clients. No email, no push — resolved Q3 of
-    knowledge-base/knowledge/features/loop_campaign_scheduling.md. Best-effort on both channels:
-    a notification must never break an advance.
+    ``loop_event`` is a ``low`` category: no email, no push — resolved Q3 of
+    knowledge-base/knowledge/features/loop_campaign_scheduling.md. Best-effort: a
+    notification must never break an advance.
+
+    Durable-command handoffs replay after response loss: with a
+    ``dedup_turn_identity`` the dedup key is deterministic, so the replay lands
+    on the same row and broadcasts nothing (record() is idempotent);
+    ``authority_check`` runs before the write and again after a *new* row, as
+    the old bell-row helper did. Legacy callers get a random key.
     """
     owner_id = loop.get("owner_id")
     if not owner_id:
         return
-    thread_id = f"loop-{str(loop.get('id', ''))[:6]}"
+    loop_id = str(loop.get("id") or "")
+    project_id = str(loop.get("project_id")) if loop.get("project_id") else None
     if dedup_turn_identity is not None:
         from services.project_loop_atomic import bounded_replay_text
 
@@ -23415,70 +24186,57 @@ async def _notify_loop_event(
         message = bounded_replay_text(message, limit_bytes=1024)
         if authority_check is not None:
             await authority_check()
-        # Durable-command handoffs replay after response loss. Persist one
-        # deterministic bell row first; its helper validates owner + immutable
-        # payload on conflict. SSE is emitted only by the inserting caller.
-        notification_id = uuid5(
-            NAMESPACE_URL,
-            ":".join(
-                (
-                    "srw-project-loop-notification-v1",
-                    str(loop.get("id")),
-                    str(dedup_turn_identity),
-                    str(job_id),
-                    str(event_type),
-                    str(note_id or "-"),
-                )
-            ),
+        dedup_key = ":".join(
+            (
+                "loop",
+                loop_id,
+                str(dedup_turn_identity),
+                str(job_id),
+                str(event_type),
+                str(note_id or "-"),
+            )
         )
-        inserted = await postgres_db.log_project_loop_message_once(
-            message_id=str(notification_id),
-            job_id=str(job_id),
-            user_id=str(owner_id),
-            thread_id=thread_id,
-            subject=subject,
-            message=message,
-        )
-        if not inserted:
-            return
-        if authority_check is not None:
-            await authority_check()
     else:
-        # Default-off/legacy callers retain the historical best-effort path and
-        # exact DB call shape.
-        try:
-            await postgres_db.log_message(
-                job_id=str(job_id),
-                thread_id=thread_id,
-                direction="outbound",
-                subject=subject,
-                message=message,
-                status="sent",
-                user_id=str(owner_id),
-                mode="async",
-            )
-        except Exception:
-            logger.warning(
-                "loop notify: message_log write failed (non-fatal)", exc_info=True
-            )
+        dedup_key = f"loop:{loop_id}:{job_id}:{event_type}:{uuid4()}"
     try:
-        from services.notification_feed import notification_feed
-
-        notification_feed.broadcast(
-            user_id=str(owner_id),
-            event_type=event_type,
-            data={
-                "loop_id": str(loop.get("id")),
-                "project_id": (
-                    str(loop.get("project_id")) if loop.get("project_id") else None
-                ),
+        result = await notification_service.record(
+            recipient_id=str(owner_id),
+            category="loop_event",
+            dedup_key=dedup_key,
+            subject=subject,
+            body=message,
+            source_kind="loop",
+            source_id=loop_id or str(job_id),
+            action_params={
+                "loop_id": loop_id,
+                "project_id": project_id,
                 "job_id": str(job_id),
-                "subject": subject,
-                "message": message,
+            },
+            payload={
+                "loop_id": loop_id,
+                "project_id": project_id,
+                "job_id": str(job_id),
+                "event_type": event_type,
             },
         )
     except Exception:
-        logger.warning("loop notify: SSE broadcast failed (non-fatal)", exc_info=True)
+        logger.warning("loop notify: feed write failed (non-fatal)", exc_info=True)
+        return
+    if dedup_turn_identity is None:
+        return
+    if not result.inserted:
+        # A durable-command replay must be byte-identical: the same turn
+        # identity carrying a different subject/message is a handoff bug, and
+        # the old bell-row helper refused it. record() tolerates text drift
+        # for ordinary producers, so the check lives here.
+        stored = await postgres_db.get_notification(result.notification_id)
+        if stored and (
+            stored.get("subject") != subject or stored.get("body") != message
+        ):
+            raise RuntimeError("loop notification replay carried a different payload")
+        return
+    if authority_check is not None:
+        await authority_check()
 
 
 async def _notify_loop_user_questions(
@@ -27733,7 +28491,13 @@ async def _complete_job_legacy(
                 async def _alert_llm_give_up() -> dict[str, Any]:
                     try:
                         await _notify_operator_freeze(
-                            job, job_id, "llm_unavailable", _lfd
+                            job,
+                            job_id,
+                            "llm_unavailable",
+                            _lfd,
+                            dedup_key=_completion_effect_dedup_key(
+                                _effect_runner, "llm_give_up_operator_alert", job_id
+                            ),
                         )
                     except Exception as exc:
                         logger.warning(
@@ -28469,6 +29233,9 @@ async def _complete_job_legacy(
                                 job_id,
                                 fd_row.get("freeze_type"),
                                 fd_row,
+                                dedup_key=_completion_effect_dedup_key(
+                                    _effect_runner, "drain_stall_operator_alert", job_id
+                                ),
                             )
                         except Exception as exc:
                             logger.warning(
@@ -28664,12 +29431,15 @@ async def _complete_job_legacy(
 
                     async def _send_freeze_notification() -> dict[str, Any]:
                         try:
-                            await _notify_operator_freeze(
+                            recorded = await _notify_operator_freeze(
                                 job,
                                 job_id,
                                 ft,
                                 fd,
                                 sudo_request_id=sudo_request_id,
+                                dedup_key=_completion_effect_dedup_key(
+                                    _effect_runner, "freeze_notification", job_id
+                                ),
                             )
                         except Exception as exc:
                             logger.warning(
@@ -28678,7 +29448,13 @@ async def _complete_job_legacy(
                                 exc,
                             )
                             return {"sent": False, "error": str(exc)}
-                        return {"sent": True}
+                        return {
+                            "sent": True,
+                            "notification_id": (
+                                recorded.notification_id if recorded else None
+                            ),
+                            "inserted": bool(recorded and recorded.inserted),
+                        }
 
                     freeze_notification = await _run_completion_effect(
                         _effect_runner,
@@ -38311,19 +39087,11 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
         durable_officer_cfg = {}
     if not durable_officer_shape_valid:
         durable_officer_cfg = {}
-    officer_state = metadata.get("officer_state") or {}
-    if not isinstance(officer_state, dict):
-        officer_state = {}
-    pages = officer_state.get("pages") or {}
-    if not isinstance(pages, dict):
-        pages = {}
     llm_cfg = config_override.get("llm") or {}
     if not isinstance(llm_cfg, dict):
         llm_cfg = {}
-    today = datetime.now(timezone.utc).date().isoformat()
     thread_id = row.get("thread_id")
     thread_status = row.get("thread_status")
-    digest = officer_state.get("digest")
     linked = bool(thread_id)
     commissioned = linked and thread_status not in (None, "ended")
 
@@ -38377,10 +39145,6 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
         "next_wake_at": _iso_or_none(row.get("next_wake_at")),
         "pending_events": int(row.get("pending_events") or 0),
         "in_flight_jobs": int(row.get("in_flight_jobs") or 0),
-        "pages_today": (
-            int(pages.get("count") or 0) if pages.get("date") == today else 0
-        ),
-        "digest_waiting": len(digest) if isinstance(digest, list) else 0,
         "auto_pull": (
             auto_pull_enabled(officer_cfg)
             if linked
@@ -38699,20 +39463,10 @@ async def get_project_officer_summary(
         )
 
     today = datetime.now(timezone.utc).date().isoformat()
-    pages = officer_state.get("pages") or {}
-    pages_used = int(pages.get("count") or 0) if pages.get("date") == today else 0
-    try:
-        pages_budget = int(officer_meta.get("max_pages_per_day") or 3)
-    except (TypeError, ValueError):
-        pages_budget = 3
     try:
         token_ceiling = int(officer_meta.get("daily_token_ceiling") or 0)
     except (TypeError, ValueError):
         token_ceiling = 0
-
-    digest = officer_state.get("digest") or []
-    if not isinstance(digest, list):
-        digest = []
 
     # Hold is thread-scoped runtime state (officer_post.md §5) — read live.
     raw_hold = officer_meta.get("hold")
@@ -38781,13 +39535,13 @@ async def get_project_officer_summary(
         },
         "next_wake_at": (timer or {}).get("fire_at"),
         "pending_events": int(pending_events or 0),
-        "pages_today": {"used": pages_used, "budget": pages_budget},
         "token_ceiling": {
             "daily": token_ceiling,
             "deferred_today": officer_state.get("ceiling_notice") == today,
         },
         "spend_today": await _officer_spend_today(officer_tid, token_ceiling),
-        "digest": digest[-10:],
+        # The officer's pages and digests are feed rows now — the card reads
+        # GET /api/notifications?source_kind=thread&source_id=<officer_tid>.
         "conference": conference_block,
     }
 
@@ -38853,7 +39607,6 @@ def _officer_editor_block(
         "sleep_min_minutes": _num("sleep_min_minutes"),
         "sleep_max_minutes": _num("sleep_max_minutes"),
         "daily_token_ceiling": _num("daily_token_ceiling"),
-        "max_pages_per_day": _num("max_pages_per_day"),
         "max_actions_per_wake": _num("max_actions_per_wake"),
         "max_concurrent_workers": _num("max_concurrent_workers"),
     }
@@ -38938,7 +39691,6 @@ _OFFICER_POST_EFFECTS: dict[str, str] = {
     "worker_spend_ceiling_daily": "next dispatch",
     "max_concurrent_workers": "next dispatch",
     "daily_token_ceiling": "next delivery",
-    "max_pages_per_day": "next delivery",
     "sleep_min_minutes": "next sleep filing + watchdog immediately",
     "sleep_max_minutes": "next sleep filing + watchdog immediately",
     "max_actions_per_wake": "next respawn",
@@ -38949,7 +39701,6 @@ _OFFICER_POST_EFFECTS: dict[str, str] = {
 _OFFICER_POST_INT_FIELDS = frozenset(
     {
         "max_concurrent_workers",
-        "max_pages_per_day",
         "max_actions_per_wake",
         "daily_token_ceiling",
         "sleep_min_minutes",
@@ -40070,82 +40821,80 @@ def _officer_session_link(thread_id: str) -> str | None:
 
 
 async def _dispatch_officer_page(
-    thread: dict, thread_id: str, subject: str, message_md: str
-) -> bool:
-    """Page the thread owner out-of-band (email/ntfy per their prefs).
+    thread: dict,
+    thread_id: str,
+    subject: str,
+    message_md: str,
+    *,
+    category: str = "officer_question",
+    severity: str = "high",
+    dedup_key: str | None = None,
+) -> str | None:
+    """Record an officer → Legate notification on the thread owner's feed.
 
-    Shared by the notify endpoint's 'page' urgency and the watchdog's
-    respawn-failure alert. The recipient MUST be resolved explicitly —
-    notification_service.dispatch's email leg sends to ``recipient_email or
-    ""`` and silently drops the send otherwise (the 2026-07-27 dev live gate
-    lesson, same as session_wake._notify_owner).
+    Shared by the notify endpoint's page/digest urgencies, the recycler's
+    respawn-failure alert and the runtime-authorization incident. Delivery
+    (email per the owner's preferences, later the escalation ladder) is the
+    notification system's business, not this function's: ``severity`` is the
+    officer's urgency, never a channel selector (unified notification system,
+    D1). A ``high`` row mails now; ``low`` is in-app only.
 
     Appends a deep link to the officer's session so every page carries a way
     back. Deliberately a labeled bare URL, not a markdown ``[label](url)``:
     the email leg renders markdown (services/email_markdown.py, which also
     auto-links a bare URL) but ntfy/Slack get the raw text — a bare URL is
     clickable-or-copyable in every leg, brackets-and-parens only in email.
+
+    Returns the notification id when the row was recorded (new or replayed);
+    ``None`` only when there is nobody to notify or the feed write itself
+    failed.
     """
     user_id = thread.get("user_id")
     if not user_id:
-        return False
-    try:
-        user = await postgres_db.get_user(str(user_id))
-    except Exception:
-        user = None
-    if not user or not user.get("email"):
-        logger.warning(
-            "officer page: owner %s has no email — page dropped",
-            str(user_id)[:8],
-        )
-        return False
+        return None
     subject = subject or "Your centurion needs you"
     session_link = _officer_session_link(thread_id)
     page_body = message_md
     if session_link:
         page_body = f"{message_md}\n\nOpen his log to reply: {session_link}"
-    results = await notification_service.dispatch(
-        user_id=str(user_id),
-        # No job behind an officer page; the thread UUID keys the queue row
-        # (plain uuid column, no FK) so quiet-hours digests still group it.
-        job_id=thread_id,
-        subject=subject,
-        message_md=page_body,
-        job_description="officer page",
-        config_name=str(thread.get("config_name") or "session_base"),
-        thread_id=thread_id,
-        recipient_email=user.get("email"),
-        recipient_name=user.get("display_name") or "Legate",
-        # A page is the one urgency that crosses quiet hours (centurion.md
-        # §6): it is budgeted, and everything digest-worthy already waits.
-        bypass_quiet_hours=True,
-    )
-    if results.get("error"):
-        return False
-    # Persist the notification-center row (message_log is the bell's backing
-    # store; get_user_notifications reads it). job_id stays NULL — the jobs FK
-    # forbids the thread UUID — and thread_id carries the session UUID so the
-    # cockpit can route "Open session log" to /sessions/{thread_id} (F4
-    # addendum). The body is the pre-link text: the card supplies the route
-    # itself. Best-effort: a bell-row failure must not fail a delivered page.
+    if not dedup_key:
+        # Identical text on one day collapses onto one row — the anti-spam
+        # role the per-day page budget used to play.
+        text_digest = hashlib.sha1(
+            f"{subject}\n{message_md}".encode("utf-8")
+        ).hexdigest()[:16]
+        today = datetime.now(timezone.utc).date().isoformat()
+        dedup_key = f"officer_notify:{thread_id}:{text_digest}:{today}"
+    project_id = thread.get("project_id")
     try:
-        await postgres_db.log_message(
-            job_id=None,
-            user_id=str(user_id),
-            thread_id=thread_id,
-            direction="outbound",
-            recipient_email=user.get("email"),
+        result = await notification_service.record(
+            recipient_id=str(user_id),
+            category=category,
+            severity=severity,
+            dedup_key=dedup_key,
             subject=subject,
-            message=message_md,
-            mode="async",
-            status="sent",
+            body=page_body,
+            source_kind="thread",
+            source_id=str(thread_id),
+            action_params={
+                "thread_id": str(thread_id),
+                "project_id": str(project_id) if project_id else None,
+            },
+            payload={
+                "thread_id": str(thread_id),
+                "project_id": str(project_id) if project_id else None,
+                "config_name": str(thread.get("config_name") or "session_base"),
+                "title": thread.get("title"),
+            },
         )
     except Exception:
         logger.warning(
-            "officer page: notification-center row write failed (non-fatal)",
+            "officer notification for thread %s failed",
+            str(thread_id)[:8],
             exc_info=True,
         )
-    return True
+        return None
+    return result.notification_id
 
 
 @app.post("/api/agents/threads/{thread_id}/officer/notify")
@@ -40157,14 +40906,16 @@ async def agent_officer_notify(
     """The officer's notify_user contract (centurion.md §6). **Internal** —
     requires ``X-Internal-Key``; ingress strips this path.
 
-    Three urgencies:
+    Three urgencies, each a feed row on the Legate's notification center
+    (unified notification system):
       * ``log`` — no-op server-side: the officer's transcript already carries
         the line; this exists so the tool has an honest cheap tier.
-      * ``digest`` — appended to ``metadata.officer_state.digest`` (capped
-        ring; surfaced in the cockpit / next conference rather than pushed).
-      * ``page`` — immediate out-of-band notification, budgeted by
-        ``officer.max_pages_per_day``; over budget it DOWNGRADES to digest
-        and tells the officer so (never fails the tool call).
+      * ``digest`` — a ``low``-severity row: in-app only, read at the next
+        look. The officer card lists these rows (feed filtered by source).
+      * ``page`` — a ``high``-severity row: reaches the Legate now, through
+        whatever channels their preferences allow. There is no per-officer
+        page budget — the platform throttles (dedup per text per day,
+        preferences, quiet hours), not the agent.
     """
     await require_internal(request)
     thread = await postgres_db.get_thread(thread_id)
@@ -40186,67 +40937,26 @@ async def agent_officer_notify(
     if urgency == "log":
         return {"delivered": "log"}
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    officer_state = metadata.get("officer_state") or {}
-    if not isinstance(officer_state, dict):
-        officer_state = {}
-    today = datetime.now(timezone.utc).date().isoformat()
-
-    downgraded = False
-    if urgency == "page":
-        pages = officer_state.get("pages") or {}
-        if not isinstance(pages, dict) or pages.get("date") != today:
-            pages = {"date": today, "count": 0}
-        try:
-            budget = int(officer_meta.get("max_pages_per_day") or 3)
-        except (TypeError, ValueError):
-            budget = 3
-        if int(pages.get("count") or 0) >= budget > 0:
-            downgraded = True
-        else:
-            paged = await _dispatch_officer_page(
-                thread, thread_id, body.subject, message
-            )
-            await postgres_db.merge_thread_officer_state(
-                thread_id,
-                {"pages": {"date": today, "count": int(pages.get("count") or 0) + 1}},
-            )
-            if paged:
-                return {
-                    "delivered": "page",
-                    "pages_used_today": int(pages.get("count") or 0) + 1,
-                    "pages_budget": budget,
-                }
-            # Undeliverable (no email / notifier down) — fall through to
-            # digest so the message is not lost, and say so.
-            downgraded = True
-
-    digest = officer_state.get("digest") or []
-    if not isinstance(digest, list):
-        digest = []
-    digest = (
-        digest
-        + [
-            {
-                "at": datetime.now(timezone.utc).isoformat(),
-                "subject": (body.subject or "")[:120],
-                "message": message[:500],
-            }
-        ]
-    )[-50:]
-    await postgres_db.merge_thread_officer_state(thread_id, {"digest": digest})
-    result: dict[str, Any] = {"delivered": "digest", "queued": len(digest)}
-    if downgraded:
-        result["downgraded"] = True
-        result["detail"] = (
-            "page budget exhausted or page undeliverable — queued as digest"
+    # A page is a `high` row (reaches the Legate now); a digest is a `low`
+    # row (in-app, read at the next look). Throttling is the platform's job:
+    # identical text on one day collapses onto one row (the dedup key), the
+    # recipient's preferences and quiet hours apply per channel, and there is
+    # no per-officer page budget any more.
+    severity = "high" if urgency == "page" else "low"
+    notification_id = await _dispatch_officer_page(
+        thread,
+        thread_id,
+        body.subject,
+        message,
+        category="officer_question",
+        severity=severity,
+    )
+    if notification_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The notification could not be recorded — try again",
         )
-    return result
+    return {"delivered": urgency, "notification_id": notification_id}
 
 
 @app.put("/api/agents/threads/{thread_id}/status")
@@ -48330,18 +49040,31 @@ async def thread_approve(
         409 — request already decided (idempotent re-clicks land here)
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
+    outcome = await _decide_permission_request(
+        thread_id, approval_id, body.decision, decided_by=decided_by
+    )
+    await notification_service.resolve_source(
+        "permission_request", approval_id, resolved_by=f"user:{decided_by}"
+    )
+    return outcome
 
-    if body.decision == "approve":
+
+async def _decide_permission_request(
+    thread_id: str, approval_id: str, decision: str, *, decided_by: str
+) -> dict[str, Any]:
+    """The one UPDATE that decides a permission gate — shared by the REST
+    endpoint and the notification's approve/deny actions. Raises the
+    endpoint's HTTP errors: 400 bad decision, 404 unknown, 409 decided."""
+    if decision == "approve":
         new_status = "approved"
-    elif body.decision == "deny":
+    elif decision == "deny":
         new_status = "denied"
     else:
         raise HTTPException(
             status_code=400,
             detail="decision must be 'approve' or 'deny'",
         )
-
-    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
 
     async with postgres_db.acquire() as conn:
         # Lookup-then-update so we can distinguish 404 (wrong id/thread)
@@ -48379,7 +49102,7 @@ async def thread_approve(
         )
     return {
         "accepted": True,
-        "decision": body.decision,
+        "decision": decision,
         "approval_id": str(row["id"]),
         "status": row["status"],
         "tool_call_id": row["tool_call_id"],
@@ -49251,11 +49974,16 @@ async def _phase5_wake_if_suspended(
 async def thread_permission_notify_sweeper(
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Background task: scan for permission requests waiting >N seconds and
-    dispatch the magic-link email if not yet notified.
+    """Background task: a permission request that has waited longer than
+    HEADLESS_NOTIFY_AGE_S without a decision becomes a ``session_permission``
+    feed row for the thread owner — ``high``, so the mail (with the two magic
+    links) goes out now, and the row resolves when the gate is decided by any
+    path. In-session gates are answered within seconds through the agent's
+    LISTEN, so only abandoned ones ever get here.
 
     Runs every HEADLESS_NOTIFY_INTERVAL_S (default 30s). Idempotent: the
-    send function dedup-skips rows already in thread_notifications.
+    feed row is keyed on the request id, and rows already recorded are
+    filtered out so the magic-link tokens are minted once.
 
     Best-effort. Survives transient errors by logging and continuing.
     """
@@ -49271,61 +49999,40 @@ async def thread_permission_notify_sweeper(
     while not shutdown_event.is_set():
         try:
             async with postgres_db.acquire() as conn:
-                # Suppress requests with terminal-or-permanent outcomes
-                # ('sent', 'failed', 'skipped_no_email',
-                # 'skipped_already_resolved') forever. Suppress
-                # transient outcomes ('skipped_rate_limit',
-                # 'skipped_smtp') only inside a recency window of
-                # 2 × sweeper interval, so they can re-try once the
-                # transient condition clears.
                 rows = await conn.fetch(
-                    "SELECT id, thread_id "
-                    "FROM thread_permission_requests "
-                    "WHERE status = 'pending' "
-                    "  AND requested_at < now() - "
-                    "      ($1 || ' seconds')::interval "
+                    "SELECT r.id, r.thread_id, r.tool_name, r.tool_args, "
+                    "       r.requested_at, t.user_id, t.title "
+                    "FROM thread_permission_requests r "
+                    "JOIN threads t ON t.id = r.thread_id "
+                    "WHERE r.status = 'pending' "
+                    "  AND r.requested_at < now() - ($1::int * interval '1 second') "
                     "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM thread_notifications tn "
-                    "    WHERE tn.request_id = thread_permission_requests.id "
-                    "      AND tn.kind = 'permission_pending' "
-                    "      AND ("
-                    "        tn.delivery_status IN ("
-                    "          'sent', 'failed', "
-                    "          'skipped_no_email', "
-                    "          'skipped_already_resolved'"
-                    "        ) "
-                    "        OR ("
-                    "          tn.delivery_status IN ("
-                    "            'skipped_rate_limit', 'skipped_smtp'"
-                    "          ) "
-                    "          AND tn.sent_at > now() - "
-                    "              make_interval(secs => $2)"
-                    "        )"
-                    "      )"
+                    "    SELECT 1 FROM notifications n "
+                    "    WHERE n.source_kind = 'permission_request' "
+                    "      AND n.source_id = r.id::text"
                     "  ) "
-                    "ORDER BY requested_at ASC "
+                    "ORDER BY r.requested_at ASC "
                     "LIMIT 50",
-                    str(age_threshold_s),
-                    interval_s * 2,
+                    age_threshold_s,
                 )
             for row in rows:
                 try:
-                    result = await headless_notifications.send_permission_pending_email(
+                    result = await headless_notifications.record_permission_pending(
                         postgres_db,
-                        email_service,
-                        thread_id=str(row["thread_id"]),
-                        approval_id=str(row["id"]),
+                        notification_service,
+                        row=dict(row),
                         cockpit_external_url=cockpit_external_url,
                     )
-                    if result.get("status") == "sent":
+                    if result.get("status") == "recorded":
                         logger.info(
-                            "Sent permission-pending email (thread=%s req=%s)",
+                            "Recorded permission-pending notification "
+                            "(thread=%s req=%s)",
                             str(row["thread_id"])[:8],
                             str(row["id"])[:8],
                         )
                 except Exception as e:
                     logger.warning(
-                        "Permission-pending email failed (req=%s): %s",
+                        "Permission-pending notification failed (req=%s): %s",
                         str(row["id"])[:8],
                         e,
                     )
@@ -49402,6 +50109,8 @@ async def _maintain_officer_runtime_authorization(
         delivered = await _dispatch_officer_page(
             officer_row,
             str(thread_id),
+            category="officer_runtime",
+            dedup_key=f"officer_runtime_auth:{outcome.notification_claim_id}",
             subject="Officer authorization unavailable",
             message_md=(
                 "The commissioned Officer cannot maintain its server-derived "
@@ -55974,6 +56683,11 @@ async def admin_bulk_approve_users(
         row = await postgres_db.get_user(uid)
         if row:
             await ensure_user_provisioned(row)
+        # Every admin's "new user pending approval" row is settled by whoever
+        # approved (D6: resolution is a property of the source).
+        await notification_service.resolve_source(
+            "user", str(uid), resolved_by=f"user:{admin.get('id')}"
+        )
     approved_set = set(approved_ids)
     results = [
         {"id": uid, "status": "approved" if uid in approved_set else "not_found"}

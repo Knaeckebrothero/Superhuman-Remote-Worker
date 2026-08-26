@@ -259,7 +259,19 @@ APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0187_managed_repository_process_zero_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY
+APP_NOTIFICATIONS_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0191_notifications.sql"
+)
+APP_NOTIFICATION_STEPS_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0192_notification_steps.sql"
+)
+APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0193_notifications_cutover.sql"
+)
+# Unified notification feed (slice 3: the cutover backfill) — the head after
+# the 0184-0190 managed-repository / stateless-input lane and the slice-1/2
+# feed tables; bump when the next lands.
+APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATIONS_CUTOVER_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

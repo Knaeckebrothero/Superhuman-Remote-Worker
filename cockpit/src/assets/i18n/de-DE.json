@@ -2406,23 +2406,12 @@
     "refresh": "Aktualisieren",
     "listAriaLabel": "Einträge im Aktionszentrum",
     "filters": {
-      "all": "Alle",
-      "messages": "Nachrichten",
-      "sudo": "Sudo",
-      "reviews": "Reviews",
-      "sessions": "Sitzungen"
+      "all": "Alle"
     },
     "list": {
-      "empty": {
-        "message": "Keine Nachrichten",
-        "sudo": "Keine Sudo-Anfragen",
-        "review": "Keine Reviews",
-        "session": "Keine Sitzungen"
-      },
+      "emptyCategory": "Nichts in dieser Kategorie",
       "emptyAll": "Alles erledigt — keine Einträge erfordern Ihre Aufmerksamkeit",
-      "resolved": "erledigt",
-      "modeBlocking": "blockierend",
-      "modeAsync": "asynchron"
+      "resolved": "erledigt"
     },
     "time": {
       "now": "jetzt"
@@ -2431,81 +2420,7 @@
       "emptyText": "Wählen Sie einen Eintrag, um Details anzuzeigen",
       "hintUse": "Mit",
       "hintToNavigate": "navigieren,",
-      "hintToSelect": "zum Auswählen",
-      "jobId": "Job-ID",
-      "requestId": "Anfrage-ID",
-      "threadId": "Thread-ID",
-      "sessionId": "Sitzungs-ID",
-      "eventId": "Ereignis-ID"
-    },
-    "sudoDetail": {
-      "vmUpgradeRequest": "VM-Upgrade-Anfrage",
-      "sudoRequest": "Sudo-Anfrage",
-      "secondsRemaining": "{{seconds}}s verbleibend",
-      "user": "Benutzer",
-      "vm": "VM",
-      "cwd": "CWD",
-      "workspace": "Arbeitsbereich",
-      "upgradeHint": "Der Agent hat Sudo in einem Container-Arbeitsbereich versucht. Für vollen Sudo-Zugriff zu einer VM upgraden oder den Job ohne VM fortsetzen.",
-      "upgradeToVm": "Auf VM upgraden",
-      "resumeWithoutVm": "Ohne VM fortsetzen",
-      "approve": "Genehmigen",
-      "deny": "Verweigern",
-      "reason": "Begründung",
-      "rulesToggle": "Auto-Genehmigungsregeln ({{count}})",
-      "rulePatternPlaceholder": "Muster (z. B. apt-get install *)",
-      "ruleActionApprove": "Genehmigen",
-      "ruleActionDeny": "Verweigern",
-      "ruleAdd": "Hinzufügen"
-    },
-    "messageDetail": {
-      "messageLabel": "Nachricht",
-      "modeBlocking": "blockierend",
-      "modeAsync": "asynchron",
-      "sessionPage": "Sitzungsmeldung",
-      "openSessionLog": "Sitzungsprotokoll öffnen",
-      "defaultAgent": "Agent",
-      "threadLoading": "Thread wird geladen …",
-      "noMessagesLoaded": "Keine Nachrichten geladen",
-      "senderAgent": "Agent",
-      "senderYou": "Sie",
-      "replyPlaceholder": "Antwort eingeben …",
-      "markUrgent": "Als dringend markieren",
-      "send": "Senden"
-    },
-    "reviewDetail": {
-      "jobReview": "Job-Review",
-      "freezePhase": "Phasengrenze",
-      "freezeUpgrade": "Sudo erforderlich",
-      "freezeComplete": "Job abgeschlossen",
-      "defaultAgent": "Agent",
-      "phase": "Phase {{number}}",
-      "loadingFrozen": "Eingefrorene Daten werden geladen …",
-      "summary": "Zusammenfassung",
-      "confidence": "Konfidenz",
-      "deliverables": "Ergebnisse",
-      "upgradeHint": "Für Sudo-Zugriff zu einer VM upgraden oder ohne VM fortsetzen.",
-      "upgradeToVm": "Auf VM upgraden",
-      "resumeWithoutVm": "Ohne VM fortsetzen",
-      "notesPlaceholder": "Optionale Notizen …",
-      "approve": "Genehmigen",
-      "feedbackPlaceholder": "Feedback für die nächste Phase …",
-      "resumeWithFeedback": "Mit Feedback fortsetzen"
-    },
-    "sessionDetail": {
-      "agentSession": "Agent-Sitzung",
-      "needsAttention": "erfordert Aufmerksamkeit",
-      "tool": "Tool",
-      "arguments": "Argumente",
-      "command": "Befehl",
-      "reason": "Grund",
-      "goToSession": "Zur Sitzung"
-    },
-    "denyDialog": {
-      "titlePrefix": "Verweigern:",
-      "reasonPlaceholder": "Begründung für Verweigerung (erforderlich)",
-      "cancel": "Abbrechen",
-      "deny": "Verweigern"
+      "hintToSelect": "zum Auswählen"
     },
     "shortcuts": {
       "title": "Tastaturkürzel",
@@ -2513,13 +2428,7 @@
       "prevItem": "Vorheriger Eintrag",
       "selectItem": "Eintrag auswählen",
       "deselect": "Abwählen / schließen",
-      "approveSudoReview": "Genehmigen (Sudo / Review)",
-      "denySudo": "Verweigern (Sudo)",
-      "focusReply": "Antwort fokussieren (Nachricht)",
-      "sendReply": "Antwort senden",
-      "filterMessages": "Filter: Nachrichten",
-      "filterSudo": "Filter: Sudo",
-      "filterReviews": "Filter: Reviews",
+      "filterCategory": "Filter: n-te Kategorie",
       "clearFilter": "Filter zurücksetzen",
       "toggleOverlay": "Dieses Overlay umschalten",
       "close": "Schließen"
@@ -3193,13 +3102,10 @@
   },
   "notificationBell": {
     "title": "Aktionszentrum",
-    "messagesSingle": "{{n}} Nachricht",
-    "messagesPlural": "{{n}} Nachrichten",
-    "sudo": "{{n}} Sudo",
-    "reviewsSingle": "{{n}} Review",
-    "reviewsPlural": "{{n}} Reviews",
-    "sessionsSingle": "{{n}} Sitzung",
-    "sessionsPlural": "{{n}} Sitzungen"
+    "unseenSingle": "{{n}} neue Benachrichtigung",
+    "unseenPlural": "{{n}} neue Benachrichtigungen",
+    "pendingSingle": "{{n}} Eintrag braucht Sie",
+    "pendingPlural": "{{n}} Einträge brauchen Sie"
   },
   "todoList": {
     "phaseSelector": {
@@ -3350,7 +3256,6 @@
       "workerSpendCeiling": "Tägliche Arbeiter-Ausgabenobergrenze der Centurie in USD",
       "maxWorkers": "Maximale Arbeiterzahl",
       "tokenCeiling": "Tägliche Token-Obergrenze",
-      "pagesPerDay": "Maximale Meldungen pro Tag",
       "sleepMin": "Minimale Schlafdauer in Minuten",
       "sleepMax": "Maximale Schlafdauer in Minuten",
       "holdNote": "Notiz zur Aussetzung des Offiziers",
@@ -3397,8 +3302,6 @@
       "reasoningLabel": "Denkaufwand"
     },
     "budgets": {
-      "pages": "Meldungen pro Tag",
-      "pagesHint": "Wie oft er dich benachrichtigen darf (Standard 3).",
       "tokenCeiling": "Tägliche Token-Obergrenze",
       "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze.",
       "workerSpendCeiling": "Arbeiter-Ausgaben / Tag (USD)",
@@ -3417,7 +3320,7 @@
       "executor": "Ausführung — Ergebnis sind ausgelieferte Dateien"
     },
     "decommission": {
-      "hint": "Ausrüstung, Budgets, Digest und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
+      "hint": "Ausrüstung, Budgets und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
       "inFlightWarning": "Er hat {{count}} laufende(n) Job(s). Die Abberufung lässt sie weiterlaufen — ihre Abschlüsse landen im Posten-Ledger für seinen Nachfolger."
     },
     "defaults": {
@@ -3426,9 +3329,6 @@
       "session": "Sitzungsstandard",
       "unlimited": "unbegrenzt",
       "worker": "Arbeiterstandard"
-    },
-    "digest": {
-      "title": "Digest — was er für dich vorgemerkt hat"
     },
     "errors": {
       "commission": "Einsetzung fehlgeschlagen",
@@ -3587,7 +3487,6 @@
       "ceilingReached": "— Obergrenze erreicht; schläft bis zum Zurücksetzen",
       "model": "Sein Modell",
       "nextWake": "Nächster Weckruf",
-      "pagesToday": "Meldungen heute",
       "queuedEvents": "Wartende Ereignisse",
       "spendToday": "Verbrauch heute",
       "tokens": "Token"
@@ -3614,6 +3513,9 @@
       "virtual": "virtuell",
       "none": "keiner",
       "vmRoot": "VM (Root)"
+    },
+    "recentNotifications": {
+      "title": "Letzte Benachrichtigungen dieses Offiziers"
     }
   },
   "statistics": {
@@ -3672,6 +3574,155 @@
       "empty": "Keine passenden Optionen",
       "selectedCount": "{{count}} ausgewählt",
       "clear": "Zurücksetzen"
+    }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM-Upgrade",
+      "budget_exceeded": "Budget überschritten",
+      "incident": "Vorfall",
+      "officer_question": "Offizier",
+      "officer_runtime": "Offizier-Laufzeit",
+      "agent_message": "Agentennachricht",
+      "session_wake": "Sitzung",
+      "loop_event": "Loop",
+      "automation_disabled": "Automation",
+      "user_registered": "Neuer Benutzer",
+      "session_permission": "Berechtigung",
+      "sudo_request": "Sudo"
+    },
+    "severity": {
+      "low": "Niedrig",
+      "normal": "Normal",
+      "high": "Hoch",
+      "critical": "Kritisch"
+    },
+    "status": {
+      "unseen": "Neu",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "archived": "Archiviert"
+    },
+    "actions": {
+      "approve": "Genehmigen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "resume": "Fortsetzen",
+      "deny": "Ablehnen",
+      "upgradeToVm": "Auf VM upgraden",
+      "resumeWithoutVm": "Ohne VM fortsetzen",
+      "reply": "Antworten",
+      "openConference": "Offizier öffnen",
+      "open": "Öffnen",
+      "openJob": "Job öffnen",
+      "openThread": "Thread öffnen",
+      "openSession": "Sitzung öffnen",
+      "openProject": "Projekt öffnen",
+      "openAutomations": "Automationen öffnen",
+      "openAdminUsers": "Benutzer öffnen"
+    },
+    "inputs": {
+      "feedback": "Feedback für den Agenten…",
+      "reason": "Begründung…",
+      "message": "Ihre Anweisungen an den Offizier…",
+      "notes": "Notizen des Reviewers (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo-Anfrage",
+      "thread": "Sitzung",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "Benutzer",
+      "permission_request": "Berechtigungsanfrage"
+    },
+    "detail": {
+      "noActions": "Keine Aktionen verfügbar",
+      "source": "Quelle",
+      "loadingSource": "Wird geladen…",
+      "jobStatus": "Status",
+      "jobDescription": "Beschreibung",
+      "command": "Befehl",
+      "requestStatus": "Anfragestatus",
+      "session": "Sitzung",
+      "timeline": "Verlauf",
+      "created": "Erstellt",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "actionFailed": "Die Aktion ist fehlgeschlagen",
+      "jobId": "Job-ID",
+      "configName": "Agent",
+      "freezeType": "Freeze",
+      "phase": "Phase",
+      "error": "Fehler",
+      "summary": "Zusammenfassung",
+      "requestType": "Anfrage",
+      "vm": "VM",
+      "user": "Benutzer",
+      "cwd": "CWD",
+      "reason": "Begründung",
+      "secondsRemaining": "{{seconds}}s verbleibend",
+      "senderAgent": "Agent",
+      "senderYou": "Sie",
+      "modeBlocking": "blockierend",
+      "noMessages": "Keine Nachrichten",
+      "status": "Status",
+      "tool": "Tool",
+      "arguments": "Argumente",
+      "requestedAt": "Angefragt",
+      "decidedBy": "Entschieden von",
+      "loop": "Loop",
+      "automation": "Automation",
+      "enabled": "aktiv",
+      "disabled": "deaktiviert",
+      "userName": "Name",
+      "email": "E-Mail",
+      "approved": "freigegeben",
+      "pendingApproval": "wartet auf Freigabe",
+      "sourceMissing": "Die Quelle ist nicht mehr verfügbar",
+      "steps": "Geplante Zustellungen",
+      "stepUnless": "außer {{conditions}}"
+    },
+    "empty": "Keine Benachrichtigungen",
+    "loadMore": "Mehr laden",
+    "deepLinkMissing": "Diese Benachrichtigung wurde nicht gefunden",
+    "sudo": {
+      "rulesToggle": "Auto-Genehmigungsregeln ({{count}})",
+      "rulePatternPlaceholder": "Muster (z. B. apt-get install *)",
+      "ruleActionApprove": "Genehmigen",
+      "ruleActionDeny": "Verweigern",
+      "ruleAdd": "Hinzufügen",
+      "ruleDelete": "Regel löschen"
+    },
+    "risk": {
+      "low": "Geringes Risiko",
+      "medium": "Mittleres Risiko",
+      "high": "Hohes Risiko",
+      "critical": "Kritisch"
+    },
+    "channel": {
+      "in_app": "In-App",
+      "email": "E-Mail",
+      "ntfy": "ntfy",
+      "slack_webhook": "Slack",
+      "discord_webhook": "Discord",
+      "push": "Push"
+    },
+    "stepState": {
+      "pending": "ausstehend",
+      "done": "gesendet",
+      "skipped": "übersprungen",
+      "cancelled": "abgebrochen",
+      "failed": "fehlgeschlagen"
+    },
+    "condition": {
+      "not_seen": "gesehen",
+      "not_read": "gelesen",
+      "not_resolved": "erledigt"
     }
   }
 }

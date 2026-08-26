@@ -24,7 +24,7 @@ PROJECT_ID = str(uuid.uuid4())
 
 
 def _officer_row(hold=None, officer_state=None, **over):
-    officer = {"enabled": True, "max_pages_per_day": 3}
+    officer = {"enabled": True}
     if hold is not None:
         officer["hold"] = hold
     metadata = {"config_override": {"officer": officer}}
@@ -329,13 +329,7 @@ class TestOfficerSummaryEndpoint:
         from datetime import datetime, timezone
 
         today = datetime.now(timezone.utc).date().isoformat()
-        officer = _officer_row(
-            officer_state={
-                "pages": {"date": today, "count": 2},
-                "digest": [{"at": "t", "subject": "s", "message": "m"}] * 12,
-                "ceiling_notice": today,
-            }
-        )
+        officer = _officer_row(officer_state={"ceiling_notice": today})
 
         class _Acq:
             async def __aenter__(self):
@@ -392,9 +386,12 @@ class TestOfficerSummaryEndpoint:
         assert out["officer"]["thread_id"] == OFFICER_TID
         assert out["next_wake_at"] == "2026-07-30T05:00:00Z"
         assert out["pending_events"] == 4
-        assert out["pages_today"] == {"used": 2, "budget": 3}
         assert out["token_ceiling"]["deferred_today"] is True
-        assert len(out["digest"]) == 10  # capped
+        # Pages and digests are feed rows now (unified notification system):
+        # the card lists them via GET /api/notifications?source_kind=thread,
+        # so the summary carries neither a page budget nor a digest ring.
+        assert "pages_today" not in out
+        assert "digest" not in out
         assert out["conference"]["thread_id"] == CONF_TID
         # The post block (officer_post.md §8, partial O2 shape).
         assert out["commissioned"] is True

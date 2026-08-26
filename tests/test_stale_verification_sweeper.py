@@ -52,7 +52,7 @@ class TestSweepTick:
         assert (cancelled, unstuck) == (3, 0)
         db.cancel_stale_verification_subjobs.assert_awaited_once_with(6)
         db.unstick_reviewing_parents.assert_awaited_once_with(30)
-        notifier.notify_review_returned_to_manual.assert_not_awaited()
+        notifier.record_review_returned.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_routes_stateless_candidates_through_queue_aware_callback(self):
@@ -95,8 +95,8 @@ class TestSweepTick:
         )
 
         assert (cancelled, unstuck) == (0, 2)
-        assert notifier.notify_review_returned_to_manual.await_count == 2
-        first = notifier.notify_review_returned_to_manual.await_args_list[0].kwargs
+        assert notifier.record_review_returned.await_count == 2
+        first = notifier.record_review_returned.await_args_list[0].kwargs
         assert first == {
             "user_id": "u1",
             "job_id": "p1",
@@ -111,7 +111,7 @@ class TestSweepTick:
             return_value=[{"id": "p1", "user_id": "u1", "config_name": "scholar"}]
         )
         notifier = AsyncMock()
-        notifier.notify_review_returned_to_manual = AsyncMock(
+        notifier.record_review_returned = AsyncMock(
             side_effect=RuntimeError("smtp down")
         )
 
@@ -340,7 +340,7 @@ class TestUnstickReviewingParentsWallclock:
 
         assert (cancelled, unstuck) == (0, 1)
         db.unstick_reviewing_parents_wallclock.assert_awaited_once_with(60)
-        notifier.notify_review_returned_to_manual.assert_awaited_once_with(
+        notifier.record_review_returned.assert_awaited_once_with(
             user_id="u9", job_id="p9", config_name="scholar"
         )
 

@@ -32056,184 +32056,641 @@ class PostgresDB:
     # Notification Queue (Phase 3 Live Communication)
     # =========================================================================
 
-    async def queue_notification(
-        self,
-        user_id: str,
-        job_id: str,
-        thread_id: str | None,
-        subject: str,
-        message: str,
-        channels: dict,
-    ) -> Dict[str, Any]:
-        """Queue a notification for later digest delivery (quiet hours)."""
-        import json as _json
+    # =========================================================================
+    # Notifications (unified feed) — feature:unified-notifications
+    # knowledge-base/knowledge/features/unified_notification_system.md
+    # =========================================================================
 
+    _NOTIFICATION_STATUS_CLAUSES = {
+        "pending": "resolved_at IS NULL AND archived_at IS NULL",
+        "resolved": "resolved_at IS NOT NULL AND archived_at IS NULL",
+        "unread": "read_at IS NULL AND archived_at IS NULL",
+        "unseen": "seen_at IS NULL AND archived_at IS NULL",
+        "archived": "archived_at IS NOT NULL",
+        "all": "archived_at IS NULL",
+    }
+
+    @staticmethod
+    def _notification_row(row: Any) -> Dict[str, Any]:
+        """asyncpg hands JSONB back as a string on some paths — normalise."""
+        data = dict(row)
+        for key, empty in (("actions", []), ("payload", {})):
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def insert_notification_once(
+        self,
+        *,
+        notification_id: str,
+        recipient_kind: str,
+        recipient_id: str,
+        category: str,
+        severity: str,
+        subject: str,
+        body: str,
+        source_kind: Optional[str],
+        source_id: Optional[str],
+        dedup_key: str,
+        actions: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+        steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Insert one feed row plus its ``in_app`` delivery, validating any replay.
+
+        Returns ``True`` only for the inserting caller — a journal-replayed
+        completion effect or a dual-leader retry lands on the deterministic
+        primary key, re-reads the row, checks that its identity fields match,
+        and returns ``False`` so the SSE frame is broadcast exactly once.
+        Subject/body drift on replay is tolerated (identity is the dedup key);
+        a different category or source is a caller bug and raises.
+
+        ``steps`` — the row's deferred channel steps (``step_index``,
+        ``step_kind``, ``due_at``, ``conditions``, ``batch_key``) — are written
+        in the same transaction, so a crash can never leave a row whose
+        escalation was silently lost.
+        """
+        nid = UUID(str(notification_id))
+        rid = UUID(str(recipient_id))
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                inserted = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    INSERT INTO notifications (
+                        id, recipient_kind, recipient_id, category, severity,
+                        subject, body, source_kind, source_id, dedup_key,
+                        actions, payload
+                    ) VALUES (
+                        $1::uuid, $2::text, $3::uuid, $4::text, $5::text,
+                        $6::text, $7::text, $8::text, $9::text, $10::text,
+                        $11::jsonb, $12::jsonb
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING TRUE
+                    """,
+                    nid,
+                    recipient_kind,
+                    rid,
+                    category,
+                    severity,
+                    subject,
+                    body,
+                    source_kind,
+                    source_id,
+                    dedup_key,
+                    json.dumps(actions),
+                    json.dumps(payload),
+                )
+                if inserted:
+                    await conn.execute(
+                        """
+                        -- feature:unified-notifications
+                        INSERT INTO notification_deliveries
+                            (notification_id, channel, state, settled_at)
+                        VALUES ($1::uuid, 'in_app', 'sent', now())
+                        ON CONFLICT DO NOTHING
+                        """,
+                        nid,
+                    )
+                    if steps:
+                        await self._insert_notification_steps(conn, nid, steps)
+                    return True
+            # Separate statement on purpose: if ON CONFLICT waited on a
+            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
+            # and can see the row whose conflict it observed.
+            async with self.acquire() as conn:
+                matches = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    SELECT category = $2::text
+                       AND source_kind IS NOT DISTINCT FROM $3::text
+                       AND source_id IS NOT DISTINCT FROM $4::text
+                       AND recipient_kind = $5::text
+                       AND recipient_id = $6::uuid
+                    FROM notifications
+                    WHERE id = $1::uuid
+                    """,
+                    nid,
+                    category,
+                    source_kind,
+                    source_id,
+                    recipient_kind,
+                    rid,
+                )
+        if not matches:
+            raise RuntimeError(
+                "notification replay identity matched a different payload"
+            )
+        return False
+
+    async def claim_notification_delivery(
+        self,
+        *,
+        notification_id: str,
+        channel: str,
+        recipient_address: Optional[str] = None,
+        step_index: Optional[int] = None,
+        batch_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Insert-as-claim BEFORE sending. ``None`` means a live pending/sent
+        row already holds the (notification, channel) slot — skip the send.
+        A ``failed`` row does not hold the slot, so the next attempt claims.
+        ``step_index``/``batch_id`` record which deferred step sent it and
+        which batched message it rode in."""
+        nid = UUID(str(notification_id))
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO notification_queue
-                    (user_id, job_id, thread_id, subject, message, channels)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                RETURNING id, user_id, job_id, thread_id, subject, queued_at
+                -- feature:unified-notifications
+                INSERT INTO notification_deliveries
+                    (notification_id, channel, state, recipient_address, attempt,
+                     step_index, batch_id)
+                VALUES (
+                    $1::uuid, $2::text, 'pending', $3::text,
+                    COALESCE((
+                        SELECT max(attempt) FROM notification_deliveries
+                        WHERE notification_id = $1::uuid AND channel = $2::text
+                    ), 0) + 1,
+                    $4::int, $5::uuid
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
                 """,
-                UUID(user_id),
-                UUID(job_id) if job_id else None,
-                thread_id,
-                subject,
-                message,
-                _json.dumps(channels),
+                nid,
+                channel,
+                recipient_address,
+                step_index,
+                UUID(str(batch_id)) if batch_id else None,
             )
-        return dict(row)
+        return str(row["id"]) if row else None
 
-    async def get_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Get undelivered notifications for a user."""
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, user_id, job_id, thread_id, subject, message, channels,
-                       queued_at
-                FROM notification_queue
-                WHERE user_id = $1 AND delivered_at IS NULL
-                ORDER BY queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notifications_delivered(self, ids: List[str]) -> int:
-        """Mark notifications as delivered. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NOW()
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        # result is like "UPDATE N"
-        return int(result.split()[-1]) if result else 0
-
-    async def claim_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Atomically claim a user's undelivered notifications for a digest.
-
-        Stamps ``delivered_at = NOW()`` and RETURNs only the rows THIS call
-        flipped (``delivered_at`` was NULL). Two quiet-hours digest loops in
-        the transient dual-leader window therefore split the pending set
-        disjointly — in practice one claims all and the other gets none — so a
-        digest email is never sent twice. If dispatch then fails, release the
-        claim with ``unmark_notifications_delivered`` so it retries next cycle.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE notification_queue
-                   SET delivered_at = NOW()
-                 WHERE user_id = $1 AND delivered_at IS NULL
-                RETURNING id, user_id, job_id, thread_id, subject, message,
-                          channels, queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def unmark_notifications_delivered(self, ids: List[str]) -> int:
-        """Release a digest claim (``delivered_at`` → NULL) so the
-        notifications are retried next cycle. Used when dispatch fails after
-        ``claim_pending_notifications`` won them. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NULL
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        return int(result.split()[-1]) if result else 0
-
-    async def get_users_exiting_quiet_hours(
+    async def settle_notification_delivery(
         self,
-        check_window_minutes: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """Find users whose quiet hours ended within the check window
-        and who have pending notifications.
-
-        Returns list of dicts with user_id and settings.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT u.id AS user_id, u.settings
-                FROM users u
-                JOIN notification_queue nq ON nq.user_id = u.id AND nq.delivered_at IS NULL
-                WHERE u.settings->'communication'->'quiet_hours'->>'enabled' = 'true'
-                """,
-            )
-        return [dict(r) for r in rows]
-
-    # =========================================================================
-    # Notification Read Tracking (Phase 3)
-    # =========================================================================
-
-    async def get_user_notifications(
-        self,
-        user_id: str,
-        limit: int = 50,
-        unread_only: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Get notifications (outbound messages) for a user."""
-        where = "WHERE ml.user_id = $1 AND ml.direction = 'outbound'"
-        if unread_only:
-            where += " AND ml.read_at IS NULL"
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT ml.id, ml.job_id, ml.thread_id, ml.subject, ml.message,
-                       ml.status, ml.created_at, ml.read_at,
-                       j.description AS job_description, j.config_name
-                FROM message_log ml
-                LEFT JOIN jobs j ON j.id = ml.job_id
-                {where}
-                ORDER BY ml.created_at DESC
-                LIMIT $2
-                """,
-                UUID(user_id),
-                limit,
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notification_read(self, message_id: str, user_id: str) -> bool:
-        """Mark a notification as read. Returns True if updated."""
+        delivery_id: str,
+        *,
+        state: str,
+        provider_msg_id: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        if state not in ("sent", "failed", "suppressed"):
+            raise ValueError(f"cannot settle a delivery to {state!r}")
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
-                UPDATE message_log SET read_at = NOW()
-                WHERE id = $1 AND user_id = $2 AND read_at IS NULL
+                -- feature:unified-notifications
+                UPDATE notification_deliveries
+                   SET state = $2::text,
+                       settled_at = now(),
+                       provider_msg_id = COALESCE($3::text, provider_msg_id),
+                       error = $4::text
+                 WHERE id = $1::uuid AND state = 'pending'
                 """,
-                UUID(message_id),
-                UUID(user_id),
+                UUID(str(delivery_id)),
+                state,
+                provider_msg_id,
+                (error or None) and str(error)[:2000],
             )
         return result == "UPDATE 1"
 
-    async def get_unread_count(self, user_id: str) -> int:
-        """Count unread notifications for a user."""
+    async def get_notification(self, notification_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            nid = UUID(str(notification_id))
+        except ValueError:
+            return None
         async with self.acquire() as conn:
-            count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM message_log
-                WHERE user_id = $1 AND direction = 'outbound' AND read_at IS NULL
-                """,
-                UUID(user_id),
+            row = await conn.fetchrow(
+                "-- feature:unified-notifications\n"
+                "SELECT * FROM notifications WHERE id = $1::uuid",
+                nid,
             )
-        return count or 0
+        return self._notification_row(row) if row else None
+
+    async def list_notifications_page(
+        self,
+        *,
+        recipient_kind: str,
+        recipient_id: str,
+        before: Optional[str] = None,
+        limit: int = 50,
+        categories: Optional[List[str]] = None,
+        status: str = "all",
+        source_kind: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Keyset page, newest first. ``before`` is ``"{created_at_iso}|{id}"``
+        from a previous page; returns ``(rows, next_before)`` with the cursor
+        set only when a ``limit + 1`` probe row proved there is more. A
+        ``source_kind``/``source_id`` pair narrows to one source (the officer
+        card's "pages about this officer")."""
+        status_clause = self._NOTIFICATION_STATUS_CLAUSES.get(status)
+        if status_clause is None:
+            raise ValueError(f"unknown notification status filter {status!r}")
+        params: List[Any] = [recipient_kind, UUID(str(recipient_id))]
+        where = ["recipient_kind = $1", "recipient_id = $2", status_clause]
+        if categories:
+            params.append([str(c) for c in categories])
+            where.append(f"category = ANY(${len(params)}::text[])")
+        if source_kind is not None and source_id is not None:
+            params.append(str(source_kind))
+            where.append(f"source_kind = ${len(params)}::text")
+            params.append(str(source_id))
+            where.append(f"source_id = ${len(params)}::text")
+        if before:
+            ts_text, _, id_text = before.partition("|")
+            params.append(datetime.fromisoformat(ts_text))
+            params.append(UUID(id_text))
+            where.append(
+                f"(created_at, id) < (${len(params) - 1}::timestamptz, ${len(params)}::uuid)"
+            )
+        params.append(limit + 1)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                -- feature:unified-notifications
+                SELECT * FROM notifications
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        has_more = len(rows) > limit
+        page = [self._notification_row(r) for r in rows[:limit]]
+        next_before = None
+        if has_more and page:
+            last = page[-1]
+            next_before = f"{last['created_at'].isoformat()}|{last['id']}"
+        return page, next_before
+
+    async def get_notification_counts(
+        self, *, recipient_kind: str, recipient_id: str
+    ) -> Dict[str, Any]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT category,
+                       count(*) FILTER (WHERE seen_at IS NULL)     AS unseen,
+                       count(*) FILTER (WHERE read_at IS NULL)     AS unread,
+                       count(*) FILTER (WHERE resolved_at IS NULL) AS pending
+                  FROM notifications
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND archived_at IS NULL
+                 GROUP BY category
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        counts: Dict[str, Any] = {
+            "unseen": 0,
+            "unread": 0,
+            "pending": 0,
+            "by_category": {},
+        }
+        for row in rows:
+            counts["unseen"] += int(row["unseen"] or 0)
+            counts["unread"] += int(row["unread"] or 0)
+            counts["pending"] += int(row["pending"] or 0)
+            counts["by_category"][row["category"]] = {
+                "pending": int(row["pending"] or 0),
+                "unseen": int(row["unseen"] or 0),
+            }
+        return counts
+
+    async def mark_notifications_seen(
+        self, *, recipient_kind: str, recipient_id: str, ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Stamp ``seen_at`` once; never regresses an earlier stamp."""
+        if not ids:
+            return []
+        uuids = [UUID(str(i)) for i in ids]
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET seen_at = now()
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND id = ANY($3::uuid[]) AND seen_at IS NULL
+                RETURNING id, seen_at
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+                uuids,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_notification_read_v2(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Idempotent: returns the row whether or not this call changed it."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def stamp_notification_interacted(
+        self, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET interacted_at = COALESCE(interacted_at, now()),
+                       read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notification(
+        self, notification_id: str, *, resolved_by: str
+    ) -> Optional[Dict[str, Any]]:
+        """Stamp one row resolved and cancel its pending steps in the same
+        statement — a resolved item must never mail (D6)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = COALESCE(resolved_at, now()),
+                           resolved_by = COALESCE(resolved_by, $2::text)
+                     WHERE id = $1::uuid
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $2::text
+                     WHERE s.notification_id = $1::uuid AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
+                """,
+                UUID(str(notification_id)),
+                resolved_by,
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notifications_by_source(
+        self, *, source_kind: str, source_id: str, resolved_by: str
+    ) -> List[Dict[str, Any]]:
+        """Settle every open row about one source, whoever the recipient is,
+        and cancel their pending steps atomically. Returns the rows this call
+        flipped (empty on a repeat)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = now(), resolved_by = $3::text
+                     WHERE source_kind = $1::text AND source_id = $2::text
+                       AND resolved_at IS NULL
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $3::text
+                      FROM resolved r
+                     WHERE s.notification_id = r.id AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
+                """,
+                source_kind,
+                str(source_id),
+                resolved_by,
+            )
+        return [self._notification_row(r) for r in rows]
+
+    async def archive_notification(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET archived_at = COALESCE(archived_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    # --- deferred channel steps (slice 2: escalate-on-timeout, D5/D6) ---------
+
+    @staticmethod
+    def _step_row(row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        for key, empty in (("conditions", []), ("payload", {})):
+            if key not in data:
+                continue
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def _insert_notification_steps(
+        self, conn: Any, nid: UUID, steps: List[Dict[str, Any]]
+    ) -> int:
+        inserted = 0
+        for step in steps:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                INSERT INTO notification_steps
+                    (notification_id, step_index, step_kind, due_at,
+                     conditions, batch_key)
+                VALUES ($1::uuid, $2::int, $3::text, $4::timestamptz,
+                        $5::jsonb, $6::text)
+                ON CONFLICT (notification_id, step_index) DO NOTHING
+                """,
+                nid,
+                int(step["step_index"]),
+                str(step["step_kind"]),
+                step["due_at"],
+                json.dumps([str(c) for c in (step.get("conditions") or [])]),
+                step.get("batch_key"),
+            )
+            if result == "INSERT 0 1":
+                inserted += 1
+        return inserted
+
+    async def insert_notification_steps(
+        self, notification_id: str, steps: List[Dict[str, Any]]
+    ) -> int:
+        """Idempotent on ``(notification, step_index)`` — quiet-hours deferral
+        of an immediate step runs on every ``record()`` call, replay included,
+        and must not stack a second promise. Returns the rows this call added."""
+        if not steps:
+            return 0
+        nid = UUID(str(notification_id))
+        async with self.acquire() as conn:
+            return await self._insert_notification_steps(conn, nid, steps)
+
+    async def list_notification_steps(
+        self, notification_id: str
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT * FROM notification_steps
+                 WHERE notification_id = $1::uuid
+                 ORDER BY step_index
+                """,
+                UUID(str(notification_id)),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def claim_due_notification_steps(
+        self, *, worker_id: str, limit: int = 200, lease_minutes: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Claim the due pending steps for one sweeper pass.
+
+        ``FOR UPDATE SKIP LOCKED`` splits concurrent sweepers (the transient
+        dual-leader window) disjointly; the ``claimed_at`` lease lets a step
+        whose claimant died be picked up again after ``lease_minutes``.
+        Each row is the step joined with the notification it belongs to —
+        everything the engine needs to evaluate conditions and render.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                WITH due AS (
+                    SELECT id FROM notification_steps
+                     WHERE state = 'pending' AND due_at <= now()
+                       AND (claimed_at IS NULL
+                            OR claimed_at < now() - ($3::int * interval '1 minute'))
+                     ORDER BY due_at, id
+                     LIMIT $2::int
+                     FOR UPDATE SKIP LOCKED
+                ), claimed AS (
+                    UPDATE notification_steps s
+                       SET claimed_by = $1::text,
+                           claimed_at = now(),
+                           attempt = s.attempt + 1
+                      FROM due
+                     WHERE s.id = due.id
+                    RETURNING s.*
+                )
+                SELECT c.*,
+                       n.recipient_kind, n.recipient_id, n.category, n.severity,
+                       n.subject, n.body, n.source_kind, n.source_id, n.payload,
+                       n.seen_at, n.read_at, n.resolved_at, n.archived_at
+                  FROM claimed c
+                  JOIN notifications n ON n.id = c.notification_id
+                 ORDER BY c.due_at, c.id
+                """,
+                str(worker_id),
+                int(limit),
+                int(lease_minutes),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def defer_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """Push claimed steps to a later ``due_at`` and release the claim. A
+        deferral (quiet hours) is not an attempt, so the claim's increment is
+        taken back."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       attempt = GREATEST(attempt - 1, 0),
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def retry_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """A failed send: keep the attempt count, release the claim, try again
+        at ``due_at``."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def settle_notification_steps(
+        self, ids: List[int], *, state: str, detail: Optional[str] = None
+    ) -> int:
+        """Terminal transition for claimed steps. Only pending rows move, so a
+        step cancelled by a concurrent resolve stays cancelled."""
+        if state not in ("done", "skipped", "cancelled", "failed"):
+            raise ValueError(f"cannot settle a step to {state!r}")
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET state = $2::text, settled_at = now(), detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                state,
+                (detail or None) and str(detail)[:2000],
+            )
+        return int(result.split()[-1]) if result else 0
 
     # =========================================================================
     # SYSTEM SETTINGS (Phase 4)
@@ -33177,74 +33634,6 @@ class PostgresDB:
                     [UUID(job_id) for job_id in job_ids],
                 )
             )
-
-    async def log_project_loop_message_once(
-        self,
-        *,
-        message_id: str,
-        job_id: str,
-        user_id: str,
-        thread_id: str,
-        subject: str,
-        message: str,
-    ) -> bool:
-        """Insert one immutable loop notification, validating any replay.
-
-        Returns ``True`` only for the inserting caller. A response-lost retry
-        sees the deterministic primary key, validates the complete immutable
-        payload/owner, and returns ``False`` so SSE is not broadcast twice.
-        """
-
-        args = (
-            UUID(message_id),
-            UUID(job_id),
-            UUID(user_id),
-            thread_id,
-            subject,
-            message,
-        )
-        async with self.transaction_scope():
-            async with self.acquire() as conn:
-                inserted = await conn.fetchval(
-                    """
-                    INSERT INTO message_log (
-                        id, job_id, user_id, thread_id, direction,
-                        subject, message, mode, status
-                    ) VALUES (
-                        $1::uuid, $2::uuid, $3::uuid, $4::text, 'outbound',
-                        $5::text, $6::text, 'async', 'sent'
-                    )
-                    ON CONFLICT (id) DO NOTHING
-                    RETURNING TRUE
-                    """,
-                    *args,
-                )
-            if inserted:
-                return True
-            # Separate statement is deliberate: if ON CONFLICT waited for a
-            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
-            # and can see the row whose conflict it observed.
-            async with self.acquire() as conn:
-                matches = await conn.fetchval(
-                    """
-                    SELECT job_id = $2::uuid
-                       AND user_id = $3::uuid
-                       AND thread_id = $4::text
-                       AND direction = 'outbound'
-                       AND subject = $5::text
-                       AND message = $6::text
-                       AND mode = 'async'
-                       AND status = 'sent'
-                    FROM message_log
-                    WHERE id = $1::uuid
-                    """,
-                    *args,
-                )
-        if not matches:
-            raise RuntimeError(
-                "project-loop notification replay identity matched a different payload"
-            )
-        return False
 
     async def list_pending_project_loop_handoffs(
         self, *, limit: int = 50

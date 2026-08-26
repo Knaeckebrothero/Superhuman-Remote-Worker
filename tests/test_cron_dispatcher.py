@@ -375,7 +375,7 @@ def _patch_notification_service(
     notify_mock = AsyncMock(side_effect=side_effect)
     fake_service = MagicMock()
     fake_service.is_available = available
-    fake_service.notify_automation_auto_disabled = notify_mock
+    fake_service.record_automation_disabled = notify_mock
     monkeypatch.setattr(
         "orchestrator.services.cron_dispatcher.notification_service",
         fake_service,

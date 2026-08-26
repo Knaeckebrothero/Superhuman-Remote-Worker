@@ -2,17 +2,18 @@
 headless persistent sessions.
 
 Phase 4 of knowledge-base/knowledge/features/headless_persistent_sessions.md. When the agent's
-permission_check inserts a row into thread_permission_requests and no
-client has been attached for >30s, the permission-pending watcher
-(orchestrator/main.py) calls send_permission_pending_email() here. We:
+permission_check inserts a row into thread_permission_requests and nobody
+has decided it for >30s, the permission-pending sweeper
+(orchestrator/main.py) calls record_permission_pending() here. We:
 
-  1. Look up the thread owner and their email.
-  2. Check dedup ((thread_id, request_id) already emailed) and rate-limit
-     (5/hr and 1/5min per thread).
-  3. Generate two magic-link tokens — one for "approve", one for "deny".
-     Plaintext lives only in the email body; the DB stores SHA-256 hashes.
-  4. Compose and send the email (subject + plaintext + HTML).
-  5. Record the send in thread_notifications for audit + future dedup.
+  1. Generate two magic-link tokens — one for "approve", one for "deny".
+     Plaintext lives only in the notification body; the DB stores SHA-256
+     hashes.
+  2. Record one `session_permission` row on the owner's feed (unified
+     notification system). The feed delivers it — mail now, with the links —
+     dedups on the request id, and resolves it when the gate is decided.
+     (`thread_notifications` is retired; the delivery ledger is
+     `notification_deliveries`.)
 
 Magic-link click flow (HTTP routes in orchestrator/main.py):
 
@@ -52,8 +53,6 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from services.brand import TRAVERTINE as _C
-from services.email_layout import Action, escape_text, render_email
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +60,6 @@ logger = logging.getLogger(__name__)
 # Module-level config knobs. Overridable via env for ops tuning without
 # changing call sites.
 MAGIC_LINK_TTL_SECONDS: int = int(os.environ.get("MAGIC_LINK_TTL_S", "1800"))  # 30 min
-NOTIFICATION_RATE_LIMIT_5MIN: int = int(os.environ.get("HEADLESS_RATE_5MIN", "1"))
-NOTIFICATION_RATE_LIMIT_HOUR: int = int(os.environ.get("HEADLESS_RATE_HOUR", "5"))
 
 
 def _hash_token(raw_token: str) -> str:
@@ -173,172 +170,12 @@ async def consume_magic_link(
     return dict(row) if row else None
 
 
-async def thread_rate_limited(db: Any, thread_id: str) -> bool:
-    """Rate-limit probe: HEADLESS_RATE_5MIN per 5min OR HEADLESS_RATE_HOUR
-    per 60min. Returns True if the thread is over either ceiling."""
-    async with db.acquire() as conn:
-        recent_5 = await conn.fetchval(
-            "SELECT COUNT(*) FROM thread_notifications "
-            "WHERE thread_id = $1 AND sent_at > now() - interval '5 minutes' "
-            "  AND delivery_status = 'sent'",
-            thread_id,
-        )
-        recent_60 = await conn.fetchval(
-            "SELECT COUNT(*) FROM thread_notifications "
-            "WHERE thread_id = $1 AND sent_at > now() - interval '60 minutes' "
-            "  AND delivery_status = 'sent'",
-            thread_id,
-        )
-    return (recent_5 or 0) >= NOTIFICATION_RATE_LIMIT_5MIN or (
-        recent_60 or 0
-    ) >= NOTIFICATION_RATE_LIMIT_HOUR
-
-
-async def record_notification(
-    db: Any,
-    *,
-    thread_id: str,
-    request_id: Optional[str],
-    kind: str,
-    delivery_status: str,
-    email_to: Optional[str] = None,
-    metadata: Optional[dict[str, Any]] = None,
-) -> None:
-    """Append a row to thread_notifications. Best-effort — logs but does
-    not raise on failure (we don't want to break the watcher loop)."""
-    try:
-        async with db.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO thread_notifications "
-                "(thread_id, request_id, kind, delivery_status, "
-                " email_to, metadata) "
-                "VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
-                thread_id,
-                request_id,
-                kind,
-                delivery_status,
-                email_to,
-                json.dumps(metadata or {}),
-            )
-    except Exception as e:
-        logger.warning(
-            "thread_notifications INSERT failed (thread=%s kind=%s): %s",
-            thread_id,
-            kind,
-            e,
-        )
-
-
-async def claim_sent_notification(
-    db: Any,
-    *,
-    thread_id: str,
-    request_id: Optional[str],
-    kind: str,
-    email_to: Optional[str] = None,
-    metadata: Optional[dict[str, Any]] = None,
-) -> Optional[int]:
-    """Atomically claim the single 'sent' slot for (request_id, kind) BEFORE
-    sending (HA / M1 — dual-leader dedup).
-
-    Inserts a thread_notifications row with delivery_status='sent' guarded by
-    the partial unique index uq_tn_sent_request_kind (migration 0038). Returns
-    the new row id iff THIS call won the slot; None means a concurrent sweeper
-    in the transient dual-leader window already claimed it (is sending), so the
-    caller MUST NOT send again. Unlike record_notification this is NOT
-    best-effort — a DB error propagates so we never silently double-send.
-    """
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO thread_notifications "
-            "(thread_id, request_id, kind, delivery_status, email_to, metadata) "
-            "VALUES ($1, $2, $3, 'sent', $4, $5::jsonb) "
-            "ON CONFLICT (request_id, kind) WHERE delivery_status = 'sent' "
-            "DO NOTHING "
-            "RETURNING id",
-            thread_id,
-            request_id,
-            kind,
-            email_to,
-            json.dumps(metadata or {}),
-        )
-    return row["id"] if row else None
-
-
-async def downgrade_sent_claim(db: Any, claim_id: int) -> None:
-    """Downgrade a claimed 'sent' row to 'failed' when the send didn't go
-    through. Frees the unique slot and keeps the audit honest. 'failed' is
-    terminal in the sweeper query, so this won't re-dispatch — matching the
-    behaviour before claim-before-send. Best-effort."""
-    try:
-        async with db.acquire() as conn:
-            await conn.execute(
-                "UPDATE thread_notifications SET delivery_status = 'failed' "
-                "WHERE id = $1",
-                claim_id,
-            )
-    except Exception as e:
-        logger.warning(
-            "thread_notifications downgrade to 'failed' failed (id=%s): %s",
-            claim_id,
-            e,
-        )
-
-
 def _build_magic_link_url(cockpit_url: str, raw_token: str) -> str:
     """Compose the user-visible URL we embed in the email. The cockpit
     serves /magic/approve/{token} via the orchestrator proxy in
     production; locally it lands directly on the orchestrator port.
     """
     return f"{cockpit_url.rstrip('/')}/magic/approve/{urllib.parse.quote(raw_token, safe='')}"
-
-
-def _build_permission_email_bodies(
-    *,
-    tool_name: str,
-    tool_args_preview: str,
-    approve_url: str,
-    deny_url: str,
-    cockpit_link: str,
-    request_age_minutes: int,
-) -> tuple[str, str]:
-    """Return (plain_text, html) bodies for the permission-pending email."""
-    text_body = (
-        f"The persistent agent is waiting for your approval to run a tool.\n\n"
-        f"Tool: {tool_name}\n"
-        f"Arguments preview: {tool_args_preview}\n"
-        f"Waiting for: ~{request_age_minutes} minutes\n\n"
-        f"Approve: {approve_url}\n"
-        f"Deny:    {deny_url}\n\n"
-        f"Or open the cockpit to review the full context:\n"
-        f"{cockpit_link}\n\n"
-        f"This link expires in 30 minutes and can be used once.\n"
-    )
-
-    safe_args = escape_text(tool_args_preview)
-    safe_tool = escape_text(tool_name)
-
-    body_html = (
-        f"<p style='margin:0 0 12px 0;'>The agent wants to call "
-        f'<code style="background:{_C["surface-0"]};padding:2px 6px;'
-        f'font-family:monospace;">{safe_tool}</code>:</p>'
-        f'<pre style="background:{_C["surface-0"]};padding:12px;'
-        f"margin:0;overflow-x:auto;font-size:12px;line-height:18px;"
-        f'font-family:monospace;color:{_C["text-primary"]};">{safe_args}</pre>'
-    )
-
-    html_body = render_email(
-        title="Permission requested",
-        subtitle=f"Waiting {request_age_minutes} min for your decision.",
-        body_html=body_html,
-        actions=[
-            Action(label="Approve", url=approve_url, variant="approve"),
-            Action(label="Deny", url=deny_url, variant="deny"),
-        ],
-        footer_note="Open the cockpit for full context.",
-    )
-
-    return text_body, html_body
 
 
 def _truncate_args_for_email(tool_args: dict[str, Any], max_chars: int = 600) -> str:
@@ -352,109 +189,39 @@ def _truncate_args_for_email(tool_args: dict[str, Any], max_chars: int = 600) ->
     return rendered
 
 
-async def send_permission_pending_email(
+async def record_permission_pending(
     db: Any,
-    email_service: Any,
+    notifier: Any,
     *,
-    thread_id: str,
-    approval_id: str,
+    row: dict[str, Any],
     cockpit_external_url: str,
 ) -> dict[str, Any]:
-    """Compose and send the approve-pending email.
+    """One ``session_permission`` feed row for a pending gate the owner has
+    not answered in-session (unified notification system).
 
-    Returns a dict with `status` ∈ {sent, failed, skipped_rate_limit,
-    skipped_no_email, skipped_smtp, skipped_already_resolved}. Every
-    outcome is recorded in thread_notifications for observability.
+    ``high``: the mail goes out now and carries the two magic links, so the
+    owner can decide from a phone without signing in — the affordance the
+    old ``thread_notifications`` email had. The row resolves when the gate is
+    decided by any path (cockpit, magic link, the notification's own
+    approve/deny action, the agent's LISTEN); a step that comes due later
+    asks the live request before mailing.
 
-    Idempotent under the sweeper: the sweeper's SQL filters out
-    requests with terminal/permanent delivery outcomes, so this entry
-    point only sees first-time dispatches plus the small window where
-    a transient skip has expired.
+    ``row`` is the sweeper's join of ``thread_permission_requests`` with the
+    thread's ``user_id``/``title``. Returns ``{"status": recorded | replayed |
+    skipped_no_owner, "notification_id"?}``.
     """
-    # 1. Rate limit.
-    if await thread_rate_limited(db, thread_id):
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="skipped_rate_limit",
-        )
-        return {"status": "skipped_rate_limit"}
+    thread_id = str(row["thread_id"])
+    approval_id = str(row["id"])
+    user_id = row.get("user_id")
+    if not user_id:
+        return {"status": "skipped_no_owner"}
 
-    # 2. Load context: thread → user → email; approval → tool details.
-    async with db.acquire() as conn:
-        thread_row = await conn.fetchrow(
-            "SELECT id, user_id, title FROM threads WHERE id = $1",
-            thread_id,
-        )
-        permission_row = await conn.fetchrow(
-            "SELECT id, tool_name, tool_args, requested_at, status "
-            "FROM thread_permission_requests WHERE id = $1",
-            approval_id,
-        )
-    if thread_row is None or permission_row is None:
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="failed",
-            metadata={"reason": "thread_or_request_missing"},
-        )
-        return {"status": "failed", "reason": "thread_or_request_missing"}
-
-    if permission_row["status"] != "pending":
-        # Resolved between sweeper detection and send. Record it so the
-        # sweeper's widened IN-set suppresses re-dispatch — the
-        # status='pending' filter does the same job today, but recording
-        # the race keeps thread_notifications a complete audit trail and
-        # protects against future changes to the sweeper SQL.
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="skipped_already_resolved",
-        )
-        return {"status": "skipped_already_resolved"}
-
-    user_id = thread_row["user_id"]
-    user_row = None
-    if user_id is not None:
-        async with db.acquire() as conn:
-            user_row = await conn.fetchrow(
-                "SELECT id, email, display_name FROM users WHERE id = $1",
-                user_id,
-            )
-
-    recipient_email = (user_row or {}).get("email") if user_row else None
-    if not recipient_email:
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="skipped_no_email",
-        )
-        return {"status": "skipped_no_email"}
-
-    if email_service is None or not getattr(email_service, "is_configured", False):
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="skipped_smtp",
-        )
-        return {"status": "skipped_smtp"}
-
-    # 3. Generate two tokens — one per decision. Both bound to the same
-    # approval_id and expire on the same clock.
+    # Two tokens — one per decision. Both bound to the same approval_id and
+    # expire on the same clock.
     approve_token, _ = await generate_magic_link_token(
         db,
         purpose="approve_permission",
-        user_id=str(user_id) if user_id else None,
+        user_id=str(user_id),
         approval_id=approval_id,
         thread_id=thread_id,
         intended_decision="approved",
@@ -462,14 +229,13 @@ async def send_permission_pending_email(
     deny_token, _ = await generate_magic_link_token(
         db,
         purpose="approve_permission",
-        user_id=str(user_id) if user_id else None,
+        user_id=str(user_id),
         approval_id=approval_id,
         thread_id=thread_id,
         intended_decision="denied",
     )
 
-    # 4. Compose bodies.
-    requested_at = permission_row["requested_at"]
+    requested_at = row.get("requested_at")
     if isinstance(requested_at, datetime):
         if requested_at.tzinfo is None:
             requested_at = requested_at.replace(tzinfo=timezone.utc)
@@ -477,7 +243,7 @@ async def send_permission_pending_email(
     else:
         age_min = 0
 
-    tool_args = permission_row["tool_args"]
+    tool_args = row.get("tool_args")
     if isinstance(tool_args, str):
         try:
             tool_args = json.loads(tool_args)
@@ -485,57 +251,45 @@ async def send_permission_pending_email(
             tool_args = {}
     elif tool_args is None:
         tool_args = {}
+    preview = _truncate_args_for_email(tool_args)
+    tool_name = str(row.get("tool_name") or "a tool")
+    title = str(row.get("title") or thread_id[:8])
+    approve_url = _build_magic_link_url(cockpit_external_url, approve_token)
+    deny_url = _build_magic_link_url(cockpit_external_url, deny_token)
+    session_link = f"{cockpit_external_url.rstrip('/')}/sessions/{thread_id}"
 
-    text_body, html_body = _build_permission_email_bodies(
-        tool_name=permission_row["tool_name"],
-        tool_args_preview=_truncate_args_for_email(tool_args),
-        approve_url=_build_magic_link_url(cockpit_external_url, approve_token),
-        deny_url=_build_magic_link_url(cockpit_external_url, deny_token),
-        cockpit_link=f"{cockpit_external_url.rstrip('/')}/sessions/{thread_id}",
-        request_age_minutes=age_min,
+    # Labeled bare URLs, not markdown links: the email leg escapes the body
+    # and ntfy/Slack get raw text — a bare URL is clickable in every leg.
+    body = (
+        f"**{tool_name}** is waiting for your approval in session **{title}** "
+        f"(requested {age_min} min ago).\n\n"
+        f"```\n{preview}\n```\n\n"
+        f"Approve: {approve_url}\n"
+        f"Deny: {deny_url}\n\n"
+        f"These links need no sign-in and expire in "
+        f"{MAGIC_LINK_TTL_SECONDS // 60} minutes. Session: {session_link}"
     )
-
-    subject = f"[SRW] Approval needed: {permission_row['tool_name']}"
-
-    # 5. Claim the single 'sent' slot for this (request, kind) BEFORE sending,
-    # so a concurrent sweeper in the transient dual-leader window (leader
-    # election has no fencing) cannot also send. Losing the claim means another
-    # sweeper already sent (or is sending) → skip silently. In steady state
-    # leadership is single, so this only fires during a partition / failover.
-    claim_id = await claim_sent_notification(
-        db,
-        thread_id=thread_id,
-        request_id=approval_id,
-        kind="permission_pending",
-        email_to=recipient_email,
-        metadata={"tool": permission_row["tool_name"]},
+    result = await notifier.record(
+        recipient_id=str(user_id),
+        category="session_permission",
+        dedup_key=f"session_permission:{approval_id}",
+        subject=f"Approval needed: {tool_name}",
+        body=body,
+        source_kind="permission_request",
+        source_id=approval_id,
+        action_params={"thread_id": thread_id, "request_id": approval_id},
+        payload={
+            "thread_id": thread_id,
+            "request_id": approval_id,
+            "tool_name": tool_name,
+            "tool_args_preview": preview,
+            "requested_at": (
+                requested_at.isoformat() if isinstance(requested_at, datetime) else None
+            ),
+            "title": title,
+        },
     )
-    if claim_id is None:
-        return {"status": "skipped_dedup"}
-
-    # 6. Dispatch via EmailService internals (private _send is fine —
-    # same package). We avoid send_agent_message because that template
-    # is job-oriented; this notification is thread-only.
-    sent_ok = False
-    try:
-        sent_ok = await email_service._send(
-            to=recipient_email,
-            subject=subject,
-            body_text=text_body,
-            body_html=html_body,
-        )
-    except Exception as e:
-        logger.warning(
-            "Permission-pending email send raised (thread=%s req=%s): %s",
-            thread_id,
-            approval_id,
-            e,
-        )
-
-    if not sent_ok:
-        # Send failed after we claimed the slot — downgrade the audit row to
-        # 'failed' (terminal in the sweeper query, same as before this change).
-        await downgrade_sent_claim(db, claim_id)
-
-    status = "sent" if sent_ok else "failed"
-    return {"status": status, "email_to": recipient_email}
+    return {
+        "status": "recorded" if result.inserted else "replayed",
+        "notification_id": result.notification_id,
+    }

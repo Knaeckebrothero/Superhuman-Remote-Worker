@@ -25,7 +25,6 @@ from main import list_officers
 PROJECT_A = str(uuid4())
 PROJECT_B = str(uuid4())
 THREAD_A = str(uuid4())
-TODAY = datetime.now(timezone.utc).date().isoformat()
 
 
 def _row(**over) -> dict:
@@ -40,10 +39,6 @@ def _row(**over) -> dict:
             "config_override": {
                 "llm": {"model": "gpt-5.6-sol"},
                 "officer": {"enabled": True, "auto_pull": False},
-            },
-            "officer_state": {
-                "pages": {"date": TODAY, "count": 2},
-                "digest": [{"subject": "s"}, {"subject": "t"}],
             },
         },
         "next_wake_at": datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc),
@@ -87,12 +82,14 @@ async def test_the_roster_reports_the_post_at_a_glance(db, as_user, monkeypatch)
     assert officer["next_wake_at"] == "2026-08-17T09:30:00+00:00"
     assert officer["pending_events"] == 3
     assert officer["in_flight_jobs"] == 1
-    assert officer["pages_today"] == 2
-    assert officer["digest_waiting"] == 2
     assert officer["model"] == "gpt-5.6-sol"
     assert officer["auto_pull_durable"] is False
     assert officer["auto_pull_runtime"] is False
     assert officer["auto_pull_mirror_consistent"] is True
+    # Pages and digests are feed rows (unified notification system), read
+    # from the notification center — the roster carries no counters for them.
+    assert "pages_today" not in officer
+    assert "digest_waiting" not in officer
 
 
 @pytest.mark.asyncio
@@ -225,7 +222,8 @@ async def test_non_object_legacy_metadata_is_invalid_not_a_roster_500(
     officer = result["officers"][0]
     assert officer["auto_pull_runtime_valid"] is False
     assert officer["model"] is None
-    assert officer["pages_today"] == 0
+    assert "pages_today" not in officer
+    assert "digest_waiting" not in officer
     assert result["auto_pull_downgrade"]["safe"] is False
     assert result["auto_pull_downgrade"]["invalid_values"] == 1
 
@@ -349,7 +347,8 @@ async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
     officer = result["officers"][0]
     assert officer["auto_pull_runtime_valid"] is True
     assert officer["model"] is None
-    assert officer["pages_today"] == 0
+    assert "pages_today" not in officer
+    assert "digest_waiting" not in officer
     assert result["auto_pull_downgrade"]["safe"] is True
 
 

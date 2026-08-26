@@ -183,6 +183,9 @@ class SudoGateService:
                 "request_type": "sudo_command",
             }
             await self._broadcast_sse("new_request", event)
+            await self._record_owner_notification(
+                request_id, job_id=job_id, thread_id=thread_id, event=event
+            )
             await self._notify_project_officer(
                 request_id,
                 job_id,
@@ -581,6 +584,9 @@ class SudoGateService:
                     await self._nats_reply(reply_subject, False, "approval timed out")
                 count += 1
 
+                await self._resolve_notification_source(
+                    req_id, resolved_by="system:sudo_expired"
+                )
                 await self._broadcast_sse(
                     "request_decided",
                     {
@@ -995,6 +1001,63 @@ class SudoGateService:
             logger.error("Failed to insert vm_upgrade request: %s", e)
             return None
 
+    async def _record_owner_notification(
+        self,
+        request_id: str,
+        *,
+        job_id: Optional[str],
+        thread_id: Optional[str],
+        event: dict,
+    ) -> None:
+        """The owner's feed row for a pending request (unified notification
+        system). ``sudo_request`` is ``critical`` with push-only steps — a
+        300 s TTL makes mail pointless. Resolved by ``_finalize_request`` and
+        the expiry sweep. Best-effort: the request itself is already durable."""
+        if not self._db:
+            return
+        try:
+            from services.notification_service import notification_service
+
+            owner = None
+            if job_id:
+                job = await self._db.get_job(str(job_id))
+                owner = (job or {}).get("user_id")
+            elif thread_id:
+                thread = await self._db.get_thread(str(thread_id))
+                owner = (thread or {}).get("user_id")
+            if not owner:
+                return
+            command = str(event.get("command") or "")
+            args = " ".join(str(a) for a in (event.get("arguments") or []))
+            full = f"{command} {args}".strip()
+            await notification_service.record(
+                recipient_id=str(owner),
+                category="sudo_request",
+                dedup_key=f"sudo_request:{request_id}",
+                subject=f"Sudo approval needed: {command[:60]}",
+                body=(
+                    f"`{full}` on **{event.get('vm_name') or 'vm'}** as "
+                    f"`{event.get('target_user') or 'root'}` (requested by "
+                    f"`{event.get('requesting_user') or 'agent'}` in "
+                    f"`{event.get('working_directory') or '/'}`). "
+                    "The request expires in 5 minutes."
+                ),
+                source_kind="sudo_request",
+                source_id=str(request_id),
+                action_params={
+                    "request_id": str(request_id),
+                    "job_id": str(job_id) if job_id else None,
+                    "thread_id": str(thread_id) if thread_id else None,
+                },
+                payload=dict(event),
+            )
+        except Exception as e:
+            logger.warning(
+                "sudo request %s: owner notification failed (non-fatal): %s",
+                str(request_id)[:8],
+                e,
+            )
+
     async def _get_request(self, request_id: str):
         """Fetch a single request row."""
         if not self._db:
@@ -1078,8 +1141,29 @@ class SudoGateService:
             except Exception as e:
                 logger.error("Failed to finalize sudo request %s: %s", request_id, e)
 
+        await self._resolve_notification_source(
+            request_id, resolved_by=f"sudo_{status}:{decided_by}"
+        )
         approved = status in ("approved", "auto_approved")
         await self._nats_reply(nats_reply_subject, approved, reason)
+
+    @staticmethod
+    async def _resolve_notification_source(
+        request_id: str, *, resolved_by: str
+    ) -> None:
+        """Settle every feed row about this request (unified notification
+        system, D6). Best-effort — the decision is already committed."""
+        try:
+            from services.notification_service import notification_service
+
+            if notification_service.is_available:
+                await notification_service.resolve_source(
+                    "sudo_request", str(request_id), resolved_by=resolved_by
+                )
+        except Exception as e:
+            logger.warning(
+                "notification resolve failed for sudo request %s: %s", request_id, e
+            )
 
     async def _nats_reply(
         self, reply_subject: Optional[str], approved: bool, reason: str = ""

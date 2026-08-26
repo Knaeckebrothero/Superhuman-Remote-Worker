@@ -10,7 +10,7 @@ Pages are the one urgency that crosses quiet hours (§6 notify contract).
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -166,14 +166,28 @@ class TestCeilingDeferral:
 
 class TestCeilingNotice:
     @pytest.mark.asyncio
-    async def test_writes_one_digest_entry(self):
+    async def test_records_one_low_officer_runtime_row_and_stamps_the_day(
+        self, monkeypatch
+    ):
+        from services import notification_service as ns
+
+        record = AsyncMock()
+        monkeypatch.setattr(ns.notification_service, "record", record)
         db = SimpleNamespace(merge_thread_officer_state=AsyncMock())
         deferred_to = datetime.now(timezone.utc) + timedelta(hours=6)
-        await session_wake._note_ceiling_breach(db, THREAD_ID, _thread(), deferred_to)
+        thread = {**_thread(), "user_id": "legate-1"}
+        await session_wake._note_ceiling_breach(db, THREAD_ID, thread, deferred_to)
+        today = datetime.now(timezone.utc).date().isoformat()
+        record.assert_awaited_once()
+        kw = record.await_args.kwargs
+        assert kw["recipient_id"] == "legate-1"
+        assert (kw["category"], kw["severity"]) == ("officer_runtime", "low")
+        assert kw["dedup_key"] == f"officer_ceiling:{THREAD_ID}:{today}"
+        assert kw["subject"] == "Daily token ceiling reached"
+        assert (kw["source_kind"], kw["source_id"]) == ("thread", THREAD_ID)
         db.merge_thread_officer_state.assert_awaited_once()
         patch = db.merge_thread_officer_state.await_args.args[1]
-        assert patch["ceiling_notice"] == datetime.now(timezone.utc).date().isoformat()
-        assert patch["digest"][-1]["subject"] == "Daily token ceiling reached"
+        assert patch == {"ceiling_notice": today}  # no digest ring any more
 
     @pytest.mark.asyncio
     async def test_idempotent_per_day(self):
@@ -366,47 +380,21 @@ class TestDeferPrimitive:
         assert captured["params"] == ([7, 9], fire_at)
 
 
-class TestQuietHoursPageBypass:
-    def _service(self, in_quiet_hours=True):
-        from services.notification_service import NotificationService
+class TestPageVsDigestSeverity:
+    """The notify contract's two tiers are two severities on the feed: a
+    page is `high` (reaches the Legate now — the only urgency that crosses
+    quiet hours by class rule is `critical`, so a page in quiet hours is
+    DEFERRED to the window's end, never dropped), a digest is `low` (in-app,
+    read at the next look). See tests/test_notification_record.py for the
+    quiet-hours deferral itself."""
 
-        svc = NotificationService.__new__(NotificationService)
-        svc._available = True
-        svc._get_user_channels = AsyncMock(return_value={"email": False})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=in_quiet_hours)
-        svc._queue_notification = AsyncMock()
-        svc._broadcast_sse = AsyncMock()
-        svc._cockpit_url = "https://cockpit"
-        svc._email_service = None
-        svc._transports = {}
-        return svc
+    def test_page_is_high_and_digest_is_low(self):
+        from services import notification_catalog as cat
 
-    @pytest.mark.asyncio
-    async def test_page_crosses_quiet_hours(self):
-        svc = self._service(in_quiet_hours=True)
-        results = await svc.dispatch(
-            user_id="u",
-            job_id=THREAD_ID,
-            subject="s",
-            message_md="m",
-            job_description="officer page",
-            config_name="centurion",
-            bypass_quiet_hours=True,
-        )
-        assert results["queued"] is False
-        svc._queue_notification.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_default_still_queues_in_quiet_hours(self):
-        svc = self._service(in_quiet_hours=True)
-        results = await svc.dispatch(
-            user_id="u",
-            job_id=THREAD_ID,
-            subject="s",
-            message_md="m",
-            job_description="digest",
-            config_name="centurion",
-        )
-        assert results["queued"] is True
-        svc._queue_notification.assert_awaited_once()
+        spec = cat.category_spec("officer_question")
+        assert spec.severity == "high"
+        high = cat.steps_for(spec, "high")
+        assert high and all(s.immediate for s in high)
+        assert "email" in {s.channel for s in high}
+        assert cat.steps_for(spec, "low") == ()
+        assert cat.bypasses_quiet_hours(spec, "high") is False

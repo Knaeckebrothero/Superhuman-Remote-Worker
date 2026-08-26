@@ -287,13 +287,13 @@ def _build_disable_payload(row: dict[str, Any], reason: str) -> dict[str, str]:
 async def _emit_auto_disable_notification(payload: dict[str, str]) -> None:
     """Best-effort owner notification when an automation is auto-disabled.
 
-    Wraps :py:meth:`NotificationService.notify_automation_auto_disabled`
+    Wraps :py:meth:`NotificationService.record_automation_disabled`
     so a misconfigured notification path can't crash the dispatcher.
     """
     if not notification_service.is_available:
         return
     try:
-        await notification_service.notify_automation_auto_disabled(
+        await notification_service.record_automation_disabled(
             user_id=payload["user_id"],
             automation_id=payload["automation_id"],
             automation_name=payload["automation_name"],

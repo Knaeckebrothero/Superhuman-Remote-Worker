@@ -8946,6 +8946,37 @@ CREATE TABLE public.models (
 
 
 --
+-- Name: notification_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_deliveries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    notification_id uuid NOT NULL,
+    channel text NOT NULL,
+    state text NOT NULL,
+    attempt integer DEFAULT 1 NOT NULL,
+    step_index integer,
+    batch_id uuid,
+    recipient_address text,
+    provider_msg_id text,
+    attempted_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    error text,
+    CONSTRAINT notification_delivery_attempt CHECK ((attempt > 0)),
+    CONSTRAINT notification_delivery_channel CHECK ((channel = ANY (ARRAY['in_app'::text, 'email'::text, 'ntfy'::text, 'slack_webhook'::text, 'discord_webhook'::text, 'push'::text]))),
+    CONSTRAINT notification_delivery_settled CHECK (((state = 'pending'::text) = (settled_at IS NULL))),
+    CONSTRAINT notification_delivery_state CHECK ((state = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'suppressed'::text])))
+);
+
+
+--
+-- Name: TABLE notification_deliveries; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_deliveries IS 'One row per channel attempt for a notification. Answers "did the mail actually go out, and when" and carries the provider message id for reply routing. The claim row is inserted BEFORE the send so replays cannot double-send.';
+
+
+--
 -- Name: notification_queue; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8960,6 +8991,116 @@ CREATE TABLE public.notification_queue (
     queued_at timestamp with time zone DEFAULT now(),
     delivered_at timestamp with time zone
 );
+
+
+--
+-- Name: TABLE notification_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_queue IS 'RETIRED (0193, unified notification system slice 3): the quiet-hours digest queue. Deferred delivery is a notification_steps row now. Kept until a later DROP.';
+
+
+--
+-- Name: notification_steps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_steps (
+    id bigint NOT NULL,
+    notification_id uuid NOT NULL,
+    step_index integer NOT NULL,
+    step_kind text NOT NULL,
+    due_at timestamp with time zone NOT NULL,
+    conditions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    batch_key text,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    detail text,
+    CONSTRAINT notification_step_claim CHECK (((claimed_by IS NULL) = (claimed_at IS NULL))),
+    CONSTRAINT notification_step_conditions_shape CHECK ((jsonb_typeof(conditions) = 'array'::text)),
+    CONSTRAINT notification_step_kind CHECK ((step_kind = ANY (ARRAY['email'::text, 'ntfy'::text, 'slack_webhook'::text, 'discord_webhook'::text, 'push'::text]))),
+    CONSTRAINT notification_step_settled CHECK (((state = 'pending'::text) = (settled_at IS NULL))),
+    CONSTRAINT notification_step_state CHECK ((state = ANY (ARRAY['pending'::text, 'done'::text, 'skipped'::text, 'cancelled'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE notification_steps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_steps IS 'Deferred channel steps of the unified notification feed (escalate-on-timeout). A row is the promise "at due_at, unless conditions say otherwise, deliver via step_kind". Resolving the source cancels its pending steps; the sweeper settles the rest. detail carries the skip reason, failure message or batch id.';
+
+
+--
+-- Name: notification_steps_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.notification_steps ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.notification_steps_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id uuid NOT NULL,
+    recipient_kind text NOT NULL,
+    recipient_id uuid NOT NULL,
+    category text NOT NULL,
+    severity text NOT NULL,
+    subject text NOT NULL,
+    body text DEFAULT ''::text NOT NULL,
+    source_kind text,
+    source_id text,
+    dedup_key text NOT NULL,
+    actions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    seen_at timestamp with time zone,
+    read_at timestamp with time zone,
+    interacted_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    resolved_by text,
+    archived_at timestamp with time zone,
+    CONSTRAINT notifications_actions_shape CHECK ((jsonb_typeof(actions) = 'array'::text)),
+    CONSTRAINT notifications_dedup_key CHECK (((dedup_key <> ''::text) AND (length(dedup_key) <= 512))),
+    CONSTRAINT notifications_payload_shape CHECK ((jsonb_typeof(payload) = 'object'::text)),
+    CONSTRAINT notifications_read_implies_seen CHECK (((read_at IS NULL) OR (seen_at IS NOT NULL))),
+    CONSTRAINT notifications_recipient_kind CHECK ((recipient_kind = ANY (ARRAY['user'::text, 'officer'::text]))),
+    CONSTRAINT notifications_severity CHECK ((severity = ANY (ARRAY['low'::text, 'normal'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT notifications_source_ref CHECK (((source_kind IS NULL) = (source_id IS NULL)))
+);
+
+
+--
+-- Name: TABLE notifications; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notifications IS 'Per-recipient notification feed: the source of truth every channel delivers FROM. Engagement state (seen/read/interacted), resolution of the underlying source, and the server-declared action set live here. Idempotent on (recipient_kind, recipient_id, dedup_key); the id is derived from that triple.';
+
+
+--
+-- Name: COLUMN notifications.dedup_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.dedup_key IS 'Caller-supplied idempotency key, e.g. freeze_notification:<completion command id>. A replayed record() with the same key returns the existing row and sends nothing twice.';
+
+
+--
+-- Name: COLUMN notifications.resolved_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.resolved_by IS 'Who settled the underlying source: user:<uuid> | system:<hook name> | officer:<thread id>.';
 
 
 --
@@ -11371,7 +11512,7 @@ CREATE TABLE public.thread_notifications (
 -- Name: TABLE thread_notifications; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.thread_notifications IS 'Audit + dedup + rate-limit log for headless-session emails. One row per outbound email regardless of delivery status.';
+COMMENT ON TABLE public.thread_notifications IS 'RETIRED (0193, unified notification system slice 3): the headless permission-email audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
 
 
 --
@@ -12728,11 +12869,35 @@ ALTER TABLE ONLY public.models
 
 
 --
+-- Name: notification_deliveries notification_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_deliveries
+    ADD CONSTRAINT notification_deliveries_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: notification_queue notification_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notification_steps notification_steps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
 
 
 --
@@ -13661,6 +13826,14 @@ ALTER TABLE ONLY public.job_completion_sweep_actions
 
 ALTER TABLE ONLY public.models
     ADD CONSTRAINT uq_model_provider_v2 UNIQUE (provider_kind, provider_ref, model_id);
+
+
+--
+-- Name: notification_steps uq_notification_step; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT uq_notification_step UNIQUE (notification_id, step_index);
 
 
 --
@@ -14997,6 +15170,62 @@ CREATE INDEX infrastructure_storage_resource_mappings_resource_idx ON public.inf
 
 
 --
+-- Name: ix_notification_deliveries_batch; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_batch ON public.notification_deliveries USING btree (batch_id) WHERE (batch_id IS NOT NULL);
+
+
+--
+-- Name: ix_notification_deliveries_notification; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_notification ON public.notification_deliveries USING btree (notification_id);
+
+
+--
+-- Name: ix_notification_deliveries_provider_msg; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_provider_msg ON public.notification_deliveries USING btree (provider_msg_id) WHERE (provider_msg_id IS NOT NULL);
+
+
+--
+-- Name: ix_notification_steps_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_due ON public.notification_steps USING btree (due_at) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: ix_notification_steps_open_by_notification; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_open_by_notification ON public.notification_steps USING btree (notification_id) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: ix_notifications_feed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_feed ON public.notifications USING btree (recipient_kind, recipient_id, created_at DESC, id DESC);
+
+
+--
+-- Name: ix_notifications_open_by_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_open_by_source ON public.notifications USING btree (source_kind, source_id) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: ix_notifications_unseen; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_unseen ON public.notifications USING btree (recipient_kind, recipient_id) WHERE ((seen_at IS NULL) AND (archived_at IS NULL));
+
+
+--
 -- Name: jobs_lease_expiry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15435,6 +15664,20 @@ CREATE UNIQUE INDEX uq_managed_repository_creation_live_repo ON public.managed_r
 --
 
 CREATE UNIQUE INDEX uq_managed_repository_creation_live_scope ON public.managed_repository_creation_intents USING btree (authority_kind, authority_id, repository_owner, repo_name) WHERE (status = ANY (ARRAY['pending'::text, 'created'::text, 'deleting'::text]));
+
+
+--
+-- Name: uq_notification_delivery_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_notification_delivery_claim ON public.notification_deliveries USING btree (notification_id, channel) WHERE (state = ANY (ARRAY['pending'::text, 'sent'::text]));
+
+
+--
+-- Name: uq_notifications_recipient_dedup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_notifications_recipient_dedup ON public.notifications USING btree (recipient_kind, recipient_id, dedup_key);
 
 
 --
@@ -17147,6 +17390,14 @@ ALTER TABLE ONLY public.message_log
 
 
 --
+-- Name: notification_deliveries notification_deliveries_notification_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_deliveries
+    ADD CONSTRAINT notification_deliveries_notification_id_fkey FOREIGN KEY (notification_id) REFERENCES public.notifications(id) ON DELETE CASCADE;
+
+
+--
 -- Name: notification_queue notification_queue_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17160,6 +17411,14 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notification_steps notification_steps_notification_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_notification_id_fkey FOREIGN KEY (notification_id) REFERENCES public.notifications(id) ON DELETE CASCADE;
 
 
 --

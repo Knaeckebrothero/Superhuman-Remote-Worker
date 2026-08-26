@@ -60,7 +60,6 @@ officer:
   sleep_min_minutes: 5
   sleep_max_minutes: 60
   max_concurrent_workers: 3
-  max_pages_per_day: 3
   max_actions_per_wake: 10
   daily_token_ceiling: 0
 

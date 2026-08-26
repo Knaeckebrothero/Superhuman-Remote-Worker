@@ -1,13 +1,16 @@
-import {SudoRequest} from '../services/sudo.service';
-import {SessionEvent} from '../services/notification.service';
+import {Notification, NotificationCategory} from './notification.model';
 
-export type ActionItemType = 'sudo' | 'message' | 'review' | 'session';
 export type ActionItemStatus = 'pending' | 'resolved';
 
+/**
+ * One row of the action center. Since slice 3 of the unified notification
+ * system every item IS a feed notification (server id, engagement state,
+ * declared actions) — the client-side join over sudo requests, message
+ * threads, review jobs and session events is gone.
+ */
 export interface ActionItem {
-  /** Stable ID: prefixed to avoid collisions (e.g., "sudo:uuid", "msg:thread_id", "rev:job_id") */
+  /** Stable ID: `ntf:<notification id>`. */
   id: string;
-  type: ActionItemType;
   status: ActionItemStatus;
   /** 0-100, higher = more urgent */
   urgency: number;
@@ -16,48 +19,8 @@ export interface ActionItem {
   title: string;
   subtitle: string;
   jobId: string | null;
-
-  // Discriminated payload - exactly one is populated
-  sudo?: SudoRequest;
-  message?: MessageActionData;
-  review?: ReviewActionData;
-    session?: SessionActionData;
-}
-
-export interface SessionActionData {
-    threadId: string;
-    event: SessionEvent;
-}
-
-export interface MessageActionData {
-  threadId: string;
-  subject: string;
-  mode: 'blocking' | 'async';
-  lastMessage: string;
-  configName: string | null;
-  jobDescription: string | null;
-  unread: boolean;
-  /**
-   * Set when the notification is keyed to a persistent session (an officer
-   * page) instead of a job: there is no job to resolve — thread lookup and
-   * inline reply would 404 — and the working reply channel is the session
-   * log at /sessions/{sessionThreadId}.
-   */
-  sessionThreadId?: string | null;
-}
-
-export interface ReviewActionData {
-  jobId: string;
-  jobDescription: string;
-  configName: string | null;
-  freezeType: 'job_complete' | 'phase_boundary' | 'vm_upgrade_required';
-  phaseType: string | null;
-  phaseNumber: number | null;
-  summary: string | null;
-  confidence: number | null;
-  deliverables: string[];
-  frozenAt: string | null;
-  command: string | null;
+  notification: Notification;
+  category: NotificationCategory;
 }
 
 export interface ThreadMessage {
@@ -75,19 +38,4 @@ export interface ThreadDetail {
   mode: string;
   status: string;
   messages: ThreadMessage[];
-}
-
-export interface PendingActionCounts {
-  counts: {
-    sudo: number;
-    messages: number;
-    reviews: number;
-    total: number;
-  };
-  most_urgent: {
-    type: string;
-    id: string;
-    title: string;
-    expires_in_seconds: number;
-  } | null;
 }

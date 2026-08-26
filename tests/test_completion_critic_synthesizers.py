@@ -144,7 +144,7 @@ async def test_critic_escalation_followups_bound_multibyte_reason_and_action(
         }
     )
     notifier = MagicMock()
-    notifier.notify_review_returned_to_manual = AsyncMock()
+    notifier.record_review_returned = AsyncMock()
     wake = AsyncMock()
     wake_drain = MagicMock()
     monkeypatch.setattr(main, "postgres_db", database)
@@ -160,9 +160,7 @@ async def test_critic_escalation_followups_bound_multibyte_reason_and_action(
     else:
         result = await main._run_verification_critic_handoff(plan)
 
-    notified_reason = notifier.notify_review_returned_to_manual.await_args.kwargs[
-        "reason"
-    ]
+    notified_reason = notifier.record_review_returned.await_args.kwargs["reason"]
     assert len(notified_reason.encode("utf-8")) <= 1024
     assert notified_reason.endswith("…")
     assert len(result["actions"][0].encode("utf-8")) <= 1024

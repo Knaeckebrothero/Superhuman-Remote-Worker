@@ -7,6 +7,8 @@ import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 
 import { environment } from '../../core/environment';
 import { ApiService } from '../../core/services/api.service';
+import { NotificationService } from '../../core/services/notification.service';
+import type { Notification } from '../../core/models/notification.model';
 import { ModelService } from '../../core/services/model.service';
 import type {
   OfficerBrainSpec,
@@ -62,7 +64,6 @@ export interface OfficerEditorDraft {
   sleepMin: string;
   sleepMax: string;
   tokenCeiling: string;
-  maxPages: string;
   maxActions: string;
   maxWorkers: string;
 }
@@ -112,7 +113,6 @@ export type OfficerEditField =
   | 'worker_spend_ceiling_daily'
   | 'max_concurrent_workers'
   | 'daily_token_ceiling'
-  | 'max_pages_per_day'
   | 'sleep'
   | 'max_actions_per_wake'
   | 'brain';
@@ -126,7 +126,6 @@ export function immediacyLabel(field: OfficerEditField, translate: OfficerTransl
     case 'max_concurrent_workers':
       return translate('officerCard.immediacy.nextDispatch');
     case 'daily_token_ceiling':
-    case 'max_pages_per_day':
       return translate('officerCard.immediacy.nextDelivery');
     case 'sleep':
       return translate('officerCard.immediacy.nextSleep');
@@ -228,7 +227,6 @@ export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
     sleepMin: num(o?.sleep_minutes?.min),
     sleepMax: num(o?.sleep_minutes?.max),
     tokenCeiling: num(o?.token_ceiling?.daily),
-    maxPages: num(o?.pages_today?.budget),
     maxActions: num(o?.max_actions_per_wake),
     maxWorkers: num(o?.max_concurrent_workers),
   };
@@ -299,8 +297,6 @@ export function buildOfficerConfig(draft: OfficerEditorDraft): OfficerPostPatch 
   if (sleepMax !== undefined) body.sleep_max_minutes = sleepMax;
   const ceiling = num(draft.tokenCeiling);
   if (ceiling !== undefined) body.daily_token_ceiling = ceiling;
-  const pages = num(draft.maxPages);
-  if (pages !== undefined) body.max_pages_per_day = pages;
   const actions = num(draft.maxActions);
   if (actions !== undefined) body.max_actions_per_wake = actions;
   const workers = num(draft.maxWorkers);
@@ -320,7 +316,6 @@ const PATCH_FIELDS: (keyof OfficerPostPatch)[] = [
   'sleep_min_minutes',
   'sleep_max_minutes',
   'daily_token_ceiling',
-  'max_pages_per_day',
   'max_actions_per_wake',
   'max_concurrent_workers',
 ];
@@ -555,12 +550,6 @@ export function nextWakeLabel(
                 <div>
                   <span class="k">{{ 'officerCard.summary.queuedEvents' | transloco }}</span>
                   <span class="v">{{ o.pending_events ?? 0 }}</span>
-                </div>
-                <div>
-                  <span class="k">{{ 'officerCard.summary.pagesToday' | transloco }}</span>
-                  <span class="v"
-                    >{{ o.pages_today?.used ?? 0 }}/{{ o.pages_today?.budget ?? 3 }}</span
-                  >
                 </div>
                 @if (post()?.spend_today; as spend) {
                   <div>
@@ -964,18 +953,6 @@ export function nextWakeLabel(
                     [placeholder]="'officerCard.defaults.unlimited' | transloco"
                   />
                 </app-form-field>
-                <app-form-field
-                  [label]="'officerCard.budgets.pages' | transloco"
-                  [hint]="'officerCard.budgets.pagesHint' | transloco"
-                >
-                  <app-input
-                    type="number"
-                    [ariaLabel]="'officerCard.a11y.pagesPerDay' | transloco"
-                    [value]="fMaxPages()"
-                    (changed)="fMaxPages.set($event)"
-                    placeholder="3"
-                  />
-                </app-form-field>
               </div>
 
               <div class="officer-editor-head">
@@ -1241,15 +1218,26 @@ export function nextWakeLabel(
             </div>
           }
 
-          @if (postState() !== 'vacant' && digest().length) {
-            <div class="officer-digest" data-testid="officer-digest">
-              <div class="officer-digest-title">{{ 'officerCard.digest.title' | transloco }}</div>
-              @for (d of digest(); track $index) {
-                <div class="officer-digest-item">
-                  <span class="dim">{{ d.at | date: 'short' }}</span>
-                  <strong>{{ d.subject }}</strong>
-                  <span>{{ d.message }}</span>
-                </div>
+          @if (postState() !== 'vacant' && recentNotifications().length) {
+            <!-- The feed rows recorded about this officer's session (pages,
+                 runtime alerts) — the unified feed replaced his digest ring. -->
+            <div class="officer-recent" data-testid="officer-recent-notifications">
+              <div class="officer-recent-title">
+                {{ 'officerCard.recentNotifications.title' | transloco }}
+              </div>
+              @for (n of recentNotifications(); track n.id) {
+                <a
+                  class="officer-recent-item"
+                  [routerLink]="['/inbox']"
+                  [queryParams]="{ n: n.id }"
+                  data-testid="officer-recent-item"
+                >
+                  <span class="dim">{{ n.created_at | date: 'short' }}</span>
+                  <span class="officer-recent-severity" [attr.data-severity]="n.severity">
+                    {{ 'notifications.severity.' + n.severity | transloco }}
+                  </span>
+                  <span class="officer-recent-subject" [class.dim]="!!n.resolved_at">{{ n.subject }}</span>
+                </a>
               }
             </div>
           }
@@ -1448,22 +1436,40 @@ export function nextWakeLabel(
         font-family: var(--font-mono, monospace);
         font-size: 12px;
       }
-      .officer-digest {
+      .officer-recent {
         display: flex;
         flex-direction: column;
         gap: 6px;
       }
-      .officer-digest-title {
+      .officer-recent-title {
         font-size: 12px;
         color: var(--text-tertiary);
         text-transform: uppercase;
         letter-spacing: 0.4px;
       }
-      .officer-digest-item {
+      .officer-recent-item {
         display: flex;
         gap: 8px;
+        align-items: baseline;
         font-size: 13px;
         flex-wrap: wrap;
+        color: var(--text-primary);
+        text-decoration: none;
+      }
+      .officer-recent-item:hover .officer-recent-subject {
+        text-decoration: underline;
+      }
+      .officer-recent-severity {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+        color: var(--text-secondary);
+      }
+      .officer-recent-severity[data-severity='high'] {
+        color: var(--warning);
+      }
+      .officer-recent-severity[data-severity='critical'] {
+        color: var(--danger);
       }
       .officer-slot-row {
         display: flex;
@@ -1496,6 +1502,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   private readonly http = inject(HttpClient);
   private readonly api = inject(ApiService);
+  private readonly notificationFeed = inject(NotificationService);
   private readonly router = inject(Router);
   private readonly modelService = inject(ModelService);
   private readonly transloco = inject(TranslocoService);
@@ -1534,7 +1541,6 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly fSleepMin = signal('');
   readonly fSleepMax = signal('');
   readonly fTokenCeiling = signal('');
-  readonly fMaxPages = signal('');
   readonly fMaxActions = signal('');
   readonly fMaxWorkers = signal('');
 
@@ -1559,7 +1565,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly wakeLabel = computed(() =>
     nextWakeLabel(this.post()?.officer?.next_wake_at ?? null, this.tr),
   );
-  readonly digest = computed(() => [...(this.post()?.officer?.digest ?? [])].reverse());
+  /** Feed rows about the officer's session, newest first (`source_kind=thread`). */
+  readonly recentNotifications = signal<Notification[]>([]);
   readonly kitRows = computed(() =>
     kitChips(this.post()?.kit, this.tr, this.post()?.backlog?.breakers, new Date()),
   );
@@ -1628,7 +1635,6 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     sleepMin: this.fSleepMin(),
     sleepMax: this.fSleepMax(),
     tokenCeiling: this.fTokenCeiling(),
-    maxPages: this.fMaxPages(),
     maxActions: this.fMaxActions(),
     maxWorkers: this.fMaxWorkers(),
   }));
@@ -1701,6 +1707,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
         this.autoPullArmed.set(false);
       }
       this.post.set(p);
+      this.loadRecentNotifications(p.commissioned ? (p.officer?.thread_id ?? null) : null);
       const key = p.commissioned ? `c:${p.officer?.thread_id ?? ''}` : 'vacant';
       if (this.editorSeedKey !== key) {
         this.seedEditor(draftFromPost(p));
@@ -1713,6 +1720,18 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     this.loading.set(false);
   }
 
+  /** The last ten feed rows recorded about this officer's session. A
+   *  transport failure keeps the previous list (same rule as the post). */
+  private loadRecentNotifications(threadId: string | null): void {
+    if (!threadId) {
+      this.recentNotifications.set([]);
+      return;
+    }
+    this.notificationFeed.listBySource('thread', threadId, 10).subscribe((page) => {
+      if (page) this.recentNotifications.set(page.items ?? []);
+    });
+  }
+
   private seedEditor(draft: OfficerEditorDraft): void {
     this.slotDrafts.set(draft.slots);
     this.fAutoPull.set(draft.autoPull);
@@ -1723,7 +1742,6 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     this.fSleepMin.set(draft.sleepMin);
     this.fSleepMax.set(draft.sleepMax);
     this.fTokenCeiling.set(draft.tokenCeiling);
-    this.fMaxPages.set(draft.maxPages);
     this.fMaxActions.set(draft.maxActions);
     this.fMaxWorkers.set(draft.maxWorkers);
   }
