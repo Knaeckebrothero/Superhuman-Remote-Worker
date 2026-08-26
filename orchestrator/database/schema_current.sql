@@ -8024,6 +8024,54 @@ CREATE TABLE public.notification_queue (
 
 
 --
+-- Name: notification_steps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_steps (
+    id bigint NOT NULL,
+    notification_id uuid NOT NULL,
+    step_index integer NOT NULL,
+    step_kind text NOT NULL,
+    due_at timestamp with time zone NOT NULL,
+    conditions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    batch_key text,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    detail text,
+    CONSTRAINT notification_step_claim CHECK (((claimed_by IS NULL) = (claimed_at IS NULL))),
+    CONSTRAINT notification_step_conditions_shape CHECK ((jsonb_typeof(conditions) = 'array'::text)),
+    CONSTRAINT notification_step_kind CHECK ((step_kind = ANY (ARRAY['email'::text, 'ntfy'::text, 'slack_webhook'::text, 'discord_webhook'::text, 'push'::text]))),
+    CONSTRAINT notification_step_settled CHECK (((state = 'pending'::text) = (settled_at IS NULL))),
+    CONSTRAINT notification_step_state CHECK ((state = ANY (ARRAY['pending'::text, 'done'::text, 'skipped'::text, 'cancelled'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE notification_steps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_steps IS 'Deferred channel steps of the unified notification feed (escalate-on-timeout). A row is the promise "at due_at, unless conditions say otherwise, deliver via step_kind". Resolving the source cancels its pending steps; the sweeper settles the rest. detail carries the skip reason, failure message or batch id.';
+
+
+--
+-- Name: notification_steps_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.notification_steps ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.notification_steps_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: notifications; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -11763,6 +11811,14 @@ ALTER TABLE ONLY public.notification_queue
 
 
 --
+-- Name: notification_steps notification_steps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12696,6 +12752,14 @@ ALTER TABLE ONLY public.job_completion_sweep_actions
 
 ALTER TABLE ONLY public.models
     ADD CONSTRAINT uq_model_provider_v2 UNIQUE (provider_kind, provider_ref, model_id);
+
+
+--
+-- Name: notification_steps uq_notification_step; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT uq_notification_step UNIQUE (notification_id, step_index);
 
 
 --
@@ -14036,6 +14100,20 @@ CREATE INDEX ix_notification_deliveries_notification ON public.notification_deli
 --
 
 CREATE INDEX ix_notification_deliveries_provider_msg ON public.notification_deliveries USING btree (provider_msg_id) WHERE (provider_msg_id IS NOT NULL);
+
+
+--
+-- Name: ix_notification_steps_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_due ON public.notification_steps USING btree (due_at) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: ix_notification_steps_open_by_notification; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_open_by_notification ON public.notification_steps USING btree (notification_id) WHERE (state = 'pending'::text);
 
 
 --
@@ -16152,6 +16230,14 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notification_steps notification_steps_notification_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_notification_id_fkey FOREIGN KEY (notification_id) REFERENCES public.notifications(id) ON DELETE CASCADE;
 
 
 --

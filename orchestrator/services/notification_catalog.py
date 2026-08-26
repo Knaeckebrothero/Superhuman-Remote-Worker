@@ -16,10 +16,16 @@ so a later buy is a mapping exercise.
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -40,8 +46,40 @@ CHANNELS: tuple[str, ...] = (
     "push",
 )
 WEBHOOK_CHANNELS: tuple[str, ...] = ("ntfy", "slack_webhook", "discord_webhook")
+EXTERNAL_CHANNELS: tuple[str, ...] = ("email",) + WEBHOOK_CHANNELS
 ACTION_STYLES: tuple[str, ...] = ("default", "primary", "danger")
 ACTION_INPUTS: tuple[str | None, ...] = (None, "text", "textarea")
+
+# Step conditions (D5/D6) — evaluated by the sweeper AT DUE TIME, never when
+# the step is written. ``severity_at_least:<level>`` is the one parametrised
+# form. ``not_resolved`` consults the row's ``resolved_at`` *and* the live
+# source through the registered probe, so a writer the resolve hooks never
+# enumerated can still never cause a stale mail.
+CONDITION_NAMES: tuple[str, ...] = ("not_seen", "not_read", "not_resolved")
+CONDITION_SEVERITY_PREFIX = "severity_at_least:"
+
+
+def validate_condition(condition: str) -> None:
+    if condition in CONDITION_NAMES:
+        return
+    if condition.startswith(CONDITION_SEVERITY_PREFIX):
+        level = condition[len(CONDITION_SEVERITY_PREFIX) :]
+        if level in SEVERITIES:
+            return
+    raise ValueError(f"unknown step condition {condition!r}")
+
+
+# Symbolic delay: resolved per notification from the source job's project
+# officer policy (``communication_policy.officer_response_minutes``) when a
+# live, un-held officer is commissioned; otherwise the recipient's
+# ``communication.escalation_minutes`` or NO_OFFICER_DELAY_MINUTES.
+DELAY_OFFICER_RESPONSE = "officer_response_minutes"
+NO_OFFICER_DELAY_MINUTES = 5
+ESCALATION_MINUTES_BOUNDS = (1, 24 * 60)
+
+# Steps written by quiet-hours deferral of an *immediate* step use indexes from
+# here up so they never collide with the class's own declared step indexes.
+DEFERRED_STEP_INDEX_BASE = 100
 
 
 def notification_id(
@@ -118,6 +156,26 @@ class StepSpec:
     def __post_init__(self) -> None:
         if self.channel not in CHANNELS or self.channel == "in_app":
             raise ValueError(f"step: unknown channel {self.channel!r}")
+        if isinstance(self.delay, bool) or not (
+            (isinstance(self.delay, int) and self.delay >= 0)
+            or self.delay == DELAY_OFFICER_RESPONSE
+        ):
+            raise ValueError(f"step {self.channel}: bad delay {self.delay!r}")
+        for condition in self.conditions:
+            validate_condition(condition)
+        if (self.batch_key is None) != (self.batch_window_minutes is None):
+            raise ValueError(
+                f"step {self.channel}: batch_key and batch_window_minutes go together"
+            )
+        if self.batch_window_minutes is not None and self.batch_window_minutes <= 0:
+            raise ValueError(f"step {self.channel}: batch window must be positive")
+        if self.immediate and (self.conditions or self.batch_key):
+            # An immediate step runs inline inside record(); there is no due
+            # time at which a condition could be re-evaluated or a batch
+            # collected. Such a step is a design error, not a runtime one.
+            raise ValueError(
+                f"step {self.channel}: conditions/batching need a non-zero delay"
+            )
 
     @property
     def immediate(self) -> bool:
@@ -150,15 +208,44 @@ def _immediate(*channels: str) -> tuple[StepSpec, ...]:
 
 
 # Slice 1 severity classes: behaviour parity — every class that mails today
-# still mails immediately. Slice 2 replaces this with delay/condition/batch
-# steps (`normal` waits for seen/resolved; `low` rides a daily digest).
+# mails immediately. Kept as the documented "before" and for the parity test.
 SEVERITY_CLASSES_V1: dict[str, tuple[StepSpec, ...]] = {
     "critical": _immediate("email", "ntfy", "slack_webhook", "discord_webhook"),
     "high": _immediate("email", "ntfy", "slack_webhook", "discord_webhook"),
     "normal": _immediate("email", "ntfy", "slack_webhook", "discord_webhook"),
     "low": (),
 }
-SEVERITY_CLASSES: dict[str, tuple[StepSpec, ...]] = SEVERITY_CLASSES_V1
+
+
+def _escalating(*channels: str) -> tuple[StepSpec, ...]:
+    """The D5 workflow: in_app now (the durable row), wait the officer's
+    response window, then reach out only if nobody looked and nobody settled
+    it. Batched per category in 15-minute buckets so three jobs finishing
+    together produce one "3 jobs awaiting review" mail, not three."""
+    return tuple(
+        StepSpec(
+            channel,
+            delay=DELAY_OFFICER_RESPONSE,
+            conditions=("not_seen", "not_resolved"),
+            batch_key="{category}",
+            batch_window_minutes=15,
+        )
+        for channel in channels
+    )
+
+
+# Slice 2 severity classes (D8): immediate delivery is reserved for classes
+# where latency costs something real. `normal` — a review-queue item — is
+# what the issue doc is about: it waits, and a mail that survives the wait
+# carries real information (the automated tier did not settle it). `low`
+# stays in-app only; a daily digest is one StepSpec away if ever wanted.
+SEVERITY_CLASSES_V2: dict[str, tuple[StepSpec, ...]] = {
+    "critical": _immediate("email", "ntfy", "slack_webhook", "discord_webhook"),
+    "high": _immediate("email", "ntfy", "slack_webhook", "discord_webhook"),
+    "normal": _escalating("email", "ntfy", "slack_webhook", "discord_webhook"),
+    "low": (),
+}
+SEVERITY_CLASSES: dict[str, tuple[StepSpec, ...]] = SEVERITY_CLASSES_V2
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +332,150 @@ def serialize_actions(
     """The declared action set for a new row, with the call's params (job id,
     request id, …) merged into every action so the cockpit can POST them back."""
     return [action.serialize(action_params) for action in spec.actions]
+
+
+# ---------------------------------------------------------------------------
+# Step conditions, batching, preferences (pure — the engine's vocabulary)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_condition(
+    condition: str, row: dict[str, Any], *, source_resolved: bool = False
+) -> bool:
+    """Does ``row`` still satisfy ``condition`` right now? Pure: the caller
+    supplies the live probe verdict for the source."""
+    validate_condition(condition)
+    if condition == "not_seen":
+        return row.get("seen_at") is None
+    if condition == "not_read":
+        return row.get("read_at") is None
+    if condition == "not_resolved":
+        return row.get("resolved_at") is None and not source_resolved
+    level = condition[len(CONDITION_SEVERITY_PREFIX) :]
+    return SEVERITY_RANK.get(str(row.get("severity")), -1) >= SEVERITY_RANK[level]
+
+
+def first_failing_condition(
+    conditions: Any, row: dict[str, Any], *, source_resolved: bool = False
+) -> str | None:
+    """The first condition that no longer holds, or ``None`` when the step
+    should go ahead. Unknown names fail closed (the step is skipped, loudly
+    named) rather than mailing on a condition nobody can read."""
+    for condition in list(conditions or ()):
+        try:
+            if not evaluate_condition(
+                str(condition), row, source_resolved=source_resolved
+            ):
+                return str(condition)
+        except ValueError:
+            return f"invalid:{condition}"
+    return None
+
+
+def batch_key_for(step: StepSpec, row: dict[str, Any]) -> str | None:
+    """Rows sharing (recipient, channel, batch key, due bucket) become one
+    message. The template sees the row's category and severity."""
+    if step.batch_key is None:
+        return None
+    return step.batch_key.format(
+        category=row.get("category") or "", severity=row.get("severity") or ""
+    )
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def bucket_due_at(due: datetime, window_minutes: int) -> datetime:
+    """Round ``due`` UP to the next epoch-aligned window boundary, so rows
+    whose delay ends inside the same window share one due instant and the
+    sweeper claims them together (Knock: batch window). Never earlier than
+    ``due`` — the delay is a floor, the bucket only adds up to one window."""
+    seconds = int(window_minutes) * 60
+    elapsed = (due - _EPOCH).total_seconds()
+    return _EPOCH + timedelta(seconds=math.ceil(elapsed / seconds) * seconds)
+
+
+def quiet_hours_window(
+    settings: dict[str, Any] | None, now: datetime | None = None
+) -> tuple[bool, datetime | None]:
+    """``(inside, end)`` for the recipient's ``communication.quiet_hours``:
+    whether ``now`` falls in the window and, if so, when it ends (UTC). An
+    unusable configuration (missing bounds, unknown zone) is "not quiet" —
+    silence must be opted into, never stumbled into."""
+    qh = ((settings or {}).get("communication") or {}).get("quiet_hours") or {}
+    if not qh.get("enabled"):
+        return False, None
+    start_str = qh.get("start") or ""
+    end_str = qh.get("end") or ""
+    tz_str = qh.get("timezone") or "UTC"
+    if not start_str or not end_str:
+        return False, None
+    try:
+        tz = ZoneInfo(tz_str)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        logger.warning("Invalid timezone in quiet hours: %s", tz_str)
+        return False, None
+    try:
+        start = time.fromisoformat(start_str)
+        end = time.fromisoformat(end_str)
+    except ValueError:
+        return False, None
+
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    current = local.time()
+    if start <= end:
+        inside = start <= current <= end
+        end_date = local.date()
+    else:  # overnight, e.g. 22:00 – 08:00
+        inside = current >= start or current <= end
+        end_date = (
+            local.date() + timedelta(days=1) if current >= start else local.date()
+        )
+    if not inside:
+        return False, None
+    end_local = datetime.combine(end_date, end, tzinfo=tz)
+    return True, end_local.astimezone(timezone.utc)
+
+
+def channel_enabled(
+    channels: dict[str, Any] | None,
+    categories: dict[str, Any] | None,
+    category: str,
+    channel: str,
+) -> bool:
+    """The D9 preference matrix, degenerate form: a per-category cell
+    overrides the channel-type default; both default to on. Only a real
+    ``False`` switches anything off — the settings validator guarantees the
+    stored values are booleans, and this stays defensive for older rows."""
+    cell = ((categories or {}).get(category) or {}).get(channel)
+    if isinstance(cell, bool):
+        return cell
+    default = (channels or {}).get(channel)
+    if isinstance(default, bool):
+        return default
+    return True
+
+
+def serialize_step(row: dict[str, Any]) -> dict[str, Any]:
+    """DB step row → the wire shape (detail pane: "email in 12 min unless…")."""
+    conditions = row.get("conditions")
+    if isinstance(conditions, str):
+        try:
+            conditions = json.loads(conditions)
+        except ValueError:
+            conditions = []
+    return {
+        "id": int(row["id"]) if row.get("id") is not None else None,
+        "step_index": row.get("step_index"),
+        "channel": row.get("step_kind"),
+        "due_at": _iso(row.get("due_at")),
+        "conditions": list(conditions or []),
+        "batch_key": row.get("batch_key"),
+        "state": row.get("state"),
+        "attempt": int(row.get("attempt") or 0),
+        "settled_at": _iso(row.get("settled_at")),
+        "detail": row.get("detail"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -382,10 +613,17 @@ __all__ = [
     "ACTION_STYLES",
     "CATEGORIES",
     "CHANNELS",
+    "CONDITION_NAMES",
+    "DEFERRED_STEP_INDEX_BASE",
+    "DELAY_OFFICER_RESPONSE",
+    "ESCALATION_MINUTES_BOUNDS",
+    "EXTERNAL_CHANNELS",
+    "NO_OFFICER_DELAY_MINUTES",
     "RECIPIENT_KINDS",
     "SEVERITIES",
     "SEVERITY_CLASSES",
     "SEVERITY_CLASSES_V1",
+    "SEVERITY_CLASSES_V2",
     "SEVERITY_RANK",
     "WEBHOOK_CHANNELS",
     "ActionContext",
@@ -397,18 +635,26 @@ __all__ = [
     "SourceProbe",
     "StepSpec",
     "action_handler",
+    "batch_key_for",
+    "bucket_due_at",
     "bypasses_quiet_hours",
     "category_spec",
+    "channel_enabled",
     "clear_registries",
     "cursor_for",
+    "evaluate_condition",
+    "first_failing_condition",
     "normalize_severity",
     "notification_id",
+    "quiet_hours_window",
     "register_action",
     "register_source_loader",
     "register_source_probe",
     "serialize_actions",
     "serialize_notification",
+    "serialize_step",
     "source_loader",
     "source_probe",
     "steps_for",
+    "validate_condition",
 ]

@@ -597,9 +597,11 @@ from services.notification_catalog import (  # noqa: E402
     ActionResult,
     register_action,
     register_source_loader,
+    register_source_probe,
     serialize_notification,
     source_loader,
 )
+from services.notification_steps import notification_steps_loop  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_audit_reader, set_postgres_db  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -10806,6 +10808,37 @@ class UserSettingsUpdate(BaseModel):
                     f"communication.channels.{name} must be a boolean, "
                     f"got {type(enabled).__name__}"
                 )
+        # D9 preference matrix: categories[category][channel] = bool overrides
+        # the channel-type default above. Same strict-bool rule, same reason.
+        categories = v.get("categories")
+        if categories is not None:
+            if not isinstance(categories, dict):
+                raise ValueError("communication.categories must be an object")
+            for category, cells in categories.items():
+                if not isinstance(cells, dict):
+                    raise ValueError(
+                        f"communication.categories.{category} must be an object"
+                    )
+                for channel, enabled in cells.items():
+                    if not isinstance(enabled, bool):
+                        raise ValueError(
+                            f"communication.categories.{category}.{channel} must be "
+                            f"a boolean, got {type(enabled).__name__}"
+                        )
+        # How long a `normal` notification waits for someone to look before it
+        # mails, when no project officer owns the wait. Minutes; bounded so a
+        # typo cannot mean "never" or "instantly".
+        minutes = v.get("escalation_minutes")
+        if minutes is not None:
+            from services.notification_catalog import ESCALATION_MINUTES_BOUNDS
+
+            lo, hi = ESCALATION_MINUTES_BOUNDS
+            if isinstance(minutes, bool) or not isinstance(minutes, int):
+                raise ValueError("communication.escalation_minutes must be an integer")
+            if not lo <= minutes <= hi:
+                raise ValueError(
+                    f"communication.escalation_minutes must be between {lo} and {hi}"
+                )
         return v
 
     @field_validator("language")
@@ -12341,6 +12374,16 @@ async def lifespan(app: FastAPI):
     digest_task = asyncio.create_task(
         run_when_leader(quiet_hours_digest_loop, _shutdown_event)
     )
+    # Unified feed: run the deferred channel steps ("mail after the officer's
+    # window unless seen/resolved", quiet-hours deferrals, batched digests).
+    notification_steps_task = asyncio.create_task(
+        run_when_leader(
+            lambda stop: notification_steps_loop(
+                stop, postgres_db, notification_service
+            ),
+            _shutdown_event,
+        )
+    )
     delegation_timeout_task = asyncio.create_task(
         run_when_leader(delegation_timeout_sweeper, _shutdown_event)
     )
@@ -12601,6 +12644,7 @@ async def lifespan(app: FastAPI):
     await gc_sweeper_task
     await imap_task
     await digest_task
+    await notification_steps_task
     await delegation_timeout_task
     await llm_outage_task
     await infra_transient_task
@@ -18223,7 +18267,18 @@ async def get_notification_detail(
                     notification_id,
                     exc_info=True,
                 )
-        return {"notification": serialize_notification(row), "source": source}
+        # The row's deferred channel steps ("email in 12 min unless you look
+        # or someone settles it") — the detail pane can say what will happen.
+        try:
+            steps = await notification_service.describe_steps(str(row["id"]))
+        except Exception:
+            logger.debug("step listing failed for %s", notification_id, exc_info=True)
+            steps = []
+        return {
+            "notification": serialize_notification(row),
+            "source": source,
+            "steps": steps,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -18569,6 +18624,32 @@ def _register_notification_actions() -> None:
         return _notification_jsonable(
             {"kind": "thread", "thread": {k: thread.get(k) for k in keep}}
         )
+
+    # --- source probes (slice 2: `not_resolved` asks the live source) ---------
+    # The resolve hooks stamp rows when they run; the probe is what makes an
+    # un-enumerated writer (a sweeper, a future endpoint, a direct DB edit)
+    # unable to cause a stale mail. "Resolved" means: nobody is waiting on a
+    # human any more.
+
+    @register_source_probe("job")
+    async def _probe_job(db: Any, job_id: str) -> bool:
+        job = await db.get_job(job_id)
+        if not job:
+            return True  # deleted: nothing left to decide
+        return str(job.get("status")) not in ("pending_review", "paused", "reviewing")
+
+    @register_source_probe("sudo_request")
+    async def _probe_sudo(db: Any, request_id: str) -> bool:
+        row = await sudo_gate._get_request(request_id)
+        if not row:
+            return True
+        return str(row["status"]) != "pending"
+
+    @register_source_probe("thread")
+    async def _probe_thread(db: Any, thread_id: str) -> bool:
+        # An officer question has no state machine to consult; only an
+        # explicit reply/resolve settles it.
+        return False
 
 
 # =============================================================================

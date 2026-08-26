@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -66,7 +67,9 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
     store = PostgresDB(connection_string=pg_dsn, min_connections=1, max_connections=8)
     await store.connect()
     async with store.acquire() as conn:
-        await conn.execute("TRUNCATE notifications, notification_deliveries CASCADE")
+        await conn.execute(
+            "TRUNCATE notifications, notification_deliveries, notification_steps CASCADE"
+        )
     try:
         yield store
     finally:
@@ -353,9 +356,11 @@ class TestRecordReplay:
         svc = self._service(db, feed)
 
         async def effect_callback():
+            # `high` (immediate email); the deferred review_queue class has
+            # its own replay test in TestSteps.
             return await svc.record(
                 recipient_id=USER,
-                category="review_queue",
+                category="budget_exceeded",
                 dedup_key="freeze_notification:cmd-9",
                 subject="s",
                 body="b",
@@ -412,3 +417,354 @@ class TestRecordReplay:
             (2, "sent"),
         ]
         assert feed.broadcast.call_count == 1
+
+
+def _step_rows(
+    nid, *, due_at, channels=("email",), conditions=("not_seen", "not_resolved")
+):
+    return [
+        {
+            "step_index": i,
+            "step_kind": channel,
+            "due_at": due_at,
+            "conditions": list(conditions),
+            "batch_key": "review_queue",
+        }
+        for i, channel in enumerate(channels)
+    ]
+
+
+async def _steps(db, nid):
+    return await db.list_notification_steps(nid)
+
+
+class TestSteps:
+    """Migration 0192: the deferred-step table under the sweeper's access
+    pattern — claim under contention, lease expiry, cancel-on-resolve in the
+    same statement, defer/retry releasing the claim."""
+
+    @pytest.mark.asyncio
+    async def test_steps_land_in_the_insert_transaction_and_replay_adds_none(self, db):
+        kwargs = _insert_kwargs()
+        nid = kwargs["notification_id"]
+        due = datetime.now(timezone.utc) + timedelta(minutes=5)
+        rows = _step_rows(nid, due_at=due, channels=("email", "ntfy"))
+        assert await db.insert_notification_once(**kwargs, steps=rows) is True
+        assert await db.insert_notification_once(**kwargs, steps=rows) is False
+        steps = await _steps(db, nid)
+        assert [(s["step_index"], s["step_kind"], s["state"]) for s in steps] == [
+            (0, "email", "pending"),
+            (1, "ntfy", "pending"),
+        ]
+        assert steps[0]["conditions"] == ["not_seen", "not_resolved"]
+        assert steps[0]["batch_key"] == "review_queue"
+        # The explicit insert is idempotent per step index too (quiet-hours
+        # deferral runs on every record() call).
+        assert await db.insert_notification_steps(nid, rows) == 0
+        extra = [{**rows[0], "step_index": 100}]
+        assert await db.insert_notification_steps(nid, extra) == 1
+        assert len(await _steps(db, nid)) == 3
+
+    @pytest.mark.asyncio
+    async def test_constraints_hold(self, db):
+        kwargs = _insert_kwargs()
+        nid = kwargs["notification_id"]
+        await db.insert_notification_once(**kwargs)
+        due = datetime.now(timezone.utc)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await db.insert_notification_steps(
+                nid, [{**_step_rows(nid, due_at=due)[0], "step_kind": "in_app"}]
+            )
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await db.insert_notification_steps(
+                str(uuid.uuid4()), _step_rows(nid, due_at=due)
+            )
+        with pytest.raises(ValueError):
+            await db.settle_notification_steps([1], state="pending")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_claims_split_disjointly_and_the_lease_expires(self, db):
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        for i in range(6):
+            kwargs = _insert_kwargs(dedup_key=f"k{i}", source_id=f"job-{i}")
+            await db.insert_notification_once(
+                **kwargs,
+                steps=_step_rows(
+                    kwargs["notification_id"], due_at=past if i < 5 else future
+                ),
+            )
+        results = await asyncio.gather(
+            *[
+                db.claim_due_notification_steps(worker_id=f"w{n}", limit=10)
+                for n in range(4)
+            ]
+        )
+        claimed = [s for batch in results for s in batch]
+        assert len(claimed) == 5  # the future one is not due
+        assert len({s["id"] for s in claimed}) == 5
+        assert {s["attempt"] for s in claimed} == {1}
+        assert all(s["claimed_by"].startswith("w") for s in claimed)
+        # Joined notification fields ride along for the engine.
+        assert claimed[0]["category"] == "review_queue"
+        assert claimed[0]["payload"] == {"job_id": "job-1"} or claimed[0]["payload"]
+        assert "seen_at" in claimed[0] and "source_id" in claimed[0]
+        # Still leased: nothing to claim.
+        assert await db.claim_due_notification_steps(worker_id="w9", limit=10) == []
+        # Lease expired (simulate): claimable again, attempt increments.
+        async with db.acquire() as conn:
+            # (claimed_by IS NULL) = (claimed_at IS NULL) is a CHECK — only
+            # the claimed rows may carry a stale lease.
+            await conn.execute(
+                "UPDATE notification_steps SET claimed_at = now() - interval '11 minutes'"
+                " WHERE claimed_by IS NOT NULL"
+            )
+        again = await db.claim_due_notification_steps(worker_id="w9", limit=10)
+        assert len(again) == 5 and {s["attempt"] for s in again} == {2}
+
+    @pytest.mark.asyncio
+    async def test_resolve_cancels_pending_steps_in_the_same_statement(self, db):
+        due = datetime.now(timezone.utc) + timedelta(minutes=5)
+        a = _insert_kwargs(dedup_key="a", source_id="job-a")
+        b = _insert_kwargs(dedup_key="b", source_id="job-b")
+        for kwargs in (a, b):
+            await db.insert_notification_once(
+                **kwargs,
+                steps=_step_rows(
+                    kwargs["notification_id"], due_at=due, channels=("email", "ntfy")
+                ),
+            )
+        rows = await db.resolve_notifications_by_source(
+            source_kind="job", source_id="job-a", resolved_by="officer:t1"
+        )
+        assert len(rows) == 1
+        a_steps = await _steps(db, a["notification_id"])
+        assert {s["state"] for s in a_steps} == {"cancelled"}
+        assert {s["detail"] for s in a_steps} == {"resolved:officer:t1"}
+        assert all(s["settled_at"] is not None for s in a_steps)
+        b_steps = await _steps(db, b["notification_id"])
+        assert {s["state"] for s in b_steps} == {"pending"}
+        # Cancelled steps are never claimed.
+        assert await db.claim_due_notification_steps(worker_id="w", limit=10) == []
+        # By id (act() with resolve=True) does the same.
+        await db.resolve_notification(b["notification_id"], resolved_by="user:u")
+        assert {s["state"] for s in await _steps(db, b["notification_id"])} == {
+            "cancelled"
+        }
+
+    @pytest.mark.asyncio
+    async def test_defer_uncounts_the_attempt_and_retry_keeps_it(self, db):
+        kwargs = _insert_kwargs()
+        nid = kwargs["notification_id"]
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.insert_notification_once(**kwargs, steps=_step_rows(nid, due_at=past))
+        [step] = await db.claim_due_notification_steps(worker_id="w", limit=10)
+        assert step["attempt"] == 1
+        later = datetime.now(timezone.utc) + timedelta(hours=8)
+        assert (
+            await db.defer_notification_steps(
+                [step["id"]], due_at=later, detail="quiet_hours"
+            )
+            == 1
+        )
+        [row] = await _steps(db, nid)
+        assert row["attempt"] == 0 and row["claimed_by"] is None
+        assert row["claimed_at"] is None and row["state"] == "pending"
+        assert row["detail"] == "quiet_hours"
+        assert abs((row["due_at"] - later).total_seconds()) < 1
+        # Not due any more.
+        assert await db.claim_due_notification_steps(worker_id="w", limit=10) == []
+        async with db.acquire() as conn:
+            await conn.execute("UPDATE notification_steps SET due_at = now()")
+        [step] = await db.claim_due_notification_steps(worker_id="w", limit=10)
+        assert step["attempt"] == 1
+        assert (
+            await db.retry_notification_steps(
+                [step["id"]], due_at=later, detail="retry:smtp"
+            )
+            == 1
+        )
+        [row] = await _steps(db, nid)
+        assert row["attempt"] == 1 and row["claimed_by"] is None
+
+    @pytest.mark.asyncio
+    async def test_settle_moves_only_pending_rows(self, db):
+        kwargs = _insert_kwargs()
+        nid = kwargs["notification_id"]
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.insert_notification_once(
+            **kwargs, steps=_step_rows(nid, due_at=past, channels=("email", "ntfy"))
+        )
+        steps = await _steps(db, nid)
+        ids = [s["id"] for s in steps]
+        assert (
+            await db.settle_notification_steps(ids[:1], state="done", detail="batch:x")
+            == 1
+        )
+        assert (
+            await db.settle_notification_steps(ids, state="skipped", detail="seen") == 1
+        )
+        rows = await _steps(db, nid)
+        assert [(r["state"], r["detail"]) for r in rows] == [
+            ("done", "batch:x"),
+            ("skipped", "seen"),
+        ]
+        assert all(r["settled_at"] is not None for r in rows)
+        assert await db.claim_due_notification_steps(worker_id="w", limit=10) == []
+
+
+class TestStepsEndToEnd:
+    """record() → steps → sweeper → delivery ledger, against the real tables."""
+
+    def _service(self, db):
+        svc = NotificationService()
+        svc.connect(db=db, email_service=MagicMock(), notification_feed=MagicMock())
+        svc._email_service.is_configured = True
+        svc._email_service.send_notification_email = AsyncMock(
+            return_value=(True, "<digest@srw>")
+        )
+        svc._get_user = AsyncMock(
+            return_value={"id": USER, "email": "legate@example.org"}
+        )
+        return svc
+
+    async def _record(self, svc, n):
+        return await svc.record(
+            recipient_id=USER,
+            category="review_queue",
+            dedup_key=f"freeze_notification:cmd-{n}",
+            subject=f"Job {n} completed — review required",
+            body="please review",
+            source_kind="job",
+            source_id=f"job-{n}",
+            action_params={"job_id": f"job-{n}"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_queue_record_plans_bucketed_steps_and_mails_nothing(self, db):
+        svc = self._service(db)
+        before = datetime.now(timezone.utc)
+        first = await self._record(svc, 1)
+        replay = await self._record(svc, 1)
+        assert first.inserted and not replay.inserted
+        svc._email_service.send_notification_email.assert_not_awaited()
+        assert "email" not in first.deliveries
+        steps = await _steps(db, first.notification_id)
+        assert [s["step_kind"] for s in steps] == [
+            "email",
+            "ntfy",
+            "slack_webhook",
+            "discord_webhook",
+        ]
+        # No officer anywhere in this schema → 5 minutes, bucketed to 15.
+        due = steps[0]["due_at"]
+        assert before + timedelta(minutes=5) <= due <= before + timedelta(minutes=20)
+        assert due.minute % 15 == 0 and due.second == 0
+        assert steps[0]["conditions"] == ["not_seen", "not_resolved"]
+        assert steps[0]["batch_key"] == "review_queue"
+        assert first.deliveries["scheduled"]["email"] == due.isoformat()
+        assert (
+            await _count(
+                db,
+                "SELECT count(*) FROM notification_deliveries WHERE channel <> 'in_app'",
+            )
+            == 0
+        )
+        # Not due: the sweeper has nothing.
+        from services.notification_steps import process_due_steps
+
+        stats = await process_due_steps(db=db, service=svc, worker_id="w")
+        assert stats == {"claimed": 0}
+
+    @pytest.mark.asyncio
+    async def test_due_steps_seen_skip_resolved_cancel_rest_digest(self, db):
+        from services.notification_steps import process_due_steps
+
+        svc = self._service(db)
+        results = [await self._record(svc, n) for n in range(1, 5)]
+        ids = [r.notification_id for r in results]
+        # Simulate time passing and the user's behaviour meanwhile.
+        async with db.acquire() as conn:
+            await conn.execute("UPDATE notification_steps SET due_at = now()")
+        await db.mark_notifications_seen(
+            recipient_kind="user", recipient_id=USER, ids=[ids[0]]
+        )
+        await db.resolve_notifications_by_source(
+            source_kind="job", source_id="job-2", resolved_by="officer:t1"
+        )
+        stats = await process_due_steps(db=db, service=svc, worker_id="w")
+        # 4 rows × 4 channels: only email is configured (3 webhooks are not);
+        # email: 1 seen → skipped, 1 resolved → cancelled (never claimed),
+        # 2 unseen+unresolved → one digest.
+        assert stats["batches"] == 1 and stats["sent"] == 2
+        assert svc._email_service.send_notification_email.await_count == 1
+        kwargs = svc._email_service.send_notification_email.call_args.kwargs
+        assert kwargs["subject"] == "2 review queue items waiting for you"
+        assert f"/inbox?n={ids[2]}" in kwargs["body_md"]
+        assert f"/inbox?n={ids[3]}" in kwargs["body_md"]
+
+        by_nid = {}
+        for nid in ids:
+            by_nid[nid] = {
+                s["step_kind"]: (s["state"], s["detail"]) for s in await _steps(db, nid)
+            }
+        assert by_nid[ids[0]]["email"] == ("skipped", "condition:not_seen")
+        assert by_nid[ids[1]]["email"] == ("cancelled", "resolved:officer:t1")
+        assert by_nid[ids[2]]["email"][0] == "done"
+        assert by_nid[ids[3]]["email"] == by_nid[ids[2]]["email"]
+        assert by_nid[ids[2]]["ntfy"] == ("skipped", "channel_unconfigured")
+
+        async with db.acquire() as conn:
+            deliveries = await conn.fetch(
+                "SELECT notification_id, state, step_index, batch_id, provider_msg_id "
+                "FROM notification_deliveries WHERE channel='email' ORDER BY notification_id"
+            )
+        assert {str(d["notification_id"]) for d in deliveries} == {ids[2], ids[3]}
+        assert {d["state"] for d in deliveries} == {"sent"}
+        assert {d["step_index"] for d in deliveries} == {0}
+        assert len({d["batch_id"] for d in deliveries}) == 1
+        assert {d["provider_msg_id"] for d in deliveries} == {"<digest@srw>"}
+        assert by_nid[ids[2]]["email"][1] == f"batch:{deliveries[0]['batch_id']}"
+
+        # A second pass finds nothing: everything is settled.
+        assert await process_due_steps(db=db, service=svc, worker_id="w") == {
+            "claimed": 0
+        }
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_retries_then_the_claim_ledger_stops_a_double(
+        self, db
+    ):
+        from services.notification_steps import process_due_steps
+
+        svc = self._service(db)
+        svc._email_service.send_notification_email = AsyncMock(
+            side_effect=[OSError("smtp down"), (True, "<ok@srw>")]
+        )
+        result = await self._record(svc, 7)
+        async with db.acquire() as conn:
+            await conn.execute("UPDATE notification_steps SET due_at = now()")
+        stats = await process_due_steps(db=db, service=svc, worker_id="w")
+        assert stats["retried"] == 1
+        [email] = [
+            s
+            for s in await _steps(db, result.notification_id)
+            if s["step_kind"] == "email"
+        ]
+        assert email["state"] == "pending" and email["attempt"] == 1
+        assert email["detail"].startswith("retry:smtp down")
+        assert email["due_at"] > datetime.now(timezone.utc) + timedelta(minutes=4)
+        # The failed claim freed the slot; the retry sends.
+        async with db.acquire() as conn:
+            await conn.execute("UPDATE notification_steps SET due_at = now()")
+        stats = await process_due_steps(db=db, service=svc, worker_id="w")
+        assert stats["sent"] == 1
+        async with db.acquire() as conn:
+            states = await conn.fetch(
+                "SELECT attempt, state FROM notification_deliveries "
+                "WHERE channel='email' ORDER BY attempt"
+            )
+        assert [(r["attempt"], r["state"]) for r in states] == [
+            (1, "failed"),
+            (2, "sent"),
+        ]

@@ -29172,6 +29172,7 @@ class PostgresDB:
         dedup_key: str,
         actions: List[Dict[str, Any]],
         payload: Dict[str, Any],
+        steps: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Insert one feed row plus its ``in_app`` delivery, validating any replay.
 
@@ -29181,6 +29182,11 @@ class PostgresDB:
         and returns ``False`` so the SSE frame is broadcast exactly once.
         Subject/body drift on replay is tolerated (identity is the dedup key);
         a different category or source is a caller bug and raises.
+
+        ``steps`` — the row's deferred channel steps (``step_index``,
+        ``step_kind``, ``due_at``, ``conditions``, ``batch_key``) — are written
+        in the same transaction, so a crash can never leave a row whose
+        escalation was silently lost.
         """
         nid = UUID(str(notification_id))
         rid = UUID(str(recipient_id))
@@ -29225,6 +29231,8 @@ class PostgresDB:
                         """,
                         nid,
                     )
+                    if steps:
+                        await self._insert_notification_steps(conn, nid, steps)
                     return True
             # Separate statement on purpose: if ON CONFLICT waited on a
             # concurrent inserter, READ COMMITTED takes a fresh snapshot here
@@ -29260,23 +29268,29 @@ class PostgresDB:
         notification_id: str,
         channel: str,
         recipient_address: Optional[str] = None,
+        step_index: Optional[int] = None,
+        batch_id: Optional[str] = None,
     ) -> Optional[str]:
         """Insert-as-claim BEFORE sending. ``None`` means a live pending/sent
         row already holds the (notification, channel) slot — skip the send.
-        A ``failed`` row does not hold the slot, so the next attempt claims."""
+        A ``failed`` row does not hold the slot, so the next attempt claims.
+        ``step_index``/``batch_id`` record which deferred step sent it and
+        which batched message it rode in."""
         nid = UUID(str(notification_id))
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 -- feature:unified-notifications
                 INSERT INTO notification_deliveries
-                    (notification_id, channel, state, recipient_address, attempt)
+                    (notification_id, channel, state, recipient_address, attempt,
+                     step_index, batch_id)
                 VALUES (
                     $1::uuid, $2::text, 'pending', $3::text,
                     COALESCE((
                         SELECT max(attempt) FROM notification_deliveries
                         WHERE notification_id = $1::uuid AND channel = $2::text
-                    ), 0) + 1
+                    ), 0) + 1,
+                    $4::int, $5::uuid
                 )
                 ON CONFLICT DO NOTHING
                 RETURNING id
@@ -29284,6 +29298,8 @@ class PostgresDB:
                 nid,
                 channel,
                 recipient_address,
+                step_index,
+                UUID(str(batch_id)) if batch_id else None,
             )
         return str(row["id"]) if row else None
 
@@ -29475,15 +29491,26 @@ class PostgresDB:
     async def resolve_notification(
         self, notification_id: str, *, resolved_by: str
     ) -> Optional[Dict[str, Any]]:
+        """Stamp one row resolved and cancel its pending steps in the same
+        statement — a resolved item must never mail (D6)."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 -- feature:unified-notifications
-                UPDATE notifications
-                   SET resolved_at = COALESCE(resolved_at, now()),
-                       resolved_by = COALESCE(resolved_by, $2::text)
-                 WHERE id = $1::uuid
-                RETURNING *
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = COALESCE(resolved_at, now()),
+                           resolved_by = COALESCE(resolved_by, $2::text)
+                     WHERE id = $1::uuid
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $2::text
+                     WHERE s.notification_id = $1::uuid AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
                 """,
                 UUID(str(notification_id)),
                 resolved_by,
@@ -29493,17 +29520,28 @@ class PostgresDB:
     async def resolve_notifications_by_source(
         self, *, source_kind: str, source_id: str, resolved_by: str
     ) -> List[Dict[str, Any]]:
-        """Settle every open row about one source, whoever the recipient is.
-        Returns the rows this call flipped (empty on a repeat)."""
+        """Settle every open row about one source, whoever the recipient is,
+        and cancel their pending steps atomically. Returns the rows this call
+        flipped (empty on a repeat)."""
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
                 -- feature:unified-notifications
-                UPDATE notifications
-                   SET resolved_at = now(), resolved_by = $3::text
-                 WHERE source_kind = $1::text AND source_id = $2::text
-                   AND resolved_at IS NULL
-                RETURNING *
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = now(), resolved_by = $3::text
+                     WHERE source_kind = $1::text AND source_id = $2::text
+                       AND resolved_at IS NULL
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $3::text
+                      FROM resolved r
+                     WHERE s.notification_id = r.id AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
                 """,
                 source_kind,
                 str(source_id),
@@ -29528,6 +29566,194 @@ class PostgresDB:
                 UUID(str(recipient_id)),
             )
         return self._notification_row(row) if row else None
+
+    # --- deferred channel steps (slice 2: escalate-on-timeout, D5/D6) ---------
+
+    @staticmethod
+    def _step_row(row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        for key, empty in (("conditions", []), ("payload", {})):
+            if key not in data:
+                continue
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def _insert_notification_steps(
+        self, conn: Any, nid: UUID, steps: List[Dict[str, Any]]
+    ) -> int:
+        inserted = 0
+        for step in steps:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                INSERT INTO notification_steps
+                    (notification_id, step_index, step_kind, due_at,
+                     conditions, batch_key)
+                VALUES ($1::uuid, $2::int, $3::text, $4::timestamptz,
+                        $5::jsonb, $6::text)
+                ON CONFLICT (notification_id, step_index) DO NOTHING
+                """,
+                nid,
+                int(step["step_index"]),
+                str(step["step_kind"]),
+                step["due_at"],
+                json.dumps([str(c) for c in (step.get("conditions") or [])]),
+                step.get("batch_key"),
+            )
+            if result == "INSERT 0 1":
+                inserted += 1
+        return inserted
+
+    async def insert_notification_steps(
+        self, notification_id: str, steps: List[Dict[str, Any]]
+    ) -> int:
+        """Idempotent on ``(notification, step_index)`` — quiet-hours deferral
+        of an immediate step runs on every ``record()`` call, replay included,
+        and must not stack a second promise. Returns the rows this call added."""
+        if not steps:
+            return 0
+        nid = UUID(str(notification_id))
+        async with self.acquire() as conn:
+            return await self._insert_notification_steps(conn, nid, steps)
+
+    async def list_notification_steps(
+        self, notification_id: str
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT * FROM notification_steps
+                 WHERE notification_id = $1::uuid
+                 ORDER BY step_index
+                """,
+                UUID(str(notification_id)),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def claim_due_notification_steps(
+        self, *, worker_id: str, limit: int = 200, lease_minutes: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Claim the due pending steps for one sweeper pass.
+
+        ``FOR UPDATE SKIP LOCKED`` splits concurrent sweepers (the transient
+        dual-leader window) disjointly; the ``claimed_at`` lease lets a step
+        whose claimant died be picked up again after ``lease_minutes``.
+        Each row is the step joined with the notification it belongs to —
+        everything the engine needs to evaluate conditions and render.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                WITH due AS (
+                    SELECT id FROM notification_steps
+                     WHERE state = 'pending' AND due_at <= now()
+                       AND (claimed_at IS NULL
+                            OR claimed_at < now() - ($3::int * interval '1 minute'))
+                     ORDER BY due_at, id
+                     LIMIT $2::int
+                     FOR UPDATE SKIP LOCKED
+                ), claimed AS (
+                    UPDATE notification_steps s
+                       SET claimed_by = $1::text,
+                           claimed_at = now(),
+                           attempt = s.attempt + 1
+                      FROM due
+                     WHERE s.id = due.id
+                    RETURNING s.*
+                )
+                SELECT c.*,
+                       n.recipient_kind, n.recipient_id, n.category, n.severity,
+                       n.subject, n.body, n.source_kind, n.source_id, n.payload,
+                       n.seen_at, n.read_at, n.resolved_at, n.archived_at
+                  FROM claimed c
+                  JOIN notifications n ON n.id = c.notification_id
+                 ORDER BY c.due_at, c.id
+                """,
+                str(worker_id),
+                int(limit),
+                int(lease_minutes),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def defer_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """Push claimed steps to a later ``due_at`` and release the claim. A
+        deferral (quiet hours) is not an attempt, so the claim's increment is
+        taken back."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       attempt = GREATEST(attempt - 1, 0),
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def retry_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """A failed send: keep the attempt count, release the claim, try again
+        at ``due_at``."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def settle_notification_steps(
+        self, ids: List[int], *, state: str, detail: Optional[str] = None
+    ) -> int:
+        """Terminal transition for claimed steps. Only pending rows move, so a
+        step cancelled by a concurrent resolve stays cancelled."""
+        if state not in ("done", "skipped", "cancelled", "failed"):
+            raise ValueError(f"cannot settle a step to {state!r}")
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET state = $2::text, settled_at = now(), detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                state,
+                (detail or None) and str(detail)[:2000],
+            )
+        return int(result.split()[-1]) if result else 0
 
     # =========================================================================
     # SYSTEM SETTINGS (Phase 4)

@@ -8,10 +8,14 @@ What these pin (unified notification system, D10):
   * every channel send is claim-before-send, so a replayed effect re-attempts
     only what never got a ``sent`` claim;
   * a channel failure settles ``failed`` and never loses the notification;
-  * quiet hours suppress (and, while the legacy digest still exists, queue)
-    only from the inserting call.
+  * quiet hours defer an immediate step to the window's end instead of
+    dropping it (slice 2), and the class's deferred steps are planned with
+    the row (D5: the delay is the step's ``due_at``), with the wait taken
+    from the project officer's window when one is live, else the
+    recipient's own escalation minutes, else 5.
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -41,16 +45,23 @@ def _service(
     svc._notification_feed = None
     svc._cockpit_url = "https://cockpit"
     svc._transports = {}
-    svc._persist_notification = AsyncMock(side_effect=lambda row: (row["id"], inserted))
+    svc._persist_notification = AsyncMock(
+        side_effect=lambda row, steps=None: (row["id"], inserted)
+    )
     svc._claim_delivery = AsyncMock(return_value=claim)
     svc._settle_delivery = AsyncMock()
     svc._record_suppressed = AsyncMock()
+    svc._defer_steps = AsyncMock(return_value=1)
     svc._get_user = AsyncMock(
         return_value={"id": USER, "email": "legate@example.org", "display_name": "L"}
     )
     svc._get_user_channels = AsyncMock(return_value=channels or {"email": True})
     svc._get_user_settings = AsyncMock(return_value={})
     svc._is_in_quiet_hours = MagicMock(return_value=quiet)
+    svc.next_quiet_hours_end = MagicMock(
+        return_value=datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc)
+    )
+    svc._resolve_delay_minutes = AsyncMock(return_value=5)
     svc._queue_notification = AsyncMock()
     svc._broadcast_notification = MagicMock()
     svc._broadcast_update = MagicMock()
@@ -65,9 +76,11 @@ def _service(
 
 
 async def _record(svc, **overrides):
+    # Default to a `high` category (immediate email); the `normal`
+    # review_queue class is the deferred case and is exercised explicitly.
     kwargs = dict(
         recipient_id=USER,
-        category="review_queue",
+        category="budget_exceeded",
         dedup_key="freeze_notification:cmd-1",
         subject="Job abc completed — review required",
         body="**Job** …",
@@ -82,8 +95,10 @@ async def _record(svc, **overrides):
 class TestRecord:
     @pytest.mark.asyncio
     async def test_inserted_row_broadcasts_once_and_mails_via_claim(self):
+        # `high` mails immediately; `review_queue` (normal) is the deferred
+        # case and has its own tests below.
         svc = _service()
-        result = await _record(svc)
+        result = await _record(svc, category="budget_exceeded")
 
         assert result.inserted is True
         assert result.notification_id == str(
@@ -108,7 +123,7 @@ class TestRecord:
     @pytest.mark.asyncio
     async def test_declared_actions_carry_the_call_params(self):
         svc = _service()
-        await _record(svc, action_params={"job_id": "job-1"})
+        await _record(svc, category="review_queue", action_params={"job_id": "job-1"})
         row = svc._persist_notification.call_args.args[0]
         assert [a["type"] for a in row["actions"]] == ["approve", "resume", "open"]
         assert all(a["params"] == {"job_id": "job-1"} for a in row["actions"])
@@ -156,27 +171,51 @@ class TestRecord:
         assert result.deliveries["email"] is False
 
     @pytest.mark.asyncio
-    async def test_quiet_hours_suppress_and_queue_only_when_inserted(self):
+    async def test_quiet_hours_defer_an_immediate_step_to_the_window_end(self):
+        # `high` mails immediately — unless the recipient is in quiet hours,
+        # in which case the step is parked (not dropped, not queued into the
+        # legacy digest) until the window ends, still gated on not_resolved.
         svc = _service(quiet=True)
-        result = await _record(svc)
-        assert result.deliveries["queued"] is True
+        result = await _record(svc, category="budget_exceeded")
+        assert result.deliveries["deferred_until"] == "2026-08-27T06:00:00+00:00"
         svc._email_service.send_notification_email.assert_not_awaited()
-        svc._record_suppressed.assert_awaited_once()
-        assert svc._record_suppressed.call_args.args[1:] == ("email", "quiet_hours")
-        svc._queue_notification.assert_awaited_once()
+        svc._claim_delivery.assert_not_awaited()
+        svc._queue_notification.assert_not_awaited()
+        svc._record_suppressed.assert_not_awaited()
+        svc._defer_steps.assert_awaited_once()
+        nid, steps = svc._defer_steps.call_args.args
+        assert nid == result.notification_id
+        assert [s["step_kind"] for s in steps] == ["email"]
+        assert steps[0]["step_index"] >= cat.DEFERRED_STEP_INDEX_BASE
+        assert steps[0]["conditions"] == ["not_resolved"]
+        assert steps[0]["due_at"] == datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc)
 
+        # A replay defers again; the insert is idempotent per step index.
         replay = _service(quiet=True, inserted=False)
-        await _record(replay)
-        replay._record_suppressed.assert_not_awaited()
-        replay._queue_notification.assert_not_awaited()
+        await _record(replay, category="budget_exceeded")
+        replay._defer_steps.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_critical_crosses_quiet_hours(self):
         svc = _service(quiet=True)
         result = await _record(svc, category="incident")
-        assert result.deliveries.get("queued") is False
+        assert "deferred_until" not in result.deliveries
         svc._email_service.send_notification_email.assert_awaited_once()
+        svc._defer_steps.assert_not_awaited()
         svc._queue_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_category_channel_cell_overrides_the_channel_default(self):
+        svc = _service(channels={"email": True})
+        svc._get_user_settings = AsyncMock(
+            return_value={
+                "communication": {"categories": {"budget_exceeded": {"email": False}}}
+            }
+        )
+        result = await _record(svc, category="budget_exceeded")
+        svc._email_service.send_notification_email.assert_not_awaited()
+        assert svc._record_suppressed.call_args.args[1:] == ("email", "preference")
+        assert "email" not in result.deliveries
 
     @pytest.mark.asyncio
     async def test_channel_preference_off_is_recorded_as_suppressed(self):
@@ -228,6 +267,167 @@ class TestRecord:
         svc = _service()
         with pytest.raises(ValueError, match="dedup_key"):
             await _record(svc, dedup_key="")
+
+
+class TestDeferredSteps:
+    """D5/D6: a `normal` row mails later, not now — the class's deferred
+    steps are planned with the row and written in its transaction."""
+
+    @pytest.mark.asyncio
+    async def test_normal_plans_steps_instead_of_mailing(self):
+        svc = _service()
+        before = datetime.now(timezone.utc)
+        result = await _record(svc, category="review_queue")
+        svc._email_service.send_notification_email.assert_not_awaited()
+        svc._claim_delivery.assert_not_awaited()
+        steps = svc._persist_notification.call_args.kwargs["steps"]
+        assert [s["step_kind"] for s in steps] == [
+            "email",
+            "ntfy",
+            "slack_webhook",
+            "discord_webhook",
+        ]
+        email = steps[0]
+        assert email["conditions"] == ["not_seen", "not_resolved"]
+        assert email["batch_key"] == "review_queue"
+        assert email["step_index"] == 0
+        # 5 minutes (the stubbed resolution), rounded up to the 15-min bucket:
+        # never earlier than the delay, at most one window later.
+        assert before + timedelta(minutes=5) <= email["due_at"]
+        assert email["due_at"] <= before + timedelta(minutes=20, seconds=1)
+        assert email["due_at"].minute % 15 == 0
+        assert result.deliveries["scheduled"]["email"] == email["due_at"].isoformat()
+        assert result.deliveries["in_app"] is True
+
+    @pytest.mark.asyncio
+    async def test_replay_hands_the_same_plan_to_the_idempotent_insert(self):
+        svc = _service(inserted=False)
+        await _record(svc, category="review_queue")
+        assert svc._persist_notification.call_args.kwargs["steps"]
+        svc._broadcast_notification.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_officer_recipient_gets_no_steps(self):
+        svc = _service()
+        await _record(svc, category="review_queue", recipient_kind="officer")
+        assert svc._persist_notification.call_args.kwargs["steps"] is None
+        svc._resolve_delay_minutes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_immediate_classes_plan_nothing(self):
+        svc = _service()
+        await _record(svc, category="incident")
+        assert svc._persist_notification.call_args.kwargs["steps"] is None
+        assert "scheduled" not in (await _record(svc, category="incident")).deliveries
+
+
+class TestDelayResolution:
+    """The wait is the officer's window when a live officer owns the review;
+    otherwise the recipient's own setting; otherwise 5 minutes."""
+
+    def _svc(self, *, job=None, post=None, officer=None):
+        svc = _service()
+        svc._resolve_delay_minutes = NotificationService._resolve_delay_minutes.__get__(
+            svc
+        )
+        svc._officer_response_minutes = (
+            NotificationService._officer_response_minutes.__get__(svc)
+        )
+        svc._db.get_job = AsyncMock(return_value=job)
+        svc._db.get_project_officer = AsyncMock(return_value=post)
+        svc._db.get_officer_thread_for_project = AsyncMock(return_value=officer)
+        return svc
+
+    def _row(self, **overrides):
+        row = {"source_kind": "job", "source_id": "job-1"}
+        row.update(overrides)
+        return row
+
+    @pytest.mark.asyncio
+    async def test_live_officer_window_wins(self):
+        svc = self._svc(
+            job={"id": "job-1", "project_id": "p-1"},
+            post={"communication_policy": {"officer_response_minutes": 30}},
+            officer={"id": "t-1", "metadata": {"officer": {}}},
+        )
+        assert await svc._resolve_delay_minutes(self._row(), {}) == 30
+
+    @pytest.mark.asyncio
+    async def test_policy_bounds_are_clamped_and_json_strings_parse(self):
+        svc = self._svc(
+            job={"id": "job-1", "project_id": "p-1"},
+            post={"communication_policy": '{"officer_response_minutes": 999}'},
+            officer={"id": "t-1"},
+        )
+        assert await svc._resolve_delay_minutes(self._row(), {}) == 120
+
+    @pytest.mark.asyncio
+    async def test_held_officer_falls_back_to_the_recipient_setting(self):
+        svc = self._svc(
+            job={"id": "job-1", "project_id": "p-1"},
+            post={"communication_policy": {"officer_response_minutes": 30}},
+            officer={
+                "id": "t-1",
+                # the hold stamp lives at metadata.config_override.officer.hold
+                "metadata": {
+                    "config_override": {"officer": {"hold": {"kind": "maintenance"}}}
+                },
+            },
+        )
+        settings = {"communication": {"escalation_minutes": 12}}
+        assert await svc._resolve_delay_minutes(self._row(), settings) == 12
+
+    @pytest.mark.asyncio
+    async def test_no_project_no_post_or_vacant_means_default_five(self):
+        assert (
+            await self._svc(job={"id": "job-1"})._resolve_delay_minutes(self._row(), {})
+            == cat.NO_OFFICER_DELAY_MINUTES
+        )
+        assert (
+            await self._svc(
+                job={"id": "job-1", "project_id": "p-1"}
+            )._resolve_delay_minutes(self._row(), {})
+            == cat.NO_OFFICER_DELAY_MINUTES
+        )
+        vacant = self._svc(
+            job={"id": "job-1", "project_id": "p-1"},
+            post={"communication_policy": {}},
+            officer=None,
+        )
+        assert (
+            await vacant._resolve_delay_minutes(self._row(), {})
+            == cat.NO_OFFICER_DELAY_MINUTES
+        )
+
+    @pytest.mark.asyncio
+    async def test_bad_recipient_setting_is_ignored(self):
+        svc = self._svc(job=None)
+        for bad in (0, -1, True, "7", 100000):
+            settings = {"communication": {"escalation_minutes": bad}}
+            assert (
+                await svc._resolve_delay_minutes(self._row(), settings)
+                == cat.NO_OFFICER_DELAY_MINUTES
+            )
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_degrades_to_the_default(self):
+        svc = self._svc()
+        svc._db.get_job = AsyncMock(side_effect=RuntimeError("db down"))
+        assert (
+            await svc._resolve_delay_minutes(self._row(), {})
+            == cat.NO_OFFICER_DELAY_MINUTES
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_job_sources_never_consult_the_officer(self):
+        svc = self._svc()
+        assert (
+            await svc._resolve_delay_minutes(
+                self._row(source_kind="thread", source_id="t-1"), {}
+            )
+            == cat.NO_OFFICER_DELAY_MINUTES
+        )
+        svc._db.get_job.assert_not_awaited()
 
 
 def _row(**overrides):

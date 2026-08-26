@@ -6,9 +6,13 @@ Two generations live side by side while the cutover runs
 * ``record()`` — the new front door (D1: callers *record* what happened and
   who has a stake; they never choose a channel). It writes one durable feed
   row per recipient (D2/D3), broadcasts the ``notification`` SSE frame once,
-  and performs the zero-delay channel deliveries of the row's severity class
+  performs the zero-delay channel deliveries of the row's severity class
   with a claim-before-send ledger so a replayed completion effect or a
-  dual-leader retry can never send twice (D10).
+  dual-leader retry can never send twice (D10), and writes the class's
+  *deferred* steps to ``notification_steps`` in the same transaction as the
+  row (D5/D6: "wait the officer's window, then mail unless somebody looked
+  or somebody settled it"). ``services/notification_steps.py`` runs those
+  when due; :meth:`send_step_group` is the send half it calls back into.
 
 * ``dispatch()`` and the ``notify_*`` helpers — the legacy fan-out (email +
   webhooks + a transient ``new_message`` frame, no durable row). Still used by
@@ -21,24 +25,35 @@ operations are no-ops when unconfigured.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from services.notification_catalog import (
+    DEFERRED_STEP_INDEX_BASE,
+    DELAY_OFFICER_RESPONSE,
+    ESCALATION_MINUTES_BOUNDS,
+    NO_OFFICER_DELAY_MINUTES,
     RECIPIENT_KINDS,
     WEBHOOK_CHANNELS,
     ActionContext,
     action_handler,
+    batch_key_for,
+    bucket_due_at,
     bypasses_quiet_hours,
     category_spec,
+    channel_enabled,
     normalize_severity,
     notification_id as mint_notification_id,
+    quiet_hours_window,
     serialize_actions,
     serialize_notification,
+    serialize_step,
+    source_probe,
     steps_for,
 )
 from services.webhook_transports import (
@@ -155,6 +170,11 @@ class NotificationService:
         finds the existing row, broadcasts nothing, and re-attempts only the
         channel deliveries that never got a ``sent`` claim. Callers never see
         or influence delivery beyond the returned outcome dict (D1).
+
+        The severity class decides what happens beyond the feed row: its
+        immediate steps run here; its deferred steps (``normal``: wait the
+        officer's response window, then mail only if ``not_seen`` and
+        ``not_resolved``) are written with the row and run by the sweeper.
         """
         if not self._available:
             raise RuntimeError("NotificationService not initialized")
@@ -196,19 +216,35 @@ class NotificationService:
             "archived_at": None,
         }
 
-        stored_id, inserted = await self._persist_notification(row)
+        steps = steps_for(spec, resolved_severity)
+        planned: list[dict[str, Any]] = []
+        if recipient_kind == "user" and any(not s.immediate for s in steps):
+            planned = await self._plan_deferred_steps(row, steps)
+
+        stored_id, inserted = await self._persist_notification(
+            row, steps=planned or None
+        )
         row["id"] = stored_id
         if inserted:
             self._broadcast_notification(row)
         deliveries = await self._deliver_immediate(row, spec, inserted=inserted)
+        if planned:
+            deliveries["scheduled"] = {
+                p["step_kind"]: p["due_at"].isoformat() for p in planned
+            }
         logger.info(
-            "notification %s %s for %s:%s (%s/%s)",
+            "notification %s %s for %s:%s (%s/%s)%s",
             stored_id[:8],
             "recorded" if inserted else "replayed",
             recipient_kind,
             str(recipient_id)[:8],
             category,
             resolved_severity,
+            (
+                f" — {len(planned)} step(s) due {planned[0]['due_at'].isoformat()}"
+                if planned
+                else ""
+            ),
         )
         return RecordResult(stored_id, inserted, deliveries)
 
@@ -392,7 +428,9 @@ class NotificationService:
 
     # --- stubbable seams (tests build NotificationService.__new__ and replace these) ---
 
-    async def _persist_notification(self, row: dict[str, Any]) -> tuple[str, bool]:
+    async def _persist_notification(
+        self, row: dict[str, Any], *, steps: list[dict[str, Any]] | None = None
+    ) -> tuple[str, bool]:
         inserted = await self._db.insert_notification_once(
             notification_id=row["id"],
             recipient_kind=row["recipient_kind"],
@@ -406,14 +444,40 @@ class NotificationService:
             dedup_key=row["dedup_key"],
             actions=row["actions"],
             payload=row["payload"],
+            steps=steps or None,
         )
         return row["id"], bool(inserted)
 
+    async def _defer_steps(
+        self, notification_id: str, steps: list[dict[str, Any]]
+    ) -> int:
+        """Quiet hours: park the immediate steps until the window ends. The
+        insert is idempotent per step index, so a replay cannot stack a
+        second promise. Failure here is logged, not raised — the feed row
+        already exists and the in-app signal is intact."""
+        try:
+            return int(await self._db.insert_notification_steps(notification_id, steps))
+        except Exception as e:
+            logger.warning(
+                "could not defer notification %s steps: %s", notification_id[:8], e
+            )
+            return 0
+
     async def _claim_delivery(
-        self, notification_id: str, channel: str, *, address: str | None
+        self,
+        notification_id: str,
+        channel: str,
+        *,
+        address: str | None,
+        step_index: int | None = None,
+        batch_id: str | None = None,
     ) -> str | None:
         return await self._db.claim_notification_delivery(
-            notification_id=notification_id, channel=channel, recipient_address=address
+            notification_id=notification_id,
+            channel=channel,
+            recipient_address=address,
+            step_index=step_index,
+            batch_id=batch_id,
         )
 
     async def _settle_delivery(
@@ -495,23 +559,30 @@ class NotificationService:
         Always runs — including on replay — because a crash between a send
         and the completion journal's mark replays the callback; the claim
         ledger decides per channel whether anything is actually sent. Rows
-        that were deliberately not attempted (preference off, quiet hours,
-        no address) are recorded as ``suppressed`` only by the inserting call
-        so a replay does not pile up duplicates.
+        that were deliberately not attempted (preference off, no address)
+        are recorded as ``suppressed`` only by the inserting call so a replay
+        does not pile up duplicates. Quiet hours never drop a step: they
+        defer it to the window's end as a ``not_resolved``-gated step row.
         """
         results: dict[str, Any] = {"in_app": True}
-        steps = [step for step in steps_for(spec, row["severity"]) if step.immediate]
-        if not steps or row["recipient_kind"] != "user":
+        steps = steps_for(spec, row["severity"])
+        immediate = [step for step in steps if step.immediate]
+        if not immediate or row["recipient_kind"] != "user":
             return results
 
         nid = row["id"]
         recipient_id = row["recipient_id"]
-        deliverable = [s for s in steps if self._channel_deliverable(s.channel)]
+        deliverable = [s for s in immediate if self._channel_deliverable(s.channel)]
         if not deliverable:
             return results
         channels = await self._get_user_channels(recipient_id)
         settings = await self._get_user_settings(recipient_id)
-        wanted = [s for s in deliverable if channels.get(s.channel, True)]
+        categories = ((settings or {}).get("communication") or {}).get("categories")
+        wanted = [
+            s
+            for s in deliverable
+            if channel_enabled(channels, categories, row["category"], s.channel)
+        ]
         if inserted:
             for step in deliverable:
                 if step not in wanted:
@@ -522,97 +593,353 @@ class NotificationService:
         if not bypasses_quiet_hours(spec, row["severity"]) and self._is_in_quiet_hours(
             settings
         ):
-            results["queued"] = True
-            if inserted:
-                for step in wanted:
-                    await self._record_suppressed(nid, step.channel, "quiet_hours")
-                # Legacy morning digest keeps working until slice 2 replaces
-                # it with delayed steps. Only the inserting call queues.
-                payload = row.get("payload") or {}
-                await self._queue_notification(
-                    user_id=recipient_id,
-                    job_id=payload.get("job_id") or row.get("source_id") or nid,
-                    thread_id=payload.get("thread_id"),
-                    subject=row["subject"],
-                    message=row["body"],
-                    channels=channels,
-                )
+            resume_at = self.next_quiet_hours_end(settings) or (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            )
+            await self._defer_steps(
+                nid,
+                [
+                    {
+                        "step_index": DEFERRED_STEP_INDEX_BASE + steps.index(step),
+                        "step_kind": step.channel,
+                        "due_at": resume_at,
+                        "conditions": ["not_resolved"],
+                        "batch_key": None,
+                    }
+                    for step in wanted
+                ],
+            )
+            results["deferred_until"] = resume_at.isoformat()
             return results
-        results["queued"] = False
 
         user = await self._get_user(recipient_id)
-        cockpit_path = f"/inbox?n={nid}"
-        payload = row.get("payload") or {}
         for step in wanted:
-            channel = step.channel
-            if channel == "email":
-                address = (user or {}).get("email")
-                if not address:
-                    if inserted:
-                        await self._record_suppressed(nid, "email", "no_email")
-                    continue
-                claim = await self._claim_delivery(nid, "email", address=address)
-                if claim is None:
-                    results["email"] = "already_delivered"
-                    continue
-                ok, msg_id, error = False, None, None
-                try:
-                    ok, msg_id = await self._email_service.send_notification_email(
-                        to=address,
-                        to_name=(user or {}).get("display_name") or "User",
-                        subject=row["subject"],
-                        body_md=row["body"],
-                        cockpit_path=cockpit_path,
-                    )
-                    if not ok:
-                        error = "send returned False"
-                except Exception as e:
-                    error = str(e)
-                    logger.warning("notification email failed (%s): %s", nid[:8], e)
-                await self._settle_delivery(
-                    claim,
-                    state="sent" if ok else "failed",
-                    provider_msg_id=msg_id,
-                    error=error,
+            results.update(
+                await self._send_one(
+                    row,
+                    step.channel,
+                    user=user,
+                    subject=row["subject"],
+                    body=row["body"],
+                    cockpit_path=f"/inbox?n={nid}",
+                    inserted=inserted,
                 )
-                results["email"] = bool(ok)
-                if msg_id:
-                    results["email_message_id"] = msg_id
-            else:
-                transport = self._transports[channel]
-                claim = await self._claim_delivery(nid, channel, address=None)
-                if claim is None:
-                    results[channel] = "already_delivered"
-                    continue
-                ok, error = False, None
-                try:
-                    ok = bool(
-                        await transport.send(
-                            NotificationPayload(
-                                subject=row["subject"],
-                                body_text=row["body"],
-                                job_id=str(
-                                    payload.get("job_id") or row.get("source_id") or ""
-                                ),
-                                job_description=str(
-                                    payload.get("job_description") or ""
-                                ),
-                                config_name=str(payload.get("config_name") or ""),
-                                thread_id=payload.get("thread_id"),
-                                cockpit_url=f"{self._cockpit_url}{cockpit_path}",
-                            )
-                        )
-                    )
-                    if not ok:
-                        error = "send returned False"
-                except Exception as e:
-                    error = str(e)
-                    logger.warning("notification %s transport failed: %s", channel, e)
-                await self._settle_delivery(
-                    claim, state="sent" if ok else "failed", error=error
-                )
-                results[channel] = ok
+            )
         return results
+
+    async def _send_one(
+        self,
+        row: dict[str, Any],
+        channel: str,
+        *,
+        user: dict[str, Any] | None,
+        subject: str,
+        body: str,
+        cockpit_path: str,
+        inserted: bool,
+    ) -> dict[str, Any]:
+        """Claim, send, settle — one channel of one row."""
+        nid = row["id"]
+        address = None
+        if channel == "email":
+            address = (user or {}).get("email")
+            if not address:
+                if inserted:
+                    await self._record_suppressed(nid, "email", "no_email")
+                return {}
+        claim = await self._claim_delivery(nid, channel, address=address)
+        if claim is None:
+            return {channel: "already_delivered"}
+        ok, msg_id, error = await self._send_channel(
+            channel,
+            user=user,
+            subject=subject,
+            body=body,
+            cockpit_path=cockpit_path,
+            payload=row.get("payload") or {},
+            source_id=row.get("source_id"),
+        )
+        await self._settle_delivery(
+            claim,
+            state="sent" if ok else "failed",
+            provider_msg_id=msg_id,
+            error=error,
+        )
+        out: dict[str, Any] = {channel: bool(ok)}
+        if msg_id:
+            out["email_message_id"] = msg_id
+        return out
+
+    async def _send_channel(
+        self,
+        channel: str,
+        *,
+        user: dict[str, Any] | None,
+        subject: str,
+        body: str,
+        cockpit_path: str,
+        payload: dict[str, Any],
+        source_id: str | None,
+    ) -> tuple[bool, str | None, str | None]:
+        """The provider call for one channel: ``(ok, provider_msg_id, error)``.
+        Never raises — a channel failure is a settled ``failed`` delivery,
+        not a lost notification."""
+        if channel == "email":
+            try:
+                ok, msg_id = await self._email_service.send_notification_email(
+                    to=(user or {}).get("email") or "",
+                    to_name=(user or {}).get("display_name") or "User",
+                    subject=subject,
+                    body_md=body,
+                    cockpit_path=cockpit_path,
+                )
+                return bool(ok), msg_id, None if ok else "send returned False"
+            except Exception as e:
+                logger.warning("notification email failed: %s", e)
+                return False, None, str(e)
+        transport = self._transports.get(channel)
+        if transport is None:
+            return False, None, f"no transport for {channel}"
+        try:
+            ok = bool(
+                await transport.send(
+                    NotificationPayload(
+                        subject=subject,
+                        body_text=body,
+                        job_id=str(payload.get("job_id") or source_id or ""),
+                        job_description=str(payload.get("job_description") or ""),
+                        config_name=str(payload.get("config_name") or ""),
+                        thread_id=payload.get("thread_id"),
+                        cockpit_url=f"{self._cockpit_url}{cockpit_path}",
+                    )
+                )
+            )
+            return ok, None, None if ok else "send returned False"
+        except Exception as e:
+            logger.warning("notification %s transport failed: %s", channel, e)
+            return False, None, str(e)
+
+    # --- deferred steps (slice 2) ----------------------------------------------
+
+    async def _plan_deferred_steps(
+        self, row: dict[str, Any], steps: tuple[Any, ...]
+    ) -> list[dict[str, Any]]:
+        """Turn the class's non-immediate steps into rows for
+        ``notification_steps``: the delay becomes ``due_at`` (D5 — a delay is
+        not its own row), batched steps round up to their window bucket, and
+        the conditions ride along to be evaluated when due, not now."""
+        settings = await self._get_user_settings(row["recipient_id"])
+        now = datetime.now(timezone.utc)
+        officer_minutes: int | None = None
+        planned: list[dict[str, Any]] = []
+        for index, step in enumerate(steps):
+            if step.immediate:
+                continue
+            if step.delay == DELAY_OFFICER_RESPONSE:
+                if officer_minutes is None:
+                    officer_minutes = await self._resolve_delay_minutes(row, settings)
+                minutes = officer_minutes
+            else:
+                minutes = int(step.delay)
+            due = now + timedelta(minutes=minutes)
+            if step.batch_window_minutes:
+                due = bucket_due_at(due, step.batch_window_minutes)
+            planned.append(
+                {
+                    "step_index": index,
+                    "step_kind": step.channel,
+                    "due_at": due,
+                    "conditions": list(step.conditions),
+                    "batch_key": batch_key_for(step, row),
+                }
+            )
+        return planned
+
+    async def _resolve_delay_minutes(
+        self, row: dict[str, Any], settings: dict[str, Any] | None
+    ) -> int:
+        """D6: wait as long as the project's officer is allowed to take — the
+        mail that survives that window says the automated tier did not
+        settle it. Without a live, un-held officer the recipient's own
+        ``communication.escalation_minutes`` applies, default 5."""
+        if row.get("source_kind") == "job" and self._db:
+            try:
+                minutes = await self._officer_response_minutes(str(row["source_id"]))
+            except Exception as e:
+                logger.warning(
+                    "officer window lookup failed for job %s: %s",
+                    str(row.get("source_id"))[:8],
+                    e,
+                )
+                minutes = None
+            if minutes is not None:
+                return minutes
+        configured = ((settings or {}).get("communication") or {}).get(
+            "escalation_minutes"
+        )
+        lo, hi = ESCALATION_MINUTES_BOUNDS
+        if (
+            isinstance(configured, int)
+            and not isinstance(configured, bool)
+            and lo <= configured <= hi
+        ):
+            return configured
+        return NO_OFFICER_DELAY_MINUTES
+
+    async def _officer_response_minutes(self, job_id: str) -> int | None:
+        """The commissioned, un-held officer's response window for the job's
+        project, or ``None`` when nobody but the human can settle it. Deliberately
+        independent of the worker-message policy: an officer reviews jobs even
+        for a project whose messages go user-direct."""
+        from services import message_routing as routing_svc
+
+        job = await self._db.get_job(job_id)
+        project_id = (job or {}).get("project_id")
+        if not project_id:
+            return None
+        post = await self._db.get_project_officer(str(project_id))
+        if not post:
+            return None
+        officer = await self._db.get_officer_thread_for_project(str(project_id))
+        if not officer or routing_svc.officer_hold(officer) is not None:
+            return None
+        policy = post.get("communication_policy") or {}
+        if isinstance(policy, str):
+            try:
+                policy = json.loads(policy)
+            except ValueError:
+                policy = {}
+        lo, hi = routing_svc.OFFICER_RESPONSE_MINUTES_BOUNDS
+        try:
+            value = int(
+                policy.get(
+                    "officer_response_minutes",
+                    routing_svc.DEFAULT_OFFICER_RESPONSE_MINUTES,
+                )
+            )
+        except (TypeError, ValueError):
+            value = routing_svc.DEFAULT_OFFICER_RESPONSE_MINUTES
+        return min(max(value, lo), hi)
+
+    async def _source_resolved(self, source_kind: str | None, source_id: Any) -> bool:
+        """Ask the registered probe whether the source is settled. Unknown
+        kinds and probe failures read as *not* resolved: the failure mode
+        stays "occasionally mails about something just settled", never
+        "silently never mails"."""
+        probe = source_probe(source_kind)
+        if probe is None or not self._db or source_id is None:
+            return False
+        try:
+            return bool(await probe(self._db, str(source_id)))
+        except Exception as e:
+            logger.warning("source probe %s/%s failed: %s", source_kind, source_id, e)
+            return False
+
+    async def describe_steps(self, notification_id: str) -> list[dict[str, Any]]:
+        if not self._db:
+            return []
+        rows = await self._db.list_notification_steps(notification_id)
+        return [serialize_step(r) for r in rows]
+
+    @staticmethod
+    def render_step_message(
+        members: list[dict[str, Any]], *, cockpit_url: str
+    ) -> tuple[str, str, str]:
+        """``(subject, body_md, cockpit_path)`` for a due group. One member is
+        the row itself; several become one digest ("3 review queue items
+        waiting") that links each row's own deep link (D8 batching)."""
+        if len(members) == 1:
+            row = members[0]
+            return (
+                str(row.get("subject") or ""),
+                str(row.get("body") or ""),
+                f"/inbox?n={row['notification_id']}",
+            )
+        category = str(members[0].get("category") or "notification")
+        label = category.replace("_", " ")
+        subject = f"{len(members)} {label} items waiting for you"
+        lines = [f"You have **{len(members)}** {label} items nobody has settled yet:\n"]
+        for row in members:
+            excerpt = str(row.get("body") or "").strip().splitlines()
+            first = excerpt[0].strip() if excerpt else ""
+            if len(first) > 160:
+                first = first[:157] + "…"
+            lines.append(
+                f"- **{row.get('subject') or '(no subject)'}** — "
+                f"[open]({cockpit_url}/inbox?n={row['notification_id']})"
+            )
+            if first:
+                lines.append(f"  {first}")
+        return subject, "\n".join(lines), "/inbox"
+
+    async def send_step_group(
+        self, members: list[dict[str, Any]], *, channel: str
+    ) -> dict[str, Any]:
+        """The send half of a due step group (called by the sweeper).
+
+        Claims one delivery per member BEFORE sending (D10) so a member whose
+        channel already went out — an earlier attempt that crashed after the
+        provider call — is left out rather than mailed twice; renders one
+        message for the survivors; settles every claim the same way.
+        """
+        batch_id = str(uuid.uuid4())
+        recipient_id = str(members[0]["recipient_id"])
+        user = await self._get_user(recipient_id)
+        address = (user or {}).get("email") if channel == "email" else None
+        outcome: dict[str, Any] = {
+            "batch_id": batch_id,
+            "attempted": [],
+            "already": [],
+            "unaddressed": [],
+            "ok": True,
+            "error": None,
+        }
+        if channel == "email" and not address:
+            outcome["unaddressed"] = [m["id"] for m in members]
+            return outcome
+
+        attempted: list[dict[str, Any]] = []
+        claims: list[str] = []
+        for member in members:
+            claim = await self._claim_delivery(
+                str(member["notification_id"]),
+                channel,
+                address=address,
+                step_index=int(member["step_index"]),
+                batch_id=batch_id,
+            )
+            if claim is None:
+                outcome["already"].append(member["id"])
+                continue
+            attempted.append(member)
+            claims.append(claim)
+        if not attempted:
+            return outcome
+
+        subject, body, cockpit_path = self.render_step_message(
+            attempted, cockpit_url=self._cockpit_url
+        )
+        first = attempted[0]
+        ok, msg_id, error = await self._send_channel(
+            channel,
+            user=user,
+            subject=subject,
+            body=body,
+            cockpit_path=cockpit_path,
+            payload=first.get("payload") or {},
+            source_id=first.get("source_id"),
+        )
+        for claim in claims:
+            await self._settle_delivery(
+                claim,
+                state="sent" if ok else "failed",
+                provider_msg_id=msg_id,
+                error=error,
+            )
+        outcome["attempted"] = [m["id"] for m in attempted]
+        outcome["ok"] = bool(ok)
+        outcome["error"] = error
+        return outcome
 
     # =========================================================================
     # Legacy fan-out — retired in slice 3; every caller is in the manifest
@@ -1096,36 +1423,13 @@ class NotificationService:
     @staticmethod
     def _is_in_quiet_hours(user_settings: dict) -> bool:
         """Check if current time falls within user's quiet hours."""
-        qh = (user_settings or {}).get("communication", {}).get("quiet_hours", {})
-        if not qh.get("enabled"):
-            return False
+        return quiet_hours_window(user_settings)[0]
 
-        start_str = qh.get("start", "")
-        end_str = qh.get("end", "")
-        tz_str = qh.get("timezone", "UTC")
-
-        if not start_str or not end_str:
-            return False
-
-        try:
-            tz = ZoneInfo(tz_str)
-        except (ZoneInfoNotFoundError, KeyError):
-            logger.warning("Invalid timezone in quiet hours: %s", tz_str)
-            return False
-
-        try:
-            start = time.fromisoformat(start_str)
-            end = time.fromisoformat(end_str)
-        except ValueError:
-            return False
-
-        now = datetime.now(tz).time()
-
-        # Handle overnight ranges (e.g., 22:00 - 08:00)
-        if start <= end:
-            return start <= now <= end
-        else:
-            return now >= start or now <= end
+    @staticmethod
+    def next_quiet_hours_end(user_settings: dict) -> datetime | None:
+        """When the current quiet-hours window ends (UTC), or ``None`` when
+        the recipient is not in one."""
+        return quiet_hours_window(user_settings)[1]
 
     async def _queue_notification(
         self,
