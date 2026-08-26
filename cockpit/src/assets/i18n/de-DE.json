@@ -3344,7 +3344,10 @@
       "slotModel": "Modell von Platz {{index}}",
       "slotWorkspace": "Arbeitsbereich von Platz {{index}}",
       "slotPool": "Pool von Platz {{index}}",
+      "slotSpendCeiling": "Tägliche Ausgabenobergrenze von Platz {{index}} in USD",
       "removeSlot": "Platz {{name}} entfernen",
+      "autoPull": "Unbeaufsichtigtes Auto-Pull aktivieren",
+      "workerSpendCeiling": "Tägliche Arbeiter-Ausgabenobergrenze der Centurie in USD",
       "maxWorkers": "Maximale Arbeiterzahl",
       "tokenCeiling": "Tägliche Token-Obergrenze",
       "pagesPerDay": "Maximale Meldungen pro Tag",
@@ -3375,6 +3378,8 @@
       "autoPull": "Auto-Pull",
       "on": "an — bereite Tickets werden freien Pool-Plätzen zugeteilt",
       "off": "aus — Pools bleiben untätig, bis er manuell entsendet",
+      "centurySpendCeiling": "Arbeiter-Obergrenze ${{amount}}/Tag",
+      "releaseClosed": "Aktivierung durch Deployment-Freigaberichtlinie gesperrt",
       "stalled": "Festgefahren",
       "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) seit mehr als {{threshold}} Std. ohne Fortschritt ({{source}}) — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen.",
       "thresholdSource": {
@@ -3395,7 +3400,15 @@
       "pages": "Meldungen pro Tag",
       "pagesHint": "Wie oft er dich benachrichtigen darf (Standard 3).",
       "tokenCeiling": "Tägliche Token-Obergrenze",
-      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze."
+      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze.",
+      "workerSpendCeiling": "Arbeiter-Ausgaben / Tag (USD)",
+      "workerSpendCeilingHint": "Optional über alle automatisch gefüllten Pools. Leer bedeutet keine mechanische Ausgabenbremse."
+    },
+    "autoPull": {
+      "label": "Kategorisierte Pools automatisch füllen",
+      "releaseClosed": "Die Aktivierung ist nicht verfügbar, bis die Gates für unbeaufsichtigten Betrieb dieses Deployments abgeschlossen sind. Aus und alle Ausgabenobergrenzen bleiben bearbeitbar.",
+      "confirmation": "Die Aktivierung startet beim nächsten Takt unbeaufsichtigte Arbeiter-Entsendung und Ausgaben aus bereiten Projekttickets. Erst nach Prüfung von Aufstellung, Kategorien und Ausgabenobergrenzen bestätigen.",
+      "confirmEnable": "Unbeaufsichtigtes Auto-Pull aktivieren"
     },
     "category": {
       "none": "Kein Pool — der Offizier entsendet manuell",
@@ -3446,7 +3459,8 @@
     "kit": {
       "breakerOpen": "SCHUTZSCHALTER OFFEN",
       "ready": "bereit {{count}}",
-      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND"
+      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND",
+      "spendCeiling": "${{amount}}/Tag"
     },
     "machineState": {
       "not-attempted": "nicht versucht",
@@ -3535,11 +3549,14 @@
       "maxWorkersHint": "Flache Parallelitätsgrenze. Ohne Ausrüstung ist sie die einzige Schranke (Standard 3).",
       "model": "Modell",
       "pool": "Pool",
+      "spendCeiling": "Ausgaben / Tag (USD)",
+      "spendCeilingHint": "Optionale Obergrenze für diesen Pool; leer bedeutet keine pool-spezifische Bremse.",
       "slot": "Platz",
       "slotPlaceholder": "Linie",
       "workspace": "Arbeitsbereich"
     },
     "sections": {
+      "autoPull": "Unbeaufsichtigte Entsendung",
       "brain": "Sein Modell",
       "budgets": "Budgets",
       "kit": "Ausrüstung",

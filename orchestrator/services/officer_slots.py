@@ -29,6 +29,7 @@ config downstream, so a slot can never exceed what its owner may grant.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Optional
 
@@ -118,13 +119,17 @@ def validate_slots_spec(slots: Any) -> dict[str, dict[str, Any]]:
             # and a frontier executor pool differ by more than an order of
             # magnitude in burn, so there is no global number worth defaulting
             # to — the knob belongs beside the model and backend it prices.
+            if isinstance(ceiling, bool):
+                raise ValueError(
+                    f"slot {name!r} spend_ceiling_daily must be a number of USD"
+                )
             try:
                 ceiling_value = float(ceiling)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"slot {name!r} spend_ceiling_daily must be a number of USD"
                 ) from exc
-            if ceiling_value <= 0:
+            if not math.isfinite(ceiling_value) or ceiling_value <= 0:
                 raise ValueError(
                     f"slot {name!r} spend_ceiling_daily must be positive "
                     "(omit the key for no ceiling)"

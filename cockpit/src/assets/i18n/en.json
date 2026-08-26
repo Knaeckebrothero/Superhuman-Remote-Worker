@@ -3344,7 +3344,10 @@
       "slotModel": "Slot {{index}} model",
       "slotWorkspace": "Slot {{index}} workspace",
       "slotPool": "Slot {{index}} pool",
+      "slotSpendCeiling": "Slot {{index}} daily spend ceiling in USD",
       "removeSlot": "Remove slot {{name}}",
+      "autoPull": "Enable unattended auto-pull",
+      "workerSpendCeiling": "Century-wide daily worker spend ceiling in USD",
       "maxWorkers": "Maximum workers",
       "tokenCeiling": "Daily token ceiling",
       "pagesPerDay": "Maximum pages per day",
@@ -3375,6 +3378,8 @@
       "autoPull": "Auto-pull",
       "on": "on — ready tickets are dispatched into free pool slots",
       "off": "off — pools stay idle until he dispatches by hand",
+      "centurySpendCeiling": "worker ceiling ${{amount}}/day",
+      "releaseClosed": "enable transition held by deployment release policy",
       "stalled": "Stalled",
       "stalledDetail": "{{count}} claimed ticket(s) not moving beyond {{threshold}} h ({{source}}) — these are never released automatically; resume or cancel the job, then close or re-ready the ticket.",
       "thresholdSource": {
@@ -3395,7 +3400,15 @@
       "pages": "Pages per day",
       "pagesHint": "How often he may page you (default 3).",
       "tokenCeiling": "Daily token ceiling",
-      "tokenCeilingHint": "Across his whole command. Blank means no ceiling."
+      "tokenCeilingHint": "Across his whole command. Blank means no ceiling.",
+      "workerSpendCeiling": "Worker spend / day (USD)",
+      "workerSpendCeilingHint": "Optional across every auto-pulled pool. Blank means no mechanical spend brake."
+    },
+    "autoPull": {
+      "label": "Fill categorized pools automatically",
+      "releaseClosed": "Enabling is unavailable until this deployment's unattended-operation gates are complete. Off and all spend ceilings remain editable.",
+      "confirmation": "Enabling starts unattended worker dispatch and spend from ready project tickets at the next tick. Confirm only after reviewing the roster, categories, and spend ceilings.",
+      "confirmEnable": "Enable unattended auto-pull"
     },
     "category": {
       "none": "No pool — officer dispatches by hand",
@@ -3446,7 +3459,8 @@
     "kit": {
       "breakerOpen": "BREAKER OPEN",
       "ready": "ready {{count}}",
-      "readyBelowFloor": "ready {{count}} — BELOW FLOOR"
+      "readyBelowFloor": "ready {{count}} — BELOW FLOOR",
+      "spendCeiling": "${{amount}}/day"
     },
     "machineState": {
       "not-attempted": "not attempted",
@@ -3535,11 +3549,14 @@
       "maxWorkersHint": "Flat concurrency cap. Without a kit it is the only gate (default 3).",
       "model": "Model",
       "pool": "Pool",
+      "spendCeiling": "Spend / day (USD)",
+      "spendCeilingHint": "Optional ceiling for this pool; blank means no pool-specific brake.",
       "slot": "Slot",
       "slotPlaceholder": "line",
       "workspace": "Workspace"
     },
     "sections": {
+      "autoPull": "Unattended dispatch",
       "brain": "His brain",
       "budgets": "Budgets",
       "kit": "Kit",

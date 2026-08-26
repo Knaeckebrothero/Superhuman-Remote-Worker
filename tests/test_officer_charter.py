@@ -584,6 +584,42 @@ class TestConferenceConfig:
         )
         assert cleaned == {"conference": True}
 
+    def test_sanitizer_admits_typed_auto_pull_and_century_ceiling(self):
+        import main
+
+        cleaned = main._validated_session_officer_override(
+            {
+                "officer": {
+                    "auto_pull": False,
+                    "worker_spend_ceiling_daily": 12.5,
+                }
+            }
+        )
+        assert cleaned == {
+            "auto_pull": False,
+            "worker_spend_ceiling_daily": 12.5,
+        }
+
+    @pytest.mark.parametrize("value", [1, "true", None])
+    def test_sanitizer_rejects_non_boolean_auto_pull(self, value):
+        from fastapi import HTTPException
+
+        import main
+
+        with pytest.raises(HTTPException):
+            main._validated_session_officer_override({"officer": {"auto_pull": value}})
+
+    @pytest.mark.parametrize("value", [0, -1, True, "nan", "inf"])
+    def test_sanitizer_rejects_invalid_century_ceiling(self, value):
+        from fastapi import HTTPException
+
+        import main
+
+        with pytest.raises(HTTPException):
+            main._validated_session_officer_override(
+                {"officer": {"worker_spend_ceiling_daily": value}}
+            )
+
     def test_sanitizer_still_rejects_unknown_keys(self):
         from fastapi import HTTPException
 

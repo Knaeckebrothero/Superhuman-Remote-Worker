@@ -1329,6 +1329,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: OFFICER_RUNTIME_VERIFICATION_ENABLED
+            - name: OFFICER_AUTO_PULL_RELEASE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OFFICER_AUTO_PULL_RELEASE_ENABLED
             {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED

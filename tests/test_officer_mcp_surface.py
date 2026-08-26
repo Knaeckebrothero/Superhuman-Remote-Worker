@@ -164,6 +164,25 @@ def test_the_roster_says_so_when_no_project_has_an_officer():
     assert "no officer" in text.lower()
 
 
+def test_the_roster_distinguishes_configured_auto_pull_from_released_dispatch():
+    text = format_officer_roster(
+        {
+            "officers": [
+                {
+                    "project_name": "Dark century",
+                    "project_id": "p1",
+                    "thread_id": "t1",
+                    "commissioned": True,
+                    "auto_pull": True,
+                    "auto_pull_enable_available": False,
+                }
+            ],
+            "total": 1,
+        }
+    )
+    assert "auto-pull configured — deployment release fenced" in text
+
+
 def test_the_post_renders_the_kit_with_its_floor_warning():
     text = format_officer_post(
         {
@@ -182,6 +201,7 @@ def test_the_post_renders_the_kit_with_its_floor_warning():
                     "in_flight": 0,
                     "ready_depth": 0,
                     "below_floor": True,
+                    "spend_ceiling_daily": 7.5,
                 },
                 "test": {"count": 1, "in_flight": 1},
             },
@@ -196,7 +216,11 @@ def test_the_post_renders_the_kit_with_its_floor_warning():
                 }
             ],
             "conference": None,
-            "backlog": {"auto_pull": False},
+            "backlog": {
+                "auto_pull": True,
+                "auto_pull_control": {"enable_available": False},
+                "worker_spend_ceiling_daily": 42.25,
+            },
         },
         project_name="Better Resavio",
     )
@@ -205,6 +229,9 @@ def test_the_post_renders_the_kit_with_its_floor_warning():
     assert "2026-08-17T09:30" in text
     assert "1/3" in text
     assert "no deployable UI yet" in text
+    assert "deployment release fenced" in text
+    assert "Worker spend ceiling: $42.25/day" in text
+    assert "$7.5/day ceiling" in text
 
 
 def test_the_post_renders_a_vacant_post_without_pretending_otherwise():

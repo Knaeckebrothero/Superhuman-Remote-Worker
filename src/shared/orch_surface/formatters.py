@@ -3261,7 +3261,16 @@ def format_officer_roster(data: dict[str, Any]) -> str:
         detail = [
             f"thread {_short_id(row.get('thread_id'))}",
             str(row.get("model") or "model ?"),
-            "auto-pull on" if row.get("auto_pull") else "auto-pull off",
+            (
+                "auto-pull on"
+                if row.get("auto_pull")
+                and row.get("auto_pull_enable_available") is True
+                else (
+                    "auto-pull configured — deployment release fenced"
+                    if row.get("auto_pull")
+                    else "auto-pull off"
+                )
+            ),
         ]
         lines.append(f"    {' | '.join(detail)}")
         counts = [
@@ -3334,10 +3343,20 @@ def format_officer_post(
     )
     pages = data.get("pages_today") or {}
     backlog = data.get("backlog") or {}
+    auto_pull_control = backlog.get("auto_pull_control") or {}
+    if backlog.get("auto_pull") and auto_pull_control.get("enable_available") is False:
+        auto_pull_label = "configured on — deployment release fenced"
+    else:
+        auto_pull_label = "on" if backlog.get("auto_pull") else "off"
     lines.append(
         f"Pages today: {pages.get('used', 0)}/{pages.get('budget', '?')} | "
-        f"Backlog auto-pull: {'on' if backlog.get('auto_pull') else 'off'}"
+        f"Backlog auto-pull: {auto_pull_label}"
     )
+    if backlog.get("worker_spend_ceiling_daily") is not None:
+        lines.append(
+            "Worker spend ceiling: "
+            f"${backlog['worker_spend_ceiling_daily']}/day across the century"
+        )
     spend = data.get("spend_today") or {}
     if spend.get("tokens") is not None:
         ceiling = spend.get("ceiling")
@@ -3359,6 +3378,8 @@ def format_officer_post(
                 line += f" | ready {entry['ready_depth']}"
                 if entry.get("below_floor"):
                     line += " — BELOW FLOOR"
+            if entry.get("spend_ceiling_daily") is not None:
+                line += f" | ${entry['spend_ceiling_daily']}/day ceiling"
             lines.append(line)
 
     digest = data.get("digest") or []

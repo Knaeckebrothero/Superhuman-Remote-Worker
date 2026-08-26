@@ -641,3 +641,8 @@ class TestSlotSpec:
         )
         with pytest.raises(ValueError, match="must be positive"):
             validate_slots_spec({"r": {"count": 1, "spend_ceiling_daily": 0}})
+
+    @pytest.mark.parametrize("value", [True, "nan", "inf", float("nan")])
+    def test_spend_ceiling_rejects_boolean_or_non_finite_values(self, value):
+        with pytest.raises(ValueError, match="spend_ceiling_daily"):
+            validate_slots_spec({"r": {"count": 1, "spend_ceiling_daily": value}})

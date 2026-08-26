@@ -50,6 +50,9 @@ async def _noop_provision(_job, *, category=None):
 async def tick_officer(*args, **kwargs):
     """Unit default mirrors the lifespan's configured provisioner."""
     kwargs.setdefault("provision_repo", _noop_provision)
+    # Existing behavioral tests exercise a deliberately released century.
+    # Production defaults dark; dedicated tests below prove that boundary.
+    kwargs.setdefault("release_enabled", True)
     return await _tick_officer(*args, **kwargs)
 
 
@@ -115,6 +118,35 @@ class TestAutoPullGate:
         }
         db.list_commissioned_officer_posts_for_backlog.assert_awaited_once()
         db.list_officer_threads.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deployment_release_gate_blocks_new_queue_reads(self):
+        db = _db()
+        vector_db = MagicMock()
+        vector_db.acquire.side_effect = AssertionError(
+            "a dark release gate must not read the ticket queue"
+        )
+
+        counts = await _tick_officer(
+            db,
+            vector_db,
+            _officer_row(),
+            now=NOW,
+            release_enabled=False,
+            provision_repo=_noop_provision,
+        )
+
+        assert counts == {
+            "dispatched": 0,
+            "skipped": 0,
+            "breakers_opened": 0,
+            "wakes": 0,
+        }
+        db.create_job.assert_not_awaited()
+        vector_db.acquire.assert_not_called()
+        # BP-07 work was already admitted and owns its claim/capacity. Its
+        # recovery stays live while new unattended admission is dark.
+        db.list_officer_job_preflights.assert_awaited_once()
 
 
 # =============================================================================

@@ -1336,6 +1336,12 @@ export interface OfficerFloorWakeOutcome {
 /** Backlog-pool policy state: what the tick enforces, made visible (§6). */
 export interface OfficerBacklogState {
   auto_pull: boolean;
+  /** Deployment-owned release fence for the unattended enable transition. */
+  auto_pull_control?: {
+    enable_available: boolean;
+    source: 'deployment_policy';
+    reason?: 'release_gate_closed' | null;
+  };
   breakers: Record<string, OfficerPoolBreaker>;
   stale_claims: OfficerStaleClaim[];
   stale_claim_policy?: {

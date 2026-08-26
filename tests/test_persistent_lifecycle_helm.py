@@ -18,6 +18,7 @@ def test_automatic_persistent_reconciliation_defaults_false() -> None:
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
     assert values["orchestrator"]["persistentAgentReconciliationEnabled"] is False
     assert values["orchestrator"]["officerRuntimeVerificationEnabled"] is False
+    assert values["orchestrator"]["officerAutoPullReleaseEnabled"] is False
 
 
 def test_flag_renders_through_configmap_and_orchestrator_environment() -> None:
@@ -172,3 +173,59 @@ def test_runtime_verification_flag_renders_dark_and_can_be_enabled_explicitly() 
     )
     enabled, _ = _render("--set", "orchestrator.officerRuntimeVerificationEnabled=true")
     assert enabled["data"]["OFFICER_RUNTIME_VERIFICATION_ENABLED"] == "true"
+
+
+def test_auto_pull_release_flag_renders_dark_and_can_be_enabled_explicitly() -> None:
+    if shutil.which("helm") is None:
+        pytest.skip("helm is not installed")
+
+    def _render(*extra: str):
+        output = subprocess.run(
+            [
+                "helm",
+                "template",
+                "auto-pull-release-proof",
+                str(CHART),
+                "-f",
+                str(CHART / "ci" / "test-values.yaml"),
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        documents = [doc for doc in yaml.safe_load_all(output) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and "OFFICER_AUTO_PULL_RELEASE_ENABLED" in (doc.get("data") or {})
+        )
+        deployment = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "Deployment"
+            and any(
+                container.get("name") == "orchestrator"
+                for container in doc["spec"]["template"]["spec"]["containers"]
+            )
+        )
+        orchestrator = next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container.get("name") == "orchestrator"
+        )
+        return configmap, {
+            entry["name"]: entry for entry in orchestrator.get("env") or []
+        }
+
+    dark, dark_env = _render()
+    assert dark["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "false"
+    assert (
+        dark_env["OFFICER_AUTO_PULL_RELEASE_ENABLED"]["valueFrom"]["configMapKeyRef"][
+            "key"
+        ]
+        == "OFFICER_AUTO_PULL_RELEASE_ENABLED"
+    )
+    enabled, _ = _render("--set", "orchestrator.officerAutoPullReleaseEnabled=true")
+    assert enabled["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "true"

@@ -160,6 +160,10 @@ orchestrator:
   # deployed-test seam, never an Officer/model capability; every profile ships
   # disabled and a bounded gate enables it only for the test interval.
   officerRuntimeVerificationEnabled: false
+  # -- Owner-facing Officer auto-pull release fence. Keep false until the
+  # unattended-operation deployment gates are complete; false always permits
+  # disabling an already configured century and suppresses new tick admission.
+  officerAutoPullReleaseEnabled: false
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:

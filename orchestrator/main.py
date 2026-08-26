@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -1660,6 +1661,16 @@ PERSISTENT_AGENT_RECONCILIATION_ENABLED = os.environ.get(
 # unless this rollout flag is explicitly enabled through Helm.
 OFFICER_RUNTIME_VERIFICATION_ENABLED = os.environ.get(
     "OFFICER_RUNTIME_VERIFICATION_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# BP-01 release fence. The owner-facing control may ship while the wider
+# unattended-release scorecard is still open, but a stored/manual JSON edit
+# must not make the money-spending tick live. The tick and every supported
+# false -> true writer consume this same immutable deployment policy.
+# ``false`` always remains writable so an operator can stand a century down
+# even during rollback or a mixed-version incident.
+OFFICER_AUTO_PULL_RELEASE_ENABLED = os.environ.get(
+    "OFFICER_AUTO_PULL_RELEASE_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
 # Local-only crash-recovery proof hook. Production/chart defaults keep this at
@@ -6039,12 +6050,14 @@ def _validated_reasoning_level(value: Any) -> str:
 _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
     {
         "enabled",
+        "auto_pull",
         "sleep_min_minutes",
         "sleep_max_minutes",
         "max_concurrent_workers",
         "max_pages_per_day",
         "max_actions_per_wake",
         "daily_token_ceiling",
+        "worker_spend_ceiling_daily",
         "slots",
         "conference",
     }
@@ -6085,6 +6098,14 @@ def _validated_session_officer_override(
         # (charter injection) without officer lifecycle — enabled stays false
         # on conference threads, so the watchdog/drain never touch them.
         cleaned["conference"] = officer["conference"] in (True, "true", "True", 1)
+    if "auto_pull" in officer:
+        # This is new money-spending authority, unlike the historical
+        # enabled/conference compatibility inputs. Accept only a JSON bool.
+        if not isinstance(officer["auto_pull"], bool):
+            raise HTTPException(
+                status_code=400, detail="officer.auto_pull must be a boolean"
+            )
+        cleaned["auto_pull"] = officer["auto_pull"]
     if "slots" in officer:
         # Typed worker roster (officer_slots.py). Validated hard at provision
         # so a typo'd kit fails HERE with a 400, not silently at the
@@ -6096,7 +6117,14 @@ def _validated_session_officer_override(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     for key in sorted(
-        _SESSION_OFFICER_OVERRIDE_KEYS - {"enabled", "slots", "conference"}
+        _SESSION_OFFICER_OVERRIDE_KEYS
+        - {
+            "enabled",
+            "auto_pull",
+            "slots",
+            "conference",
+            "worker_spend_ceiling_daily",
+        }
     ):
         if key in officer:
             try:
@@ -6106,6 +6134,26 @@ def _validated_session_officer_override(
                     status_code=400,
                     detail=f"officer.{key} must be an integer",
                 ) from exc
+    if "worker_spend_ceiling_daily" in officer:
+        value = officer["worker_spend_ceiling_daily"]
+        if isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
+            )
+        try:
+            ceiling = float(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
+            ) from exc
+        if not math.isfinite(ceiling) or ceiling <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="officer.worker_spend_ceiling_daily must be a positive USD number",
+            )
+        cleaned["worker_spend_ceiling_daily"] = ceiling
     return cleaned or None
 
 
@@ -12296,6 +12344,7 @@ async def lifespan(app: FastAPI):
                 postgres_db,
                 vector_db,
                 ev,
+                release_enabled=OFFICER_AUTO_PULL_RELEASE_ENABLED,
                 provision_repo=_provision_officer_ticket_repo,
                 trigger_dispatch=_trigger_dispatch,
                 enforce_grants=_enforce_officer_ticket_grants,
@@ -37869,6 +37918,8 @@ async def _conclude_conference_if_any(thread: dict) -> None:
 
 def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
     """One roster line from a ``project_officers`` join row."""
+    from services.officer_backlog import auto_pull_enabled
+
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
         try:
@@ -37897,7 +37948,8 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
             int(pages.get("count") or 0) if pages.get("date") == today else 0
         ),
         "digest_waiting": len(digest) if isinstance(digest, list) else 0,
-        "auto_pull": bool(officer_cfg.get("auto_pull")),
+        "auto_pull": auto_pull_enabled(officer_cfg),
+        "auto_pull_enable_available": OFFICER_AUTO_PULL_RELEASE_ENABLED,
         "model": (config_override.get("llm") or {}).get("model"),
         "last_activity_at": _iso_or_none(row.get("last_agent_activity")),
     }
@@ -38023,6 +38075,8 @@ async def get_project_officer_summary(
     )
     floor_wakes = await postgres_db.list_officer_floor_wake_outcomes(project_id)
     from services.job_liveness import get_liveness_policy
+    from services.officer_backlog import auto_pull_enabled, pools_from_meta
+    from services.officer_backlog import ready_depth_by_pool as _ready_depth
 
     stale_claim_policy = get_liveness_policy().stale_claim.as_dict()
     post_block: dict[str, Any] = {
@@ -38060,7 +38114,14 @@ async def get_project_officer_summary(
         # post has no live counters — only the setting the next incarnation
         # will boot with.
         "backlog": {
-            "auto_pull": bool(row_officer_cfg.get("auto_pull")),
+            "auto_pull": auto_pull_enabled(row_officer_cfg),
+            "auto_pull_control": {
+                "enable_available": OFFICER_AUTO_PULL_RELEASE_ENABLED,
+                "source": "deployment_policy",
+                "reason": (
+                    None if OFFICER_AUTO_PULL_RELEASE_ENABLED else "release_gate_closed"
+                ),
+            },
             "breakers": {},
             "stale_claims": [],
             "stale_claim_policy": stale_claim_policy,
@@ -38162,9 +38223,6 @@ async def get_project_officer_summary(
     )
     post_block["held"] = public_hold or None
 
-    from services.officer_backlog import auto_pull_enabled, pools_from_meta
-    from services.officer_backlog import ready_depth_by_pool as _ready_depth
-
     _pools = pools_from_meta(officer_meta)
     if _pools and vector_db is not None:
         ready_by_pool = await _ready_depth(
@@ -38183,6 +38241,13 @@ async def get_project_officer_summary(
     # them, so the card cannot disagree with what actually happened.
     post_block["backlog"] = {
         "auto_pull": auto_pull_enabled(officer_meta),
+        "auto_pull_control": {
+            "enable_available": OFFICER_AUTO_PULL_RELEASE_ENABLED,
+            "source": "deployment_policy",
+            "reason": (
+                None if OFFICER_AUTO_PULL_RELEASE_ENABLED else "release_gate_closed"
+            ),
+        },
         "breakers": {
             pool: entry
             for pool, entry in (officer_state.get("backlog_breakers") or {}).items()
@@ -38369,6 +38434,8 @@ OFFICER_PERMISSION_MODE = "autonomous"
 
 _OFFICER_POST_EFFECTS: dict[str, str] = {
     "slots": "next dispatch",
+    "auto_pull": "next dispatch",
+    "worker_spend_ceiling_daily": "next dispatch",
     "max_concurrent_workers": "next dispatch",
     "daily_token_ceiling": "next delivery",
     "max_pages_per_day": "next delivery",
@@ -38389,6 +38456,8 @@ _OFFICER_POST_INT_FIELDS = frozenset(
         "sleep_max_minutes",
     }
 )
+
+_OFFICER_POST_POSITIVE_NUMBER_FIELDS = frozenset({"worker_spend_ceiling_daily"})
 
 # Row-only worker-message routing policy (officer_post.md §7): the server
 # resolves it per message, the officer thread can never rewrite it, and it is
@@ -38444,6 +38513,40 @@ def _validated_officer_post_patch(
                 officer_patch["slots"] = validate_slots_spec(body["slots"])
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if "auto_pull" in body:
+        value = body["auto_pull"]
+        if value is None:
+            # Null clears to the safe database/UI default rather than leaving
+            # a truthy historical projection behind.
+            officer_patch["auto_pull"] = False
+        elif not isinstance(value, bool):
+            raise HTTPException(status_code=400, detail="auto_pull must be a boolean")
+        else:
+            officer_patch["auto_pull"] = value
+
+    for key in sorted(_OFFICER_POST_POSITIVE_NUMBER_FIELDS):
+        if key not in body:
+            continue
+        value = body[key]
+        if value is None:
+            officer_patch[key] = None
+            continue
+        if isinstance(value, bool):
+            raise HTTPException(
+                status_code=400, detail=f"{key} must be a positive USD number"
+            )
+        try:
+            ceiling = float(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"{key} must be a positive USD number"
+            ) from exc
+        if not math.isfinite(ceiling) or ceiling <= 0:
+            raise HTTPException(
+                status_code=400, detail=f"{key} must be a positive USD number"
+            )
+        officer_patch[key] = ceiling
 
     for key in sorted(_OFFICER_POST_INT_FIELDS):
         if key in body:
@@ -38556,6 +38659,29 @@ def _validated_officer_post_patch(
         fragment["llm"] = llm_patch
     effects = {key: _OFFICER_POST_EFFECTS[key] for key in body}
     return fragment, comm_patch, effects
+
+
+def _enforce_officer_auto_pull_release(desired: Any) -> None:
+    """Refuse unattended enablement while the deployment release fence is dark.
+
+    Callers pass the *effective* commissioned value, not merely the incoming
+    patch. A post enabled before a rollback therefore cannot be recommissioned
+    behind a dark fence. False/absent always passes so the supported stop path
+    remains available during an incident.
+    """
+
+    # Historical JSON written before the typed surface may contain the exact
+    # truthy shapes accepted by ``auto_pull_enabled``.  A rollback must fence
+    # those too; otherwise a recommission could turn an unsupported string or
+    # integer into live unattended authority behind the dark gate.
+    if desired in (True, "true", "True", 1) and not OFFICER_AUTO_PULL_RELEASE_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Officer auto-pull is not released in this deployment. "
+                "Keep it off until the unattended-operation gates are complete."
+            ),
+        )
 
 
 def _check_officer_sleep_bounds(
@@ -38817,6 +38943,14 @@ async def commission_project_officer(
         request, postgres_db, project_id, allow_archived=False
     )
 
+    # Parse the money-spending authority before stale-link handoff or any
+    # other lifecycle mutation. A closed release fence must be a no-write
+    # refusal, not a half-completed commission.
+    fragment, comm_patch, _effects = _validated_officer_post_patch(body)
+    requested_officer_patch = fragment.get("officer") or {}
+    if requested_officer_patch.get("auto_pull") is True:
+        _enforce_officer_auto_pull_release(True)
+
     # Capability gate, BEFORE anything mutates. The config PDP would also catch
     # this downstream (``evaluate`` refuses ``officer.enabled`` without the
     # grant, which is what covers a hand-rolled thread create), but only after
@@ -38847,6 +38981,14 @@ async def commission_project_officer(
     if post is None:
         raise HTTPException(status_code=404, detail="Project post not found")
 
+    row_officer_before = (post.get("config_override") or {}).get("officer") or {}
+    effective_auto_pull = (
+        requested_officer_patch.get("auto_pull")
+        if "auto_pull" in requested_officer_patch
+        else row_officer_before.get("auto_pull")
+    )
+    _enforce_officer_auto_pull_release(effective_auto_pull)
+
     # A stale ended/disabled link is not a live commission, but it still owns
     # an unfinished handoff. Complete that handoff atomically before preparing
     # a successor; registration itself never performs a partial fold.
@@ -38862,7 +39004,6 @@ async def commission_project_officer(
             raise HTTPException(status_code=409, detail=exc.detail) from exc
         post = await postgres_db.get_project_officer(project_id) or post
 
-    fragment, comm_patch, _effects = _validated_officer_post_patch(body)
     _check_officer_sleep_bounds(
         (post.get("config_override") or {}).get("officer") or {},
         fragment.get("officer") or {},
@@ -39325,6 +39466,8 @@ async def patch_project_officer(
     """
     await require_project_owner(request, postgres_db, project_id, allow_archived=False)
     fragment, comm_patch, effects = _validated_officer_post_patch(body)
+    if (fragment.get("officer") or {}).get("auto_pull") is True:
+        _enforce_officer_auto_pull_release(True)
     if not fragment and comm_patch is None:
         raise HTTPException(
             status_code=400,

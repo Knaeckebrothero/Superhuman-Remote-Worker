@@ -1084,6 +1084,7 @@ async def tick_officer(
     usage_ledger: Any = None,
     notify: Any = None,
     now: Optional[datetime] = None,
+    release_enabled: bool = False,
 ) -> dict[str, int]:
     """One officer's pass. Never raises — a bad post must not stop the fleet."""
     now = now or _now()
@@ -1131,7 +1132,11 @@ async def tick_officer(
     except Exception:
         logger.exception("officer backlog: provisioning recovery failed")
 
-    if not auto_pull_enabled(meta) or vector_db is None:
+    # BP-07 recovery belongs to already-admitted, claim-holding work and must
+    # continue through a disable/rollback. The deployment release fence gates
+    # only *new* ticket admission, immediately before the ordinary auto-pull
+    # predicate and every queue read.
+    if not release_enabled or not auto_pull_enabled(meta) or vector_db is None:
         return counts
 
     pools = pools_from_meta(meta)
@@ -1368,6 +1373,7 @@ async def officer_backlog_tick_once(
     usage_ledger: Any = None,
     notify: Any = None,
     now: Optional[datetime] = None,
+    release_enabled: bool = False,
 ) -> dict[str, int]:
     """One tick across every commissioned officer. Errors isolate per officer."""
     totals = {"dispatched": 0, "skipped": 0, "breakers_opened": 0, "wakes": 0}
@@ -1389,6 +1395,7 @@ async def officer_backlog_tick_once(
                 usage_ledger=usage_ledger,
                 notify=notify,
                 now=now,
+                release_enabled=release_enabled,
             )
         except Exception:
             logger.exception(
@@ -1411,6 +1418,7 @@ async def officer_backlog_tick_loop(
     enforce_grants: Optional[GrantsFn] = None,
     usage_ledger: Any = None,
     notify: Any = None,
+    release_enabled: bool = False,
 ) -> None:
     """The ~60s tick, mounted leader-gated from main.py's lifespan."""
     stale_policy = get_liveness_policy().stale_claim
@@ -1430,6 +1438,7 @@ async def officer_backlog_tick_loop(
                 enforce_grants=enforce_grants,
                 usage_ledger=usage_ledger,
                 notify=notify,
+                release_enabled=release_enabled,
             )
             if any(counts.values()):
                 logger.info("Officer backlog tick: %s", counts)
