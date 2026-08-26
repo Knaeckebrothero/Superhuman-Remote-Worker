@@ -1849,6 +1849,57 @@ COMMENT ON FUNCTION public.enforce_managed_thread_repository_url_authority() IS 
 
 
 --
+-- Name: enforce_officer_post_thread_repository_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_officer_post_thread_repository_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    repository_name TEXT;
+    repository_url TEXT;
+    authority_record UUID;
+BEGIN
+    IF NEW.thread_id IS NULL
+       OR (TG_OP = 'UPDATE' AND NEW.thread_id IS NOT DISTINCT FROM OLD.thread_id)
+    THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT thread.metadata->'workspace_container'->>'repo_name',
+           thread.metadata->'workspace_container'->>'git_remote_url'
+      INTO repository_name, repository_url
+      FROM public.threads AS thread
+     WHERE thread.id = NEW.thread_id;
+
+    IF repository_name IS NOT NULL THEN
+        SELECT authority.id
+          INTO authority_record
+          FROM public.managed_repository_authorities AS authority
+         WHERE authority.authority_kind = 'thread'
+           AND authority.authority_id = NEW.thread_id
+           AND authority.project_id = NEW.project_id
+           AND authority.repo_name = repository_name
+           AND authority.access_mode = 'write'
+           AND authority.status = 'active'
+           AND authority.clean_repo_url = repository_url
+         FOR KEY SHARE;
+    END IF;
+
+    IF repository_name IS NOT NULL AND authority_record IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'officer_post_requires_repository_authority',
+            MESSAGE = 'Officer thread repository authority is not active',
+            HINT = 'Adopt or provision the repository before commissioning.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_officer_runtime_agent_binding(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2407,6 +2458,70 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: lock_managed_repository_job_lineage_on_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_managed_repository_job_lineage_on_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    lineage_root UUID;
+    confirmed_root UUID;
+BEGIN
+    IF NEW.parent_job_id IS NULL THEN
+        lineage_root := NEW.id;
+    ELSE
+        WITH RECURSIVE ancestors AS (
+            SELECT job.id, job.parent_job_id
+              FROM public.jobs AS job
+             WHERE job.id = NEW.parent_job_id
+            UNION
+            SELECT parent.id, parent.parent_job_id
+              FROM public.jobs AS parent
+              JOIN ancestors AS child ON parent.id = child.parent_job_id
+        )
+        SELECT id INTO lineage_root
+          FROM ancestors
+         WHERE parent_job_id IS NULL;
+        IF lineage_root IS NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_job_lineage_invalid',
+                MESSAGE = 'Job parent lineage has no authoritative root';
+        END IF;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'managed_repository_job_lineage:' || lineage_root::text,
+        0
+    ));
+
+    IF NEW.parent_job_id IS NOT NULL THEN
+        WITH RECURSIVE ancestors AS (
+            SELECT job.id, job.parent_job_id
+              FROM public.jobs AS job
+             WHERE job.id = NEW.parent_job_id
+            UNION
+            SELECT parent.id, parent.parent_job_id
+              FROM public.jobs AS parent
+              JOIN ancestors AS child ON parent.id = child.parent_job_id
+        )
+        SELECT id INTO confirmed_root
+          FROM ancestors
+         WHERE parent_job_id IS NULL;
+        IF confirmed_root IS DISTINCT FROM lineage_root THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '40001',
+                MESSAGE = 'Job parent lineage changed during admission';
+        END IF;
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -3419,6 +3534,21 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_managed_repository_legacy_rearm_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_managed_repository_legacy_rearm_history() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'managed repository reconciliation re-arms are append-only'
+        USING ERRCODE = '55000';
 END;
 $$;
 
@@ -7839,6 +7969,114 @@ COMMENT ON TABLE public.managed_repository_creation_intents IS 'Durable exact-sc
 
 
 --
+-- Name: managed_repository_legacy_reconcile_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.managed_repository_legacy_reconcile_claim_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_legacy_reconciliation_rearms (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    reconciliation_id uuid NOT NULL,
+    generation integer NOT NULL,
+    actor_id uuid NOT NULL,
+    reason_code text NOT NULL,
+    attempts_in_generation integer NOT NULL,
+    lifetime_attempts integer NOT NULL,
+    failure_reason_code text,
+    rearmed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_legacy_rearm_attempts_check CHECK (((attempts_in_generation >= 0) AND (lifetime_attempts >= attempts_in_generation))),
+    CONSTRAINT managed_repository_legacy_rearm_generation_positive CHECK ((generation > 0)),
+    CONSTRAINT managed_repository_legacy_rearm_reason_check CHECK ((reason_code ~ '^[a-z0-9][a-z0-9_.-]{0,99}$'::text))
+);
+
+
+--
+-- Name: TABLE managed_repository_legacy_reconciliation_rearms; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_legacy_reconciliation_rearms IS 'Append-only attribution for exact-scope operator re-arms. It stores the actor, non-secret reason, failed attempt window, and cumulative attempts; it contains no repository coordinate or credential material.';
+
+
+--
+-- Name: managed_repository_legacy_reconciliations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_legacy_reconciliations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    source_kind text NOT NULL,
+    source_id uuid NOT NULL,
+    project_id uuid,
+    classification text NOT NULL,
+    authority_kind text,
+    authority_id uuid,
+    authority_record_id uuid,
+    authority_generation bigint,
+    repository_owner text,
+    repo_name text,
+    access_mode text,
+    state text DEFAULT 'pending'::text NOT NULL,
+    result_kind text,
+    reason_code text,
+    attempts integer DEFAULT 0 NOT NULL,
+    lifetime_attempts integer DEFAULT 0 NOT NULL,
+    last_failure_reason_code text,
+    rearm_generation integer DEFAULT 0 NOT NULL,
+    claim_token bigint DEFAULT 0 NOT NULL,
+    claimed_by uuid,
+    claim_expires_at timestamp with time zone,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_scanned_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_legacy_access_mode_check CHECK (((access_mode IS NULL) OR (access_mode = ANY (ARRAY['none'::text, 'read'::text, 'write'::text])))),
+    CONSTRAINT managed_repository_legacy_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT managed_repository_legacy_authority_kind_check CHECK (((authority_kind IS NULL) OR (authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text])))),
+    CONSTRAINT managed_repository_legacy_authority_record_shape_check CHECK ((((authority_record_id IS NULL) AND (authority_generation IS NULL)) OR ((authority_record_id IS NOT NULL) AND (authority_generation > 0)))),
+    CONSTRAINT managed_repository_legacy_authority_shape_check CHECK ((((classification = ANY (ARRAY['runnable_job'::text, 'resumable_thread'::text, 'current_officer_thread'::text, 'shared_project_jobs_repository'::text, 'project_runtime_repository'::text])) AND (authority_kind IS NOT NULL) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = ANY (ARRAY['read'::text, 'write'::text]))) OR ((classification = 'terminal_historical'::text) AND (authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text])) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = ANY (ARRAY['read'::text, 'write'::text]))) OR ((classification = 'server_only_repository'::text) AND (authority_kind = 'project_repository'::text) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = 'none'::text)) OR ((classification = 'ambiguous'::text) AND (authority_kind IS NULL) AND (authority_id IS NULL) AND (repository_owner IS NULL) AND (repo_name IS NULL) AND (access_mode IS NULL)))),
+    CONSTRAINT managed_repository_legacy_claim_shape_check CHECK ((((state = 'claimed'::text) AND (claimed_by IS NOT NULL) AND (claim_expires_at IS NOT NULL) AND (claim_token > 0)) OR ((state <> 'claimed'::text) AND (claimed_by IS NULL) AND (claim_expires_at IS NULL)))),
+    CONSTRAINT managed_repository_legacy_classification_check CHECK ((classification = ANY (ARRAY['runnable_job'::text, 'resumable_thread'::text, 'current_officer_thread'::text, 'shared_project_jobs_repository'::text, 'project_runtime_repository'::text, 'server_only_repository'::text, 'terminal_historical'::text, 'ambiguous'::text]))),
+    CONSTRAINT managed_repository_legacy_completion_shape_check CHECK ((((state = 'completed'::text) AND (result_kind IS NOT NULL) AND (completed_at IS NOT NULL)) OR ((state <> 'completed'::text) AND (result_kind IS NULL) AND (completed_at IS NULL)))),
+    CONSTRAINT managed_repository_legacy_lifetime_attempts_check CHECK (((lifetime_attempts >= attempts) AND (lifetime_attempts >= 0))),
+    CONSTRAINT managed_repository_legacy_rearm_generation_check CHECK ((rearm_generation >= 0)),
+    CONSTRAINT managed_repository_legacy_result_check CHECK (((result_kind IS NULL) OR (result_kind = ANY (ARRAY['adopted'::text, 'scrubbed_terminal'::text, 'source_absent'::text, 'authority_revoked'::text])))),
+    CONSTRAINT managed_repository_legacy_source_kind_check CHECK ((source_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text]))),
+    CONSTRAINT managed_repository_legacy_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'retry'::text, 'completed'::text, 'ambiguous'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE managed_repository_legacy_reconciliations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_legacy_reconciliations IS 'Server-owned, restart-safe intent and leased progress for legacy managed repository adoption or terminal credential-URL scrubbing. It stores no raw URL, credential, private key, ciphertext, or transport endpoint.';
+
+
+--
+-- Name: COLUMN managed_repository_legacy_reconciliations.lifetime_attempts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_legacy_reconciliations.lifetime_attempts IS 'Monotonic count across bounded attempt windows and explicit operator re-arms. Unlike attempts, this value is never reset.';
+
+
+--
+-- Name: COLUMN managed_repository_legacy_reconciliations.claim_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_legacy_reconciliations.claim_token IS 'Never-reused settlement generation. A predecessor cannot acknowledge a claim reclaimed after lease expiry.';
+
+
+--
 -- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -11597,6 +11835,46 @@ ALTER TABLE ONLY public.managed_repository_creation_intents
 
 
 --
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearm_request_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_rearm_request_unique UNIQUE (reconciliation_id, actor_id, reason_code);
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearm_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_rearm_unique UNIQUE (reconciliation_id, generation);
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_reconciliation_rearms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_reconciliation_rearms_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_reconciliations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_reconciliations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_source_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_source_unique UNIQUE (source_kind, source_id);
+
+
+--
 -- Name: auth_tokens mcp_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13328,6 +13606,20 @@ CREATE INDEX idx_managed_repository_authority_scope ON public.managed_repository
 
 
 --
+-- Name: idx_managed_repository_legacy_reconcile_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_legacy_reconcile_due ON public.managed_repository_legacy_reconciliations USING btree (next_attempt_at, updated_at, id) WHERE (state = ANY (ARRAY['pending'::text, 'retry'::text, 'claimed'::text]));
+
+
+--
+-- Name: idx_managed_repository_legacy_reconcile_progress; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_legacy_reconcile_progress ON public.managed_repository_legacy_reconciliations USING btree (state, classification, updated_at, id);
+
+
+--
 -- Name: idx_mcp_tokens_hash; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -14721,6 +15013,13 @@ CREATE TRIGGER legacy_workspace_cutover_plans_frozen BEFORE DELETE OR UPDATE ON 
 
 
 --
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearms_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER managed_repository_legacy_rearms_append_only BEFORE DELETE OR UPDATE ON public.managed_repository_legacy_reconciliation_rearms FOR EACH ROW EXECUTE FUNCTION public.protect_managed_repository_legacy_rearm_history();
+
+
+--
 -- Name: message_log mirror_legacy_message_delivery_intent; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -15162,6 +15461,13 @@ CREATE TRIGGER trg_managed_project_repository_url_authority BEFORE INSERT OR UPD
 
 
 --
+-- Name: jobs trg_managed_repository_job_lineage_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_repository_job_lineage_admission BEFORE INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.lock_managed_repository_job_lineage_on_insert();
+
+
+--
 -- Name: threads trg_managed_thread_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -15173,6 +15479,13 @@ CREATE TRIGGER trg_managed_thread_repository_cleanup BEFORE DELETE ON public.thr
 --
 
 CREATE TRIGGER trg_managed_thread_repository_url_authority BEFORE INSERT OR UPDATE OF metadata, agent_id ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_thread_repository_url_authority();
+
+
+--
+-- Name: project_officers trg_officer_post_thread_repository_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_officer_post_thread_repository_authority BEFORE INSERT OR UPDATE OF thread_id ON public.project_officers FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_post_thread_repository_authority();
 
 
 --
@@ -15914,6 +16227,22 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 ALTER TABLE ONLY public.managed_repository_authorities
     ADD CONSTRAINT managed_repository_authorities_creation_intent_id_fkey FOREIGN KEY (creation_intent_id) REFERENCES public.managed_repository_creation_intents(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_reconciliati_authority_record_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_reconciliati_authority_record_id_fkey FOREIGN KEY (authority_record_id) REFERENCES public.managed_repository_authorities(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_reconciliation_reconciliation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_reconciliation_reconciliation_id_fkey FOREIGN KEY (reconciliation_id) REFERENCES public.managed_repository_legacy_reconciliations(id) ON DELETE RESTRICT;
 
 
 --

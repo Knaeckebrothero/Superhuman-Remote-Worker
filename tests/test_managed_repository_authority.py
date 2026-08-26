@@ -580,6 +580,9 @@ async def test_authority_is_proven_before_activation() -> None:
     db = MagicMock()
     db.managed_repository_scope_is_unambiguous = AsyncMock(return_value=True)
     db.reserve_managed_repository_authority = AsyncMock(return_value=provisioning)
+    db.record_managed_repository_authority_forge_key = AsyncMock(
+        return_value=provisioning
+    )
     db.activate_managed_repository_authority = AsyncMock(
         return_value={
             key: value for key, value in authority.items() if key != "private_key"
@@ -614,6 +617,18 @@ async def test_authority_is_proven_before_activation() -> None:
     db.activate_managed_repository_authority.assert_awaited_once_with(
         str(authority["id"]), forge_key_id=41, access_mode="write"
     )
+    db.record_managed_repository_authority_forge_key.assert_awaited_once_with(
+        str(authority["id"]),
+        repository_owner="srw",
+        repo_name=authority["repo_name"],
+        authority_kind="job",
+        authority_scope_id=str(authority["authority_id"]),
+        project_id=None,
+        generation=1,
+        access_mode="write",
+        public_key_fingerprint=authority["public_key_fingerprint"],
+        forge_key_id=41,
+    )
 
 
 @pytest.mark.asyncio
@@ -622,6 +637,7 @@ async def test_unproven_key_never_activates() -> None:
     db = MagicMock()
     db.managed_repository_scope_is_unambiguous = AsyncMock(return_value=True)
     db.reserve_managed_repository_authority = AsyncMock(return_value=authority)
+    db.record_managed_repository_authority_forge_key = AsyncMock(return_value=authority)
     db.fail_managed_repository_authority = AsyncMock(return_value=True)
     db.get_managed_repository_authority = AsyncMock(return_value=None)
     db.activate_managed_repository_authority = AsyncMock()

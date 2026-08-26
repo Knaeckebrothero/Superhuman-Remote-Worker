@@ -242,7 +242,11 @@ APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0183_compute_initial_recovery_epoch_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY
+APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0184_managed_repository_legacy_reconciliation.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -798,6 +802,23 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     assert "schema_current" not in APP_DATASOURCE_TOMBSTONES_MIGRATION.read_text()
     assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_managed_repository_legacy_reconciliation_migration_is_additive() -> None:
+    raw = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0183_compute_initial_recovery_epoch_authority.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    assert "CREATE TABLE public.managed_repository_legacy_reconciliations" in sql
+    assert "CREATE SEQUENCE public.managed_repository_legacy_reconcile_claim_seq" in sql
+    assert "managed_repository_legacy_source_unique" in sql
+    assert "managed_repository_legacy_claim_shape_check" in sql
+    assert "managed_repository_legacy_completion_shape_check" in sql
+    assert "UPDATE jobs" not in sql
+    assert "UPDATE threads" not in sql
+    assert "UPDATE project_repositories" not in sql
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:

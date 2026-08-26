@@ -51,6 +51,7 @@ from security.crypto import (
 from utils.db_url import build_postgres_url
 from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
+from src.shared.session_retirement import stateless_settled_retirement_authority
 from src.shared.deliverable_contract import (
     parse_required_deliverables,
     pr_repositories,
@@ -26446,6 +26447,1409 @@ class PostgresDB:
             )
         return False
 
+    async def list_managed_repository_legacy_candidates(
+        self,
+        *,
+        after_kind: str | None = None,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Keyset-page credential-bearing managed repository source rows.
+
+        Raw URLs are returned only to the in-process reconciler for exact CAS.
+        Callers must never log, serialize, or persist them.  The stable order is
+        project repository -> job -> thread, then UUID; no correctness decision
+        applies ``LIMIT`` before the credential predicate.
+        """
+
+        ranks = {None: 0, "project_repository": 1, "job": 2, "thread": 3}
+        if after_kind not in ranks:
+            raise ValueError("Unsupported managed repository source kind")
+        after_rank = ranks[after_kind]
+        try:
+            after_uuid = UUID(str(after_id)) if after_id else UUID(int=0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid managed repository keyset cursor") from exc
+        safe_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT 1::integer AS source_rank,
+                           'project_repository'::text AS source_kind,
+                           repository.id AS source_id,
+                           repository.project_id,
+                           repository.repo_url AS observed_url,
+                           repository.name AS repo_name,
+                           repository.role,
+                           repository.read_only,
+                           repository.is_managed,
+                           project.status::text AS project_status,
+                           NULL::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           NULL::text AS execution_lane,
+                           NULL::jsonb AS source_metadata,
+                           FALSE AS current_officer
+                      FROM project_repositories AS repository
+                      JOIN projects AS project ON project.id = repository.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               repository.repo_url
+                           )
+                    UNION ALL
+                    SELECT 2, 'job', job.id, job.project_id,
+                           job.context->>'git_remote_url', job.repo_name,
+                           NULL::text, NULL::boolean, NULL::boolean,
+                           project.status::text, job.status::text,
+                           job.completion_outcome_kind,
+                           job.parent_job_id, job.branch_name,
+                           job.execution_lane, job.context, FALSE
+                      FROM jobs AS job
+                      LEFT JOIN projects AS project ON project.id = job.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               job.context->>'git_remote_url'
+                           )
+                    UNION ALL
+                    SELECT 3, 'thread', thread.id, thread.project_id,
+                           thread.metadata->'workspace_container'
+                               ->>'git_remote_url',
+                           thread.metadata->'workspace_container'->>'repo_name',
+                           NULL::text, NULL::boolean, NULL::boolean,
+                           project.status::text, thread.status::text,
+                           NULL::text,
+                           NULL::uuid, NULL::text, thread.execution_lane,
+                           thread.metadata,
+                           EXISTS (
+                               SELECT 1
+                                 FROM project_officers AS officer
+                                WHERE officer.project_id = thread.project_id
+                                  AND officer.thread_id = thread.id
+                           )
+                      FROM threads AS thread
+                      LEFT JOIN projects AS project ON project.id = thread.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               thread.metadata->'workspace_container'
+                                   ->>'git_remote_url'
+                           )
+                )
+                SELECT *
+                  FROM candidates
+                 WHERE source_rank > $1
+                    OR (source_rank = $1 AND source_id > $2)
+                 ORDER BY source_rank, source_id
+                 LIMIT $3
+                """,
+                after_rank,
+                after_uuid,
+                safe_limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_managed_repository_legacy_candidate(
+        self, source_kind: str, source_id: str
+    ) -> Dict[str, Any] | None:
+        """Re-read one still-credentialed legacy source without exposing it."""
+
+        try:
+            source_uuid = UUID(str(source_id))
+        except (TypeError, ValueError):
+            return None
+        if source_kind not in {"project_repository", "job", "thread"}:
+            return None
+        async with self.acquire() as conn:
+            if source_kind == "project_repository":
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1::integer AS source_rank,
+                           'project_repository'::text AS source_kind,
+                           repository.id AS source_id,
+                           repository.project_id, repository.repo_url AS observed_url,
+                           repository.name AS repo_name, repository.role,
+                           repository.read_only, repository.is_managed,
+                           project.status::text AS project_status,
+                           NULL::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           NULL::text AS execution_lane,
+                           NULL::jsonb AS source_metadata,
+                           FALSE AS current_officer
+                      FROM project_repositories AS repository
+                      JOIN projects AS project ON project.id=repository.project_id
+                     WHERE repository.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               repository.repo_url
+                           )
+                    """,
+                    source_uuid,
+                )
+            elif source_kind == "job":
+                row = await conn.fetchrow(
+                    """
+                    SELECT 2::integer AS source_rank, 'job'::text AS source_kind,
+                           job.id AS source_id, job.project_id,
+                           job.context->>'git_remote_url' AS observed_url,
+                           job.repo_name, NULL::text AS role,
+                           NULL::boolean AS read_only,
+                           NULL::boolean AS is_managed,
+                           project.status::text AS project_status,
+                           job.status::text AS source_status,
+                           job.completion_outcome_kind,
+                           job.parent_job_id, job.branch_name,
+                           job.execution_lane, job.context AS source_metadata,
+                           FALSE AS current_officer
+                      FROM jobs AS job
+                      LEFT JOIN projects AS project ON project.id=job.project_id
+                     WHERE job.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               job.context->>'git_remote_url'
+                           )
+                    """,
+                    source_uuid,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 3::integer AS source_rank,
+                           'thread'::text AS source_kind,
+                           thread.id AS source_id, thread.project_id,
+                           thread.metadata->'workspace_container'
+                               ->>'git_remote_url' AS observed_url,
+                           thread.metadata->'workspace_container'
+                               ->>'repo_name' AS repo_name,
+                           NULL::text AS role, NULL::boolean AS read_only,
+                           NULL::boolean AS is_managed,
+                           project.status::text AS project_status,
+                           thread.status::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           thread.execution_lane,
+                           thread.metadata AS source_metadata,
+                           EXISTS (
+                               SELECT 1 FROM project_officers AS officer
+                                WHERE officer.project_id=thread.project_id
+                                  AND officer.thread_id=thread.id
+                           ) AS current_officer
+                      FROM threads AS thread
+                      LEFT JOIN projects AS project ON project.id=thread.project_id
+                     WHERE thread.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               thread.metadata->'workspace_container'
+                                   ->>'git_remote_url'
+                           )
+                    """,
+                    source_uuid,
+                )
+        return dict(row) if row else None
+
+    async def list_managed_repository_legacy_active_authority_candidates(
+        self,
+        *,
+        after_kind: str | None = None,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Keyset-page live exact authorities for lifecycle convergence.
+
+        The cursor UUID is the immutable authority-record id, not the mutable
+        source id. The public key is returned only so a lost registration
+        response can recover its exact forge identifier. Rows contain no URL,
+        private key, ciphertext, credential, or transport coordinate.
+        """
+
+        ranks = {None: 0, "project_repository": 1, "job": 2, "thread": 3}
+        if after_kind not in ranks:
+            raise ValueError("Unsupported managed repository authority cursor")
+        after_rank = ranks[after_kind]
+        try:
+            after_uuid = UUID(str(after_id)) if after_id else UUID(int=0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid managed repository authority cursor") from exc
+        safe_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT CASE authority_kind
+                               WHEN 'project_repository' THEN 1
+                               WHEN 'job' THEN 2
+                               WHEN 'thread' THEN 3
+                           END AS source_rank,
+                           authority_kind AS source_kind,
+                           authority_id AS source_id,
+                           id AS authority_record_id,
+                           project_id, repository_owner, repo_name, access_mode,
+                           generation AS authority_generation,
+                           public_key, public_key_fingerprint, forge_key_id,
+                           status
+                      FROM managed_repository_authorities
+                     WHERE status IN ('provisioning', 'active', 'revoking')
+                )
+                SELECT source_kind, source_id, authority_record_id, project_id,
+                       repository_owner, repo_name, access_mode,
+                       authority_generation, public_key, public_key_fingerprint,
+                       forge_key_id, status
+                  FROM candidates
+                 WHERE source_rank > $1
+                    OR (source_rank = $1 AND authority_record_id > $2)
+                 ORDER BY source_rank, authority_record_id
+                 LIMIT $3
+                """,
+                after_rank,
+                after_uuid,
+                safe_limit,
+            )
+            result: list[dict[str, Any]] = []
+            for raw in rows:
+                row = dict(raw)
+                source_kind = str(row["source_kind"])
+                source_id = row["source_id"]
+                containable = False
+                containment_reason = None
+                if source_kind == "job":
+                    lineage = await conn.fetch(
+                        """
+                        WITH RECURSIVE lineage AS (
+                            SELECT id, parent_job_id, project_id, repo_name,
+                                   status::text AS status,
+                                   completion_outcome_kind
+                              FROM jobs WHERE id=$1
+                            UNION
+                            SELECT child.id, child.parent_job_id,
+                                   child.project_id, child.repo_name,
+                                   child.status::text,
+                                   child.completion_outcome_kind
+                              FROM jobs AS child
+                              JOIN lineage AS parent
+                                ON child.parent_job_id=parent.id
+                        )
+                        SELECT * FROM lineage
+                        """,
+                        source_id,
+                    )
+                    root = next(
+                        (item for item in lineage if item["id"] == source_id), None
+                    )
+                    containable = not lineage or bool(
+                        root is not None
+                        and root["parent_job_id"] is None
+                        and all(
+                            item["project_id"] == row["project_id"]
+                            and item["repo_name"] == row["repo_name"]
+                            and (
+                                (
+                                    item["status"] == "completed"
+                                    and item["completion_outcome_kind"]
+                                    != "blocked_undelivered"
+                                )
+                                or (
+                                    item["status"] == "cancelled"
+                                    and item["completion_outcome_kind"]
+                                    == "blocked_undelivered"
+                                )
+                            )
+                            for item in lineage
+                        )
+                    )
+                    if containable:
+                        containment_reason = (
+                            "source_absent" if not lineage else "job_lineage_terminal"
+                        )
+                elif source_kind == "thread":
+                    source = await conn.fetchrow(
+                        "SELECT project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads WHERE id=$1",
+                        source_id,
+                    )
+                    if source is None:
+                        commissioned = bool(
+                            await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE thread_id=$1)",
+                                source_id,
+                            )
+                        )
+                        containable = not commissioned
+                        containment_reason = "source_absent" if containable else None
+                    else:
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            settled = None
+                            workspace = {}
+                        commissioned = bool(
+                            await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE project_id=$1 AND thread_id=$2)",
+                                source["project_id"],
+                                source_id,
+                            )
+                        )
+                        containable = bool(
+                            source["project_id"] == row["project_id"]
+                            and workspace.get("repo_name") == row["repo_name"]
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and not commissioned
+                        )
+                        if containable:
+                            containment_reason = "thread_permanently_retired"
+                else:
+                    source = await conn.fetchrow(
+                        "SELECT project_id, name, role, read_only, is_managed "
+                        "FROM project_repositories WHERE id=$1",
+                        source_id,
+                    )
+                    if source is None:
+                        containable = True
+                        containment_reason = "source_absent"
+                    else:
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        containable = bool(
+                            source["project_id"] != row["project_id"]
+                            or source["name"] != row["repo_name"]
+                            or current_mode != row["access_mode"]
+                        )
+                        if containable:
+                            containment_reason = "project_repository_authority_changed"
+                row["containment_candidate"] = containable
+                row["containment_reason"] = containment_reason
+                result.append(row)
+        return result
+
+    async def upsert_managed_repository_legacy_reconciliation(
+        self,
+        *,
+        source_kind: str,
+        source_id: str,
+        project_id: str | None,
+        classification: str,
+        authority_kind: str | None,
+        authority_id: str | None,
+        repository_owner: str | None,
+        repo_name: str | None,
+        access_mode: str | None,
+        reason_code: str | None,
+        authority_record_id: str | None = None,
+        authority_generation: int | None = None,
+    ) -> Dict[str, Any]:
+        """Persist one exact, secret-free reconciliation intent.
+
+        Re-scanning an unchanged retry/failed/ambiguous intent never resets its
+        attempt budget. A genuine authoritative reclassification (including an
+        operator resolving ambiguity in durable source rows) reopens it.
+        """
+
+        source_uuid = UUID(str(source_id))
+        project_uuid = UUID(str(project_id)) if project_id else None
+        authority_uuid = UUID(str(authority_id)) if authority_id else None
+        authority_record_uuid = (
+            UUID(str(authority_record_id)) if authority_record_id else None
+        )
+        if (authority_record_uuid is None) != (authority_generation is None):
+            raise ValueError(
+                "Managed repository authority record and generation must be paired"
+            )
+        authority_generation_value = (
+            int(authority_generation) if authority_generation is not None else None
+        )
+        if authority_generation_value is not None and authority_generation_value <= 0:
+            raise ValueError("Managed repository authority generation must be positive")
+        initial_state = "ambiguous" if classification == "ambiguous" else "pending"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO managed_repository_legacy_reconciliations (
+                        source_kind, source_id, project_id, classification,
+                        authority_kind, authority_id, authority_record_id,
+                        authority_generation, repository_owner, repo_name,
+                        access_mode, state, reason_code
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                    )
+                    ON CONFLICT (source_kind, source_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    source_kind,
+                    source_uuid,
+                    project_uuid,
+                    classification,
+                    authority_kind,
+                    authority_uuid,
+                    authority_record_uuid,
+                    authority_generation_value,
+                    repository_owner,
+                    repo_name,
+                    access_mode,
+                    initial_state,
+                    reason_code,
+                )
+                if row is None:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT *,
+                               state = 'claimed'
+                               AND claim_expires_at IS NOT NULL
+                               AND claim_expires_at > clock_timestamp()
+                                   AS claim_is_active
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE source_kind=$1 AND source_id=$2
+                         FOR UPDATE
+                        """,
+                        source_kind,
+                        source_uuid,
+                    )
+                    assert existing is not None
+                    active_claim = bool(existing["claim_is_active"])
+                    same_plan = (
+                        existing["project_id"] == project_uuid
+                        and existing["classification"] == classification
+                        and existing["authority_kind"] == authority_kind
+                        and existing["authority_id"] == authority_uuid
+                        and existing["authority_record_id"] == authority_record_uuid
+                        and existing["authority_generation"]
+                        == authority_generation_value
+                        and existing["repository_owner"] == repository_owner
+                        and existing["repo_name"] == repo_name
+                        and existing["access_mode"] == access_mode
+                        and (
+                            classification != "ambiguous"
+                            or existing["reason_code"] == reason_code
+                        )
+                    )
+                    if active_claim or (same_plan and existing["state"] != "completed"):
+                        row = await conn.fetchrow(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET last_scanned_at=now(), updated_at=now()
+                             WHERE id=$1
+                            RETURNING *
+                            """,
+                            existing["id"],
+                        )
+                    else:
+                        # A changed authoritative scope, resolved ambiguity, or
+                        # reappearance after completion is a new bounded attempt
+                        # series. Never rewrite an unexpired worker's plan.
+                        row = await conn.fetchrow(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET project_id=$2, classification=$3,
+                                   authority_kind=$4, authority_id=$5,
+                                   authority_record_id=$6,
+                                   authority_generation=$7,
+                                   repository_owner=$8, repo_name=$9,
+                                   access_mode=$10, state=$11, reason_code=$12,
+                                   attempts=0, claimed_by=NULL,
+                                   claim_expires_at=NULL, next_attempt_at=now(),
+                                   result_kind=NULL, completed_at=NULL,
+                                   last_scanned_at=now(), updated_at=now()
+                             WHERE id=$1
+                            RETURNING *
+                            """,
+                            existing["id"],
+                            project_uuid,
+                            classification,
+                            authority_kind,
+                            authority_uuid,
+                            authority_record_uuid,
+                            authority_generation_value,
+                            repository_owner,
+                            repo_name,
+                            access_mode,
+                            initial_state,
+                            reason_code,
+                        )
+        return dict(row)
+
+    async def claim_managed_repository_legacy_reconciliations(
+        self,
+        *,
+        claimant_id: str,
+        limit: int = 10,
+        lease_seconds: int = 300,
+        max_attempts: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Claim due exact intents with a never-reused settlement token."""
+
+        claimant_uuid = UUID(str(claimant_id))
+        safe_limit = max(1, min(int(limit), 100))
+        safe_lease = max(30, min(int(lease_seconds), 1800))
+        safe_attempts = max(1, min(int(max_attempts), 50))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE managed_repository_legacy_reconciliations
+                       SET state = 'failed', reason_code = 'attempt_limit_exhausted',
+                           claimed_by = NULL, claim_expires_at = NULL,
+                           result_kind = NULL, completed_at = NULL,
+                           updated_at = now()
+                     WHERE state IN ('pending', 'retry', 'claimed')
+                       AND attempts >= $1
+                       AND (state <> 'claimed' OR claim_expires_at <= now())
+                    """,
+                    safe_attempts,
+                )
+                rows = await conn.fetch(
+                    """
+                    WITH due AS (
+                        SELECT id
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE classification <> 'ambiguous'
+                           AND attempts < $3
+                           AND next_attempt_at <= now()
+                           AND (
+                               state IN ('pending', 'retry')
+                               OR (state = 'claimed' AND claim_expires_at <= now())
+                           )
+                         ORDER BY next_attempt_at, updated_at, id
+                         FOR UPDATE SKIP LOCKED
+                         LIMIT $1
+                    )
+                    UPDATE managed_repository_legacy_reconciliations AS intent
+                       SET state = 'claimed', attempts = intent.attempts + 1,
+                           lifetime_attempts = intent.lifetime_attempts + 1,
+                           claim_token = nextval(
+                               'managed_repository_legacy_reconcile_claim_seq'
+                           ),
+                           claimed_by = $4,
+                           claim_expires_at = now() + make_interval(secs => $2),
+                           reason_code = NULL, updated_at = now()
+                      FROM due
+                     WHERE intent.id = due.id
+                    RETURNING intent.*
+                    """,
+                    safe_limit,
+                    safe_lease,
+                    safe_attempts,
+                    claimant_uuid,
+                )
+        return [dict(row) for row in rows]
+
+    async def settle_inactive_managed_repository_legacy_reconciliations(
+        self,
+    ) -> int:
+        """Close intents whose exact source vanished or is credential-free.
+
+        A concurrent normal adoption with an exact active authority is left for
+        the leased worker, which records ``adopted`` after locked validation.
+        This sweep exists primarily for an operator-supported ambiguity
+        resolution (for example, deleting a proven duplicate attachment) and
+        retains a durable audit row instead of silently deleting the intent.
+        """
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations AS intent
+                   SET state='completed',
+                       result_kind=CASE WHEN EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS settled_authority
+                            WHERE settled_authority.id=intent.authority_record_id
+                              AND settled_authority.generation=
+                                  intent.authority_generation
+                              AND settled_authority.status='revoked'
+                       ) THEN 'authority_revoked' ELSE 'source_absent' END,
+                       reason_code=CASE WHEN EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS settled_authority
+                            WHERE settled_authority.id=intent.authority_record_id
+                              AND settled_authority.generation=
+                                  intent.authority_generation
+                              AND settled_authority.status='revoked'
+                       ) THEN 'authority_revoked' ELSE 'source_absent_or_clean' END,
+                       completed_at=COALESCE(completed_at, now()),
+                       claimed_by=NULL, claim_expires_at=NULL,
+                       updated_at=now()
+                 WHERE state NOT IN ('claimed', 'completed')
+                   AND (
+                       intent.authority_kind IS DISTINCT FROM intent.source_kind
+                       OR intent.authority_id IS DISTINCT FROM intent.source_id
+                       OR NOT EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS authority
+                            WHERE authority.status IN (
+                                      'provisioning', 'active', 'revoking'
+                                  )
+                              AND authority.authority_kind=intent.authority_kind
+                              AND authority.authority_id=intent.authority_id
+                              AND authority.project_id IS NOT DISTINCT FROM
+                                  intent.project_id
+                              AND authority.repository_owner=
+                                  intent.repository_owner
+                              AND authority.repo_name=intent.repo_name
+                              AND authority.access_mode=intent.access_mode
+                       )
+                   )
+                   AND CASE intent.source_kind
+                       WHEN 'job' THEN NOT EXISTS (
+                           SELECT 1 FROM jobs AS job
+                            WHERE job.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  job.context->>'git_remote_url'
+                              )
+                       )
+                       WHEN 'thread' THEN NOT EXISTS (
+                           SELECT 1 FROM threads AS thread
+                            WHERE thread.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  thread.metadata->'workspace_container'
+                                      ->>'git_remote_url'
+                              )
+                       )
+                       WHEN 'project_repository' THEN NOT EXISTS (
+                           SELECT 1
+                             FROM project_repositories AS repository
+                            WHERE repository.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  repository.repo_url
+                              )
+                       )
+                       ELSE FALSE
+                   END
+                """
+            )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def retry_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        reason_code: str,
+        delay_seconds: int,
+        max_attempts: int = 8,
+    ) -> bool:
+        """Release one failed claim to bounded backoff or terminal failure."""
+
+        safe_delay = max(60, min(int(delay_seconds), 900))
+        safe_attempts = max(1, min(int(max_attempts), 50))
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations
+                   SET state = CASE WHEN attempts >= $5 THEN 'failed'
+                                    ELSE 'retry' END,
+                       reason_code = CASE WHEN attempts >= $5
+                                          THEN 'attempt_limit_exhausted'
+                                          ELSE $3 END,
+                       next_attempt_at = now() + make_interval(secs => $4),
+                       last_failure_reason_code = $3,
+                       claimed_by = NULL, claim_expires_at = NULL,
+                       result_kind = NULL, completed_at = NULL,
+                       updated_at = now()
+                 WHERE id = $1 AND state = 'claimed' AND claim_token = $2
+                   AND claim_expires_at > clock_timestamp()
+                """,
+                UUID(str(reconciliation_id)),
+                int(claim_token),
+                str(reason_code)[:100],
+                safe_delay,
+                safe_attempts,
+            )
+        return result == "UPDATE 1"
+
+    async def managed_repository_legacy_reconciliation_claim_is_current(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+    ) -> bool:
+        """Return whether an exact reconciliation lease still owns side effects.
+
+        The database clock is the sole lease authority. Callers use this
+        immediately before an external containment mutation so an expired
+        predecessor cannot revoke a key after another worker reclaimed the
+        durable intent.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+        except (TypeError, ValueError):
+            return False
+        if token <= 0:
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE id = $1
+                           AND state = 'claimed'
+                           AND claim_token = $2
+                           AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at > clock_timestamp()
+                    )
+                    """,
+                    reconciliation_uuid,
+                    token,
+                )
+            )
+
+    async def rearm_managed_repository_legacy_reconciliation(
+        self,
+        source_kind: str,
+        source_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Explicitly reopen one exact attempt-exhausted reconciliation.
+
+        This is intentionally not a bulk reset.  The exact source row is locked,
+        the actor and non-secret reason are appended to immutable history, and
+        the lifetime attempt count plus never-reused claim token are retained.
+        Repeating a committed request while its rearmed generation is active
+        replays that generation; different attribution fails closed.
+        """
+
+        if source_kind not in {"job", "thread", "project_repository"}:
+            raise ValueError("Unsupported managed repository source kind")
+        try:
+            source_uuid = UUID(str(source_id))
+            actor_uuid = UUID(str(actor_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Source and actor identifiers must be UUIDs") from exc
+        clean_reason = str(reason or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,99}", clean_reason):
+            raise ValueError("Re-arm reason must be a secret-safe machine reason code")
+
+        def _safe_result(
+            status: str,
+            row: Mapping[str, Any] | None,
+            *,
+            generation: int | None = None,
+        ) -> Dict[str, Any]:
+            return {
+                "status": status,
+                "source_kind": source_kind,
+                "source_id": str(source_uuid),
+                "state": str(row["state"]) if row is not None else None,
+                "rearm_generation": (
+                    generation
+                    if generation is not None
+                    else (int(row["rearm_generation"]) if row is not None else None)
+                ),
+            }
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE source_kind=$1 AND source_id=$2
+                     FOR UPDATE
+                    """,
+                    source_kind,
+                    source_uuid,
+                )
+                if intent is None:
+                    return _safe_result("not_found", None)
+
+                matching_rearm = await conn.fetchrow(
+                    """
+                    SELECT generation, actor_id, reason_code
+                      FROM managed_repository_legacy_reconciliation_rearms
+                     WHERE reconciliation_id=$1
+                       AND actor_id=$2
+                       AND reason_code=$3
+                    """,
+                    intent["id"],
+                    actor_uuid,
+                    clean_reason,
+                )
+                if matching_rearm is not None:
+                    # Actor+reason is the idempotency identity. It replays even
+                    # after newer attempt windows have been opened. A delayed
+                    # response can therefore never mint a later generation.
+                    return _safe_result(
+                        "replayed",
+                        intent,
+                        generation=int(matching_rearm["generation"]),
+                    )
+                if intent["state"] != "failed":
+                    if int(intent["rearm_generation"]) > 0:
+                        return _safe_result("idempotency_conflict", intent)
+                    return _safe_result("not_failed", intent)
+
+                generation = int(intent["rearm_generation"]) + 1
+                await conn.execute(
+                    """
+                    INSERT INTO managed_repository_legacy_reconciliation_rearms (
+                        reconciliation_id, generation, actor_id, reason_code,
+                        attempts_in_generation, lifetime_attempts,
+                        failure_reason_code
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    intent["id"],
+                    generation,
+                    actor_uuid,
+                    clean_reason,
+                    int(intent["attempts"]),
+                    int(intent["lifetime_attempts"]),
+                    intent["last_failure_reason_code"] or intent["reason_code"],
+                )
+                rearmed = await conn.fetchrow(
+                    """
+                    UPDATE managed_repository_legacy_reconciliations
+                       SET state='retry', attempts=0,
+                           rearm_generation=$2,
+                           reason_code='operator_rearmed',
+                           next_attempt_at=now(), claimed_by=NULL,
+                           claim_expires_at=NULL, result_kind=NULL,
+                           completed_at=NULL, updated_at=now()
+                     WHERE id=$1 AND state='failed'
+                       AND rearm_generation=$3
+                    RETURNING *
+                    """,
+                    intent["id"],
+                    generation,
+                    int(intent["rearm_generation"]),
+                )
+                if rearmed is None:  # Row lock makes this defensive only.
+                    raise RuntimeError("Managed repository re-arm CAS was lost")
+                return _safe_result("rearmed", rearmed)
+
+    async def mark_managed_repository_legacy_reconciliation_ambiguous(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        reason_code: str,
+    ) -> bool:
+        """Fail one claimed source closed with only an opaque reason."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations
+                   SET classification = 'ambiguous', state = 'ambiguous',
+                       authority_kind = NULL, authority_id = NULL,
+                       repository_owner = NULL, repo_name = NULL,
+                       access_mode = NULL, reason_code = $3,
+                       claimed_by = NULL, claim_expires_at = NULL,
+                       result_kind = NULL, completed_at = NULL,
+                       updated_at = now()
+                 WHERE id = $1 AND state = 'claimed' AND claim_token = $2
+                   AND claim_expires_at > clock_timestamp()
+                """,
+                UUID(str(reconciliation_id)),
+                int(claim_token),
+                str(reason_code)[:100],
+            )
+        return result == "UPDATE 1"
+
+    async def finish_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        observed_url: str | None,
+        authority_id: str | None,
+    ) -> str | None:
+        """Atomically revalidate source+authority, scrub, and settle a claim.
+
+        Lock order is reconciliation intent -> source row -> active authority.
+        No other path locks the private intent table, so this preserves the
+        established durable-owner-before-authority order without a cycle.
+        ``observed_url`` exists only as a query parameter for exact snapshot
+        CAS and is never copied into the ledger or an error. ``None`` permits
+        only convergence on the exact clean URL of an already-active authority.
+        """
+
+        reconciliation_uuid = UUID(str(reconciliation_id))
+        authority_uuid = UUID(str(authority_id)) if authority_id else None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *,
+                           state = 'claimed'
+                           AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at > clock_timestamp()
+                               AS claim_is_active
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id = $1 FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if (
+                    intent is None
+                    or intent["state"] != "claimed"
+                    or int(intent["claim_token"]) != int(claim_token)
+                    or not intent["claim_is_active"]
+                ):
+                    return None
+
+                source_kind = str(intent["source_kind"])
+                source_id = intent["source_id"]
+                classification = str(intent["classification"])
+                source = None
+                if source_kind == "job":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "completion_outcome_kind, parent_job_id, repo_name, context "
+                        "FROM jobs WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    source_context = (
+                        _strict_json_object(source["context"], label="job context")
+                        if source
+                        else {}
+                    )
+                    current_url = source_context.get("git_remote_url")
+                elif source_kind == "thread":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    source_metadata = (
+                        _strict_json_object(source["metadata"], label="thread metadata")
+                        if source
+                        else {}
+                    )
+                    workspace = (
+                        source_metadata.get("workspace_container", {}) if source else {}
+                    )
+                    current_url = workspace.get("git_remote_url")
+                elif source_kind == "project_repository":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, repo_url, role, read_only, "
+                        "is_managed FROM project_repositories "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    current_url = source["repo_url"] if source else None
+                else:
+                    return None
+                if source is None or source["project_id"] != intent["project_id"]:
+                    return None
+
+                terminal = classification in {
+                    "terminal_historical",
+                    "server_only_repository",
+                }
+                settlement_authority_record_id = None
+                settlement_authority_generation = None
+                if terminal:
+                    if (
+                        observed_url is None
+                        or str(current_url or "") != observed_url
+                        or not await conn.fetchval(
+                            "SELECT public.managed_repository_url_has_userinfo($1)",
+                            current_url,
+                        )
+                    ):
+                        return None
+                    if source_kind == "job":
+                        valid_terminal = (
+                            (
+                                source["status"] == "completed"
+                                and source["completion_outcome_kind"]
+                                != "blocked_undelivered"
+                            )
+                            or (
+                                source["status"] == "cancelled"
+                                and source["completion_outcome_kind"]
+                                == "blocked_undelivered"
+                            )
+                        ) and source["repo_name"] == intent["repo_name"]
+                        if valid_terminal and intent["authority_kind"] == "job":
+                            root_id = await conn.fetchval(
+                                """
+                                WITH RECURSIVE lineage AS (
+                                    SELECT id, parent_job_id FROM jobs WHERE id=$1
+                                    UNION ALL
+                                    SELECT parent.id, parent.parent_job_id
+                                      FROM jobs AS parent
+                                      JOIN lineage
+                                        ON parent.id = lineage.parent_job_id
+                                )
+                                SELECT id FROM lineage
+                                 WHERE parent_job_id IS NULL LIMIT 1
+                                """,
+                                source_id,
+                            )
+                            valid_terminal = root_id == intent["authority_id"]
+                        elif valid_terminal:
+                            valid_terminal = bool(
+                                intent["authority_kind"] == "project_repository"
+                                and await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM "
+                                    "project_repositories WHERE id=$1 "
+                                    "AND project_id=$2 AND name=$3 "
+                                    "AND is_managed AND role='jobs' "
+                                    "AND NOT read_only)",
+                                    intent["authority_id"],
+                                    source["project_id"],
+                                    intent["repo_name"],
+                                )
+                            )
+                    elif source_kind == "thread":
+                        workspace = source_metadata.get("workspace_container", {})
+                        try:
+                            settled_retirement = stateless_settled_retirement_authority(
+                                source_metadata
+                            )
+                        except RuntimeError:
+                            settled_retirement = None
+                        valid_terminal = bool(
+                            source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled_retirement is not None
+                            and settled_retirement.get("permanent") is True
+                            and workspace.get("repo_name") == intent["repo_name"]
+                            and intent["authority_kind"] == "thread"
+                            and intent["authority_id"] == source_id
+                            and not await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE project_id=$1 AND thread_id=$2)",
+                                source["project_id"],
+                                source_id,
+                            )
+                        )
+                    else:
+                        valid_terminal = bool(
+                            classification == "server_only_repository"
+                            and source["is_managed"]
+                            and source["role"] == "knowledge"
+                            and source["name"] == intent["repo_name"]
+                            and intent["authority_kind"] == "project_repository"
+                            and intent["authority_id"] == source_id
+                            and intent["access_mode"] == "none"
+                        )
+                    clean_url = await conn.fetchval(
+                        "SELECT public.managed_repository_url_without_userinfo($1)",
+                        current_url,
+                    )
+                    if not valid_terminal or clean_url is None:
+                        return None
+                    result_kind = "scrubbed_terminal"
+                    source_needs_update = True
+                else:
+                    if authority_uuid is None:
+                        return None
+                    authority = await conn.fetchrow(
+                        """
+                        SELECT id, authority_kind, authority_id, project_id,
+                               repository_owner, repo_name, access_mode,
+                               generation, clean_repo_url, status
+                          FROM managed_repository_authorities
+                         WHERE id=$1 FOR SHARE
+                        """,
+                        authority_uuid,
+                    )
+                    if (
+                        authority is None
+                        or authority["status"] != "active"
+                        or authority["authority_kind"] != intent["authority_kind"]
+                        or authority["authority_id"] != intent["authority_id"]
+                        or authority["project_id"] != intent["project_id"]
+                        or authority["repository_owner"] != intent["repository_owner"]
+                        or authority["repo_name"] != intent["repo_name"]
+                        or authority["access_mode"] != intent["access_mode"]
+                    ):
+                        return None
+                    settlement_authority_record_id = authority["id"]
+                    settlement_authority_generation = int(authority["generation"])
+                    clean_url = authority["clean_repo_url"]
+                    if str(current_url or "") == clean_url:
+                        # A concurrent normal attach/dispatch already proved
+                        # and scrubbed this exact authority. The locked source
+                        # and active authority checks below are still required
+                        # before the durable reconciliation claim may settle.
+                        source_needs_update = False
+                    elif (
+                        observed_url is not None
+                        and str(current_url or "") == observed_url
+                        and await conn.fetchval(
+                            "SELECT public.managed_repository_url_has_userinfo($1)",
+                            current_url,
+                        )
+                    ):
+                        source_needs_update = True
+                    else:
+                        return None
+                    if source_kind == "job":
+                        blocked_undelivered = bool(
+                            source["completion_outcome_kind"] == "blocked_undelivered"
+                        )
+                        valid_source = bool(
+                            source["status"] != "completed"
+                            and not blocked_undelivered
+                            and source["repo_name"] == intent["repo_name"]
+                        )
+                        if valid_source and intent["authority_kind"] == "job":
+                            root_id = await conn.fetchval(
+                                """
+                                WITH RECURSIVE lineage AS (
+                                    SELECT id, parent_job_id FROM jobs WHERE id=$1
+                                    UNION ALL
+                                    SELECT parent.id, parent.parent_job_id
+                                      FROM jobs AS parent
+                                      JOIN lineage
+                                        ON parent.id = lineage.parent_job_id
+                                )
+                                SELECT id FROM lineage
+                                 WHERE parent_job_id IS NULL LIMIT 1
+                                """,
+                                source_id,
+                            )
+                            valid_source = root_id == intent["authority_id"]
+                        elif valid_source:
+                            valid_source = bool(
+                                intent["authority_kind"] == "project_repository"
+                                and await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM "
+                                    "project_repositories WHERE id=$1 "
+                                    "AND project_id=$2 AND name=$3 "
+                                    "AND is_managed AND role='jobs' "
+                                    "AND NOT read_only)",
+                                    intent["authority_id"],
+                                    source["project_id"],
+                                    intent["repo_name"],
+                                )
+                            )
+                    elif source_kind == "thread":
+                        workspace = source_metadata.get("workspace_container", {})
+                        settled_retirement_invalid = False
+                        try:
+                            settled_retirement = stateless_settled_retirement_authority(
+                                source_metadata
+                            )
+                        except RuntimeError:
+                            settled_retirement = None
+                            settled_retirement_invalid = True
+                        permanently_retired = bool(
+                            source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled_retirement is not None
+                            and settled_retirement.get("permanent") is True
+                        )
+                        valid_source = bool(
+                            workspace.get("repo_name") == intent["repo_name"]
+                            and intent["authority_kind"] == "thread"
+                            and intent["authority_id"] == source_id
+                            and not settled_retirement_invalid
+                            and not permanently_retired
+                        )
+                        if classification == "current_officer_thread":
+                            valid_source = valid_source and bool(
+                                await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                    "WHERE project_id=$1 AND thread_id=$2)",
+                                    source["project_id"],
+                                    source_id,
+                                )
+                            )
+                    else:
+                        expected_mode = (
+                            "read"
+                            if source["role"] == "reference" or source["read_only"]
+                            else "write"
+                        )
+                        valid_source = bool(
+                            source["is_managed"]
+                            and source["role"] != "knowledge"
+                            and source["name"] == intent["repo_name"]
+                            and expected_mode == intent["access_mode"]
+                            and intent["authority_kind"] == "project_repository"
+                            and intent["authority_id"] == source_id
+                        )
+                    if not valid_source:
+                        return None
+                    result_kind = "adopted"
+
+                class _LeaseSettlementLost(Exception):
+                    pass
+
+                try:
+                    # A nested transaction makes this a savepoint. If database
+                    # time crosses the lease boundary after source validation,
+                    # the exact source CAS is rolled back with settlement.
+                    async with conn.transaction():
+                        if not source_needs_update:
+                            changed = source_id
+                        elif source_kind == "job":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE jobs
+                                   SET context = jsonb_set(
+                                           COALESCE(context, '{}'::jsonb),
+                                           '{git_remote_url}',
+                                           to_jsonb($3::text), true
+                                       )
+                                       - '_managed_repository_authority_pending',
+                                       updated_at = now()
+                                 WHERE id=$1
+                                   AND context->>'git_remote_url' = $2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        elif source_kind == "thread":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE threads
+                                   SET metadata = jsonb_set(
+                                           COALESCE(metadata, '{}'::jsonb),
+                                           '{workspace_container}',
+                                           (COALESCE(
+                                               metadata->'workspace_container',
+                                               '{}'::jsonb
+                                           )
+                                           - '_managed_repository_authority_pending')
+                                           || jsonb_build_object(
+                                               'git_remote_url', $3::text
+                                           ), true
+                                       ),
+                                       last_activity = now()
+                                 WHERE id=$1
+                                   AND metadata->'workspace_container'
+                                       ->>'git_remote_url' = $2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        else:
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE project_repositories
+                                   SET repo_url=$3, credentials='{}'::jsonb,
+                                       updated_at=now()
+                                 WHERE id=$1 AND repo_url=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        if changed is None:
+                            return None
+                        settled = await conn.fetchval(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET state='completed', result_kind=$3,
+                                   authority_record_id=COALESCE(
+                                       $4, authority_record_id
+                                   ),
+                                   authority_generation=COALESCE(
+                                       $5, authority_generation
+                                   ),
+                                   reason_code=NULL, completed_at=COALESCE(
+                                       completed_at, now()
+                                   ), claimed_by=NULL, claim_expires_at=NULL,
+                                   updated_at=now()
+                             WHERE id=$1 AND state='claimed' AND claim_token=$2
+                               AND claim_expires_at > clock_timestamp()
+                            RETURNING result_kind
+                            """,
+                            reconciliation_uuid,
+                            int(claim_token),
+                            result_kind,
+                            settlement_authority_record_id,
+                            settlement_authority_generation,
+                        )
+                        if settled is None:
+                            raise _LeaseSettlementLost
+                except _LeaseSettlementLost:
+                    return None
+                return str(settled)
+
+    async def get_managed_repository_legacy_reconciliation_progress(
+        self, *, ambiguous_sample_limit: int = 20
+    ) -> Dict[str, Any]:
+        """Return only aggregate/opaque operator progress."""
+
+        sample_limit = max(0, min(int(ambiguous_sample_limit), 100))
+        async with self.acquire() as conn:
+            states = await conn.fetch(
+                """
+                SELECT state, classification, result_kind, count(*) AS count
+                  FROM managed_repository_legacy_reconciliations
+                 GROUP BY state, classification, result_kind
+                 ORDER BY state, classification, result_kind
+                """
+            )
+            oldest = await conn.fetchval(
+                """
+                SELECT min(CASE WHEN state='claimed' THEN claim_expires_at
+                                ELSE next_attempt_at END)
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state IN ('pending', 'retry', 'claimed')
+                """
+            )
+            ambiguous = await conn.fetch(
+                """
+                SELECT source_kind, source_id, reason_code
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state='ambiguous'
+                 ORDER BY updated_at, id
+                 LIMIT $1
+                """,
+                sample_limit,
+            )
+            failures = await conn.fetch(
+                """
+                SELECT state, reason_code, count(*) AS count
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state IN ('retry', 'failed')
+                 GROUP BY state, reason_code
+                 ORDER BY state, reason_code
+                """
+            )
+            rearm_required = await conn.fetch(
+                """
+                SELECT source_kind, source_id, attempts, lifetime_attempts,
+                       rearm_generation, last_failure_reason_code
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state='failed'
+                 ORDER BY updated_at, id
+                 LIMIT $1
+                """,
+                sample_limit,
+            )
+        return {
+            "counts": [dict(row) for row in states],
+            "oldest_pending_or_retry_at": oldest,
+            "ambiguous": [dict(row) for row in ambiguous],
+            "failure_reasons": [dict(row) for row in failures],
+            "rearm_required": [dict(row) for row in rearm_required],
+        }
+
     async def reserve_managed_repository_creation_intent(
         self,
         *,
@@ -26948,6 +28352,9 @@ class PostgresDB:
     ) -> Dict[str, Any] | None:
         """CAS one proven deploy key to active; replay returns the same row."""
         authority_uuid = UUID(str(authority_id))
+        key_id = int(forge_key_id)
+        if key_id <= 0:
+            raise ValueError("Managed repository forge key id must be positive")
         async with self.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -26963,11 +28370,12 @@ class PostgresDB:
                     or row["access_mode"] != access_mode
                 ):
                     return None
+                if (
+                    row["forge_key_id"] is not None
+                    and int(row["forge_key_id"]) != key_id
+                ):
+                    raise RuntimeError("Managed repository deploy-key identity changed")
                 if row["status"] == "active":
-                    if row["forge_key_id"] != int(forge_key_id):
-                        raise RuntimeError(
-                            "Managed repository deploy-key identity changed"
-                        )
                     return self._managed_repository_authority_row(row)
                 row = await conn.fetchrow(
                     """
@@ -26979,8 +28387,96 @@ class PostgresDB:
                     RETURNING *
                     """,
                     authority_uuid,
-                    int(forge_key_id),
+                    key_id,
                 )
+        return self._managed_repository_authority_row(row)
+
+    async def record_managed_repository_authority_forge_key(
+        self,
+        authority_id: str,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_scope_id: str,
+        project_id: str | None,
+        generation: int,
+        access_mode: str,
+        public_key_fingerprint: str,
+        forge_key_id: int,
+    ) -> Dict[str, Any] | None:
+        """Persist an exact registered key before any fallible forge probe.
+
+        The full immutable authority identity is required so a caller cannot
+        attach a recovered key identifier to a newer generation or another
+        repository scope. Identical retries replay; a different key id for the
+        same durable generation fails closed.
+        """
+
+        try:
+            authority_uuid = UUID(str(authority_id))
+            scope_uuid = UUID(str(authority_scope_id))
+            project_uuid = UUID(str(project_id)) if project_id else None
+            expected_generation = int(generation)
+            key_id = int(forge_key_id)
+        except (TypeError, ValueError):
+            return None
+        if (
+            authority_kind not in {"job", "thread", "project_repository"}
+            or access_mode not in {"read", "write"}
+            or expected_generation <= 0
+            or key_id <= 0
+            or not str(repository_owner or "").strip()
+            or not str(repo_name or "").strip()
+            or not str(public_key_fingerprint or "").strip()
+        ):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_authorities
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    authority_uuid,
+                )
+                if (
+                    row is None
+                    or row["repository_owner"] != str(repository_owner)
+                    or row["repo_name"] != str(repo_name)
+                    or row["authority_kind"] != authority_kind
+                    or row["authority_id"] != scope_uuid
+                    or row["project_id"] != project_uuid
+                    or int(row["generation"]) != expected_generation
+                    or row["access_mode"] != access_mode
+                    or row["public_key_fingerprint"] != str(public_key_fingerprint)
+                    or row["status"] not in {"provisioning", "active", "revoking"}
+                ):
+                    return None
+                persisted_key_id = row["forge_key_id"]
+                if persisted_key_id is not None:
+                    if int(persisted_key_id) != key_id:
+                        raise RuntimeError(
+                            "Managed repository deploy-key identity changed"
+                        )
+                    return self._managed_repository_authority_row(row)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE managed_repository_authorities
+                       SET forge_key_id = $2, updated_at = now()
+                     WHERE id = $1
+                       AND forge_key_id IS NULL
+                       AND status IN ('provisioning', 'revoking')
+                    RETURNING *
+                    """,
+                    authority_uuid,
+                    key_id,
+                )
+                if row is None:
+                    return None
         return self._managed_repository_authority_row(row)
 
     async def fail_managed_repository_authority(
@@ -27035,6 +28531,264 @@ class PostgresDB:
                     )
         return self._managed_repository_authority_row(row)
 
+    async def claim_managed_repository_authority_revoke_exact(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        authority_id: str,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_scope_id: str,
+        project_id: str | None,
+        generation: int,
+        access_mode: str,
+        public_key_fingerprint: str,
+    ) -> Dict[str, Any] | None:
+        """Atomically claim one lifecycle-stale exact authority for revocation.
+
+        Lock order is reconciliation intent -> complete source lineage ->
+        authority row.  Besides token/lease fencing, the final database facts
+        must prove the exact source is absent or permanently terminal.  A root
+        job key is retained while any descendant remains resumable.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+            authority_uuid = UUID(str(authority_id))
+            scope_uuid = UUID(str(authority_scope_id))
+            project_uuid = UUID(str(project_id)) if project_id else None
+            expected_generation = int(generation)
+        except (TypeError, ValueError):
+            return None
+        if token <= 0 or expected_generation <= 0:
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if (
+                    intent is None
+                    or intent["state"] != "claimed"
+                    or int(intent["claim_token"]) != token
+                    or intent["claim_expires_at"] is None
+                    or not await conn.fetchval(
+                        "SELECT $1::timestamptz > clock_timestamp()",
+                        intent["claim_expires_at"],
+                    )
+                    or intent["classification"] != "terminal_historical"
+                    or intent["source_kind"] != authority_kind
+                    or intent["source_id"] != scope_uuid
+                    or intent["project_id"] != project_uuid
+                    or intent["authority_kind"] != authority_kind
+                    or intent["authority_id"] != scope_uuid
+                    or intent["authority_record_id"] != authority_uuid
+                    or intent["authority_generation"] != expected_generation
+                    or intent["repository_owner"] != str(repository_owner)
+                    or intent["repo_name"] != str(repo_name)
+                    or intent["access_mode"] != access_mode
+                ):
+                    return None
+
+                source_is_containable = False
+                if authority_kind == "job":
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended("
+                        "'managed_repository_job_lineage:' || $1::uuid::text, 0))",
+                        scope_uuid,
+                    )
+                    # Lock the exact root in its own statement. Foreign-key
+                    # child insertion takes a conflicting key-share lock, so
+                    # the following fresh READ COMMITTED statement cannot miss
+                    # a descendant committed while this transaction waited.
+                    root_lock = await conn.fetchrow(
+                        "SELECT id, parent_job_id FROM jobs WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if root_lock is None:
+                        source_is_containable = True
+                    else:
+                        lineage = await conn.fetch(
+                            """
+                            WITH RECURSIVE lineage_ids AS (
+                                SELECT id
+                                  FROM jobs
+                                 WHERE id = $1
+                                UNION
+                                SELECT child.id
+                                  FROM jobs AS child
+                                  JOIN lineage_ids AS parent
+                                    ON child.parent_job_id = parent.id
+                            )
+                            SELECT job.id, job.parent_job_id, job.project_id,
+                                   job.status::text AS status,
+                                   job.completion_outcome_kind, job.repo_name
+                              FROM jobs AS job
+                              JOIN lineage_ids ON lineage_ids.id = job.id
+                             FOR UPDATE OF job
+                            """,
+                            scope_uuid,
+                        )
+                        root = next(
+                            (item for item in lineage if item["id"] == scope_uuid),
+                            None,
+                        )
+                        source_is_containable = bool(
+                            root is not None
+                            and root["parent_job_id"] is None
+                            and root["project_id"] == project_uuid
+                            and root["repo_name"] == str(repo_name)
+                            and all(
+                                item["project_id"] == project_uuid
+                                and item["repo_name"] == str(repo_name)
+                                and (
+                                    (
+                                        item["status"] == "completed"
+                                        and item["completion_outcome_kind"]
+                                        != "blocked_undelivered"
+                                    )
+                                    or (
+                                        item["status"] == "cancelled"
+                                        and item["completion_outcome_kind"]
+                                        == "blocked_undelivered"
+                                    )
+                                )
+                                for item in lineage
+                            )
+                        )
+                elif authority_kind == "thread":
+                    officer = None
+                    if project_uuid is not None:
+                        officer = await conn.fetchrow(
+                            "SELECT project_id, thread_id FROM project_officers "
+                            "WHERE project_id=$1 FOR UPDATE",
+                            project_uuid,
+                        )
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if source is None:
+                        source_is_containable = bool(
+                            officer is None or officer["thread_id"] != scope_uuid
+                        )
+                    else:
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            settled = None
+                            workspace = {}
+                        source_is_containable = bool(
+                            source["project_id"] == project_uuid
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and workspace.get("repo_name") == str(repo_name)
+                            and (officer is None or officer["thread_id"] != scope_uuid)
+                        )
+                elif authority_kind == "project_repository":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, role, read_only, is_managed "
+                        "FROM project_repositories WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if source is None:
+                        source_is_containable = True
+                    else:
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        source_is_containable = bool(
+                            source["project_id"] != project_uuid
+                            or source["name"] != str(repo_name)
+                            or current_mode != access_mode
+                        )
+                if not source_is_containable:
+                    return None
+
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_authorities
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    authority_uuid,
+                )
+                if (
+                    row is None
+                    or row["repository_owner"] != str(repository_owner)
+                    or row["repo_name"] != str(repo_name)
+                    or row["authority_kind"] != authority_kind
+                    or row["authority_id"] != scope_uuid
+                    or row["project_id"] != project_uuid
+                    or int(row["generation"]) != expected_generation
+                    or row["access_mode"] != access_mode
+                    or row["public_key_fingerprint"] != str(public_key_fingerprint)
+                    or row["status"] not in {"provisioning", "active", "revoking"}
+                ):
+                    return None
+                if authority_kind == "thread" and await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                    "WHERE project_id=$1 AND thread_id=$2)",
+                    project_uuid,
+                    scope_uuid,
+                ):
+                    return None
+                # Source/authority locks can outlive a short lease. Recheck
+                # database time immediately before the authoritative status
+                # transition; a stale claimant may inspect but never mutate.
+                if not await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE id=$1 AND state='claimed' AND claim_token=$2
+                           AND claim_expires_at > clock_timestamp()
+                    )
+                    """,
+                    reconciliation_uuid,
+                    token,
+                ):
+                    return None
+                if row["status"] != "revoking":
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE managed_repository_authorities
+                           SET status = 'revoking', updated_at = now()
+                         WHERE id = $1
+                           AND status IN ('provisioning', 'active')
+                        RETURNING *
+                        """,
+                        authority_uuid,
+                    )
+        return self._managed_repository_authority_row(row)
+
     async def finish_managed_repository_authority_revoke(
         self, authority_id: str
     ) -> bool:
@@ -27050,6 +28804,356 @@ class PostgresDB:
                 UUID(str(authority_id)),
             )
         return result == "UPDATE 1"
+
+    async def finish_missing_or_clean_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+    ) -> str | None:
+        """Settle an exact lifecycle-containment claim after key revocation.
+
+        The external forge deletion is complete before this transaction.  The
+        database nevertheless re-locks and revalidates the intent, the exact
+        source (including a complete job lineage), and its bound authority.
+        Only an absent source, or one whose current URL exactly scrubs to the
+        bound authority's clean coordinate and whose lifecycle still makes
+        that authority disposable, may settle. Any required scrub commits
+        with settlement. A lost successful response is replayed for the same
+        claim token; a resumed/rebound source fails closed for reclassification.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+        except (TypeError, ValueError):
+            return None
+        if token <= 0:
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id=$1
+                     FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if intent is None or int(intent["claim_token"]) != token:
+                    return None
+                replay = bool(
+                    intent["state"] == "completed"
+                    and intent["result_kind"] == "authority_revoked"
+                )
+                if not replay and (
+                    intent["state"] != "claimed"
+                    or intent["claim_expires_at"] is None
+                    or not await conn.fetchval(
+                        "SELECT $1::timestamptz > clock_timestamp()",
+                        intent["claim_expires_at"],
+                    )
+                ):
+                    return None
+                source_kind = str(intent["source_kind"])
+                source_id = intent["source_id"]
+                project_id = intent["project_id"]
+                if (
+                    intent["classification"] != "terminal_historical"
+                    or source_kind not in {"job", "thread", "project_repository"}
+                    or intent["authority_kind"] != source_kind
+                    or intent["authority_id"] != source_id
+                    or intent["authority_record_id"] is None
+                    or intent["authority_generation"] is None
+                    or intent["access_mode"] not in {"read", "write"}
+                ):
+                    return None
+
+                source_is_containable = False
+                source_exists = False
+                current_url = None
+                if source_kind == "job":
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended("
+                        "'managed_repository_job_lineage:' || $1::uuid::text, 0))",
+                        source_id,
+                    )
+                    root_lock = await conn.fetchrow(
+                        "SELECT id, parent_job_id FROM jobs WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if root_lock is None:
+                        source_is_containable = True
+                    else:
+                        source_exists = True
+                        lineage = await conn.fetch(
+                            """
+                            WITH RECURSIVE lineage_ids AS (
+                                SELECT id
+                                  FROM jobs
+                                 WHERE id=$1
+                                UNION
+                                SELECT child.id
+                                  FROM jobs AS child
+                                  JOIN lineage_ids AS parent
+                                    ON child.parent_job_id=parent.id
+                            )
+                            SELECT job.id, job.parent_job_id, job.project_id,
+                                   job.status::text AS status,
+                                   job.completion_outcome_kind, job.repo_name,
+                                   job.context
+                              FROM jobs AS job
+                              JOIN lineage_ids ON lineage_ids.id=job.id
+                             FOR UPDATE OF job
+                            """,
+                            source_id,
+                        )
+                        root = next(
+                            (row for row in lineage if row["id"] == source_id), None
+                        )
+                        if root is not None:
+                            root_context = _strict_json_object(
+                                root["context"], label="job context"
+                            )
+                            current_url = root_context.get("git_remote_url")
+                            source_is_containable = bool(
+                                root["parent_job_id"] is None
+                                and root["project_id"] == project_id
+                                and root["repo_name"] == intent["repo_name"]
+                                and all(
+                                    row["project_id"] == project_id
+                                    and row["repo_name"] == intent["repo_name"]
+                                    and (
+                                        (
+                                            row["status"] == "completed"
+                                            and row["completion_outcome_kind"]
+                                            != "blocked_undelivered"
+                                        )
+                                        or (
+                                            row["status"] == "cancelled"
+                                            and row["completion_outcome_kind"]
+                                            == "blocked_undelivered"
+                                        )
+                                    )
+                                    for row in lineage
+                                )
+                            )
+                elif source_kind == "thread":
+                    officer = None
+                    if project_id is not None:
+                        officer = await conn.fetchrow(
+                            "SELECT project_id, thread_id FROM project_officers "
+                            "WHERE project_id=$1 FOR UPDATE",
+                            project_id,
+                        )
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if source is None:
+                        source_is_containable = bool(
+                            officer is None or officer["thread_id"] != source_id
+                        )
+                    else:
+                        source_exists = True
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            workspace = {}
+                            settled = None
+                        current_url = workspace.get("git_remote_url")
+                        source_is_containable = bool(
+                            source["project_id"] == project_id
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and workspace.get("repo_name") == intent["repo_name"]
+                            and (officer is None or officer["thread_id"] != source_id)
+                        )
+                else:
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, repo_url, role, read_only, "
+                        "is_managed FROM project_repositories "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if source is None:
+                        source_is_containable = True
+                    else:
+                        source_exists = True
+                        current_url = source["repo_url"]
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        source_is_containable = bool(
+                            source["project_id"] != project_id
+                            or source["name"] != intent["repo_name"]
+                            or current_mode != intent["access_mode"]
+                        )
+                if not source_is_containable:
+                    return None
+
+                source_needs_scrub = bool(
+                    source_exists
+                    and await conn.fetchval(
+                        "SELECT public.managed_repository_url_has_userinfo($1)",
+                        current_url,
+                    )
+                )
+                clean_url = current_url
+                if source_needs_scrub:
+                    clean_url = await conn.fetchval(
+                        "SELECT public.managed_repository_url_without_userinfo($1)",
+                        current_url,
+                    )
+                    if clean_url is None:
+                        return None
+
+                authority = await conn.fetchrow(
+                    """
+                    SELECT id, authority_kind, authority_id, project_id,
+                           repository_owner, repo_name, access_mode,
+                           generation, clean_repo_url, status, revoked_at
+                      FROM managed_repository_authorities
+                     WHERE id=$1
+                     FOR UPDATE
+                    """,
+                    intent["authority_record_id"],
+                )
+                if (
+                    authority is None
+                    or authority["status"] != "revoked"
+                    or authority["revoked_at"] is None
+                    or authority["authority_kind"] != source_kind
+                    or authority["authority_id"] != source_id
+                    or authority["project_id"] != project_id
+                    or authority["repository_owner"] != intent["repository_owner"]
+                    or authority["repo_name"] != intent["repo_name"]
+                    or authority["access_mode"] != intent["access_mode"]
+                    or int(authority["generation"])
+                    != int(intent["authority_generation"])
+                    or (
+                        source_exists
+                        and str(clean_url or "") != authority["clean_repo_url"]
+                    )
+                ):
+                    return None
+                if source_kind == "thread" and await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                    "WHERE project_id=$1 AND thread_id=$2)",
+                    project_id,
+                    source_id,
+                ):
+                    return None
+                if replay:
+                    return "authority_revoked"
+
+                class _ContainmentSettlementLost(Exception):
+                    pass
+
+                try:
+                    # Keep the exact credential scrub and claim settlement in
+                    # one savepoint. If database time crosses the lease fence,
+                    # no partial source rewrite escapes this transaction.
+                    async with conn.transaction():
+                        if source_needs_scrub and source_kind == "job":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE jobs
+                                   SET context=jsonb_set(
+                                           COALESCE(context, '{}'::jsonb),
+                                           '{git_remote_url}',
+                                           to_jsonb($3::text), true
+                                       ) - '_managed_repository_authority_pending',
+                                       updated_at=now()
+                                 WHERE id=$1
+                                   AND context->>'git_remote_url'=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        elif source_needs_scrub and source_kind == "thread":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE threads
+                                   SET metadata=jsonb_set(
+                                           COALESCE(metadata, '{}'::jsonb),
+                                           '{workspace_container}',
+                                           (COALESCE(
+                                               metadata->'workspace_container',
+                                               '{}'::jsonb
+                                           ) - '_managed_repository_authority_pending')
+                                           || jsonb_build_object(
+                                               'git_remote_url', $3::text
+                                           ), true
+                                       ),
+                                       last_activity=now()
+                                 WHERE id=$1
+                                   AND metadata->'workspace_container'
+                                       ->>'git_remote_url'=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        elif source_needs_scrub:
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE project_repositories
+                                   SET repo_url=$3, credentials='{}'::jsonb,
+                                       updated_at=now()
+                                 WHERE id=$1 AND repo_url=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        else:
+                            changed = source_id
+                        if changed is None:
+                            return None
+                        settled = await conn.fetchval(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET state='completed',
+                                   result_kind='authority_revoked',
+                                   reason_code=NULL,
+                                   completed_at=COALESCE(completed_at, now()),
+                                   claimed_by=NULL, claim_expires_at=NULL,
+                                   updated_at=now()
+                             WHERE id=$1 AND state='claimed' AND claim_token=$2
+                               AND claim_expires_at > clock_timestamp()
+                            RETURNING result_kind
+                            """,
+                            reconciliation_uuid,
+                            token,
+                        )
+                        if settled is None:
+                            raise _ContainmentSettlementLost
+                except _ContainmentSettlementLost:
+                    return None
+                return str(settled)
 
     async def scrub_job_managed_repository_url(
         self,
