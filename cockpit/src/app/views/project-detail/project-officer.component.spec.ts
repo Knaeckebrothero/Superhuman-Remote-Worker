@@ -37,6 +37,7 @@ import {
   type SlotDraft,
 } from './project-officer.component';
 import { ApiService } from '../../core/services/api.service';
+import { NotificationService } from '../../core/services/notification.service';
 import { ModelService } from '../../core/services/model.service';
 import type { OfficerPost } from '../../core/models/api.model';
 
@@ -102,9 +103,7 @@ function commissionedPost(over: Partial<OfficerPost> = {}): OfficerPost {
       sleep_minutes: { min: 5, max: 60 },
       next_wake_at: null,
       pending_events: 2,
-      pages_today: { used: 1, budget: 3 },
       token_ceiling: { daily: 5000000, deferred_today: false },
-      digest: [],
       conference: null,
     },
     kit: { line: { count: 2, model: 'MiniMax-M3', backend: 'vm', in_flight: 1 } },
@@ -129,7 +128,6 @@ function emptyDraft(over: Partial<OfficerEditorDraft> = {}): OfficerEditorDraft 
     sleepMin: '',
     sleepMax: '',
     tokenCeiling: '',
-    maxPages: '',
     maxActions: '',
     maxWorkers: '',
     ...over,
@@ -148,6 +146,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
   };
   const router = { navigate: vi.fn().mockResolvedValue(true) };
   const http = { post: vi.fn().mockReturnValue(of({ thread_id: 'conf-1' })) };
+  const feed = { listBySource: vi.fn().mockReturnValue(of(null)) };
   const translate = lang === 'de-DE' ? trDe : trEn;
   const transloco = {
     translate,
@@ -160,6 +159,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
       { provide: Router, useValue: router },
       { provide: ModelService, useValue: { load: vi.fn(), models: () => [] } },
       { provide: HttpClient, useValue: http },
+      { provide: NotificationService, useValue: feed },
       { provide: TranslocoService, useValue: transloco },
     ],
   });
@@ -168,7 +168,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
   // off-DOM (this repo's no-TestBed convention) the field is swapped for a
   // plain accessor — the class only ever CALLS this.projectId().
   (component as unknown as { projectId: () => string }).projectId = () => 'p-1';
-  return { component, api, router, http };
+  return { component, api, router, http, feed };
 }
 
 @Component({
@@ -285,6 +285,10 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
         provide: HttpClient,
         useValue: { post: vi.fn().mockReturnValue(of({ thread_id: 'conf-1' })) },
       },
+      {
+        provide: NotificationService,
+        useValue: { listBySource: vi.fn().mockReturnValue(of(null)) },
+      },
     ],
   }).compileComponents();
   TestBed.inject(TranslocoService).setActiveLang(lang);
@@ -300,6 +304,49 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
   fixture.detectChanges();
   return { fixture, api };
 }
+
+// ---------------------------------------------------------------------------
+// Recent notifications from this officer (the unified feed replaced the
+// digest ring and the pages-per-day budget).
+
+describe('recent notifications from this officer', () => {
+  const page = (items: unknown[]) => ({ items, next_before: null, counts: { unseen: 0, unread: 0, pending: 0, by_category: {} } });
+
+  it('a commissioned post lists the last ten feed rows about his session', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    feed.listBySource.mockReturnValue(
+      of(page([{ id: 'ntf-1', subject: 'Your centurion needs you', severity: 'high', created_at: '2026-08-26T09:00:00Z', resolved_at: null }])),
+    );
+
+    component.refresh();
+
+    expect(feed.listBySource).toHaveBeenCalledWith('thread', 't-1', 10);
+    expect(component.recentNotifications().map((n) => n.id)).toEqual(['ntf-1']);
+  });
+
+  it('a vacant post asks for nothing and clears the list', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(vacantPost()));
+
+    component.refresh();
+
+    expect(feed.listBySource).not.toHaveBeenCalled();
+    expect(component.recentNotifications()).toEqual([]);
+  });
+
+  it('a transport failure keeps the previous list (stale beats wrong)', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    feed.listBySource.mockReturnValueOnce(of(page([{ id: 'ntf-1', subject: 's', severity: 'normal', created_at: null, resolved_at: null }])));
+    component.refresh();
+    feed.listBySource.mockReturnValueOnce(of(null));
+
+    component.refresh();
+
+    expect(component.recentNotifications().map((n) => n.id)).toEqual(['ntf-1']);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // The state machine and per-state labels.
@@ -336,7 +383,6 @@ describe('immediacyLabel (§7 per-field honesty, verbatim)', () => {
 
   it('budget fields land at next delivery', () => {
     expect(immediacyLabel('daily_token_ceiling', trEn)).toBe('applies at next delivery');
-    expect(immediacyLabel('max_pages_per_day', trEn)).toBe('applies at next delivery');
   });
 
   it('sleep bounds land at the next sleep filing', () => {
@@ -639,7 +685,6 @@ describe('draftFromPost', () => {
       sleepMin: '5',
       sleepMax: '60',
       tokenCeiling: '5000000',
-      maxPages: '3',
       maxActions: '',
       maxWorkers: '',
     });
@@ -657,7 +702,6 @@ describe('buildOfficerConfig (commission body)', () => {
           sleepMin: '5',
           sleepMax: '60',
           tokenCeiling: '5000000',
-          maxPages: '3',
         }),
       ),
     ).toEqual({
@@ -666,7 +710,6 @@ describe('buildOfficerConfig (commission body)', () => {
       sleep_min_minutes: 5,
       sleep_max_minutes: 60,
       daily_token_ceiling: 5000000,
-      max_pages_per_day: 3,
     });
   });
 

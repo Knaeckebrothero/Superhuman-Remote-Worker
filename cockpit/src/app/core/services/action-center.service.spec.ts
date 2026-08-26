@@ -1,12 +1,9 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {DestroyRef, Injector, runInInjectionContext, signal} from '@angular/core';
+import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {of} from 'rxjs';
 
 import {ActionCenterService} from './action-center.service';
 import {NotificationService} from './notification.service';
-import {SudoService} from './sudo.service';
-import {ApiService} from './api.service';
-import {AppNotification, Job} from '../models/api.model';
 import {
   EMPTY_NOTIFICATION_COUNTS,
   Notification,
@@ -14,10 +11,10 @@ import {
 } from '../models/notification.model';
 
 /**
- * The action center over the unified feed (slice 1): feed rows become
- * first-class items, a feed row hides the legacy twin of the same source,
- * `seen` is batched, and the bell badge is unseen-driven. No TestBed —
- * the real service runs over signal mocks, like inbox-page.component.spec.
+ * The action center over the unified feed (slice 3): the feed is the only
+ * source of items, counts are the server's, the bell badge is `unseen`,
+ * `seen` is batched, and the legacy email deep links resolve by source.
+ * No TestBed — the real service runs over signal mocks.
  */
 
 const THREAD_ID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
@@ -47,38 +44,16 @@ function feedRow(overrides: Partial<Notification> = {}): Notification {
   };
 }
 
-function legacyMessage(overrides: Partial<AppNotification> = {}): AppNotification {
-  return {
-    id: 'm-1',
-    job_id: null,
-    thread_id: THREAD_ID,
-    subject: 'Your centurion needs you',
-    message: 'old ring row',
-    job_description: '',
-    config_name: null,
-    status: 'sent',
-    read_at: null,
-    created_at: '2026-08-25T06:00:00Z',
-    ...overrides,
-  };
-}
-
-function create(opts: {
-  feed?: Notification[];
-  counts?: NotificationCounts;
-  legacy?: AppNotification[];
-  reviewJobs?: Job[];
-} = {}) {
+function create(opts: {feed?: Notification[]; counts?: NotificationCounts} = {}) {
   const feed = signal<Notification[]>(opts.feed ?? []);
   const feedCounts = signal<NotificationCounts>(opts.counts ?? EMPTY_NOTIFICATION_COUNTS);
   const notificationsMock = {
     feed,
     feedCounts,
     feedNextBefore: signal<string | null>(null),
-    notifications: signal<AppNotification[]>(opts.legacy ?? []),
-    sessionEvents: signal([]),
     loadNotifications: vi.fn(),
     loadMoreFeed: vi.fn(),
+    listBySource: vi.fn().mockReturnValue(of(null)),
     connectSSE: vi.fn(),
     disconnectSSE: vi.fn(),
     markSeen: vi.fn().mockReturnValue(of({updated: []})),
@@ -98,95 +73,76 @@ function create(opts: {
       );
     }),
   };
-  const sudoMock = {
-    requests: signal([]),
-    connectSSE: vi.fn(),
-    disconnectSSE: vi.fn(),
-    loadRequests: vi.fn(),
-  };
-  const apiMock = {
-    getJobs: vi.fn().mockReturnValue(of(opts.reviewJobs ?? [])),
-  };
+  // `inject(DestroyRef)` inside an R3Injector context resolves to the
+  // injector itself (NG_ENV_ID), so destroying the injector is the hook.
   const injector = Injector.create({
-    providers: [
-      {provide: SudoService, useValue: sudoMock},
-      {provide: NotificationService, useValue: notificationsMock},
-      {provide: ApiService, useValue: apiMock},
-      {provide: DestroyRef, useValue: {onDestroy: vi.fn()}},
-    ],
-  });
+    providers: [{provide: NotificationService, useValue: notificationsMock}],
+  }) as Injector & {destroy(): void};
   const service = runInInjectionContext(injector, () => new ActionCenterService());
-  return {service, notificationsMock, apiMock, feed};
+  return {service, notificationsMock, feed, injector};
 }
 
 describe('ActionCenterService — unified feed', () => {
-  it('maps a feed row to a first-class item with server identity and severity urgency', () => {
+  it('maps a feed row to an item with server identity and severity urgency', () => {
     const {service} = create({feed: [feedRow()]});
     const items = service.items();
     expect(items).toHaveLength(1);
     const item = items[0];
     expect(item.id).toBe('ntf:n-1');
-    expect(item.type).toBe('notification');
     expect(item.category).toBe('review_queue');
     expect(item.status).toBe('pending');
     expect(item.urgency).toBe(45);
     expect(item.jobId).toBe(JOB_ID);
     expect(item.title).toContain('review required');
     expect(item.subtitle).toBe('worker_base · Publish the demo');
-    expect(item.notification?.actions.map((a) => a.type)).toEqual(['approve', 'open']);
+    expect(item.notification.actions.map((a) => a.type)).toEqual(['approve', 'open']);
   });
 
-  it('a resolved row sorts below pending ones and carries no urgency', () => {
+  it('sorts pending above resolved, then by severity, then newest first', () => {
     const {service} = create({
-      feed: [feedRow({id: 'done', resolved_at: '2026-08-26T09:10:00Z'}), feedRow({id: 'open', severity: 'low'})],
+      feed: [
+        feedRow({id: 'done', resolved_at: '2026-08-26T09:10:00Z'}),
+        feedRow({id: 'low-new', severity: 'low', created_at: '2026-08-26T10:00:00Z'}),
+        feedRow({id: 'crit', severity: 'critical', category: 'sudo_request', created_at: '2026-08-26T08:00:00Z'}),
+        feedRow({id: 'low-old', severity: 'low', created_at: '2026-08-26T09:00:00Z'}),
+      ],
     });
-    const [first, second] = service.items();
-    expect(first.id).toBe('ntf:open');
-    expect(second.id).toBe('ntf:done');
-    expect(second.status).toBe('resolved');
-    expect(second.urgency).toBe(0);
+    expect(service.items().map((i) => i.id)).toEqual(['ntf:crit', 'ntf:low-new', 'ntf:low-old', 'ntf:done']);
+    expect(service.items()[3].urgency).toBe(0);
   });
 
-  it('hides the legacy review twin of a job the feed already covers', () => {
-    const job = {id: JOB_ID, status: 'pending_review', description: 'd', config_name: 'c', created_at: 'x'} as unknown as Job;
-    const other = {id: 'other-job', status: 'pending_review', description: 'e', config_name: 'c', created_at: 'x'} as unknown as Job;
-    const {service} = create({feed: [feedRow()], reviewJobs: [job, other]});
-    service.loadReviewJobs();
-    const ids = service.items().map((i) => i.id);
-    expect(ids).toContain('ntf:n-1');
-    expect(ids).toContain('rev:other-job');
-    expect(ids).not.toContain(`rev:${JOB_ID}`);
+  it('items come from the feed alone — no legacy sudo/message/review/session join', () => {
+    const {service, notificationsMock} = create({feed: [feedRow()]});
+    expect(service.items().map((i) => i.id)).toEqual(['ntf:n-1']);
+    service.refreshAll();
+    expect(notificationsMock.loadNotifications).toHaveBeenCalledTimes(1);
   });
 
-  it('hides the legacy officer session-page row when the feed carries the thread', () => {
-    const {service} = create({
-      feed: [feedRow({id: 'p-1', category: 'officer_question', source_ref: {kind: 'thread', id: THREAD_ID}, payload: {}})],
-      legacy: [legacyMessage()],
-    });
-    const ids = service.items().map((i) => i.id);
-    expect(ids).toEqual(['ntf:p-1']);
+  it('initSSE opens only the notification stream and closes it on destroy', () => {
+    const {service, notificationsMock, injector} = create();
+    service.initSSE();
+    service.initSSE();
+    expect(notificationsMock.connectSSE).toHaveBeenCalledTimes(1);
+    injector.destroy();
+    expect(notificationsMock.disconnectSSE).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps legacy items whose source the feed does not cover', () => {
-    const {service} = create({feed: [feedRow()], legacy: [legacyMessage()]});
-    const ids = service.items().map((i) => i.id);
-    expect(ids).toContain('ntf:n-1');
-    expect(ids).toContain(`msg:${THREAD_ID}:${THREAD_ID}`);
-  });
-
-  it('counts feed items and exposes the server unseen count; the badge adds legacy pending', () => {
+  it('counts and the bell badge are the server\'s: pending, unseen, by_category', () => {
     const {service} = create({
       feed: [feedRow(), feedRow({id: 'n-2', seen_at: '2026-08-26T09:01:00Z'})],
-      counts: {...EMPTY_NOTIFICATION_COUNTS, unseen: 1, unread: 2, pending: 2},
-      legacy: [legacyMessage()],
+      counts: {
+        unseen: 1,
+        unread: 2,
+        pending: 7,
+        by_category: {review_queue: {pending: 5, unseen: 1}, sudo_request: {pending: 2, unseen: 0}},
+      },
     });
     const c = service.counts();
-    expect(c.notifications).toBe(2);
-    expect(c.messages).toBe(1);
+    expect(c.notifications).toBe(7);
+    expect(c.total).toBe(7);
     expect(c.unseen).toBe(1);
-    expect(c.total).toBe(3);
-    // 1 unseen feed row + 1 pending legacy message; the seen feed row no longer nags.
-    expect(service.badgeCount()).toBe(2);
+    expect(c.byCategory['sudo_request'].pending).toBe(2);
+    expect(service.badgeCount()).toBe(1);
   });
 
   describe('seen batching', () => {
@@ -208,7 +164,7 @@ describe('ActionCenterService — unified feed', () => {
       expect(notificationsMock.markSeen).toHaveBeenCalledTimes(1);
       expect(notificationsMock.markSeen.mock.calls[0][0].sort()).toEqual(['a', 'b']);
       expect(notificationsMock.patchFeedRow).toHaveBeenCalledTimes(2);
-      expect(service.items().find((i) => i.id === 'ntf:a')?.notification?.seen_at).toBeTruthy();
+      expect(service.items().find((i) => i.id === 'ntf:a')?.notification.seen_at).toBeTruthy();
     });
   });
 
@@ -240,5 +196,42 @@ describe('ActionCenterService — unified feed', () => {
     service.fetchNotification('deep').subscribe((r) => (row = r));
     expect(row).not.toBeNull();
     expect(service.items().map((i) => i.id)).toEqual(['ntf:deep']);
+  });
+
+  describe('fetchBySource (legacy email deep links)', () => {
+    it('answers from the loaded page without a request', () => {
+      const {service, notificationsMock} = create({
+        feed: [feedRow({id: 's-1', category: 'sudo_request', source_ref: {kind: 'sudo_request', id: 'req-9'}})],
+      });
+      let row: Notification | null = null;
+      service.fetchBySource({kind: 'sudo_request', id: 'req-9'}).subscribe((r) => (row = r));
+      expect(row).toMatchObject({id: 's-1'});
+      expect(notificationsMock.listBySource).not.toHaveBeenCalled();
+    });
+
+    it('asks the server for the newest row about the source and upserts it', () => {
+      const {service, notificationsMock} = create({feed: []});
+      notificationsMock.listBySource.mockReturnValue(
+        of({
+          items: [feedRow({id: 'p-1', category: 'officer_question', source_ref: {kind: 'thread', id: THREAD_ID}})],
+          next_before: null,
+          counts: EMPTY_NOTIFICATION_COUNTS,
+        }),
+      );
+      let row: Notification | null = null;
+      service.fetchBySource({kind: 'thread', id: THREAD_ID}).subscribe((r) => (row = r));
+      expect(notificationsMock.listBySource).toHaveBeenCalledWith('thread', THREAD_ID, 1);
+      expect(row).toMatchObject({id: 'p-1'});
+      expect(service.items().map((i) => i.id)).toEqual(['ntf:p-1']);
+    });
+
+    it('yields null when nothing was ever recorded about the source', () => {
+      const {service, notificationsMock} = create({feed: []});
+      notificationsMock.listBySource.mockReturnValue(of({items: [], next_before: null, counts: EMPTY_NOTIFICATION_COUNTS}));
+      let row: Notification | null | undefined;
+      service.fetchBySource({kind: 'job', id: 'ghost'}).subscribe((r) => (row = r));
+      expect(row).toBeNull();
+      expect(service.items()).toHaveLength(0);
+    });
   });
 });

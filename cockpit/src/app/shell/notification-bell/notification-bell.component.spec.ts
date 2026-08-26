@@ -6,9 +6,9 @@ import {TranslocoService} from '@jsverse/transloco';
 import {NotificationBellComponent} from './notification-bell.component';
 import {ActionCenterService} from '../../core/services/action-center.service';
 
-function create(counts: Record<string, number>, badge: number) {
+function create(counts: {notifications: number; unseen: number; total: number}, badge: number) {
   const actionCenter = {
-    counts: signal(counts),
+    counts: signal({...counts, byCategory: {}}),
     badgeCount: signal(badge),
   };
   const router = {navigate: vi.fn()};
@@ -29,35 +29,23 @@ function create(counts: Record<string, number>, badge: number) {
 }
 
 describe('NotificationBellComponent', () => {
-  it('reads the unseen-driven badge and leads the tooltip with it', () => {
-    const {component} = create(
-      {notifications: 2, sudo: 1, messages: 0, reviews: 0, sessions: 0, unseen: 2, total: 3},
-      3,
-    );
-    expect(component.tooltipText()).toBe('notificationBell.unseenPlural:2, notificationBell.sudo:1');
+  it('leads the tooltip with the server unseen count and adds the pending total when it differs', () => {
+    const {component} = create({notifications: 3, unseen: 2, total: 3}, 2);
+    expect(component.tooltipText()).toBe('notificationBell.unseenPlural:2, notificationBell.pendingPlural:3');
   });
 
-  it('singular unseen copy', () => {
-    const {component} = create(
-      {notifications: 1, sudo: 0, messages: 0, reviews: 0, sessions: 0, unseen: 1, total: 1},
-      1,
-    );
+  it('singular unseen copy, no pending suffix when every pending row is the unseen one', () => {
+    const {component} = create({notifications: 1, unseen: 1, total: 1}, 1);
     expect(component.tooltipText()).toBe('notificationBell.unseenSingle:1');
   });
 
-  it('falls back to the title when nothing needs attention', () => {
-    const {component} = create(
-      {notifications: 0, sudo: 0, messages: 0, reviews: 0, sessions: 0, unseen: 0, total: 0},
-      0,
-    );
+  it('falls back to the title when nothing is unseen (the badge is unseen-driven)', () => {
+    const {component} = create({notifications: 4, unseen: 0, total: 4}, 0);
     expect(component.tooltipText()).toBe('notificationBell.title');
   });
 
   it('routes to the inbox', () => {
-    const {component, router} = create(
-      {notifications: 0, sudo: 0, messages: 0, reviews: 0, sessions: 0, unseen: 0, total: 0},
-      0,
-    );
+    const {component, router} = create({notifications: 0, unseen: 0, total: 0}, 0);
     component.goToInbox();
     expect(router.navigate).toHaveBeenCalledWith(['/inbox']);
   });

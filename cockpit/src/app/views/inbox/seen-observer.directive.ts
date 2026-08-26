@@ -12,7 +12,7 @@ import {ActionCenterService} from '../../core/services/action-center.service';
   standalone: true,
 })
 export class SeenObserverDirective implements OnInit, OnDestroy {
-  /** The notification id, or null for legacy items (no-op). */
+  /** The notification id (null disables the observer). */
   readonly notificationId = input<string | null>(null, {alias: 'appSeenObserver'});
 
   private readonly el = inject<ElementRef<HTMLElement>>(ElementRef);

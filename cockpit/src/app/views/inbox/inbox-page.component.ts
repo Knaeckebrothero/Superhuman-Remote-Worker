@@ -1,70 +1,38 @@
 import {
     Component,
     computed,
-    ElementRef,
     HostListener,
     inject,
     NgZone,
     OnDestroy,
     OnInit,
     signal,
-    ViewChild,
 } from '@angular/core';
-import {ActivatedRoute, Router} from '@angular/router';
-import {JsonPipe} from '@angular/common';
-import {MarkdownComponent} from 'ngx-markdown';
+import {ActivatedRoute} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ActionCenterService} from '../../core/services/action-center.service';
-import {SudoRequest, SudoService} from '../../core/services/sudo.service';
-import {ApiService} from '../../core/services/api.service';
-import {ActionItem, ActionItemType, ThreadDetail,} from '../../core/models/action.model';
+import {NotificationService} from '../../core/services/notification.service';
+import {ActionItem} from '../../core/models/action.model';
+import {KNOWN_CATEGORIES, SourceRef} from '../../core/models/notification.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconButtonComponent} from '../../ui/icon-button';
-import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
+import {AppBadgeComponent} from '../../ui/badge';
 import {AppDialogComponent} from '../../ui/dialog';
-import {AppTextareaComponent} from '../../ui/textarea';
 import {AppButtonComponent} from '../../ui/button';
-import {AppInputComponent} from '../../ui/input';
-import {AppSelectComponent} from '../../ui/select';
-import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppIconComponent} from '../../ui/icon';
-import {AppCopyFieldComponent} from '../../ui/copy-field';
-import {ExternalImageDirective} from '../../ui/external-image';
 import {categoryIcon, NotificationDetailComponent} from './notification-detail.component';
 import {SeenObserverDirective} from './seen-observer.directive';
 
-interface FrozenJobData {
-  freeze_type?: string;
-  phase_type?: string;
-  summary?: string;
-  deliverables?: string[];
-  confidence?: number;
-  notes?: string;
-  phase_number?: number;
-  frozen_at?: string;
-  command?: string;
-  reason?: string;
-}
-
-/** Risk level for sudo visual badging. */
-function riskLevel(req: SudoRequest): 'low' | 'medium' | 'high' | 'critical' {
-  const cmd = req.arguments?.join(' ') || req.command;
-  if (/rm\s+-rf|chmod\s+777|mkfs|dd\s+if=/.test(cmd)) return 'critical';
-  if (/chmod|chown|passwd|useradd|userdel|visudo/.test(cmd)) return 'high';
-  if (/apt|dnf|yum|pip|npm|install|systemctl/.test(cmd)) return 'medium';
-  return 'low';
-}
-
-function secondsLeft(req: SudoRequest): number {
-  if (!req.expires_at) return 0;
-  return Math.max(0, Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000));
-}
-
-function relativeTime(iso: string, nowLabel: string): string {
+/**
+ * `now` is passed in (a signal read once per tick) rather than `Date.now()`
+ * so the label is stable within one change-detection pass — a minute
+ * boundary crossed between dev-mode's two passes is NG0100 otherwise.
+ */
+function relativeTime(iso: string, nowLabel: string, now: number): string {
   if (!iso) return '';
-  const diff = Date.now() - new Date(iso).getTime();
+  const diff = now - new Date(iso).getTime();
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return nowLabel;
   if (mins < 60) return `${mins}m`;
@@ -73,26 +41,26 @@ function relativeTime(iso: string, nowLabel: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+/**
+ * The action center over the unified notification feed. Every row is a
+ * feed notification; the chips are its categories (server counts), the
+ * detail pane renders the row's declared actions and its source payload
+ * (`NotificationDetailComponent`). The legacy email deep links
+ * (`?sudo=`, `?job=&thread=`, `?job=&review=1`) resolve to the feed row
+ * whose `source_ref` matches.
+ */
 @Component({
   selector: 'app-inbox-page',
   standalone: true,
   imports: [
-    JsonPipe,
-    MarkdownComponent,
-    ExternalImageDirective,
     SidebarToggleComponent,
     TranslocoPipe,
     AppChipComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
     AppDialogComponent,
-    AppTextareaComponent,
     AppButtonComponent,
-    AppInputComponent,
-    AppSelectComponent,
-    AppCheckboxComponent,
     AppIconComponent,
-    AppCopyFieldComponent,
     NotificationDetailComponent,
     SeenObserverDirective,
   ],
@@ -125,63 +93,25 @@ function relativeTime(iso: string, nowLabel: string): string {
               <span class="chip-count">{{ actionCenter.counts().total }}</span>
             }
           </app-chip>
-          <app-chip
-            [selected]="activeFilter() === 'notification'"
-            (clicked)="setFilter('notification')"
-          >
-            <app-icon size="sm">notifications</app-icon>
-            {{ 'inbox.filters.notifications' | transloco }}
-            @if (actionCenter.counts().notifications > 0) {
-              <span class="chip-count">{{ actionCenter.counts().notifications }}</span>
-            }
-          </app-chip>
-          <app-chip
-            [selected]="activeFilter() === 'message'"
-            (clicked)="setFilter('message')"
-          >
-            <app-icon size="sm">mail</app-icon>
-            {{ 'inbox.filters.messages' | transloco }}
-            @if (actionCenter.counts().messages > 0) {
-              <span class="chip-count">{{ actionCenter.counts().messages }}</span>
-            }
-          </app-chip>
-          <app-chip
-            [selected]="activeFilter() === 'sudo'"
-            (clicked)="setFilter('sudo')"
-          >
-            <app-icon size="sm">admin_panel_settings</app-icon>
-            {{ 'inbox.filters.sudo' | transloco }}
-            @if (actionCenter.counts().sudo > 0) {
-              <span class="chip-count">{{ actionCenter.counts().sudo }}</span>
-            }
-          </app-chip>
-          <app-chip
-            [selected]="activeFilter() === 'review'"
-            (clicked)="setFilter('review')"
-          >
-            <app-icon size="sm">rate_review</app-icon>
-            {{ 'inbox.filters.reviews' | transloco }}
-            @if (actionCenter.counts().reviews > 0) {
-              <span class="chip-count">{{ actionCenter.counts().reviews }}</span>
-            }
-          </app-chip>
-          <app-chip
-            [selected]="activeFilter() === 'session'"
-            (clicked)="setFilter('session')"
-          >
-            <app-icon size="sm">smart_toy</app-icon>
-            {{ 'inbox.filters.sessions' | transloco }}
-            @if (actionCenter.counts().sessions > 0) {
-              <span class="chip-count">{{ actionCenter.counts().sessions }}</span>
-            }
-          </app-chip>
+          @for (chip of categoryChips(); track chip.category) {
+            <app-chip
+              [selected]="activeFilter() === chip.category"
+              (clicked)="setFilter(chip.category)"
+            >
+              <app-icon size="sm">{{ chip.icon }}</app-icon>
+              {{ ('notifications.category.' + chip.category) | transloco }}
+              @if (chip.pending > 0) {
+                <span class="chip-count">{{ chip.pending }}</span>
+              }
+            </app-chip>
+          }
         </div>
 
         <div class="header-right">
           <span
             class="sse-dot"
-            [class.connected]="sudo.isConnected()"
-            [title]="(sudo.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
+            [class.connected]="notifications.isConnected()"
+            [title]="(notifications.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
           ></span>
           <app-icon-button
             size="sm"
@@ -203,7 +133,7 @@ function relativeTime(iso: string, nowLabel: string): string {
               <app-icon size="inherit" class="empty-icon">inbox</app-icon>
               <span class="empty-text">
                 @if (activeFilter()) {
-                  {{ 'inbox.list.empty.' + activeFilter() | transloco }}
+                  {{ 'inbox.list.emptyCategory' | transloco }}
                 } @else {
                   {{ 'inbox.list.emptyAll' | transloco }}
                 }
@@ -216,65 +146,52 @@ function relativeTime(iso: string, nowLabel: string): string {
                 [class.selected]="selectedItem()?.id === item.id"
                 [class.pending]="item.status === 'pending'"
                 [class.resolved]="item.status === 'resolved'"
-                [class.urgent-high]="item.type === 'sudo' && item.sudo && item.sudo.status === 'pending' && getSecondsLeft(item.sudo!) < 30"
-                [class.urgent-med]="item.type === 'sudo' && item.sudo && item.sudo.status === 'pending' && getSecondsLeft(item.sudo!) >= 30 && getSecondsLeft(item.sudo!) < 120"
                 [attr.data-index]="i"
-                [appSeenObserver]="item.type === 'notification' && item.notification ? item.notification.id : null"
+                [appSeenObserver]="item.notification.id"
                 (click)="selectItem(item)"
               >
                 <div class="item-urgency-bar" [class]="'urgency-' + urgencyColor(item)"></div>
-                <app-icon size="lg" class="item-type-icon" [class]="'type-' + item.type">
-                  @switch (item.type) {
-                    @case ('notification') { {{ iconFor(item) }} }
-                    @case ('message') { mail }
-                    @case ('sudo') { admin_panel_settings }
-                    @case ('review') { rate_review }
-                    @case ('session') { smart_toy }
-                  }
+                <app-icon size="lg" class="item-type-icon" [class]="'cat-' + item.category">
+                  {{ iconFor(item) }}
                 </app-icon>
                 <div class="item-content">
                   <div class="item-title-row">
                     <span class="item-title">{{ item.title }}</span>
-                    @if (item.type === 'message' && item.message?.unread) {
+                    @if (!item.notification.seen_at) {
                       <span class="unread-dot"></span>
-                    }
-                    @if (item.type === 'notification' && !item.notification?.seen_at) {
-                      <span class="unread-dot"></span>
-                    }
-                    @if (item.type === 'sudo' && item.sudo?.status === 'pending') {
-                      <span class="item-countdown" [class]="'ttl-' + ttlColor(item.sudo!)">
-                        {{ getSecondsLeft(item.sudo!) }}s
-                      </span>
                     }
                     <span class="item-time">{{ relativeTime(item.timestamp) }}</span>
                   </div>
                   <div class="item-subtitle">
-                    @if (item.type === 'message' && item.message?.mode === 'blocking') {
-                      <app-badge tone="danger" size="xs" [uppercase]="true">
-                        {{ 'inbox.list.modeBlocking' | transloco }}
-                      </app-badge>
-                    }
                     @if (item.status === 'resolved') {
                       <app-badge tone="neutral" size="xs" [uppercase]="true">
-                        @if (item.type === 'sudo' && item.sudo) {
-                          {{ item.sudo.status }}
-                        } @else {
-                          {{ 'inbox.list.resolved' | transloco }}
-                        }
+                        {{ 'inbox.list.resolved' | transloco }}
+                      </app-badge>
+                    } @else if (item.notification.severity === 'critical' || item.notification.severity === 'high') {
+                      <app-badge [tone]="item.notification.severity === 'critical' ? 'danger' : 'warning'" size="xs" [uppercase]="true">
+                        {{ ('notifications.severity.' + item.notification.severity) | transloco }}
                       </app-badge>
                     }
-                    {{ item.subtitle }}
+                    {{ item.subtitle || (('notifications.category.' + item.category) | transloco) }}
                   </div>
                 </div>
               </button>
+            }
+            @if (notifications.feedNextBefore()) {
+              <div class="load-more">
+                <app-button variant="ghost" size="sm" (clicked)="actionCenter.loadMore()">
+                  {{ 'notifications.loadMore' | transloco }}
+                </app-button>
+              </div>
             }
           }
         </div>
 
         <!-- Right: Detail Panel -->
         <div class="detail-panel">
-          @if (!selectedItem()) {
-            <!-- Empty state -->
+          @if (selectedItem(); as item) {
+            <app-notification-detail [item]="item" />
+          } @else {
             <div class="detail-empty">
               <app-icon size="inherit" class="detail-empty-icon">select_all</app-icon>
               <span class="detail-empty-text">{{ 'inbox.detail.emptyText' | transloco }}</span>
@@ -282,510 +199,10 @@ function relativeTime(iso: string, nowLabel: string): string {
                 {{ 'inbox.detail.hintUse' | transloco }} <kbd>j</kbd>/<kbd>k</kbd> {{ 'inbox.detail.hintToNavigate' | transloco }} <kbd>Enter</kbd> {{ 'inbox.detail.hintToSelect' | transloco }}
               </span>
             </div>
-          } @else if (selectedItem()!.type === 'notification' && selectedItem()!.notification) {
-            <!-- ========== FEED NOTIFICATION (unified notification system) ========== -->
-            <app-notification-detail [item]="selectedItem()!" />
-          } @else if (selectedItem()!.type === 'sudo' && selectedItem()!.sudo) {
-            <!-- ========== SUDO DETAIL ========== -->
-            <div class="detail-content sudo-detail">
-              <div class="detail-header">
-                <span class="detail-type-badge sudo">
-                  <app-icon size="sm">{{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'cloud_upload' : 'admin_panel_settings' }}</app-icon>
-                  {{ (selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'inbox.sudoDetail.vmUpgradeRequest' : 'inbox.sudoDetail.sudoRequest') | transloco }}
-                </span>
-                @if (selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
-                  <app-badge
-                    [tone]="riskTone(getRisk(selectedItem()!.sudo!))"
-                    appearance="solid"
-                    size="xs"
-                    [uppercase]="true"
-                  >
-                    {{ getRisk(selectedItem()!.sudo!) }}
-                  </app-badge>
-                }
-                @if (selectedItem()!.sudo!.status === 'pending' && selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
-                  <span class="detail-countdown" [class]="'ttl-' + ttlColor(selectedItem()!.sudo!)">
-                    {{ 'inbox.sudoDetail.secondsRemaining' | transloco: {seconds: getSecondsLeft(selectedItem()!.sudo!)} }}
-                  </span>
-                }
-                <app-badge [tone]="sudoStatusTone(selectedItem()!.sudo!.status)" size="xs" [uppercase]="true">
-                  {{ selectedItem()!.sudo!.status }}
-                </app-badge>
-              </div>
-
-              <div class="command-block">
-                <code>{{ selectedItem()!.sudo!.arguments.join(' ') || selectedItem()!.sudo!.command }}</code>
-              </div>
-
-              <div class="meta-grid">
-                @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
-                  <div class="meta-row">
-                    <span class="meta-label">{{ 'inbox.sudoDetail.workspace' | transloco }}</span>
-                    <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
-                  </div>
-                } @else {
-                  <div class="meta-row">
-                    <span class="meta-label">{{ 'inbox.sudoDetail.user' | transloco }}</span>
-                    <span class="meta-value">{{ selectedItem()!.sudo!.requesting_user }} → {{ selectedItem()!.sudo!.target_user }}</span>
-                  </div>
-                  <div class="meta-row">
-                    <span class="meta-label">{{ 'inbox.sudoDetail.vm' | transloco }}</span>
-                    <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
-                  </div>
-                }
-                @if (selectedItem()!.sudo!.working_directory) {
-                  <div class="meta-row">
-                    <span class="meta-label">{{ 'inbox.sudoDetail.cwd' | transloco }}</span>
-                    <span class="meta-value mono">{{ selectedItem()!.sudo!.working_directory }}</span>
-                  </div>
-                }
-              </div>
-
-              <div class="detail-ids">
-                @if (selectedItem()!.sudo!.job_id) {
-                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.sudo!.job_id!" />
-                }
-                <app-copy-field [label]="'inbox.detail.requestId' | transloco" [value]="selectedItem()!.sudo!.id" />
-              </div>
-
-              @if (selectedItem()!.sudo!.status === 'pending') {
-                @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
-                  <div class="upgrade-hint">
-                    {{ 'inbox.sudoDetail.upgradeHint' | transloco }}
-                  </div>
-                  <div class="action-bar">
-                    <app-button variant="warning" size="sm" (clicked)="approveVmUpgrade()">
-                      <app-icon size="sm">cloud_upload</app-icon> {{ 'inbox.sudoDetail.upgradeToVm' | transloco }}
-                      <kbd>u</kbd>
-                    </app-button>
-                    <app-button variant="primary" size="sm" (clicked)="resumeWithoutVmSudo()">
-                      <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.sudoDetail.resumeWithoutVm' | transloco }}
-                    </app-button>
-                    <app-button variant="danger" size="sm" (clicked)="startDenySudo()">
-                      <app-icon size="sm">close</app-icon> {{ 'inbox.sudoDetail.deny' | transloco }}
-                      <kbd>d</kbd>
-                    </app-button>
-                  </div>
-                } @else {
-                  <div class="action-bar">
-                    <app-button variant="success" size="sm" (clicked)="approveSudo()">
-                      <app-icon size="sm">check</app-icon> {{ 'inbox.sudoDetail.approve' | transloco }}
-                      <kbd>a</kbd>
-                    </app-button>
-                    <app-button variant="danger" size="sm" (clicked)="startDenySudo()">
-                      <app-icon size="sm">close</app-icon> {{ 'inbox.sudoDetail.deny' | transloco }}
-                      <kbd>d</kbd>
-                    </app-button>
-                  </div>
-                }
-              }
-
-              @if (selectedItem()!.sudo!.decision_reason) {
-                <div class="decision-info">
-                  <span class="meta-label">{{ 'inbox.sudoDetail.reason' | transloco }}</span>
-                  <span class="decision-reason">{{ selectedItem()!.sudo!.decision_reason }}</span>
-                </div>
-              }
-
-              <!-- Rules section -->
-              <details class="rules-section">
-                <summary class="rules-toggle">
-                  <app-icon size="sm">settings</app-icon>
-                  {{ 'inbox.sudoDetail.rulesToggle' | transloco: {count: sudo.rules().length} }}
-                </summary>
-                <div class="rules-body">
-                  <div class="rule-form">
-                    <app-input
-                      size="sm"
-                      [(value)]="newRulePattern"
-                      [placeholder]="'inbox.sudoDetail.rulePatternPlaceholder' | transloco"
-                    />
-                    <app-select size="sm" [(value)]="newRuleAction">
-                      <option value="approve">{{ 'inbox.sudoDetail.ruleActionApprove' | transloco }}</option>
-                      <option value="deny">{{ 'inbox.sudoDetail.ruleActionDeny' | transloco }}</option>
-                    </app-select>
-                    <app-button variant="primary" size="sm" (clicked)="addRule()">
-                      {{ 'inbox.sudoDetail.ruleAdd' | transloco }}
-                    </app-button>
-                  </div>
-                  @for (rule of sudo.rules(); track rule.id) {
-                    <div class="rule-row">
-                      <app-badge
-                        [tone]="rule.action === 'approve' ? 'success' : 'danger'"
-                        appearance="solid"
-                        size="xs"
-                        [uppercase]="true"
-                      >{{ rule.action }}</app-badge>
-                      <code class="rule-pattern">{{ rule.pattern }}</code>
-                      <app-icon-button
-                        size="sm"
-                        variant="danger"
-                        [ariaLabel]="'inbox.sudoDetail.ruleDelete' | transloco"
-                        (clicked)="deleteRule(rule.id)"
-                      >
-                        <app-icon size="sm">close</app-icon>
-                      </app-icon-button>
-                    </div>
-                  }
-                </div>
-              </details>
-            </div>
-
-          } @else if (selectedItem()!.type === 'message' && selectedItem()!.message?.sessionThreadId) {
-            <!-- ========== SESSION PAGE DETAIL (officer page: no job) ========== -->
-            <!-- Keyed to a persistent session, not a job — there is no thread
-                 to fetch and no job-scoped reply route. The session log is the
-                 working reply channel, so the primary action opens it. -->
-            <div class="detail-content message-detail session-page-detail">
-              <div class="detail-header">
-                <span class="detail-type-badge message">
-                  <app-icon size="sm">campaign</app-icon>
-                  {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
-                </span>
-                <app-badge tone="accent" size="xs" [uppercase]="true">
-                  {{ 'inbox.messageDetail.sessionPage' | transloco }}
-                </app-badge>
-              </div>
-
-              <div class="detail-ids">
-                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.message!.sessionThreadId!" />
-              </div>
-
-              <div class="thread-body">
-                <div class="msg-bubble msg-outbound">
-                  <div class="msg-header">
-                    <span class="msg-sender">{{ 'inbox.messageDetail.senderAgent' | transloco }}</span>
-                    <span class="msg-time">{{ formatMsgTime(selectedItem()!.timestamp) }}</span>
-                  </div>
-                  <div class="msg-content">
-                    @if (selectedItem()!.message!.lastMessage) {
-                      <markdown [data]="selectedItem()!.message!.lastMessage"></markdown>
-                    } @else {
-                      {{ 'inbox.messageDetail.noMessagesLoaded' | transloco }}
-                    }
-                  </div>
-                </div>
-              </div>
-
-              <div class="action-bar">
-                <app-button variant="primary" size="sm" (clicked)="goToSession(selectedItem()!.message!.sessionThreadId!)">
-                  <app-icon size="sm">open_in_new</app-icon> {{ 'inbox.messageDetail.openSessionLog' | transloco }}
-                </app-button>
-              </div>
-            </div>
-
-          } @else if (selectedItem()!.type === 'message' && selectedItem()!.message) {
-            <!-- ========== MESSAGE DETAIL ========== -->
-            <div class="detail-content message-detail">
-              <div class="detail-header">
-                <span class="detail-type-badge message">
-                  <app-icon size="sm">mail</app-icon>
-                  {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
-                </span>
-                @if (selectedItem()!.message!.mode === 'blocking') {
-                  <app-badge tone="danger" size="xs" [uppercase]="true">
-                    {{ 'inbox.messageDetail.modeBlocking' | transloco }}
-                  </app-badge>
-                } @else {
-                  <app-badge tone="neutral" size="xs" [uppercase]="true">
-                    {{ 'inbox.messageDetail.modeAsync' | transloco }}
-                  </app-badge>
-                }
-              </div>
-
-              <div class="thread-meta">
-                {{ selectedItem()!.message!.configName || ('inbox.messageDetail.defaultAgent' | transloco) }}
-                @if (selectedItem()!.message!.jobDescription) {
-                  · {{ selectedItem()!.message!.jobDescription }}
-                }
-              </div>
-
-              <div class="detail-ids">
-                @if (selectedItem()!.jobId) {
-                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.jobId!" />
-                }
-                <app-copy-field [label]="'inbox.detail.threadId' | transloco" [value]="selectedItem()!.message!.threadId" />
-              </div>
-
-              <!-- Thread messages -->
-              <div class="thread-body" #threadBody>
-                @if (threadLoading()) {
-                  <div class="thread-loading">{{ 'inbox.messageDetail.threadLoading' | transloco }}</div>
-                } @else if (threadDetail()) {
-                  @for (msg of threadDetail()!.messages; track msg.id) {
-                    <div class="msg-bubble" [class]="'msg-' + msg.direction">
-                      <div class="msg-header">
-                        <span class="msg-sender">
-                          @if (msg.direction === 'outbound') {
-                            {{ 'inbox.messageDetail.senderAgent' | transloco }}
-                          } @else {
-                            {{ 'inbox.messageDetail.senderYou' | transloco }}
-                          }
-                        </span>
-                        <span class="msg-time">{{ formatMsgTime(msg.created_at) }}</span>
-                      </div>
-                      <div class="msg-content">
-                        <markdown [data]="msg.message"></markdown>
-                      </div>
-                    </div>
-                  }
-                } @else {
-                  <div class="thread-loading">
-                    @if (selectedItem()!.message!.lastMessage) {
-                      <div class="msg-preview">{{ selectedItem()!.message!.lastMessage }}</div>
-                    } @else {
-                      {{ 'inbox.messageDetail.noMessagesLoaded' | transloco }}
-                    }
-                  </div>
-                }
-              </div>
-
-              <!-- Reply form -->
-              <div class="reply-form">
-                <app-textarea
-                  #replyInput
-                  [(value)]="replyText"
-                  [placeholder]="'inbox.messageDetail.replyPlaceholder' | transloco"
-                  [rows]="2"
-                  (keydown.control.enter)="sendReply()"
-                  (keydown.meta.enter)="sendReply()"
-                />
-                <div class="reply-actions">
-                  <app-checkbox [(checked)]="replyUrgent">
-                    {{ 'inbox.messageDetail.markUrgent' | transloco }}
-                  </app-checkbox>
-                  <app-button
-                    variant="info"
-                    size="sm"
-                    [disabled]="!replyText.trim() || replySending()"
-                    (clicked)="sendReply()"
-                  >
-                    <app-icon size="sm">send</app-icon>
-                    {{ 'inbox.messageDetail.send' | transloco }}
-                    <kbd>Ctrl+Enter</kbd>
-                  </app-button>
-                </div>
-              </div>
-            </div>
-
-          } @else if (selectedItem()!.type === 'review' && selectedItem()!.review) {
-            <!-- ========== REVIEW DETAIL ========== -->
-            <div class="detail-content review-detail">
-              <div class="detail-header">
-                <span class="detail-type-badge review">
-                  <app-icon size="sm">rate_review</app-icon>
-                  {{ 'inbox.reviewDetail.jobReview' | transloco }}
-                </span>
-                <app-badge [tone]="freezeTone()" appearance="solid" size="xs" [uppercase]="true">
-                  {{ (frozenData()?.freeze_type === 'phase_boundary' ? 'inbox.reviewDetail.freezePhase' :
-                     frozenData()?.freeze_type === 'vm_upgrade_required' ? 'inbox.reviewDetail.freezeUpgrade' : 'inbox.reviewDetail.freezeComplete') | transloco }}
-                </app-badge>
-              </div>
-
-              <div class="review-job-info">
-                <div class="review-job-desc">{{ selectedItem()!.review!.jobDescription }}</div>
-                <div class="review-job-meta">
-                  <span>{{ selectedItem()!.review!.configName || ('inbox.reviewDetail.defaultAgent' | transloco) }}</span>
-                  @if (frozenData()?.phase_number !== undefined) {
-                    <span>{{ 'inbox.reviewDetail.phase' | transloco: {number: frozenData()?.phase_number} }}</span>
-                  }
-                </div>
-                <div class="detail-ids">
-                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.review!.jobId" />
-                </div>
-              </div>
-
-              @if (reviewLoading()) {
-                <div class="review-loading">{{ 'inbox.reviewDetail.loadingFrozen' | transloco }}</div>
-              } @else if (frozenData()) {
-                @if (frozenData()!.summary) {
-                  <div class="review-section">
-                    <div class="review-section-title">{{ 'inbox.reviewDetail.summary' | transloco }}</div>
-                    <div class="review-summary">
-                      <markdown [data]="frozenData()!.summary!"></markdown>
-                    </div>
-                  </div>
-                }
-
-                @if (frozenData()!.confidence !== undefined && frozenData()!.confidence !== null) {
-                  <div class="review-section">
-                    <div class="review-section-title">{{ 'inbox.reviewDetail.confidence' | transloco }}</div>
-                    <div class="confidence-bar-wrap">
-                      <div class="confidence-bar">
-                        <div
-                          class="confidence-fill"
-                          [style.width.%]="(frozenData()!.confidence || 0) * 100"
-                          [class.low]="(frozenData()!.confidence || 0) < 0.5"
-                          [class.medium]="(frozenData()!.confidence || 0) >= 0.5 && (frozenData()!.confidence || 0) < 0.8"
-                          [class.high]="(frozenData()!.confidence || 0) >= 0.8"
-                        ></div>
-                      </div>
-                      <span class="confidence-label">{{ ((frozenData()!.confidence || 0) * 100).toFixed(0) }}%</span>
-                    </div>
-                  </div>
-                }
-
-                @if (frozenData()!.deliverables?.length) {
-                  <div class="review-section">
-                    <div class="review-section-title">{{ 'inbox.reviewDetail.deliverables' | transloco }}</div>
-                    <ul class="deliverables-list">
-                      @for (d of frozenData()!.deliverables; track d) {
-                        <li>{{ d }}</li>
-                      }
-                    </ul>
-                  </div>
-                }
-              }
-
-              <!-- Actions -->
-              <div class="action-bar">
-                @if (frozenData()?.freeze_type === 'vm_upgrade_required') {
-                  <div class="review-action-group upgrade-group">
-                    @if (frozenData()!.command) {
-                      <code class="upgrade-command">{{ frozenData()!.command }}</code>
-                    }
-                    <div class="upgrade-hint">
-                      {{ 'inbox.reviewDetail.upgradeHint' | transloco }}
-                    </div>
-                    <div class="upgrade-buttons">
-                      <app-button
-                        variant="warning"
-                        size="sm"
-                        [disabled]="reviewActing()"
-                        (clicked)="upgradeToVm()"
-                      >
-                        <app-icon size="sm">cloud_upload</app-icon> {{ 'inbox.reviewDetail.upgradeToVm' | transloco }}
-                      </app-button>
-                      <app-button
-                        variant="primary"
-                        size="sm"
-                        [disabled]="reviewActing()"
-                        (clicked)="resumeWithoutVm()"
-                      >
-                        <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.reviewDetail.resumeWithoutVm' | transloco }}
-                      </app-button>
-                    </div>
-                  </div>
-                } @else if (frozenData()?.freeze_type === 'job_complete') {
-                  <div class="review-action-group">
-                    <app-textarea
-                      [(value)]="reviewNotes"
-                      [placeholder]="'inbox.reviewDetail.notesPlaceholder' | transloco"
-                      [rows]="2"
-                    />
-                    <app-button
-                      variant="success"
-                      size="sm"
-                      [disabled]="reviewActing()"
-                      (clicked)="approveReview()"
-                    >
-                      <app-icon size="sm">check_circle</app-icon> {{ 'inbox.reviewDetail.approve' | transloco }}
-                      <kbd>a</kbd>
-                    </app-button>
-                  </div>
-                } @else {
-                  <div class="review-action-group">
-                    <app-textarea
-                      [(value)]="reviewFeedback"
-                      [placeholder]="'inbox.reviewDetail.feedbackPlaceholder' | transloco"
-                      [rows]="2"
-                    />
-                    <app-button
-                      variant="primary"
-                      size="sm"
-                      [disabled]="reviewActing()"
-                      (clicked)="resumeReview()"
-                    >
-                      <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.reviewDetail.resumeWithFeedback' | transloco }}
-                    </app-button>
-                  </div>
-                }
-              </div>
-            </div>
-          } @else if (selectedItem()!.type === 'session' && selectedItem()!.session) {
-            <!-- ========== SESSION DETAIL ========== -->
-            <div class="detail-content session-detail">
-              <div class="detail-header">
-                <span class="detail-type-badge session">
-                  <app-icon size="sm">smart_toy</app-icon>
-                  {{ 'inbox.sessionDetail.agentSession' | transloco }}
-                </span>
-                <app-badge tone="warning" size="xs" [uppercase]="true">
-                  {{ 'inbox.sessionDetail.needsAttention' | transloco }}
-                </app-badge>
-              </div>
-
-              <h3 class="session-title">{{ selectedItem()!.title }}</h3>
-              <div class="session-subtitle">{{ selectedItem()!.subtitle }}</div>
-
-              <div class="detail-ids">
-                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.session!.threadId" />
-                <app-copy-field [label]="'inbox.detail.eventId' | transloco" [value]="selectedItem()!.session!.event.event_id" />
-              </div>
-
-              @if (selectedItem()!.session!.event.tool) {
-                <div class="session-section">
-                  <span class="meta-label">{{ 'inbox.sessionDetail.tool' | transloco }}</span>
-                  <code class="command-block">{{ selectedItem()!.session!.event.tool }}</code>
-                </div>
-                @if (selectedItem()!.session!.event.args) {
-                  <div class="session-section">
-                    <span class="meta-label">{{ 'inbox.sessionDetail.arguments' | transloco }}</span>
-                    <pre class="args-block">{{ selectedItem()!.session!.event.args | json }}</pre>
-                  </div>
-                }
-              }
-              @if (selectedItem()!.session!.event.command) {
-                <div class="session-section">
-                  <span class="meta-label">{{ 'inbox.sessionDetail.command' | transloco }}</span>
-                  <code class="command-block">{{ selectedItem()!.session!.event.command }}</code>
-                </div>
-              }
-              @if (selectedItem()!.session!.event.reason) {
-                <div class="session-section">
-                  <span class="meta-label">{{ 'inbox.sessionDetail.reason' | transloco }}</span>
-                  <span>{{ selectedItem()!.session!.event.reason }}</span>
-                </div>
-              }
-
-              <div class="session-actions">
-                <app-button variant="primary" size="sm" (clicked)="goToSession(selectedItem()!.session!.threadId)">
-                  <app-icon size="sm">open_in_new</app-icon> {{ 'inbox.sessionDetail.goToSession' | transloco }}
-                </app-button>
-              </div>
-            </div>
           }
         </div>
       </div>
     </div>
-
-    <!-- Deny dialog -->
-    <app-dialog
-      [open]="!!denyTarget()"
-      size="md"
-      [closeOnBackdrop]="false"
-      [title]="('inbox.denyDialog.titlePrefix' | transloco) + ' ' + (denyTarget()?.command ?? '')"
-      (closed)="cancelDeny()"
-    >
-      <app-textarea
-        [(value)]="denyReason"
-        [placeholder]="'inbox.denyDialog.reasonPlaceholder' | transloco"
-        [rows]="3"
-      />
-      <ng-container appDialogActions>
-        <app-button variant="ghost" size="sm" (clicked)="cancelDeny()">
-          {{ 'inbox.denyDialog.cancel' | transloco }}
-        </app-button>
-        <app-button
-          variant="danger"
-          size="sm"
-          [disabled]="!denyReason.trim()"
-          (clicked)="confirmDeny()"
-        >
-          {{ 'inbox.denyDialog.deny' | transloco }}
-        </app-button>
-      </ng-container>
-    </app-dialog>
 
     <!-- Keyboard shortcuts dialog -->
     <app-dialog
@@ -799,13 +216,7 @@ function relativeTime(iso: string, nowLabel: string): string {
         <kbd>k</kbd><span>{{ 'inbox.shortcuts.prevItem' | transloco }}</span>
         <kbd>Enter</kbd><span>{{ 'inbox.shortcuts.selectItem' | transloco }}</span>
         <kbd>Escape</kbd><span>{{ 'inbox.shortcuts.deselect' | transloco }}</span>
-        <kbd>a</kbd><span>{{ 'inbox.shortcuts.approveSudoReview' | transloco }}</span>
-        <kbd>d</kbd><span>{{ 'inbox.shortcuts.denySudo' | transloco }}</span>
-        <kbd>r</kbd><span>{{ 'inbox.shortcuts.focusReply' | transloco }}</span>
-        <kbd>Ctrl+Enter</kbd><span>{{ 'inbox.shortcuts.sendReply' | transloco }}</span>
-        <kbd>1</kbd><span>{{ 'inbox.shortcuts.filterMessages' | transloco }}</span>
-        <kbd>2</kbd><span>{{ 'inbox.shortcuts.filterSudo' | transloco }}</span>
-        <kbd>3</kbd><span>{{ 'inbox.shortcuts.filterReviews' | transloco }}</span>
+        <kbd>1</kbd>–<kbd>9</kbd><span>{{ 'inbox.shortcuts.filterCategory' | transloco }}</span>
         <kbd>0</kbd><span>{{ 'inbox.shortcuts.clearFilter' | transloco }}</span>
         <kbd>?</kbd><span>{{ 'inbox.shortcuts.toggleOverlay' | transloco }}</span>
       </div>
@@ -833,7 +244,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       align-items: center;
       gap: 12px;
       padding: 8px 16px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
+      border-bottom: 1px solid var(--surface-0);
       flex-shrink: 0;
       min-height: 44px;
     }
@@ -849,7 +260,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin: 0;
       font-size: 15px;
       font-weight: 600;
-      color: var(--text-primary, var(--text-primary));
+      color: var(--text-primary);
       white-space: nowrap;
     }
 
@@ -863,7 +274,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .filter-chips::-webkit-scrollbar { display: none; }
 
     .chip-count {
-      background: var(--accent-color, var(--accent-color));
+      background: var(--accent-color);
       color: var(--on-accent, var(--timeline-bg));
       font-size: 9px;
       font-weight: 700;
@@ -902,17 +313,17 @@ function relativeTime(iso: string, nowLabel: string): string {
       width: 360px;
       min-width: 280px;
       flex-shrink: 0;
-      border-right: 1px solid var(--border-color, var(--surface-0));
+      border-right: 1px solid var(--surface-0);
       overflow-y: auto;
       scrollbar-width: thin;
-      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
+      scrollbar-color: var(--surface-0) transparent;
     }
 
     .detail-panel {
       flex: 1;
       overflow-y: auto;
       scrollbar-width: thin;
-      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
+      scrollbar-color: var(--surface-0) transparent;
     }
 
     /* ===== LIST ITEMS ===== */
@@ -925,16 +336,16 @@ function relativeTime(iso: string, nowLabel: string): string {
       padding: 10px 12px 10px 0;
       background: transparent;
       border: none;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
+      border-bottom: 1px solid var(--surface-0);
       cursor: pointer;
       text-align: left;
       font-family: inherit;
-      color: var(--text-primary, var(--text-primary));
+      color: var(--text-primary);
       transition: background 0.1s;
       position: relative;
     }
     .list-item:hover { background: color-mix(in srgb, var(--surface-1) 40%, transparent); }
-    .list-item.selected { background: var(--surface-0, var(--surface-0)); }
+    .list-item.selected { background: var(--surface-0); }
     .list-item.resolved { opacity: 0.55; }
 
     .item-urgency-bar {
@@ -946,8 +357,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .urgency-green { background: var(--success); }
     .urgency-amber { background: var(--warning); }
     .urgency-red { background: var(--danger); }
-    .urgency-purple { background: var(--accent-color, var(--accent-color)); }
-    .urgency-muted { background: var(--border-color, var(--surface-0)); }
+    .urgency-muted { background: var(--surface-0); }
 
     .item-type-icon {
       font-size: 18px;
@@ -955,10 +365,11 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin-top: 1px;
       color: var(--text-muted);
     }
-    .type-message { color: var(--info); }
-    .type-sudo { color: var(--alert); }
-    .type-review { color: var(--success); }
-    .type-session { color: var(--accent-color); }
+    .cat-agent_message, .cat-officer_question { color: var(--info); }
+    .cat-sudo_request, .cat-session_permission { color: var(--alert); }
+    .cat-review_queue { color: var(--success); }
+    .cat-session_wake, .cat-loop_event { color: var(--accent-color); }
+    .cat-incident, .cat-vm_upgrade { color: var(--danger); }
 
     .item-content { flex: 1; min-width: 0; }
 
@@ -971,7 +382,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .item-title {
       font-size: 12px;
       font-weight: 500;
-      color: var(--text-primary, var(--text-primary));
+      color: var(--text-primary);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -984,13 +395,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       height: 6px;
       border-radius: 50%;
       background: var(--info);
-      flex-shrink: 0;
-    }
-
-    .item-countdown {
-      font-size: 10px;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
       flex-shrink: 0;
     }
 
@@ -1013,9 +417,11 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 4px;
     }
 
-    .ttl-green { color: var(--success); }
-    .ttl-amber { color: var(--warning); }
-    .ttl-red { color: var(--danger); }
+    .load-more {
+      display: flex;
+      justify-content: center;
+      padding: 10px;
+    }
 
     /* ===== EMPTY STATES ===== */
 
@@ -1030,7 +436,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .empty-icon {
       font-size: 40px;
-      color: var(--border-color, var(--surface-0));
+      color: var(--surface-0);
     }
 
     .empty-text {
@@ -1049,7 +455,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .detail-empty-icon {
       font-size: 48px;
-      color: var(--border-color, var(--surface-0));
+      color: var(--surface-0);
     }
 
     .detail-empty-text {
@@ -1066,444 +472,17 @@ function relativeTime(iso: string, nowLabel: string): string {
     .detail-empty-hint kbd {
       display: inline-block;
       padding: 1px 5px;
-      background: var(--surface-0, var(--surface-0));
+      background: var(--surface-0);
       border-radius: var(--radius-tag);
       font-size: 10px;
       font-family: inherit;
     }
 
-    /* ===== DETAIL SHARED ===== */
+    /* ===== DETAIL ===== */
 
-    .detail-content {
+    app-notification-detail {
+      display: block;
       padding: 16px 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    .detail-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    .detail-type-badge {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--text-primary, var(--text-primary));
-    }
-    .detail-type-badge .icon { font-size: 18px; }
-    .detail-type-badge.sudo .icon { color: var(--alert); }
-    .detail-type-badge.message .icon { color: var(--info); }
-    .detail-type-badge.review .icon { color: var(--success); }
-    .detail-type-badge.session .icon { color: var(--accent-color); }
-
-    .session-detail .session-title {
-      font-size: 16px;
-      font-weight: 600;
-      margin: 16px 0 4px;
-    }
-    .session-detail .session-subtitle {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin-bottom: 16px;
-    }
-    .session-detail .session-section {
-      margin-bottom: 12px;
-    }
-    .session-detail .args-block {
-      background: var(--surface-0, var(--surface-0));
-      border-radius: var(--radius-tag);
-      padding: 8px 12px;
-      font-size: 12px;
-      overflow-x: auto;
-      max-height: 200px;
-      margin-top: 4px;
-    }
-    .session-detail .session-actions {
-      margin-top: 20px;
-      display: flex;
-      gap: 8px;
-    }
-    .detail-countdown {
-      font-size: 12px;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
-      margin-left: auto;
-    }
-
-    .detail-ids {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      margin-top: 8px;
-    }
-
-    /* ===== SUDO DETAIL ===== */
-
-    .command-block {
-      background: var(--panel-bg, var(--panel-bg));
-      border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: var(--radius-tag);
-      padding: 12px 14px;
-    }
-    .command-block code {
-      font-size: 13px;
-      color: var(--text-primary, var(--text-primary));
-      word-break: break-all;
-      line-height: 1.5;
-    }
-
-    .meta-grid {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .meta-row {
-      display: flex;
-      gap: 12px;
-      font-size: 12px;
-    }
-
-    .meta-label {
-      color: var(--text-muted);
-      min-width: 40px;
-      flex-shrink: 0;
-    }
-
-    .meta-value {
-      color: var(--text-secondary, var(--text-secondary));
-    }
-    .meta-value.mono { font-family: monospace; font-size: 11px; }
-
-    .decision-info {
-      background: var(--panel-bg, var(--panel-bg));
-      border-radius: var(--radius-surface);
-      padding: 10px 12px;
-    }
-
-    .decision-reason {
-      font-size: 12px;
-      color: var(--text-secondary, var(--text-secondary));
-      font-style: italic;
-      display: block;
-      margin-top: 4px;
-    }
-
-    /* Rules */
-
-    .rules-section {
-      border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: var(--radius-surface);
-      overflow: hidden;
-    }
-
-    .rules-toggle {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 8px 12px;
-      font-size: 12px;
-      color: var(--text-muted);
-      cursor: pointer;
-      list-style: none;
-    }
-    .rules-toggle::-webkit-details-marker { display: none; }
-    .rules-toggle .icon { font-size: 14px; }
-
-    .rules-body {
-      border-top: 1px solid var(--border-color, var(--surface-0));
-    }
-
-    .rule-form {
-      display: flex;
-      gap: 6px;
-      padding: 8px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
-      align-items: center;
-    }
-    .rule-form app-input { flex: 1; min-width: 0; }
-    /* Bound the approve/deny <select>: its base-select field is width:100%, so without
-       a definite host width it takes the whole flex row and starves the pattern input
-       down to ~16px (reproduces at every viewport, not just mobile). */
-    .rule-form app-select { flex: 0 0 7.5rem; }
-
-    .rule-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 8px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
-      font-size: 11px;
-    }
-    .rule-row:last-child { border-bottom: none; }
-
-    .rule-pattern {
-      flex: 1;
-      font-size: 11px;
-      color: var(--text-primary, var(--text-primary));
-    }
-
-    /* ===== MESSAGE DETAIL ===== */
-
-    .thread-meta {
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-
-    .thread-body {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      min-height: 120px;
-      max-height: 50vh;
-      overflow-y: auto;
-      padding: 4px 0;
-      scrollbar-width: thin;
-      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
-    }
-
-    .thread-loading {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      color: var(--text-muted);
-      font-size: 12px;
-    }
-
-    .msg-preview {
-      color: var(--text-secondary, var(--text-secondary));
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .msg-bubble {
-      border-radius: var(--radius-surface);
-      padding: 10px 14px;
-      max-width: 85%;
-    }
-    .msg-outbound {
-      background: var(--panel-bg, var(--panel-bg));
-      border: 1px solid var(--border-color, var(--surface-0));
-      align-self: flex-start;
-    }
-    .msg-inbound {
-      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-      border: 1px solid color-mix(in srgb, var(--accent-color) 20%, transparent);
-      align-self: flex-end;
-    }
-
-    .msg-header {
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 6px;
-      gap: 12px;
-    }
-
-    .msg-sender {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-secondary, var(--text-secondary));
-    }
-    .msg-outbound .msg-sender { color: var(--alert); }
-    .msg-inbound .msg-sender { color: var(--accent-color, var(--accent-color)); }
-
-    .msg-time {
-      font-size: 10px;
-      color: var(--text-muted);
-    }
-
-    .msg-content {
-      font-size: 13px;
-      line-height: 1.55;
-      color: var(--text-primary, var(--text-primary));
-    }
-
-    .msg-content ::ng-deep {
-      p { margin: 0 0 8px; }
-      p:last-child { margin-bottom: 0; }
-      code {
-        background: var(--surface-0, var(--surface-0));
-        padding: 1px 4px;
-        border-radius: var(--radius-tag);
-        font-size: 12px;
-      }
-      pre {
-        background: var(--surface-0, var(--surface-0));
-        border-radius: var(--radius-tag);
-        padding: 8px 10px;
-        overflow-x: auto;
-        margin: 6px 0;
-      }
-      pre code { background: none; padding: 0; }
-    }
-
-    .reply-form {
-      border-top: 1px solid var(--border-color, var(--surface-0));
-      padding-top: 12px;
-    }
-
-    .reply-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-top: 8px;
-    }
-
-    /* ===== REVIEW DETAIL ===== */
-
-    .upgrade-command {
-      display: block;
-      padding: 6px 10px;
-      background: rgba(0, 0, 0, 0.3);
-      border-radius: var(--radius-tag);
-      font-family: monospace;
-      font-size: 0.85em;
-      color: var(--text-primary, var(--text-primary));
-      word-break: break-all;
-    }
-
-    .upgrade-hint {
-      font-size: 0.8em;
-      color: var(--text-secondary, var(--text-secondary));
-      font-style: italic;
-    }
-
-    .upgrade-buttons {
-      display: flex;
-      gap: 8px;
-    }
-
-    .review-job-info {
-      background: var(--panel-bg, var(--panel-bg));
-      border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: var(--radius-surface);
-      padding: 12px;
-    }
-
-    .review-job-desc {
-      font-size: 13px;
-      color: var(--text-primary, var(--text-primary));
-      line-height: 1.5;
-    }
-
-    .review-job-meta {
-      display: flex;
-      gap: 12px;
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 6px;
-    }
-
-    .review-loading {
-      text-align: center;
-      padding: 20px;
-      color: var(--text-muted);
-      font-size: 12px;
-    }
-
-    .review-section {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .review-section-title {
-      font-size: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--text-muted);
-    }
-
-    .review-summary {
-      font-size: 13px;
-      color: var(--text-secondary, var(--text-secondary));
-      line-height: 1.55;
-    }
-    .review-summary ::ng-deep p { margin: 0 0 6px; }
-    .review-summary ::ng-deep p:last-child { margin-bottom: 0; }
-
-    .confidence-bar-wrap {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .confidence-bar {
-      flex: 1;
-      height: 6px;
-      background: var(--surface-0, var(--surface-0));
-      border-radius: var(--radius-pill);
-      overflow: hidden;
-    }
-
-    .confidence-fill {
-      height: 100%;
-      border-radius: var(--radius-pill);
-      transition: width 0.3s ease;
-    }
-    .confidence-fill.low { background: var(--danger); }
-    .confidence-fill.medium { background: var(--warning); }
-    .confidence-fill.high { background: var(--success); }
-
-    .confidence-label {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-secondary, var(--text-secondary));
-      font-variant-numeric: tabular-nums;
-      min-width: 30px;
-    }
-
-    .deliverables-list {
-      margin: 0;
-      padding: 0 0 0 18px;
-      font-size: 12px;
-      color: var(--text-secondary, var(--text-secondary));
-      line-height: 1.6;
-    }
-
-    .review-action-group {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      width: 100%;
-    }
-
-    /* ===== SHARED: ACTION BAR LAYOUT + KBD HINTS ===== */
-
-    .upgrade-hint {
-      font-size: 12px;
-      color: var(--text-secondary);
-      padding: 8px 12px;
-      background: var(--warning-tint);
-      border-left: 2px solid var(--warning);
-      border-radius: var(--radius-tag);
-      margin-bottom: 8px;
-      line-height: 1.5;
-    }
-
-    .action-bar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    /* Kbd shortcut hints projected into <app-button>. Scoped to inbox view. */
-    app-button kbd {
-      font-size: 9px;
-      padding: 1px 4px;
-      border-radius: var(--radius-tag);
-      background: rgba(0, 0, 0, 0.2);
-      font-family: inherit;
-      margin-left: 2px;
     }
 
     /* ===== SHORTCUTS DIALOG BODY ===== */
@@ -1517,18 +496,18 @@ function relativeTime(iso: string, nowLabel: string): string {
     .shortcuts-grid kbd {
       display: inline-block;
       padding: 2px 7px;
-      background: var(--surface-0, var(--surface-0));
+      background: var(--surface-0);
       border-radius: var(--radius-tag);
       font-size: 11px;
       font-family: inherit;
-      color: var(--accent-color, var(--accent-color));
+      color: var(--accent-color);
       text-align: center;
       min-width: 24px;
     }
 
     .shortcuts-grid span {
       font-size: 12px;
-      color: var(--text-secondary, var(--text-secondary));
+      color: var(--text-secondary);
       padding-top: 2px;
     }
 
@@ -1544,10 +523,9 @@ function relativeTime(iso: string, nowLabel: string): string {
       .inbox-body.mobile-detail .list-panel { display: none; }
       .inbox-body.mobile-detail .detail-panel { display: block; }
 
-      /* Give the filter chips their own full-width row instead of a ~138px sliver
-         squeezed between the title and the SSE/refresh cluster (which hid 3 of the 5
-         filters behind a scrollbar-less swipe). Title + status stay on row 1; the
-         chips wrap to row 2 and scroll there with ~4 visible at rest. */
+      /* Give the filter chips their own full-width row instead of a sliver
+         squeezed between the title and the SSE/refresh cluster. Title +
+         status stay on row 1; the chips wrap to row 2 and scroll there. */
       .inbox-header { flex-wrap: wrap; row-gap: 6px; }
       .header-right { margin-left: auto; }
       .filter-chips { gap: 3px; order: 3; flex-basis: 100%; }
@@ -1556,57 +534,55 @@ function relativeTime(iso: string, nowLabel: string): string {
 })
 export class InboxPageComponent implements OnInit, OnDestroy {
   readonly actionCenter = inject(ActionCenterService);
-  readonly sudo = inject(SudoService);
-  private readonly api = inject(ApiService);
+  readonly notifications = inject(NotificationService);
   private readonly route = inject(ActivatedRoute);
-  private readonly router = inject(Router);
   private readonly zone = inject(NgZone);
   private readonly transloco = inject(TranslocoService);
 
-  @ViewChild('threadBody') threadBodyRef?: ElementRef<HTMLElement>;
-  @ViewChild('replyInput') replyInputRef?: AppTextareaComponent;
-
   // --- State ---
-  readonly activeFilter = signal<ActionItemType | null>(null);
+  /** Category filter (a `notifications.category.*` key), or null for all. */
+  readonly activeFilter = signal<string | null>(null);
   readonly selectedItem = signal<ActionItem | null>(null);
   readonly showShortcuts = signal(false);
 
-  // Countdown tick
+  // Relative-time / countdown tick
   private countdownTimer: ReturnType<typeof setInterval> | null = null;
   readonly tick = signal(0);
-
-  // Message detail
-  readonly threadDetail = signal<ThreadDetail | null>(null);
-  readonly threadLoading = signal(false);
-  replyText = '';
-  replyUrgent = false;
-  readonly replySending = signal(false);
-
-  // Review detail
-  readonly frozenData = signal<FrozenJobData | null>(null);
-  readonly reviewLoading = signal(false);
-  readonly reviewActing = signal(false);
-  reviewNotes = '';
-  reviewFeedback = '';
-
-  // Sudo deny
-  readonly denyTarget = signal<SudoRequest | null>(null);
-  denyReason = '';
-
-  // Sudo rules
-  newRulePattern = '';
-  newRuleAction = 'approve';
+  /** Wall clock the relative-time labels are computed against; advanced by the tick. */
+  readonly now = signal(Date.now());
 
   // Navigation
   private focusIndex = -1;
 
+  /**
+   * Category chips: every category with a server count or a loaded row, in
+   * the catalog's display order; categories the cockpit does not know yet
+   * append at the end and render with the generic bell.
+   */
+  readonly categoryChips = computed(() => {
+    const byCategory = this.actionCenter.counts().byCategory;
+    const present = new Set<string>(Object.keys(byCategory));
+    for (const item of this.actionCenter.items()) present.add(item.category);
+    const rank = (c: string) => {
+      const i = KNOWN_CATEGORIES.indexOf(c);
+      return i === -1 ? KNOWN_CATEGORIES.length : i;
+    };
+    return Array.from(present)
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+      .map((category) => ({
+        category,
+        icon: categoryIcon(category),
+        pending: byCategory[category]?.pending ?? 0,
+      }));
+  });
+
   readonly filteredItems = computed(() => {
-    // Touch tick to force re-evaluation for countdowns
+    // Touch tick to force re-evaluation for relative times
     this.tick();
     const filter = this.activeFilter();
     const items = this.actionCenter.items();
     if (!filter) return items;
-    return items.filter((i) => i.type === filter);
+    return items.filter((i) => i.category === filter);
   });
 
   private readonly viewport = inject(ViewportService);
@@ -1617,20 +593,22 @@ export class InboxPageComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     // SSE is opened at app-shell init (App constructor effect) so it's
-    // already up by the time the user navigates to Inbox. initSSE() is
-    // idempotent — this call is removed; keep the rest of the bring-up.
+    // already up by the time the user navigates to Inbox.
     this.actionCenter.refreshAll();
-    this.sudo.loadRules();
 
-    // Countdown tick every second — run outside Angular zone to avoid
+    // Tick every second — run outside Angular zone to avoid
     // ExpressionChangedAfterItHasBeenChecked errors, then re-enter zone
     this.zone.runOutsideAngular(() => {
       this.countdownTimer = setInterval(() => {
-        this.zone.run(() => this.tick.update((t) => t + 1));
+        this.zone.run(() => {
+          this.now.set(Date.now());
+          this.tick.update((t) => t + 1);
+        });
       }, 1000);
     });
 
-    // Deep-link support
+    // Deep-link support: `?n=<id>` is what every email carries now; the
+    // older links name a source and still work.
     this.route.queryParams.subscribe((params) => {
       const notificationId = params['n'];
       const jobId = params['job'];
@@ -1641,11 +619,16 @@ export class InboxPageComponent implements OnInit, OnDestroy {
       if (notificationId) {
         this.trySelectNotification(notificationId);
       } else if (sudoId) {
-        this.trySelectById(`sudo:${sudoId}`);
+        this.trySelectBySource([{kind: 'sudo_request', id: sudoId}]);
       } else if (jobId && threadId) {
-        this.trySelectById(`msg:${jobId}:${threadId}`);
+        // An agent message thread, or an officer page keyed to its session
+        // (the old `?job={thread}&thread={thread}` shape).
+        this.trySelectBySource([
+          {kind: 'message_thread', id: threadId},
+          {kind: 'thread', id: threadId},
+        ]);
       } else if (jobId && review) {
-        this.trySelectById(`rev:${jobId}`);
+        this.trySelectBySource([{kind: 'job', id: jobId}]);
       }
     });
   }
@@ -1655,23 +638,10 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   }
 
   // --- Deep-link ---
-  private trySelectById(id: string): void {
-    const item = this.actionCenter.items().find((i) => i.id === id);
-    if (item) {
-      this.selectItem(item);
-    } else {
-      // Retry once after data loads
-      setTimeout(() => {
-        const retryItem = this.actionCenter.items().find((i) => i.id === id);
-        if (retryItem) this.selectItem(retryItem);
-      }, 2000);
-    }
-  }
 
   /**
-   * `?n=<id>` — the deep link every email now carries. The row is normally
-   * in the loaded page; otherwise fetch it by id and upsert, which replaces
-   * the old "retry once after 2 s and give up" dance.
+   * `?n=<id>`: the row is normally in the loaded page; otherwise fetch it
+   * by id and upsert.
    */
   private trySelectNotification(notificationId: string): void {
     const id = `ntf:${notificationId}`;
@@ -1687,271 +657,55 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     });
   }
 
+  /** Try each candidate source in order; the first with a feed row wins. */
+  private trySelectBySource(candidates: SourceRef[]): void {
+    const [head, ...rest] = candidates;
+    if (!head) return;
+    this.actionCenter.fetchBySource(head).subscribe((row) => {
+      if (!row) {
+        this.trySelectBySource(rest);
+        return;
+      }
+      const item = this.actionCenter.items().find((i) => i.id === `ntf:${row.id}`);
+      if (item) this.selectItem(item);
+    });
+  }
+
   // --- Filters ---
-  setFilter(type: ActionItemType | null): void {
-    this.activeFilter.set(type);
+  setFilter(category: string | null): void {
+    this.activeFilter.set(category);
   }
 
   refresh(): void {
     this.actionCenter.refreshAll();
-    this.sudo.loadRules();
   }
 
   // --- Selection ---
   selectItem(item: ActionItem): void {
     this.selectedItem.set(item);
     this.focusIndex = this.filteredItems().findIndex((i) => i.id === item.id);
-
-    // Load detail data based on type
-    if (item.type === 'notification' && item.notification) {
-      // Opening the row is reading it; the pane loads its own source payload.
-      this.actionCenter.markRead(item.notification.id);
-    } else if (item.type === 'message' && item.message && item.jobId) {
-      this.loadThreadDetail(item.jobId, item.message.threadId);
-    } else if (item.type === 'review' && item.review) {
-      this.loadFrozenData(item.review.jobId);
-    }
+    // Opening the row is reading it; the pane loads its own source payload.
+    this.actionCenter.markRead(item.notification.id);
   }
 
   deselect(): void {
     this.selectedItem.set(null);
-    this.threadDetail.set(null);
-    this.frozenData.set(null);
-  }
-
-  // --- Message detail ---
-  private loadThreadDetail(jobId: string, threadId: string): void {
-    this.threadLoading.set(true);
-    this.threadDetail.set(null);
-    this.actionCenter.loadThread(jobId, threadId).subscribe({
-      next: (detail) => {
-        this.threadDetail.set(detail);
-        this.threadLoading.set(false);
-        // Auto-scroll to bottom
-        setTimeout(() => {
-          const el = this.threadBodyRef?.nativeElement;
-          if (el) el.scrollTop = el.scrollHeight;
-        }, 50);
-      },
-      error: () => this.threadLoading.set(false),
-    });
-  }
-
-  sendReply(): void {
-    const item = this.selectedItem();
-    if (!item?.message || !item.jobId || !this.replyText.trim()) return;
-
-    this.replySending.set(true);
-    this.actionCenter
-      .reply(item.jobId, item.message.threadId, this.replyText.trim(), this.replyUrgent)
-      .subscribe({
-        next: () => {
-          this.replyText = '';
-          this.replyUrgent = false;
-          this.replySending.set(false);
-          // Reload thread
-          if (item.jobId && item.message) {
-            this.loadThreadDetail(item.jobId, item.message.threadId);
-          }
-        },
-        error: () => this.replySending.set(false),
-      });
-  }
-
-  // --- Review detail ---
-  private loadFrozenData(jobId: string): void {
-    this.reviewLoading.set(true);
-    this.frozenData.set(null);
-    this.api.getFrozenJobData(jobId).subscribe({
-      next: (data) => {
-        this.frozenData.set(data as FrozenJobData | null);
-        this.reviewLoading.set(false);
-      },
-      error: () => this.reviewLoading.set(false),
-    });
-  }
-
-  approveReview(): void {
-    const item = this.selectedItem();
-    if (!item?.review) return;
-    this.reviewActing.set(true);
-    this.actionCenter.approveJob(item.review.jobId, this.reviewNotes || undefined).subscribe({
-      next: () => {
-        this.reviewActing.set(false);
-        this.reviewNotes = '';
-        this.actionCenter.loadReviewJobs();
-      },
-      error: () => this.reviewActing.set(false),
-    });
-  }
-
-  resumeReview(): void {
-    const item = this.selectedItem();
-    if (!item?.review || !this.reviewFeedback.trim()) return;
-    this.reviewActing.set(true);
-    this.actionCenter.resumeJob(item.review.jobId, this.reviewFeedback.trim()).subscribe({
-      next: () => {
-        this.reviewActing.set(false);
-        this.reviewFeedback = '';
-        this.actionCenter.loadReviewJobs();
-      },
-      error: () => this.reviewActing.set(false),
-    });
-  }
-
-  upgradeToVm(): void {
-    const item = this.selectedItem();
-    if (!item?.review) return;
-    this.reviewActing.set(true);
-    this.actionCenter.upgradeJobToVm(item.review.jobId).subscribe({
-      next: () => {
-        this.reviewActing.set(false);
-        this.actionCenter.loadReviewJobs();
-      },
-      error: () => this.reviewActing.set(false),
-    });
-  }
-
-  resumeWithoutVm(): void {
-    const item = this.selectedItem();
-    if (!item?.review) return;
-    this.reviewActing.set(true);
-    this.actionCenter.approveJob(item.review.jobId).subscribe({
-      next: () => {
-        this.reviewActing.set(false);
-        this.actionCenter.loadReviewJobs();
-      },
-      error: () => this.reviewActing.set(false),
-    });
-  }
-
-  // --- Session actions ---
-  goToSession(threadId: string): void {
-    this.router.navigate(['/sessions', threadId]);
-  }
-
-  // --- Sudo actions ---
-  approveSudo(): void {
-    const item = this.selectedItem();
-    if (!item?.sudo) return;
-    this.sudo.approve(item.sudo.id);
-  }
-
-  approveVmUpgrade(): void {
-    const item = this.selectedItem();
-    if (!item?.sudo) return;
-    this.sudo.approveVmUpgrade(item.sudo.id);
-  }
-
-  resumeWithoutVmSudo(): void {
-    const item = this.selectedItem();
-    if (!item?.sudo) return;
-    this.sudo.resumeWithoutVm(item.sudo.id);
-  }
-
-  startDenySudo(): void {
-    const item = this.selectedItem();
-    if (!item?.sudo) return;
-    this.denyTarget.set(item.sudo);
-    this.denyReason = '';
-  }
-
-  confirmDeny(): void {
-    const target = this.denyTarget();
-    if (target && this.denyReason.trim()) {
-      this.sudo.deny(target.id, this.denyReason.trim());
-      this.denyTarget.set(null);
-      this.denyReason = '';
-    }
-  }
-
-  cancelDeny(): void {
-    this.denyTarget.set(null);
-    this.denyReason = '';
-  }
-
-  addRule(): void {
-    if (this.newRulePattern.trim()) {
-      this.sudo.createRule(this.newRulePattern.trim(), this.newRuleAction);
-      this.newRulePattern = '';
-    }
-  }
-
-  deleteRule(ruleId: string): void {
-    this.sudo.deleteRule(ruleId);
   }
 
   // --- Helpers ---
-  iconFor(item: ActionItem): string { return categoryIcon(item.category || ''); }
-  getRisk(req: SudoRequest): string { return riskLevel(req); }
-  getSecondsLeft(req: SudoRequest): number { return secondsLeft(req); }
+  iconFor(item: ActionItem): string { return categoryIcon(item.category); }
   relativeTime(iso: string): string {
-    return relativeTime(iso, this.transloco.translate('inbox.time.now'));
-  }
-
-  ttlColor(req: SudoRequest): string {
-    const s = secondsLeft(req);
-    if (s <= 0) return 'red';
-    if (s < 30) return 'red';
-    if (s < 120) return 'amber';
-    return 'green';
-  }
-
-  sudoStatusTone(status: string | undefined): BadgeTone {
-    switch (status) {
-      case 'pending': return 'warning';
-      case 'approved':
-      case 'auto_approved': return 'success';
-      case 'denied':
-      case 'auto_denied':
-      case 'expired': return 'danger';
-      default: return 'neutral';
-    }
-  }
-
-  riskTone(risk: string): BadgeTone {
-    switch (risk) {
-      case 'low': return 'success';
-      case 'medium': return 'warning';
-      case 'high': return 'alert';
-      case 'critical': return 'danger';
-      default: return 'neutral';
-    }
-  }
-
-  freezeTone(): BadgeTone {
-    const t = this.frozenData()?.freeze_type;
-    if (t === 'phase_boundary') return 'accent';
-    if (t === 'vm_upgrade_required') return 'warning';
-    return 'success';
+    return relativeTime(iso, this.transloco.translate('inbox.time.now'), this.now());
   }
 
   urgencyColor(item: ActionItem): string {
     if (item.status === 'resolved') return 'muted';
-    if (item.type === 'notification' && item.notification) {
-      switch (item.notification.severity) {
-        case 'critical': return 'red';
-        case 'high': return 'amber';
-        case 'normal': return 'green';
-        default: return 'muted';
-      }
+    switch (item.notification.severity) {
+      case 'critical': return 'red';
+      case 'high': return 'amber';
+      case 'normal': return 'green';
+      default: return 'muted';
     }
-    if (item.type === 'sudo' && item.sudo?.status === 'pending') {
-      return this.ttlColor(item.sudo!);
-    }
-    if (item.type === 'message') {
-      if (item.message?.mode === 'blocking') return 'red';
-      if (item.message?.unread) return 'purple';
-      return 'muted';
-    }
-    if (item.type === 'review') return 'green';
-    return 'muted';
-  }
-
-  formatMsgTime(iso: string): string {
-    if (!iso) return '';
-    const d = new Date(iso);
-    return d.toLocaleTimeString(this.transloco.getActiveLang(), { hour: '2-digit', minute: '2-digit' });
   }
 
   // --- Keyboard navigation ---
@@ -1970,8 +724,6 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     if (e.key === 'Escape') {
       if (this.showShortcuts()) {
         this.showShortcuts.set(false);
-      } else if (this.denyTarget()) {
-        this.cancelDeny();
       } else {
         this.deselect();
       }
@@ -1999,40 +751,17 @@ export class InboxPageComponent implements OnInit, OnDestroy {
           this.selectItem(items[this.focusIndex]);
         }
         break;
-      case 'a':
-        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending'
-            && this.selectedItem()?.sudo?.request_type !== 'vm_upgrade') {
-          this.approveSudo();
-        } else if (this.selectedItem()?.type === 'review') {
-          this.approveReview();
+      case '0':
+        this.setFilter(null);
+        break;
+      default: {
+        // 1–9 select the n-th category chip.
+        const n = parseInt(e.key, 10);
+        if (n >= 1 && n <= 9) {
+          const chip = this.categoryChips()[n - 1];
+          if (chip) this.setFilter(chip.category);
         }
-        break;
-      case 'u':
-        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending'
-            && this.selectedItem()?.sudo?.request_type === 'vm_upgrade') {
-          this.approveVmUpgrade();
-        }
-        break;
-      case 'd':
-        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending') {
-          this.startDenySudo();
-        }
-        break;
-      case 'r':
-        if (this.selectedItem()?.type === 'message') {
-          this.replyInputRef?.focus();
-        }
-        break;
-      case '0': this.setFilter(null); break;
-      case '1': this.setFilter('message'); break;
-      case '2': this.setFilter('sudo'); break;
-      case '3': this.setFilter('review'); break;
-      case '4':
-        this.setFilter('session');
-        break;
-      case '5':
-        this.setFilter('notification');
-        break;
+      }
     }
   }
 }

@@ -10,8 +10,9 @@
 
 export type NotificationSeverity = 'low' | 'normal' | 'high' | 'critical';
 
-/** Known categories (slice 1). Open-ended on purpose: a new server category
- *  renders generically until the cockpit learns an icon/label for it. */
+/** Known categories (server `notification_catalog.CATEGORIES`). Open-ended on
+ *  purpose: a new server category renders generically until the cockpit
+ *  learns an icon/label for it. */
 export type NotificationCategory =
   | 'review_queue'
   | 'vm_upgrade'
@@ -19,7 +20,31 @@ export type NotificationCategory =
   | 'incident'
   | 'officer_question'
   | 'officer_runtime'
+  | 'agent_message'
+  | 'session_wake'
+  | 'loop_event'
+  | 'automation_disabled'
+  | 'user_registered'
+  | 'session_permission'
+  | 'sudo_request'
   | (string & {});
+
+/** Display order of the category chips; unknown categories append after. */
+export const KNOWN_CATEGORIES: readonly string[] = [
+  'review_queue',
+  'sudo_request',
+  'session_permission',
+  'vm_upgrade',
+  'budget_exceeded',
+  'incident',
+  'agent_message',
+  'officer_question',
+  'officer_runtime',
+  'session_wake',
+  'loop_event',
+  'automation_disabled',
+  'user_registered',
+];
 
 export type NotificationActionStyle = 'default' | 'primary' | 'danger';
 export type NotificationActionInput = 'text' | 'textarea';
@@ -84,11 +109,157 @@ export interface NotificationFeedPage {
   counts: NotificationCounts;
 }
 
-/** `GET /api/notifications/{id}` — the row plus its source's presentation
- *  payload (job + freeze data, sudo request row, thread summary). */
+/** One deferred channel step of a row ("email at 21:45 unless seen/resolved"). */
+export interface NotificationStep {
+  id: string;
+  step_index: number;
+  channel: string;
+  due_at: string | null;
+  conditions: string[];
+  batch_key: string | null;
+  state: 'pending' | 'done' | 'skipped' | 'cancelled' | 'failed' | (string & {});
+  attempt: number;
+  settled_at: string | null;
+  detail: string | null;
+}
+
+// ── Source payloads (`GET /api/notifications/{id}`), keyed by source_kind ──
+
+export interface SourceJob {
+  kind: 'job';
+  job: {
+    id: string;
+    status: string;
+    description: string | null;
+    config_name: string | null;
+    project_id: string | null;
+    parent_job_id: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+    completed_at: string | null;
+    error_message: string | null;
+  };
+  freeze_data: Record<string, unknown> | null;
+}
+
+export interface SudoRequestRow {
+  id: string;
+  job_id: string | null;
+  thread_id: string | null;
+  vm_name: string | null;
+  command: string;
+  arguments: string[] | null;
+  working_directory: string | null;
+  requesting_user: string | null;
+  target_user: string | null;
+  status: string;
+  requested_at: string | null;
+  expires_at: string | null;
+  request_type: 'sudo_command' | 'vm_upgrade' | (string & {});
+  metadata: Record<string, unknown> | null;
+  decision_reason?: string | null;
+}
+
+export interface SourceSudoRequest {
+  kind: 'sudo_request';
+  request: SudoRequestRow;
+}
+
+export interface SourceThread {
+  kind: 'thread';
+  thread: {
+    id: string;
+    title: string | null;
+    project_id: string | null;
+    config_name: string | null;
+    status: string | null;
+    created_at: string | null;
+  };
+}
+
+export interface SourceMessage {
+  id: string;
+  job_id: string | null;
+  direction: 'outbound' | 'inbound';
+  subject: string | null;
+  message: string;
+  mode: string | null;
+  status: string | null;
+  read_at: string | null;
+  created_at: string | null;
+}
+
+export interface SourceMessageThread {
+  kind: 'message_thread';
+  thread_id: string;
+  job_id: string | null;
+  messages: SourceMessage[];
+}
+
+export interface SourceLoop {
+  kind: 'loop';
+  loop: {
+    id: string;
+    project_id: string | null;
+    name?: string | null;
+    title?: string | null;
+    status?: string | null;
+    created_at: string | null;
+  };
+}
+
+export interface SourceAutomation {
+  kind: 'automation';
+  automation: {
+    id: string;
+    name: string | null;
+    enabled: boolean;
+    disabled_reason: string | null;
+    created_at: string | null;
+  };
+}
+
+export interface SourceUser {
+  kind: 'user';
+  user: {
+    id: string;
+    email: string | null;
+    display_name: string | null;
+    is_approved: boolean;
+    created_at: string | null;
+  };
+}
+
+export interface SourcePermissionRequest {
+  kind: 'permission_request';
+  request: {
+    id: string;
+    thread_id: string;
+    tool_name: string | null;
+    tool_args: Record<string, unknown> | string | null;
+    status: string;
+    requested_at: string | null;
+    decided_at: string | null;
+    decided_by: string | null;
+  };
+}
+
+export type NotificationSource =
+  | SourceJob
+  | SourceSudoRequest
+  | SourceThread
+  | SourceMessageThread
+  | SourceLoop
+  | SourceAutomation
+  | SourceUser
+  | SourcePermissionRequest;
+
+/** `GET /api/notifications/{id}` — the row, its source's presentation
+ *  payload, and its deferred channel steps. */
 export interface NotificationDetail {
   notification: Notification;
-  source: Record<string, unknown> | null;
+  source: NotificationSource | null;
+  steps?: NotificationStep[];
 }
 
 export interface NotificationActResponse {
@@ -111,3 +282,8 @@ export const SEVERITY_URGENCY: Record<NotificationSeverity, number> = {
   normal: 45,
   low: 25,
 };
+
+/** `kind:id` — the key the deep links and the feed share. */
+export function sourceKey(ref: SourceRef | null | undefined): string | null {
+  return ref ? `${ref.kind}:${ref.id}` : null;
+}
