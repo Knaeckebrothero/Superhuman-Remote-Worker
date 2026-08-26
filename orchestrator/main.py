@@ -33102,6 +33102,100 @@ async def _test_mcp_datasource(
         }
 
 
+async def _test_repository_datasource(
+    ds: dict[str, Any], url: str | None, creds: dict[str, Any]
+) -> dict[str, Any]:
+    """Probe a token-authenticated repository connector without exposing the token.
+
+    Reports the principal the agent will act as, its permission on the
+    repository, the token class (GitHub only), and the repository's default
+    branch, with warnings for the two configurations that silently defeat
+    the guardrails: an administrator token (bypasses branch rules) and a
+    connector that is not read-only but cannot push. SSH-key connectors have
+    no API to ask; their clone at job start is the test.
+    """
+    from src.services.forge import (  # noqa: PLC0415
+        ForgeError,
+        ForgeRepo,
+        parse_owner_repo,
+        probe_repository_access,
+        resolve_api_base,
+    )
+
+    token = str(creds.get("token") or "")
+    auth_method = str(creds.get("auth_method") or "").lower()
+    if not auth_method:
+        auth_method = "ssh" if creds.get("ssh_key") else ("token" if token else "")
+    if auth_method != "token" or not token:
+        return {
+            "status": "ok",
+            "message": (
+                "No API probe for SSH-key repository connectors; "
+                "the clone at job start is the test"
+            ),
+        }
+
+    config = ds.get("config") or {}
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            config = {}
+    try:
+        forge = _normalize_repository_config(config, url)["forge"]
+        owner, repo = parse_owner_repo(url or "")
+        target = ForgeRepo(
+            forge=forge,
+            api_base=resolve_api_base(url or "", forge),
+            owner=owner,
+            repo=repo,
+            token=token,
+        )
+    except HTTPException as exc:
+        return {"status": "error", "message": str(exc.detail)}
+    except ForgeError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    try:
+        facts = await asyncio.wait_for(probe_repository_access(target), timeout=15)
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "Repository probe timed out after 15s"}
+    except ForgeError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    warnings = list(facts.get("warnings") or [])
+    if not facts["can_write"] and not ds.get("read_only"):
+        warnings.append(
+            f"{facts['principal'] or 'the token'} cannot push to {owner}/{repo} "
+            "but the connector is not marked read-only"
+        )
+    configured_branch = str(ds.get("default_branch") or "")
+    repo_default = facts.get("default_branch")
+    branch_note = ""
+    if repo_default:
+        branch_note = f"; repository default branch {repo_default}"
+        if configured_branch and configured_branch != repo_default:
+            branch_note += f" (connector targets {configured_branch})"
+
+    token_label = (
+        f"{facts['token_class']} token"
+        if facts["token_class"] != "unknown"
+        else "token"
+    )
+    access = "write" if facts["can_write"] else "read-only"
+    message = (
+        f"Authenticated as {facts['principal'] or 'unknown principal'} "
+        f"({token_label}); {access} access to {owner}/{repo}{branch_note}"
+    )
+    if warnings:
+        message += " — WARNING: " + "; ".join(warnings)
+    return {
+        "status": "ok",
+        "message": message,
+        "details": {**facts, "warnings": warnings},
+    }
+
+
 @app.post("/api/datasources/{datasource_id}/test")
 async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Test connectivity to a connector.
@@ -33202,10 +33296,13 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
-        elif ds_type in ("generic", "repository"):
+        elif ds_type == "repository":
+            return await _test_repository_datasource(ds, url, creds)
+
+        elif ds_type == "generic":
             return {
                 "status": "ok",
-                "message": f"No connectivity test for {ds_type} connectors",
+                "message": "No connectivity test for generic connectors",
             }
 
         else:
