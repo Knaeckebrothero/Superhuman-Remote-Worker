@@ -996,14 +996,16 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        conn.fetchval = AsyncMock(side_effect=[12, "tid-1", "tid-1"])
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1") is True
-        queue_sql = " ".join(conn.fetchval.await_args_list[0].args[0].split())
+        pending_sql = " ".join(conn.fetchval.await_args_list[0].args[0].split())
+        assert "FROM thread_input_deliveries" in pending_sql
+        queue_sql = " ".join(conn.fetchval.await_args_list[1].args[0].split())
         assert "input_seq > COALESCE(consumed_seq, -1)" in queue_sql
         assert "THEN 'queued' ELSE 'done'" in queue_sql
-        assert conn.fetchval.await_args_list[0].args[1:] == ("tid-1",)
+        assert conn.fetchval.await_args_list[1].args[1:] == ("tid-1", 12)
 
     @pytest.mark.asyncio
     async def test_resume_clears_agent_and_control_capability(self):
@@ -1060,7 +1062,7 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        settled_conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        settled_conn.fetchval = AsyncMock(side_effect=[None, "tid-1", "tid-1"])
         settled_db = _make_db_with_conn(settled_conn)
 
         assert await settled_db.resume_thread("tid-1") is True
@@ -1219,7 +1221,7 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=["tid-1", "tid-1"])
+        conn.fetchval = AsyncMock(side_effect=[None, "tid-1", "tid-1"])
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1")

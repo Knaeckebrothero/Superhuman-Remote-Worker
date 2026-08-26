@@ -306,6 +306,10 @@ BEGIN
                 MESSAGE = 'Docker workspace process-zero authority is required';
         END IF;
     ELSIF old_workspace <> '{}'::JSONB
+       -- A status-only placeholder has no process, endpoint, lease, or
+       -- repository authority to retire.  Sanitized untrusted creation paths
+       -- legitimately move that placeholder between pending/ready states.
+       AND old_workspace - 'status' <> '{}'::JSONB
        AND (
            TG_OP = 'DELETE'
            OR new_workspace IS DISTINCT FROM old_workspace
@@ -330,11 +334,25 @@ BEGIN
                    - 'git_remote_url'
                    - '_managed_repository_authority_pending'
            )
-           AND public.managed_repository_url_has_userinfo(
-               old_workspace->>'git_remote_url'
-           )
+           AND new_workspace->>'git_remote_url' IS NOT NULL
            AND NOT public.managed_repository_url_has_userinfo(
                new_workspace->>'git_remote_url'
+           )
+           AND (
+               public.managed_repository_url_has_userinfo(
+                   old_workspace->>'git_remote_url'
+               )
+               OR (
+                   old_workspace->'_managed_repository_authority_pending'
+                       = 'true'::JSONB
+                   AND NOT (
+                       new_workspace
+                           ? '_managed_repository_authority_pending'
+                   )
+                   AND old_workspace->>'git_remote_url'
+                       IS NOT DISTINCT FROM
+                       new_workspace->>'git_remote_url'
+               )
            )
        ) THEN
         RAISE EXCEPTION USING
