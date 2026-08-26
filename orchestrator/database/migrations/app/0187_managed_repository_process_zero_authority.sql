@@ -309,6 +309,33 @@ BEGIN
        AND (
            TG_OP = 'DELETE'
            OR new_workspace IS DISTINCT FROM old_workspace
+       )
+       AND NOT (
+           -- A pre-0175 persistent thread can lack a provisioner stamp while
+           -- still carrying its historical credential-bearing repository
+           -- URL.  Managed-authority adoption must be able to perform the
+           -- exact authority-reducing URL scrub before the replacement agent
+           -- binds.  Migration 0176 independently requires the matching
+           -- active write authority; this exception permits only removal of
+           -- userinfo (and its transient pending marker), never a workspace
+           -- runtime mutation.
+           TG_OP = 'UPDATE'
+           AND source_kind = 'thread'
+           AND (
+               old_workspace
+                   - 'git_remote_url'
+                   - '_managed_repository_authority_pending'
+           ) = (
+               new_workspace
+                   - 'git_remote_url'
+                   - '_managed_repository_authority_pending'
+           )
+           AND public.managed_repository_url_has_userinfo(
+               old_workspace->>'git_remote_url'
+           )
+           AND NOT public.managed_repository_url_has_userinfo(
+               new_workspace->>'git_remote_url'
+           )
        ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',

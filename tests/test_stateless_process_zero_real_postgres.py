@@ -50,7 +50,11 @@ async def _schema_applied(pg_dsn):
     conn = await asyncpg.connect(pg_dsn)
     try:
         await conn.execute(SCHEMA_FILE.read_text())
-        await conn.execute(PROCESS_ZERO_MIGRATION.read_text())
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.managed_repository_process_zero_receipts') "
+            "IS NOT NULL"
+        ):
+            await conn.execute(PROCESS_ZERO_MIGRATION.read_text())
     finally:
         await conn.close()
 
