@@ -284,6 +284,7 @@ async def _scan_pinned_host_key(
             proc.kill()
             await proc.wait()
 
+    saw_candidate = False
     for raw_line in stdout.splitlines():
         line = raw_line.decode("ascii", errors="ignore").strip()
         if not line or line.startswith("#"):
@@ -295,10 +296,20 @@ async def _scan_pinned_host_key(
             actual = _fingerprint_host_key(fields[2])
         except (ValueError, UnicodeError):
             continue
+        saw_candidate = True
         if secrets.compare_digest(actual, expected_fingerprint):
             return line, b""
 
-    return None, b"SSH server host key did not match the pinned fingerprint"
+    if saw_candidate:
+        # The server PRESENTED an ed25519 key and it is not ours. This exact
+        # wording is an identity verdict: vm_readiness demotes a ready VM on
+        # it, and test_thread_uploads_stateless asserts it. Keep it stable.
+        return None, b"SSH server host key did not match the pinned fingerprint"
+    # No ed25519 key was presented at all: unreachable host, closed port, or
+    # sshd not yet up. That is an AVAILABILITY outcome, not an identity one —
+    # the wording must not contain "fingerprint" or vm_readiness would demote
+    # a ready VM on every blip (the k3d gate proved it did).
+    return None, b"SSH host-key scan found no ed25519 host key"
 
 
 async def stream_extract_snapshot(

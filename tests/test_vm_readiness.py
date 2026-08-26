@@ -563,3 +563,104 @@ async def test_readiness_queries_filter_finished_fake_row(
 
     db.acquire = acquire
     assert await getattr(db, method_name)() == []
+
+
+@pytest.mark.asyncio
+async def test_reprobe_scan_no_key_blip_preserves_ready_row(monkeypatch):
+    """Unreachable/closed-port scans are availability, never identity (D2)."""
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(
+            return_value=(False, 1, "SSH host-key scan found no ed25519 host key")
+        ),
+    )
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.20",
+            "active_pod_uid": "pod-old",
+            "phase": "Running",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes == []
+
+
+@pytest.mark.asyncio
+async def test_reprobe_ssh_process_verification_failure_demotes_ready_row(monkeypatch):
+    """The scan->connect race surfaces ssh's own wording; still identity."""
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(False, 1, "Host key verification failed.")),
+    )
+    row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.20",
+            "active_pod_uid": "pod-old",
+            "phase": "Running",
+        }
+    )
+
+    await VMReadinessService(
+        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.writes[-1][3]["status"] == "ssh_pending"
+    assert provisioner.writes[-1][4] is False
+
+
+class _FakeKeyscanProc:
+    def __init__(self, stdout: bytes):
+        self._stdout = stdout
+        self.returncode = 0
+
+    async def communicate(self):
+        return self._stdout, b""
+
+
+@pytest.mark.asyncio
+async def test_scan_empty_output_is_availability_not_identity(monkeypatch):
+    from orchestrator.services import ssh_helpers
+
+    async def fake_exec(*_args, **_kwargs):
+        return _FakeKeyscanProc(b"")
+
+    monkeypatch.setattr(ssh_helpers.asyncio, "create_subprocess_exec", fake_exec)
+    line, error = await ssh_helpers._scan_pinned_host_key(
+        "10.0.0.1", 22, "SHA256:" + "A" * 43
+    )
+    assert line is None
+    assert error == b"SSH host-key scan found no ed25519 host key"
+    assert b"fingerprint" not in error
+
+
+@pytest.mark.asyncio
+async def test_scan_presented_wrong_key_is_identity_mismatch(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from orchestrator.services import ssh_helpers
+
+    pub = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH)
+        .decode("ascii")
+    )
+
+    async def fake_exec(*_args, **_kwargs):
+        return _FakeKeyscanProc(f"10.0.0.1 {pub}\n".encode("ascii"))
+
+    monkeypatch.setattr(ssh_helpers.asyncio, "create_subprocess_exec", fake_exec)
+    line, error = await ssh_helpers._scan_pinned_host_key(
+        "10.0.0.1", 22, "SHA256:" + "A" * 43
+    )
+    assert line is None
+    assert error == b"SSH server host key did not match the pinned fingerprint"

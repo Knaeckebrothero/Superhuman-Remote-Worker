@@ -273,7 +273,14 @@ class VMReadinessService:
             # Availability blips on an already-ready VM preserve the existing
             # endpoint, but identity failures never do: a missing/invalid pin
             # or mismatched presented key must demote the VM fail-closed.
-            identity_failure = "fingerprint" in (error or "").lower()
+            # Two identity sources: the scan's fingerprint verdicts, and the
+            # ssh process itself refusing the one-use known_hosts line (the
+            # scan->connect race). The scan's no-key-seen availability error
+            # deliberately avoids both wordings.
+            lowered = (error or "").lower()
+            identity_failure = (
+                "fingerprint" in lowered or "host key verification failed" in lowered
+            )
             if reprobe and not identity_failure:
                 logger.debug(
                     "Ready VM %s %s failed SSH auth; preserving readiness",
