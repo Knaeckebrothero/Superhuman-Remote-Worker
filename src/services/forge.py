@@ -563,3 +563,143 @@ async def open_pull_request(
     if number is None:
         raise ForgeError(f"{target.forge} returned no PR number: {list(data)[:5]}")
     return {"number": int(number), "url": link}
+
+
+# GitLab access levels: 30 = Developer (may push), 40 = Maintainer, 50 = Owner.
+_GITLAB_WRITE_LEVEL = 30
+_GITLAB_ADMIN_LEVEL = 40
+
+
+def _probe_requests_for(
+    target: ForgeRepo,
+) -> tuple[tuple[str, dict[str, str]], tuple[str, dict[str, str]]]:
+    """Return ``((user_url, headers), (repo_url, headers))`` for one probe."""
+    if target.forge == "gitlab":
+        headers = {"PRIVATE-TOKEN": target.token, "Accept": "application/json"}
+        repo_url = (
+            f"{target.api_base}/projects/"
+            f"{_gitlab_project_path(target.owner, target.repo)}"
+        )
+        return (f"{target.api_base}/user", headers), (repo_url, headers)
+
+    scheme = "token" if target.forge == "gitea" else "Bearer"
+    headers = {
+        "Authorization": f"{scheme} {target.token}",
+        "Accept": "application/json",
+    }
+    repo_url = f"{target.api_base}/repos/{target.owner}/{target.repo}"
+    return (f"{target.api_base}/user", headers), (repo_url, headers)
+
+
+async def probe_repository_access(target: ForgeRepo, *, timeout: float = 10.0) -> dict:
+    """Authenticate the connector token and report who it is and what it may do.
+
+    Two reads, nothing written: the token's own principal (``/user``) and the
+    repository's permission view. Raises :class:`ForgeError` when the token
+    is rejected, the repository is invisible, or the forge is unreachable.
+
+    The facts exist so an operator can verify a connector without ever
+    reading the token: which account the agent will act as, whether that
+    account administers the repository (branch rules with an admin bypass
+    then do not bind the agent), whether the token is a classic scoped PAT
+    (GitHub only reveals this), and the repository's real default branch.
+    Warnings that need connector context (read-only flag, configured
+    branch) are the caller's to add.
+    """
+    if target.forge not in SUPPORTED_FORGES:
+        raise ForgeError(f"Unsupported forge {target.forge!r}")
+    if not target.token:
+        raise ForgeError("Repository connector has no token to probe")
+
+    (user_url, user_headers), (repo_url, repo_headers) = _probe_requests_for(target)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, transport=_transport) as client:
+            user_resp = await client.get(user_url, headers=user_headers)
+            if user_resp.status_code == 401:
+                raise ForgeError(f"{target.forge} rejected the token (HTTP 401)")
+            if user_resp.status_code != 200:
+                detail = _response_error_detail(user_resp)
+                raise ForgeError(
+                    f"{target.forge} could not identify the token "
+                    f"(HTTP {user_resp.status_code}){': ' + detail if detail else ''}"
+                )
+            repo_resp = await client.get(repo_url, headers=repo_headers)
+    except httpx.HTTPError as exc:
+        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
+
+    if repo_resp.status_code == 404:
+        raise ForgeError(
+            f"{target.owner}/{target.repo} not found on {target.forge}, or the "
+            "token cannot see it (HTTP 404)"
+        )
+    if repo_resp.status_code != 200:
+        detail = _response_error_detail(repo_resp)
+        raise ForgeError(
+            f"{target.forge} refused the repository read "
+            f"(HTTP {repo_resp.status_code}){': ' + detail if detail else ''}"
+        )
+
+    try:
+        user = user_resp.json()
+        repo = repo_resp.json()
+    except ValueError as exc:
+        raise ForgeError(f"{target.forge} returned a non-JSON probe response") from exc
+    if not isinstance(user, dict) or not isinstance(repo, dict):
+        raise ForgeError(f"{target.forge} returned an unexpected probe response shape")
+
+    scopes: list[str] | None = None
+    if target.forge == "gitlab":
+        principal = str(user.get("username") or "")
+        perms = repo.get("permissions") or {}
+        levels = [
+            (perms.get(key) or {}).get("access_level")
+            for key in ("project_access", "group_access")
+            if isinstance(perms.get(key), dict)
+        ]
+        level = max((int(v) for v in levels if isinstance(v, int)), default=0)
+        can_write = level >= _GITLAB_WRITE_LEVEL
+        is_admin = level >= _GITLAB_ADMIN_LEVEL
+        token_class = "unknown"
+    else:
+        principal = str(user.get("login") or "")
+        perms = repo.get("permissions") or {}
+        can_write = bool(perms.get("push"))
+        is_admin = bool(perms.get("admin"))
+        if target.forge == "github":
+            # Classic PATs answer with X-OAuth-Scopes; fine-grained PATs and
+            # App installation tokens never send the header.
+            scopes_header = user_resp.headers.get("x-oauth-scopes")
+            if scopes_header is None:
+                token_class = "fine-grained"
+            else:
+                token_class = "classic"
+                scopes = [s.strip() for s in scopes_header.split(",") if s.strip()]
+        else:
+            token_class = "unknown"
+
+    warnings: list[str] = []
+    if is_admin:
+        warnings.append(
+            f"{principal or 'the token principal'} administers "
+            f"{target.owner}/{target.repo}: branch rules with an admin bypass "
+            "will not bind the agent"
+        )
+    if scopes is not None and "repo" in scopes:
+        warnings.append(
+            "classic 'repo' scope reaches every repository this account can "
+            "push to, private ones included; 'public_repo' bounds it to public repos"
+        )
+
+    return {
+        "forge": target.forge,
+        "owner": target.owner,
+        "repo": target.repo,
+        "principal": principal,
+        "principal_id": user.get("id"),
+        "token_class": token_class,
+        "scopes": scopes,
+        "can_write": can_write,
+        "is_admin": is_admin,
+        "default_branch": str(repo.get("default_branch") or "") or None,
+        "warnings": warnings,
+    }
