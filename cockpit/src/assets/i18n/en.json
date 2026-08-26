@@ -2410,14 +2410,16 @@
       "messages": "Messages",
       "sudo": "Sudo",
       "reviews": "Reviews",
-      "sessions": "Sessions"
+      "sessions": "Sessions",
+      "notifications": "Notifications"
     },
     "list": {
       "empty": {
         "message": "No message items",
         "sudo": "No sudo items",
         "review": "No review items",
-        "session": "No session items"
+        "session": "No session items",
+        "notification": "No notifications"
       },
       "emptyAll": "All clear — no items need your attention",
       "resolved": "resolved",
@@ -2522,7 +2524,8 @@
       "filterReviews": "Filter: Reviews",
       "clearFilter": "Clear filter",
       "toggleOverlay": "Toggle this overlay",
-      "close": "Close"
+      "close": "Close",
+      "filterNotifications": "Filter: notifications"
     }
   },
   "builder": {
@@ -3199,7 +3202,9 @@
     "reviewsSingle": "{{n}} review",
     "reviewsPlural": "{{n}} reviews",
     "sessionsSingle": "{{n}} session",
-    "sessionsPlural": "{{n}} sessions"
+    "sessionsPlural": "{{n}} sessions",
+    "unseenSingle": "{{n}} new notification",
+    "unseenPlural": "{{n}} new notifications"
   },
   "todoList": {
     "phaseSelector": {
@@ -3656,5 +3661,81 @@
       "selectedCount": "{{count}} selected",
       "clear": "Clear"
     }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM upgrade",
+      "budget_exceeded": "Budget exceeded",
+      "incident": "Incident",
+      "officer_question": "Officer",
+      "officer_runtime": "Officer runtime"
+    },
+    "severity": {
+      "low": "Low",
+      "normal": "Normal",
+      "high": "High",
+      "critical": "Critical"
+    },
+    "status": {
+      "unseen": "New",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "archived": "Archived"
+    },
+    "actions": {
+      "approve": "Approve",
+      "resumeWithFeedback": "Resume with feedback",
+      "resume": "Resume",
+      "deny": "Deny",
+      "upgradeToVm": "Upgrade to VM",
+      "resumeWithoutVm": "Resume without VM",
+      "reply": "Reply",
+      "openConference": "Open officer",
+      "open": "Open",
+      "openJob": "Open job",
+      "openThread": "Open thread",
+      "openSession": "Open session",
+      "openProject": "Open project",
+      "openAutomations": "Open automations",
+      "openAdminUsers": "Open users"
+    },
+    "inputs": {
+      "feedback": "Feedback for the agent…",
+      "reason": "Reason…",
+      "message": "Your orders for the officer…",
+      "notes": "Reviewer notes (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo request",
+      "thread": "Session",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "User",
+      "permission_request": "Permission request"
+    },
+    "detail": {
+      "noActions": "No actions available",
+      "source": "Source",
+      "loadingSource": "Loading…",
+      "jobStatus": "Status",
+      "jobDescription": "Description",
+      "command": "Command",
+      "requestStatus": "Request status",
+      "session": "Session",
+      "timeline": "Timeline",
+      "created": "Created",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "actionFailed": "The action failed"
+    },
+    "empty": "No notifications",
+    "loadMore": "Load more",
+    "deepLinkMissing": "That notification could not be found"
   }
 }

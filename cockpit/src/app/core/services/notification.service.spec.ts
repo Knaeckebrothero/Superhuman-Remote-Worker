@@ -146,3 +146,82 @@ describe('NotificationService.handleSseEvent', () => {
     expect(service.notifications()[0].job_id).toBeNull();
   });
 });
+
+describe('NotificationService — unified feed frames', () => {
+  const row = {
+    id: 'n-1',
+    category: 'review_queue',
+    severity: 'normal',
+    subject: 's',
+    body: 'b',
+    source_ref: {kind: 'job', id: 'j-1'},
+    actions: [],
+    payload: {},
+    created_at: '2026-08-26T09:00:00Z',
+    seen_at: null,
+    read_at: null,
+    interacted_at: null,
+    resolved_at: null,
+    resolved_by: null,
+    archived_at: null,
+  };
+
+  it('notification frame prepends the row once and bumps the counts', () => {
+    const {service, toast} = createService();
+
+    service.handleSseEvent({type: 'notification', notification: row});
+    service.handleSseEvent({type: 'notification', notification: row}); // a replay never re-broadcasts, but be safe
+
+    expect(service.feed().map((n) => n.id)).toEqual(['n-1']);
+    expect(service.feedCounts()).toMatchObject({unseen: 1, unread: 1, pending: 1});
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('notification.updated patches engagement and decrements the counts', () => {
+    const {service} = createService();
+    service.handleSseEvent({type: 'notification', notification: row});
+
+    service.handleSseEvent({type: 'notification.updated', id: 'n-1', seen_at: '2026-08-26T09:01:00Z'});
+    expect(service.feed()[0].seen_at).toBe('2026-08-26T09:01:00Z');
+    expect(service.feedCounts().unseen).toBe(0);
+
+    service.handleSseEvent({
+      type: 'notification.updated',
+      id: 'n-1',
+      resolved_at: '2026-08-26T09:02:00Z',
+      resolved_by: 'officer:t-1',
+    });
+    expect(service.feed()[0].resolved_by).toBe('officer:t-1');
+    expect(service.feedCounts().pending).toBe(0);
+    // Unknown id is ignored, not crashed on.
+    service.handleSseEvent({type: 'notification.updated', id: 'ghost', read_at: 'x'});
+    expect(service.feed()).toHaveLength(1);
+  });
+
+  it('a feed load carries both the feed page and the legacy rows', () => {
+    const {service, http} = createService();
+    http.get.mockReturnValue(
+      of({
+        items: [row],
+        next_before: 'cursor',
+        counts: {unseen: 1, unread: 1, pending: 1, by_category: {review_queue: {pending: 1, unseen: 1}}},
+        notifications: [],
+        unread_count: 0,
+      }),
+    );
+    service.loadNotifications();
+    expect(service.feed()).toHaveLength(1);
+    expect(service.feedNextBefore()).toBe('cursor');
+    expect(service.feedCounts().by_category['review_queue'].pending).toBe(1);
+    expect(service.notifications()).toEqual([]);
+  });
+
+  it('session.lifecycle and user_registered still ride the same stream', () => {
+    const {service, toast} = createService();
+    service.handleSseEvent({type: 'session.lifecycle', thread_id: 't-1', state: 'booting', backend: 'vm'});
+    expect(service.lifecycleEvent()).toEqual({thread_id: 't-1', state: 'booting', reason: undefined, backend: 'vm'});
+    service.handleSseEvent({type: 'user_registered', user_id: 'u-9', display_name: 'nine'});
+    expect(service.adminUserRegistered()?.user_id).toBe('u-9');
+    expect(toast.info).toHaveBeenCalledOnce();
+  });
+});

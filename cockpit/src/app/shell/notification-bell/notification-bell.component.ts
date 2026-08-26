@@ -15,8 +15,8 @@ import { AppIconComponent } from '../../ui/icon';
       [title]="tooltipText()"
     >
       <app-icon size="lg">inbox</app-icon>
-      @if (actionCenter.counts().total > 0) {
-        <span class="badge">{{ actionCenter.counts().total > 99 ? '99+' : actionCenter.counts().total }}</span>
+      @if (actionCenter.badgeCount() > 0) {
+        <span class="badge">{{ actionCenter.badgeCount() > 99 ? '99+' : actionCenter.badgeCount() }}</span>
       }
     </button>
   `,
@@ -72,9 +72,10 @@ export class NotificationBellComponent {
 
   tooltipText(): string {
     const c = this.actionCenter.counts();
-    if (c.total === 0) return this.transloco.translate('notificationBell.title');
+    if (this.actionCenter.badgeCount() === 0) return this.transloco.translate('notificationBell.title');
     const t = this.transloco;
     const parts: string[] = [];
+    if (c.unseen > 0) parts.push(t.translate(c.unseen === 1 ? 'notificationBell.unseenSingle' : 'notificationBell.unseenPlural', {n: c.unseen}));
     if (c.messages > 0) parts.push(t.translate(c.messages === 1 ? 'notificationBell.messagesSingle' : 'notificationBell.messagesPlural', {n: c.messages}));
     if (c.sudo > 0) parts.push(t.translate('notificationBell.sudo', {n: c.sudo}));
     if (c.reviews > 0) parts.push(t.translate(c.reviews === 1 ? 'notificationBell.reviewsSingle' : 'notificationBell.reviewsPlural', {n: c.reviews}));

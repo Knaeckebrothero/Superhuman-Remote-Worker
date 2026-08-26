@@ -1,10 +1,26 @@
 import { Injectable, inject, signal, computed, NgZone } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { TranslocoService } from '@jsverse/transloco';
-import { catchError, of } from 'rxjs';
+import { catchError, Observable, of } from 'rxjs';
 import { AppNotification } from '../models/api.model';
+import {
+  EMPTY_NOTIFICATION_COUNTS,
+  Notification,
+  NotificationActResponse,
+  NotificationCounts,
+  NotificationDetail,
+  NotificationFeedPage,
+  NotificationUpdate,
+} from '../models/notification.model';
 import { environment } from '../environment';
 import { AppToastService } from '../../ui/toast';
+
+/** `GET /api/notifications` carries the durable feed AND (until slice 3 of
+ *  the notification rework) the legacy message_log view in one response. */
+type FeedResponse = Partial<NotificationFeedPage> & {
+  notifications?: AppNotification[];
+  unread_count?: number;
+};
 
 /** A session event from a persistent agent (permission request, VM upgrade, etc.). */
 export interface SessionEvent {
@@ -90,25 +106,119 @@ export class NotificationService {
     this.notifications().filter((n) => !n.read_at),
   );
 
+  // ── The durable feed (unified notification system) ──────────────────
+  /** Feed rows, newest first. Live frames upsert into it; `loadMoreFeed`
+   *  appends older pages behind `feedNextBefore`. */
+  readonly feed = signal<Notification[]>([]);
+  /** Server counts — `unseen` drives the bell badge. Live frames adjust
+   *  them optimistically; the next load corrects any drift. */
+  readonly feedCounts = signal<NotificationCounts>(EMPTY_NOTIFICATION_COUNTS);
+  readonly feedNextBefore = signal<string | null>(null);
+
   private eventSource: EventSource | null = null;
 
-  /** Load notifications from REST API. */
-  loadNotifications(limit = 50, unreadOnly = false): void {
+  /** Load the feed (and, until slice 3, the legacy message rows) from REST. */
+  loadNotifications(limit = 100, unreadOnly = false): void {
     this.isLoading.set(true);
     const params: Record<string, string> = { limit: String(limit) };
     if (unreadOnly) params['unread_only'] = 'true';
 
     this.http
-      .get<{ notifications: AppNotification[]; unread_count: number }>(
-        `${this.baseUrl}/notifications`,
-        { params },
-      )
-      .pipe(catchError(() => of({ notifications: [], unread_count: 0 })))
+      .get<FeedResponse>(`${this.baseUrl}/notifications`, { params })
+      .pipe(catchError(() => of({} as FeedResponse)))
       .subscribe((data) => {
-        this.notifications.set(data.notifications);
-        this.unreadCount.set(data.unread_count);
+        this.notifications.set(data.notifications ?? []);
+        this.unreadCount.set(data.unread_count ?? 0);
+        this.feed.set(data.items ?? []);
+        this.feedCounts.set(data.counts ?? EMPTY_NOTIFICATION_COUNTS);
+        this.feedNextBefore.set(data.next_before ?? null);
         this.isLoading.set(false);
       });
+  }
+
+  /** Append the next (older) feed page behind the keyset cursor. */
+  loadMoreFeed(limit = 50): void {
+    const before = this.feedNextBefore();
+    if (!before) return;
+    this.http
+      .get<FeedResponse>(`${this.baseUrl}/notifications`, {
+        params: { before, limit: String(limit) },
+      })
+      .pipe(catchError(() => of(null)))
+      .subscribe((page) => {
+        if (!page) return;
+        this.feed.update((rows) => {
+          const known = new Set(rows.map((r) => r.id));
+          return [...rows, ...(page.items ?? []).filter((r) => !known.has(r.id))];
+        });
+        this.feedNextBefore.set(page.next_before ?? null);
+      });
+  }
+
+  getNotification(id: string): Observable<NotificationDetail | null> {
+    return this.http
+      .get<NotificationDetail>(`${this.baseUrl}/notifications/${id}`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  markSeen(ids: string[]): Observable<{ updated: string[] }> {
+    return this.http.post<{ updated: string[] }>(`${this.baseUrl}/notifications/seen`, { ids });
+  }
+
+  markReadV2(id: string): Observable<{ notification: Notification }> {
+    return this.http.patch<{ notification: Notification }>(
+      `${this.baseUrl}/notifications/${id}/read`,
+      {},
+    );
+  }
+
+  act(
+    id: string,
+    actionType: string,
+    params: Record<string, unknown>,
+  ): Observable<NotificationActResponse> {
+    return this.http.post<NotificationActResponse>(`${this.baseUrl}/notifications/${id}/act`, {
+      action_type: actionType,
+      params,
+    });
+  }
+
+  /** Insert-or-replace one feed row (live `notification` frame, action
+   *  response, deep-link fetch). A brand-new row bumps the counts. */
+  upsertFeedRow(row: Notification): void {
+    const existing = this.feed().find((r) => r.id === row.id);
+    if (existing) {
+      this.feed.update((rows) => rows.map((r) => (r.id === row.id ? { ...r, ...row } : r)));
+      this.adjustCounts(existing, { ...existing, ...row });
+      return;
+    }
+    this.feed.update((rows) => [row, ...rows]);
+    this.feedCounts.update((c) => ({
+      ...c,
+      unseen: c.unseen + (row.seen_at ? 0 : 1),
+      unread: c.unread + (row.read_at ? 0 : 1),
+      pending: c.pending + (row.resolved_at ? 0 : 1),
+    }));
+  }
+
+  /** Apply a `notification.updated` patch (seen/read/resolved/archived). */
+  patchFeedRow(update: NotificationUpdate): void {
+    const prev = this.feed().find((r) => r.id === update.id);
+    if (!prev) return;
+    const next: Notification = { ...prev, ...update };
+    this.feed.update((rows) => rows.map((r) => (r.id === update.id ? next : r)));
+    this.adjustCounts(prev, next);
+  }
+
+  private adjustCounts(prev: Notification, next: Notification): void {
+    const delta = (before: string | null, after: string | null) =>
+      !before && after ? -1 : before && !after ? 1 : 0;
+    this.feedCounts.update((c) => ({
+      ...c,
+      unseen: Math.max(0, c.unseen + delta(prev.seen_at, next.seen_at)),
+      unread: Math.max(0, c.unread + delta(prev.read_at, next.read_at)),
+      pending: Math.max(0, c.pending + delta(prev.resolved_at, next.resolved_at)),
+    }));
   }
 
   /** Mark a notification as read. */
@@ -167,7 +277,14 @@ export class NotificationService {
   // signatures, so Record<string, unknown> would force bracket noise).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   handleSseEvent(data: any): void {
-    if (data.type === 'new_message') {
+    if (data.type === 'notification' && data.notification?.id) {
+      // Unified feed: the inserting record() call broadcasts the full row
+      // exactly once; a replay never re-broadcasts.
+      this.upsertFeedRow(data.notification as Notification);
+    } else if (data.type === 'notification.updated' && data.id) {
+      // Engagement / resolution patch — only the changed fields travel.
+      this.patchFeedRow(data as NotificationUpdate);
+    } else if (data.type === 'new_message') {
       this.unreadCount.update((c) => c + 1);
       // Prepend a lightweight notification entry
       this.notifications.update((ns) => [

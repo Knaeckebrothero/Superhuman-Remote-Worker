@@ -32,6 +32,8 @@ import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppIconComponent} from '../../ui/icon';
 import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {ExternalImageDirective} from '../../ui/external-image';
+import {categoryIcon, NotificationDetailComponent} from './notification-detail.component';
+import {SeenObserverDirective} from './seen-observer.directive';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -91,6 +93,8 @@ function relativeTime(iso: string, nowLabel: string): string {
     AppCheckboxComponent,
     AppIconComponent,
     AppCopyFieldComponent,
+    NotificationDetailComponent,
+    SeenObserverDirective,
   ],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
@@ -119,6 +123,16 @@ function relativeTime(iso: string, nowLabel: string): string {
             {{ 'inbox.filters.all' | transloco }}
             @if (actionCenter.counts().total > 0) {
               <span class="chip-count">{{ actionCenter.counts().total }}</span>
+            }
+          </app-chip>
+          <app-chip
+            [selected]="activeFilter() === 'notification'"
+            (clicked)="setFilter('notification')"
+          >
+            <app-icon size="sm">notifications</app-icon>
+            {{ 'inbox.filters.notifications' | transloco }}
+            @if (actionCenter.counts().notifications > 0) {
+              <span class="chip-count">{{ actionCenter.counts().notifications }}</span>
             }
           </app-chip>
           <app-chip
@@ -205,11 +219,13 @@ function relativeTime(iso: string, nowLabel: string): string {
                 [class.urgent-high]="item.type === 'sudo' && item.sudo && item.sudo.status === 'pending' && getSecondsLeft(item.sudo!) < 30"
                 [class.urgent-med]="item.type === 'sudo' && item.sudo && item.sudo.status === 'pending' && getSecondsLeft(item.sudo!) >= 30 && getSecondsLeft(item.sudo!) < 120"
                 [attr.data-index]="i"
+                [appSeenObserver]="item.type === 'notification' && item.notification ? item.notification.id : null"
                 (click)="selectItem(item)"
               >
                 <div class="item-urgency-bar" [class]="'urgency-' + urgencyColor(item)"></div>
                 <app-icon size="lg" class="item-type-icon" [class]="'type-' + item.type">
                   @switch (item.type) {
+                    @case ('notification') { {{ iconFor(item) }} }
                     @case ('message') { mail }
                     @case ('sudo') { admin_panel_settings }
                     @case ('review') { rate_review }
@@ -220,6 +236,9 @@ function relativeTime(iso: string, nowLabel: string): string {
                   <div class="item-title-row">
                     <span class="item-title">{{ item.title }}</span>
                     @if (item.type === 'message' && item.message?.unread) {
+                      <span class="unread-dot"></span>
+                    }
+                    @if (item.type === 'notification' && !item.notification?.seen_at) {
                       <span class="unread-dot"></span>
                     }
                     @if (item.type === 'sudo' && item.sudo?.status === 'pending') {
@@ -263,6 +282,9 @@ function relativeTime(iso: string, nowLabel: string): string {
                 {{ 'inbox.detail.hintUse' | transloco }} <kbd>j</kbd>/<kbd>k</kbd> {{ 'inbox.detail.hintToNavigate' | transloco }} <kbd>Enter</kbd> {{ 'inbox.detail.hintToSelect' | transloco }}
               </span>
             </div>
+          } @else if (selectedItem()!.type === 'notification' && selectedItem()!.notification) {
+            <!-- ========== FEED NOTIFICATION (unified notification system) ========== -->
+            <app-notification-detail [item]="selectedItem()!" />
           } @else if (selectedItem()!.type === 'sudo' && selectedItem()!.sudo) {
             <!-- ========== SUDO DETAIL ========== -->
             <div class="detail-content sudo-detail">
@@ -1610,12 +1632,15 @@ export class InboxPageComponent implements OnInit, OnDestroy {
 
     // Deep-link support
     this.route.queryParams.subscribe((params) => {
+      const notificationId = params['n'];
       const jobId = params['job'];
       const threadId = params['thread'];
       const sudoId = params['sudo'];
       const review = params['review'];
 
-      if (sudoId) {
+      if (notificationId) {
+        this.trySelectNotification(notificationId);
+      } else if (sudoId) {
         this.trySelectById(`sudo:${sudoId}`);
       } else if (jobId && threadId) {
         this.trySelectById(`msg:${jobId}:${threadId}`);
@@ -1643,6 +1668,25 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     }
   }
 
+  /**
+   * `?n=<id>` — the deep link every email now carries. The row is normally
+   * in the loaded page; otherwise fetch it by id and upsert, which replaces
+   * the old "retry once after 2 s and give up" dance.
+   */
+  private trySelectNotification(notificationId: string): void {
+    const id = `ntf:${notificationId}`;
+    const item = this.actionCenter.items().find((i) => i.id === id);
+    if (item) {
+      this.selectItem(item);
+      return;
+    }
+    this.actionCenter.fetchNotification(notificationId).subscribe((row) => {
+      if (!row) return;
+      const fetched = this.actionCenter.items().find((i) => i.id === id);
+      if (fetched) this.selectItem(fetched);
+    });
+  }
+
   // --- Filters ---
   setFilter(type: ActionItemType | null): void {
     this.activeFilter.set(type);
@@ -1659,7 +1703,10 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     this.focusIndex = this.filteredItems().findIndex((i) => i.id === item.id);
 
     // Load detail data based on type
-    if (item.type === 'message' && item.message && item.jobId) {
+    if (item.type === 'notification' && item.notification) {
+      // Opening the row is reading it; the pane loads its own source payload.
+      this.actionCenter.markRead(item.notification.id);
+    } else if (item.type === 'message' && item.message && item.jobId) {
       this.loadThreadDetail(item.jobId, item.message.threadId);
     } else if (item.type === 'review' && item.review) {
       this.loadFrozenData(item.review.jobId);
@@ -1835,6 +1882,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   }
 
   // --- Helpers ---
+  iconFor(item: ActionItem): string { return categoryIcon(item.category || ''); }
   getRisk(req: SudoRequest): string { return riskLevel(req); }
   getSecondsLeft(req: SudoRequest): number { return secondsLeft(req); }
   relativeTime(iso: string): string {
@@ -1880,6 +1928,14 @@ export class InboxPageComponent implements OnInit, OnDestroy {
 
   urgencyColor(item: ActionItem): string {
     if (item.status === 'resolved') return 'muted';
+    if (item.type === 'notification' && item.notification) {
+      switch (item.notification.severity) {
+        case 'critical': return 'red';
+        case 'high': return 'amber';
+        case 'normal': return 'green';
+        default: return 'muted';
+      }
+    }
     if (item.type === 'sudo' && item.sudo?.status === 'pending') {
       return this.ttlColor(item.sudo!);
     }
@@ -1973,6 +2029,9 @@ export class InboxPageComponent implements OnInit, OnDestroy {
       case '3': this.setFilter('review'); break;
       case '4':
         this.setFilter('session');
+        break;
+      case '5':
+        this.setFilter('notification');
         break;
     }
   }

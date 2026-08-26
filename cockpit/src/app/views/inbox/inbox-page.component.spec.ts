@@ -11,6 +11,7 @@ import {SudoService} from '../../core/services/sudo.service';
 import {ApiService} from '../../core/services/api.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppNotification} from '../../core/models/api.model';
+import {EMPTY_NOTIFICATION_COUNTS, Notification} from '../../core/models/notification.model';
 
 /**
  * Officer-page card in the action center (F4 addendum,
@@ -45,9 +46,32 @@ function makeNotification(overrides: Partial<AppNotification> = {}): AppNotifica
   };
 }
 
+function feedRow(id: string): Notification {
+  return {
+    id,
+    category: 'review_queue',
+    severity: 'normal',
+    subject: 'Job abc completed — review required',
+    body: '**Job** …',
+    source_ref: {kind: 'job', id: 'job-abc'},
+    actions: [
+      {type: 'approve', label_key: 'notifications.actions.approve', style: 'primary', params: {job_id: 'job-abc'}},
+    ],
+    payload: {job_id: 'job-abc', config_name: 'worker_base'},
+    created_at: '2026-08-26T09:00:00Z',
+    seen_at: null,
+    read_at: null,
+    interacted_at: null,
+    resolved_at: null,
+    resolved_by: null,
+    archived_at: null,
+  };
+}
+
 function createComponent(
   notifications: AppNotification[],
   queryParams: Record<string, string> = {},
+  feed: Notification[] = [],
 ) {
   const sudoMock = {
     requests: signal([]),
@@ -65,13 +89,30 @@ function createComponent(
     deleteRule: vi.fn(),
   };
 
+  const feedSignal = signal<Notification[]>(feed);
   const notificationsMock = {
     notifications: signal<AppNotification[]>(notifications),
     sessionEvents: signal([]),
+    feed: feedSignal,
+    feedCounts: signal(EMPTY_NOTIFICATION_COUNTS),
+    feedNextBefore: signal<string | null>(null),
     loadNotifications: vi.fn(),
+    loadMoreFeed: vi.fn(),
     connectSSE: vi.fn(),
     disconnectSSE: vi.fn(),
     markRead: vi.fn(),
+    markSeen: vi.fn().mockReturnValue(of({updated: []})),
+    markReadV2: vi.fn().mockImplementation((id: string) =>
+      of({notification: {...feedRow(id), read_at: '2026-08-26T09:05:00Z', seen_at: '2026-08-26T09:05:00Z'}}),
+    ),
+    act: vi.fn().mockReturnValue(of({status: 'ok', result: {}, notification: feedRow('n-1')})),
+    getNotification: vi.fn().mockReturnValue(of(null)),
+    patchFeedRow: vi.fn(),
+    upsertFeedRow: vi.fn((row: Notification) => {
+      feedSignal.update((rows) =>
+        rows.some((r) => r.id === row.id) ? rows.map((r) => (r.id === row.id ? row : r)) : [row, ...rows],
+      );
+    }),
   };
 
   const apiMock = {
@@ -218,5 +259,74 @@ describe('InboxPageComponent officer-page card', () => {
     ]);
 
     expect(actionCenter.items()).toHaveLength(0);
+  });
+});
+
+describe('InboxPageComponent unified feed (slice 1)', () => {
+  let cleanup: (() => void) | null = null;
+
+  afterEach(() => {
+    cleanup?.();
+    cleanup = null;
+  });
+
+  it('a feed row renders as a notification item and selecting it marks it read', () => {
+    const {component, actionCenter, notificationsMock} = createComponent([], {}, [feedRow('n-1')]);
+    cleanup = () => component.ngOnDestroy();
+    component.ngOnInit();
+
+    const item = actionCenter.items()[0];
+    expect(item.type).toBe('notification');
+    expect(item.id).toBe('ntf:n-1');
+
+    component.selectItem(item);
+    expect(component.selectedItem()?.id).toBe('ntf:n-1');
+    expect(notificationsMock.markReadV2).toHaveBeenCalledWith('n-1');
+    // The pane owns its source fetch; the legacy job/thread lookups stay quiet.
+    expect(component.threadLoading()).toBe(false);
+    expect(component.reviewLoading()).toBe(false);
+  });
+
+  it('resolves the email deep link ?n=<id> to the feed row', () => {
+    const {component} = createComponent([], {n: 'n-1'}, [feedRow('n-1')]);
+    cleanup = () => component.ngOnDestroy();
+
+    component.ngOnInit();
+
+    expect(component.selectedItem()?.id).toBe('ntf:n-1');
+  });
+
+  it('fetches a deep-linked row that is not in the loaded page', () => {
+    const {component, notificationsMock} = createComponent([], {n: 'deep'}, []);
+    notificationsMock.getNotification.mockReturnValue(of({notification: feedRow('deep'), source: null}));
+    cleanup = () => component.ngOnDestroy();
+
+    component.ngOnInit();
+
+    expect(notificationsMock.getNotification).toHaveBeenCalledWith('deep');
+    expect(component.selectedItem()?.id).toBe('ntf:deep');
+  });
+
+  it('the notification filter and its keyboard shortcut narrow the list', () => {
+    const {component} = createComponent([makeNotification()], {}, [feedRow('n-1')]);
+    cleanup = () => component.ngOnDestroy();
+    component.ngOnInit();
+
+    expect(component.filteredItems()).toHaveLength(2);
+    component.setFilter('notification');
+    expect(component.filteredItems().map((i) => i.id)).toEqual(['ntf:n-1']);
+  });
+
+  it('severity drives the urgency bar colour', () => {
+    const {component, actionCenter} = createComponent([], {}, [
+      feedRow('crit'),
+    ]);
+    const item = {...actionCenter.items()[0]};
+    item.notification = {...item.notification!, severity: 'critical'};
+    expect(component.urgencyColor(item)).toBe('red');
+    item.notification = {...item.notification, severity: 'low'};
+    expect(component.urgencyColor(item)).toBe('muted');
+    item.status = 'resolved';
+    expect(component.urgencyColor(item)).toBe('muted');
   });
 });

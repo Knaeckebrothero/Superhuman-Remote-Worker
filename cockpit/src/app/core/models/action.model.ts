@@ -1,11 +1,18 @@
 import {SudoRequest} from '../services/sudo.service';
 import {SessionEvent} from '../services/notification.service';
+import {Notification, NotificationCategory} from './notification.model';
 
-export type ActionItemType = 'sudo' | 'message' | 'review' | 'session';
+/**
+ * `notification` is the unified feed (server ids, engagement state, declared
+ * actions). The other four are the legacy client-side join that slice 3 of
+ * the notification rework retires; a feed row that covers the same source
+ * hides its legacy twin (see ActionCenterService.items).
+ */
+export type ActionItemType = 'notification' | 'sudo' | 'message' | 'review' | 'session';
 export type ActionItemStatus = 'pending' | 'resolved';
 
 export interface ActionItem {
-  /** Stable ID: prefixed to avoid collisions (e.g., "sudo:uuid", "msg:thread_id", "rev:job_id") */
+  /** Stable ID: prefixed to avoid collisions (e.g., "ntf:uuid", "sudo:uuid", "msg:thread_id", "rev:job_id") */
   id: string;
   type: ActionItemType;
   status: ActionItemStatus;
@@ -18,6 +25,8 @@ export interface ActionItem {
   jobId: string | null;
 
   // Discriminated payload - exactly one is populated
+  notification?: Notification;
+  category?: NotificationCategory;
   sudo?: SudoRequest;
   message?: MessageActionData;
   review?: ReviewActionData;

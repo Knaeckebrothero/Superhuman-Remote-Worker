@@ -1,9 +1,15 @@
 import {computed, DestroyRef, inject, Injectable, signal} from '@angular/core';
+import {Observable, tap} from 'rxjs';
 import {SudoRequest, SudoService} from './sudo.service';
 import {NotificationService, SessionEvent} from './notification.service';
 import {ApiService} from './api.service';
 import {AppNotification, Job} from '../models/api.model';
 import {ActionItem, ActionItemStatus, MessageActionData, ReviewActionData,} from '../models/action.model';
+import {
+  Notification,
+  NotificationActResponse,
+  SEVERITY_URGENCY,
+} from '../models/notification.model';
 
 /**
  * Full UUID — the shape of a persistent-session thread id. Job-message
@@ -38,6 +44,19 @@ function actionItemComparator(a: ActionItem, b: ActionItem): number {
   return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
 }
 
+/** Debounce for the batched seen-stamp POST. */
+const SEEN_FLUSH_MS = 750;
+
+/**
+ * The action center's item list.
+ *
+ * Since the unified notification system (slice 1) the durable feed
+ * (`NotificationService.feed`) is the source of truth for anything the
+ * server recorded through `record()` — freeze reviews, VM upgrades,
+ * incidents, officer questions. The four legacy sources below are the
+ * client-side join slice 3 retires; a feed row that already covers a legacy
+ * item's source (`source_ref`) hides the twin so nothing shows twice.
+ */
 @Injectable({ providedIn: 'root' })
 export class ActionCenterService {
   private readonly sudo = inject(SudoService);
@@ -79,25 +98,120 @@ export class ActionCenterService {
 
   // --- Merged action items ---
   readonly items = computed<ActionItem[]>(() => {
+    const feedItems = this.notifications.feed().map((n) => this.mapNotification(n));
+    // Sources the feed already carries. A legacy twin of the same job /
+    // message thread / officer session must not appear next to it.
+    const covered = new Set<string>();
+    for (const n of this.notifications.feed()) {
+      if (n.source_ref) covered.add(`${n.source_ref.kind}:${n.source_ref.id}`);
+    }
     const sudoItems = this.sudo.requests().map((r) => this.mapSudo(r));
-    const messageItems = this.deduplicateThreads(this.notifications.notifications());
-    const reviewItems = this.reviewJobs().map((j) => this.mapReview(j));
-      const sessionItems = this.notifications.sessionEvents().map((e) => this.mapSession(e));
-      return [...sudoItems, ...messageItems, ...reviewItems, ...sessionItems].sort(actionItemComparator);
+    const messageItems = this.deduplicateThreads(this.notifications.notifications()).filter(
+      (i) =>
+        !(i.message?.sessionThreadId && covered.has(`thread:${i.message.sessionThreadId}`)) &&
+        !(i.message && covered.has(`message_thread:${i.message.threadId}`)),
+    );
+    const reviewItems = this.reviewJobs()
+      .filter((j) => !covered.has(`job:${j.id}`))
+      .map((j) => this.mapReview(j));
+    const sessionItems = this.notifications.sessionEvents().map((e) => this.mapSession(e));
+    return [...feedItems, ...sudoItems, ...messageItems, ...reviewItems, ...sessionItems].sort(
+      actionItemComparator,
+    );
   });
 
   readonly counts = computed(() => {
     const pending = this.items().filter((i) => i.status === 'pending');
     return {
+      notifications: pending.filter((i) => i.type === 'notification').length,
       sudo: pending.filter((i) => i.type === 'sudo').length,
       messages: pending.filter((i) => i.type === 'message').length,
       reviews: pending.filter((i) => i.type === 'review').length,
-        sessions: pending.filter((i) => i.type === 'session').length,
+      sessions: pending.filter((i) => i.type === 'session').length,
+      /** Server-side unseen feed rows — the bell's first-class signal. */
+      unseen: this.notifications.feedCounts().unseen,
       total: pending.length,
     };
   });
 
-  // --- Actions ---
+  /**
+   * Bell badge: unseen feed rows plus pending legacy items. A feed row the
+   * user has already had in front of them stops counting — that is the
+   * whole point of `seen` (D4). Pure server `unseen` once slice 3 lands.
+   */
+  readonly badgeCount = computed(() => {
+    const c = this.counts();
+    return c.unseen + (c.total - c.notifications);
+  });
+
+  // --- Feed engagement ---
+  private pendingSeen = new Set<string>();
+  private seenTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** A feed row rendered in the list. Batched + debounced into one POST;
+   *  stamped optimistically so the badge drops immediately. */
+  noteSeen(notificationId: string): void {
+    const row = this.notifications.feed().find((n) => n.id === notificationId);
+    if (!row || row.seen_at || this.pendingSeen.has(notificationId)) return;
+    this.pendingSeen.add(notificationId);
+    if (this.seenTimer) clearTimeout(this.seenTimer);
+    this.seenTimer = setTimeout(() => this.flushSeen(), SEEN_FLUSH_MS);
+  }
+
+  /** Exposed for specs (fake timers) and for `ngOnDestroy` paths. */
+  flushSeen(): void {
+    this.seenTimer = null;
+    const ids = Array.from(this.pendingSeen);
+    this.pendingSeen.clear();
+    if (!ids.length) return;
+    const now = new Date().toISOString();
+    for (const id of ids) this.notifications.patchFeedRow({ id, seen_at: now });
+    this.notifications.markSeen(ids).subscribe({
+      error: () => {
+        /* the next load corrects the optimistic stamp */
+      },
+    });
+  }
+
+  /** Selecting a row is reading it; the server stamps read (and seen). */
+  markRead(notificationId: string): void {
+    const row = this.notifications.feed().find((n) => n.id === notificationId);
+    if (!row || row.read_at) return;
+    this.notifications.markReadV2(notificationId).subscribe({
+      next: (res) => this.notifications.upsertFeedRow(res.notification),
+      error: () => {
+        /* stays unread; nothing to undo */
+      },
+    });
+  }
+
+  /** Run a declared action; the response row replaces the local one. */
+  act(
+    notificationId: string,
+    actionType: string,
+    params: Record<string, unknown>,
+  ): Observable<NotificationActResponse> {
+    return this.notifications
+      .act(notificationId, actionType, params)
+      .pipe(tap((res) => this.notifications.upsertFeedRow(res.notification)));
+  }
+
+  /** Deep link `?n=<id>` for a row not in the loaded page: fetch + upsert. */
+  fetchNotification(notificationId: string): Observable<Notification | null> {
+    return new Observable((subscriber) => {
+      this.notifications.getNotification(notificationId).subscribe((detail) => {
+        if (detail?.notification) this.notifications.upsertFeedRow(detail.notification);
+        subscriber.next(detail?.notification ?? null);
+        subscriber.complete();
+      });
+    });
+  }
+
+  loadMore(): void {
+    this.notifications.loadMoreFeed();
+  }
+
+  // --- Legacy pass-throughs (slice 3 removes them with their panes) ---
 
   loadThread(jobId: string, threadId: string) {
     return this.api.getThreadMessages(jobId, threadId);
@@ -127,6 +241,28 @@ export class ActionCenterService {
   }
 
   // --- Mapping helpers ---
+
+  private mapNotification(n: Notification): ActionItem {
+    const pending = !n.resolved_at;
+    const payload = n.payload || {};
+    const configName = typeof payload['config_name'] === 'string' ? payload['config_name'] : null;
+    const jobDescription =
+      typeof payload['job_description'] === 'string' ? payload['job_description'] : null;
+    const title = typeof payload['title'] === 'string' ? payload['title'] : null;
+    const jobId = typeof payload['job_id'] === 'string' ? payload['job_id'] : null;
+    return {
+      id: `ntf:${n.id}`,
+      type: 'notification',
+      status: pending ? 'pending' : 'resolved',
+      urgency: pending ? (SEVERITY_URGENCY[n.severity] ?? 40) : 0,
+      timestamp: n.created_at || new Date(0).toISOString(),
+      title: n.subject || n.category,
+      subtitle: [configName, jobDescription || title].filter(Boolean).join(' · ') || n.category,
+      jobId,
+      notification: n,
+      category: n.category,
+    };
+  }
 
   private deduplicateThreads(notifications: AppNotification[]): ActionItem[] {
     const threadMap = new Map<string, AppNotification>();
@@ -165,8 +301,8 @@ export class ActionCenterService {
         timestamp: n.created_at,
         title: n.subject || 'Message',
         subtitle: sessionPage
-          ? [n.config_name, `session ${n.thread_id!.slice(0, 8)}`].filter(Boolean).join(' \u00B7 ')
-          : [n.config_name || 'agent', n.job_description].filter(Boolean).join(' \u00B7 '),
+          ? [n.config_name, `session ${n.thread_id!.slice(0, 8)}`].filter(Boolean).join(' · ')
+          : [n.config_name || 'agent', n.job_description].filter(Boolean).join(' · '),
         // No resolvable job behind a session page: a null jobId keeps the
         // detail pane from firing the thread lookup that 404s (today's
         // dead-end bug) and disables the job-scoped reply path.
@@ -206,10 +342,10 @@ export class ActionCenterService {
     const command = req.arguments?.join(' ') || req.command;
     const title = isVmUpgrade ? `VM Upgrade: ${command}` : command;
     const subtitle = isVmUpgrade
-      ? [req.vm_name, 'sudo in container'].filter(Boolean).join(' \u00B7 ')
-      : [req.vm_name, `${req.requesting_user} \u2192 ${req.target_user}`]
+      ? [req.vm_name, 'sudo in container'].filter(Boolean).join(' · ')
+      : [req.vm_name, `${req.requesting_user} → ${req.target_user}`]
           .filter(Boolean)
-          .join(' \u00B7 ');
+          .join(' · ');
 
     return {
       id: `sudo:${req.id}`,
@@ -234,7 +370,7 @@ export class ActionCenterService {
       urgency: 30, // Default; will be refined when frozen data loads
       timestamp: job.updated_at || job.created_at,
       title: job.description,
-      subtitle: [job.config_name, `job ${job.id.slice(0, 8)}`].filter(Boolean).join(' \u00B7 '),
+      subtitle: [job.config_name, `job ${job.id.slice(0, 8)}`].filter(Boolean).join(' · '),
       jobId: job.id,
       review: {
         jobId: job.id,
@@ -271,7 +407,7 @@ export class ActionCenterService {
                     : isWorkspaceUpgrade
                         ? 'Workspace Upgrade Needed'
                         : 'Waiting for Input',
-            subtitle: [e.title, e.config_name].filter(Boolean).join(' \u00B7 '),
+            subtitle: [e.title, e.config_name].filter(Boolean).join(' · '),
             jobId: null,
             session: {threadId: e.thread_id, event: e},
         };

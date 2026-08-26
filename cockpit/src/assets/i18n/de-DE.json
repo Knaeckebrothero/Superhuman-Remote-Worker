@@ -2410,14 +2410,16 @@
       "messages": "Nachrichten",
       "sudo": "Sudo",
       "reviews": "Reviews",
-      "sessions": "Sitzungen"
+      "sessions": "Sitzungen",
+      "notifications": "Benachrichtigungen"
     },
     "list": {
       "empty": {
         "message": "Keine Nachrichten",
         "sudo": "Keine Sudo-Anfragen",
         "review": "Keine Reviews",
-        "session": "Keine Sitzungen"
+        "session": "Keine Sitzungen",
+        "notification": "Keine Benachrichtigungen"
       },
       "emptyAll": "Alles erledigt — keine Einträge erfordern Ihre Aufmerksamkeit",
       "resolved": "erledigt",
@@ -2522,7 +2524,8 @@
       "filterReviews": "Filter: Reviews",
       "clearFilter": "Filter zurücksetzen",
       "toggleOverlay": "Dieses Overlay umschalten",
-      "close": "Schließen"
+      "close": "Schließen",
+      "filterNotifications": "Filter: Benachrichtigungen"
     }
   },
   "builder": {
@@ -3199,7 +3202,9 @@
     "reviewsSingle": "{{n}} Review",
     "reviewsPlural": "{{n}} Reviews",
     "sessionsSingle": "{{n}} Sitzung",
-    "sessionsPlural": "{{n}} Sitzungen"
+    "sessionsPlural": "{{n}} Sitzungen",
+    "unseenSingle": "{{n}} neue Benachrichtigung",
+    "unseenPlural": "{{n}} neue Benachrichtigungen"
   },
   "todoList": {
     "phaseSelector": {
@@ -3656,5 +3661,81 @@
       "selectedCount": "{{count}} ausgewählt",
       "clear": "Zurücksetzen"
     }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM-Upgrade",
+      "budget_exceeded": "Budget überschritten",
+      "incident": "Vorfall",
+      "officer_question": "Offizier",
+      "officer_runtime": "Offizier-Laufzeit"
+    },
+    "severity": {
+      "low": "Niedrig",
+      "normal": "Normal",
+      "high": "Hoch",
+      "critical": "Kritisch"
+    },
+    "status": {
+      "unseen": "Neu",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "archived": "Archiviert"
+    },
+    "actions": {
+      "approve": "Genehmigen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "resume": "Fortsetzen",
+      "deny": "Ablehnen",
+      "upgradeToVm": "Auf VM upgraden",
+      "resumeWithoutVm": "Ohne VM fortsetzen",
+      "reply": "Antworten",
+      "openConference": "Offizier öffnen",
+      "open": "Öffnen",
+      "openJob": "Job öffnen",
+      "openThread": "Thread öffnen",
+      "openSession": "Sitzung öffnen",
+      "openProject": "Projekt öffnen",
+      "openAutomations": "Automationen öffnen",
+      "openAdminUsers": "Benutzer öffnen"
+    },
+    "inputs": {
+      "feedback": "Feedback für den Agenten…",
+      "reason": "Begründung…",
+      "message": "Ihre Anweisungen an den Offizier…",
+      "notes": "Notizen des Reviewers (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo-Anfrage",
+      "thread": "Sitzung",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "Benutzer",
+      "permission_request": "Berechtigungsanfrage"
+    },
+    "detail": {
+      "noActions": "Keine Aktionen verfügbar",
+      "source": "Quelle",
+      "loadingSource": "Wird geladen…",
+      "jobStatus": "Status",
+      "jobDescription": "Beschreibung",
+      "command": "Befehl",
+      "requestStatus": "Anfragestatus",
+      "session": "Sitzung",
+      "timeline": "Verlauf",
+      "created": "Erstellt",
+      "seen": "Gesehen",
+      "read": "Gelesen",
+      "resolved": "Erledigt",
+      "actionFailed": "Die Aktion ist fehlgeschlagen"
+    },
+    "empty": "Keine Benachrichtigungen",
+    "loadMore": "Mehr laden",
+    "deepLinkMissing": "Diese Benachrichtigung wurde nicht gefunden"
   }
 }
