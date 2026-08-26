@@ -30,7 +30,6 @@ workspace:
     - output/repros/
     - output/audits/
     - notes/
-    - repo/
   git_versioning: true
 
 instruction_files:

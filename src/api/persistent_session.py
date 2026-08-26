@@ -289,7 +289,7 @@ class PersistentSession:
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
     # Raw datasource payloads (orchestrator-shaped dicts) currently attached —
-    # the diff baseline + datasources.md input for live datasource changes
+    # the diff baseline + README.md facts-block input for live datasource changes
     # (live_session_settings.md Slice B). Set at attach; replaced by
     # resetup_datasources().
     datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
@@ -2343,7 +2343,7 @@ class PersistentSession:
         tool categories directly to ``config.tools`` (the validated session
         tools override's closed vocabulary silently drops sql/graph/mongodb/
         webdav, so they must never ride ``config.update``), clones added
-        repositories, rewrites the datasources.md index, and re-derives +
+        repositories, rewrites the README.md workspace-facts block, and re-derives +
         rebinds the toolset — which also rebuilds the system prompt for the
         per-turn ``messages[0]`` refresh (P0.1).
 
@@ -2379,7 +2379,7 @@ class PersistentSession:
         from ..core.datasource_setup import (
             clone_repository_datasources,
             datasource_tool_categories,
-            inject_datasource_index,
+            inject_workspace_facts,
             process_datasources,
             resolve_repo_clone_names,
         )
@@ -2468,13 +2468,17 @@ class PersistentSession:
         self._refresh_runtime_facts()
 
         if self.workspace_manager:
-            # inject_datasource_index rewrites (cuts the previous section), so
+            # inject_workspace_facts replaces the marked README.md block, so
             # connection names stay truthful for the next turn — including the
-            # explicit "no datasources" state after a remove-all.
+            # explicit "no connectors" state after a remove-all.
             try:
-                inject_datasource_index(new_configs, self.workspace_manager)
+                inject_workspace_facts(
+                    new_configs,
+                    self.workspace_manager,
+                    expert=getattr(self.config, "display_name", None),
+                )
             except Exception as e:
-                logger.warning("Failed to rewrite datasource index: %s", e)
+                logger.warning("Failed to rewrite workspace facts: %s", e)
 
         self.resetup_tools_for_backend()
 

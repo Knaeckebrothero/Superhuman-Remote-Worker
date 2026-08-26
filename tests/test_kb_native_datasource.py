@@ -41,7 +41,7 @@ from orchestrator.services.kb_datasources import (
     reindex_kb_datasource,
 )
 from orchestrator.services.kb_reindex import kb_sweep_tick
-from src.core.datasource_setup import inject_datasource_index
+from src.core.datasource_setup import inject_workspace_facts
 from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from src.managers.git_manager import GitManager
 from src.services.knowledge.bindings import (
@@ -1111,7 +1111,7 @@ class TestBindingsDoNotDuplicateTheProjectKb:
         ws = MagicMock()
         ws.read_file.return_value = ""
 
-        inject_datasource_index([native_kb_row(), external_kb_row()], ws)
+        inject_workspace_facts([native_kb_row(), external_kb_row()], ws)
 
         written = ws.write_file.call_args.args[1]
         assert "Team Docs" in written

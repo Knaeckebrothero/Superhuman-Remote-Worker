@@ -28,15 +28,16 @@ plan, you're done, not when you've read it all.
 ## The orientation
 
 **1. Read what's already known — first.** The project knowledge base is the
-accumulated onboarding of every prior job; so are the prior `notes/`,
-`datasources.md`, and the memories injected each call. Search it
+accumulated onboarding of every prior job; so are the prior `notes/`, the
+workspace `README.md`, and the memories injected each call. Search it
 (`search_knowledge` / `get_knowledge_summary`) before re-deriving anything —
 re-discovering what's already recorded is wasted budget. Reuse before rediscover.
 *(But trust it only as far as step 3's freshness check allows.)*
 
 **2. Inventory the connectors.** Find out what's actually attached, and what kind
 of project that makes this — a document corpus? a database? a repo? a mix? Don't
-assume it's a repo. Start from the connector index, not a guess.
+assume it's a repo. Start from the connector list in the workspace `README.md`,
+not a guess.
 
 **3. Find each source's source of truth and conventions — and confirm it's the
 real, current one.** The move differs by type:

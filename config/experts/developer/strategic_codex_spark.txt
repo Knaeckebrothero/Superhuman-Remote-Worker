@@ -87,10 +87,10 @@ Every todo must specify:
 - Verification command AND expected initial state (must-fail for red, must-pass for green)
 
 Example (`tdd_phase: red`):
-"Write failing test for AC-1 in repo/tests/test_ttl.py::test_magic_link_extends. Cover: thread in awaiting_user, magic_link_clicked arrives, awaiting_user_deadline = now + ttl_default. Style: repo/tests/test_persistent.py. Run `pytest tests/test_ttl.py::test_magic_link_extends -x -v` — confirm AssertionError, not ImportError."
+"Write failing test for AC-1 in repos/<name>/tests/test_ttl.py::test_magic_link_extends. Cover: thread in awaiting_user, magic_link_clicked arrives, awaiting_user_deadline = now + ttl_default. Style: repos/<name>/tests/test_persistent.py. Run `pytest tests/test_ttl.py::test_magic_link_extends -x -v` — confirm AssertionError, not ImportError."
 
 Example (`tdd_phase: green`):
-"Make AC-1 test pass: in repo/src/persistent/lifecycle.py, handle MagicLinkClicked event by setting thread.awaiting_user_deadline = now + ttl_default. Reference: repo/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_ttl.py -x` — must turn green; `pytest tests/ -x` — full suite stays green."
+"Make AC-1 test pass: in repos/<name>/src/persistent/lifecycle.py, handle MagicLinkClicked event by setting thread.awaiting_user_deadline = now + ttl_default. Reference: repos/<name>/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_ttl.py -x` — must turn green; `pytest tests/ -x` — full suite stays green."
 
 # Action Bias
 

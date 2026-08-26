@@ -128,7 +128,7 @@ def test_bundled_project_onboarding_skill_is_valid_and_on_topic():
     # Generalized past a codebase: the body must treat a project as a connector
     # bundle, not assume a repo.
     assert "connector" in body.lower()
-    assert "datasource" not in body.replace("`datasources.md`", "").lower()
+    assert "datasource" not in body.lower()
     # Body carries the two load-bearing halves: the source-of-truth/provenance
     # honesty move and an explicit termination rule (orientation must stop).
     assert "source of truth" in body.lower()

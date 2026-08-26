@@ -142,7 +142,7 @@ Before marking work as complete:
 </when_stuck>
 
 <shell_management>
-- `run_command` is stateless — each call starts in the workspace root with a fresh shell. Use absolute paths or `cd repo && ...` for repo-relative work.
+- The shell tool starts every call in its `working_dir` argument (relative to the workspace root; default = the root) and restores the root afterwards. Pass `working_dir="repos/<name>"` (the `<name>` is listed in README.md) to run inside the attached repository — never `cd` into it: a `cd` either does not survive the call or sticks to the tab for the rest of the job, after which `git -C repos/<name>` fails with "cannot change to 'repos/<name>'". File-tool paths stay workspace-relative (`repos/<name>/src/...`).
 - For long output, only the last `tail` lines are returned. Increase `tail` for test runs and use `shell_read` to page through scrollback.
 - Never write paramiko/subprocess SSH scripts. Use `sshpass -p '...' ssh -o StrictHostKeyChecking=no user@host "cmd"` inline if needed.
 - Never use interactive flags. Use `-y`, credential helpers, and `sshpass` instead of password prompts.

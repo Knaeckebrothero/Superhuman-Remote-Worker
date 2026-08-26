@@ -2514,7 +2514,6 @@ async def _attach_session(
     if datasources:
         from ..core.datasource_setup import (
             datasource_tool_categories,
-            inject_datasource_index as _inject_ds_index,
             process_datasources,
         )
 
@@ -2910,12 +2909,20 @@ async def _attach_session(
 
         clone_repository_datasources(repo_datasources, _session.workspace_manager)
 
-    # Inject datasource index into datasources.md (after workspace is initialized)
-    if datasources and _session.workspace_manager:
+    # README.md workspace-facts block (connectors, materials, layout) — after
+    # the workspace is initialized and repositories are cloned. Written even
+    # without connectors so the file states the explicit "none" case.
+    if _session.workspace_manager:
+        from ..core.datasource_setup import inject_workspace_facts
+
         try:
-            _inject_ds_index(datasources, _session.workspace_manager)
+            inject_workspace_facts(
+                datasources or [],
+                _session.workspace_manager,
+                expert=getattr(_session.config, "display_name", None),
+            )
         except Exception as e:
-            logger.warning(f"Failed to inject datasource index: {e}")
+            logger.warning(f"Failed to write workspace facts: {e}")
 
     # Initialize cloud workspace sync if the orchestrator gave us a config.
     # F-C1: a protected thread NEVER adopts cloud_sync or nc_session_folder

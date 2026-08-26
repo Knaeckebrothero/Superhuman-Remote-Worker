@@ -2732,39 +2732,6 @@ class UniversalAgent:
         resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
         return resolver.load("workspace_template")
 
-    def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
-        """Append safe workspace Git guidance to datasources.md after clone.
-
-        Repository transport is server-owned. The model needs the branch and
-        ordinary ``origin`` workflow, not endpoint/authentication coordinates.
-        """
-        del git_url
-
-        section = f"""
-
-## Repository Context
-
-- **Branch**: `{git_branch}`
-- **Remote**: `origin` (preconfigured with repository-scoped write authority)
-
-### Push Workflow
-
-```bash
-git push origin {git_branch}
-```
-
-Do not replace `origin`; its authority is selected and installed by the server.
-"""
-        try:
-            try:
-                existing = self._workspace_manager.read_file("datasources.md")
-            except (FileNotFoundError, ValueError, OSError):
-                existing = ""
-            self._workspace_manager.write_file("datasources.md", existing + section)
-            logger.info("Injected repository context into datasources.md")
-        except Exception as e:
-            logger.warning(f"Failed to inject repo context into datasources.md: {e}")
-
     async def _resolve_uploaded_instructions(
         self, metadata: Dict[str, Any]
     ) -> Optional[str]:
@@ -3702,14 +3669,10 @@ Do not replace `origin`; its authority is selected and installed by the server.
         # workspace was seeded for this job", not "a process booted".
         mark_workspace_seeded(self._workspace_manager.backend)
 
-        # Give the repo a meaningful landing page: replace the Gitea auto-init
-        # stub README (or write one when absent) with the job description.
-        # Project jobs and subjobs run on branches of shared repos whose README
-        # belongs to the project — a real README is never touched.
-        try:
-            self._write_job_readme(job_id, metadata)
-        except Exception as e:
-            logger.warning(f"Failed to write job README (non-fatal): {e}")
+        # The repo landing page (README.md workspace-facts block) is written in
+        # _setup_job_tools(), after documents are copied and connectors are
+        # cloned, so it can list them. It carries facts only — the task stays
+        # in the virtual task_brief.md.
 
         # Process initial_files from config (templates seeded into the workspace)
         if self.config.workspace.initial_files:
@@ -3776,10 +3739,6 @@ Do not replace `origin`; its authority is selected and installed by the server.
                 logger.error("Git clone timed out after 300s")
             except Exception as e:
                 logger.error(f"Git clone failed: {e}")
-
-            # Inject repo context into datasources.md if clone succeeded
-            if repo_dir.exists() and any(repo_dir.iterdir()):
-                self._inject_repo_context_to_workspace(git_url, git_branch)
 
         # Copy documents to workspace if provided
         updated_metadata = dict(metadata)
@@ -3983,7 +3942,7 @@ Do not replace `origin`; its authority is selected and installed by the server.
         # Process datasources from job metadata (sent by orchestrator)
         from src.core.datasource_setup import (
             clone_repository_datasources,
-            inject_datasource_index,
+            inject_workspace_facts,
             process_credential_files,
             process_datasources,
         )
@@ -4011,7 +3970,7 @@ Do not replace `origin`; its authority is selected and installed by the server.
 
         from .tools.registry import register_mcp_tools
 
-        # Discovery must finish before rendering datasources.md and loading
+        # Discovery must finish before rendering the README.md facts block and loading
         # tools. MCPManager degrades individual server failures internally.
         mcp_manager = datasources_dict.get("mcp")
         if mcp_manager is not None:
@@ -4046,8 +4005,24 @@ Do not replace `origin`; its authority is selected and installed by the server.
             logger.warning("Failed to materialize credential files: %s", e)
             self._datasource_files_manifest = None
 
-        if ds_configs:
-            inject_datasource_index(ds_configs, ws)
+        # README.md workspace-facts block (connectors, materials, layout).
+        # Regenerated on every init — resume included — so it reflects the
+        # current connector set; it replaced the connector index file and the
+        # description-bearing job README.
+        if ws is not None:
+            metadata = self._job_metadata or {}
+            context = metadata.get("context")
+            project_name = metadata.get("project_name") or (
+                context.get("project_name") if isinstance(context, dict) else None
+            )
+            readme = inject_workspace_facts(
+                ds_configs,
+                ws,
+                project_name=project_name,
+                expert=getattr(self.config, "display_name", None),
+            )
+            if readme:
+                self._agent_seed_files["README.md"] = readme
 
         if cli_ds_types:
             self.config.extra["_cli_datasources"] = cli_ds_types
@@ -4517,47 +4492,6 @@ Do not replace `origin`; its authority is selected and installed by the server.
             # Neo4j is optional: do not mark vector search/read as degraded.
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
-    # Gitea auto-inits per-job repos with a stub README of the form
-    # "# job-xxxxxxxx\n\nWorkspace for job-xxxxxxxx"; anything else is a real
-    # README that must not be replaced.
-    _GITEA_STUB_README_MARKER = "Workspace for job-"
-
-    def _write_job_readme(self, job_id: str, metadata: Dict[str, Any]) -> None:
-        """Write a human-readable README.md for per-job workspace repos.
-
-        Replaces the Gitea auto-init stub (or creates a README when absent)
-        with the job description, so the repo landing page describes the job
-        instead of just naming its id. Shared-repo READMEs (project jobs,
-        subjobs) never match the stub pattern and are left untouched.
-        """
-        ws = self._workspace_manager
-        if ws.exists("README.md"):
-            existing = ws.read_file("README.md").strip()
-            is_stub = (
-                existing.startswith("# job-")
-                and self._GITEA_STUB_README_MARKER in existing
-                and len(existing) < 300
-            )
-            if not is_stub:
-                return
-        description = (metadata.get("description") or "").strip()
-        config_name = metadata.get("config_name") or "worker_base"
-        lines = [f"# Job {job_id[:8]}", ""]
-        if description:
-            lines += [description, ""]
-        lines += [
-            "---",
-            "",
-            f"Workspace repository for job `{job_id}` (config: `{config_name}`).",
-            "See `instructions.md` for the task instructions and `task_brief.md` "
-            "for the brief.",
-            "",
-        ]
-        content = "\n".join(lines)
-        ws.write_file("README.md", content)
-        self._agent_seed_files["README.md"] = content
-        logger.debug("Wrote job README.md to workspace")
-
     async def _hydrate_job_brief(self, job_id: str) -> None:
         """Backfill description/required_deliverables/kickoff_message.
 
@@ -4908,85 +4842,6 @@ Do not replace `origin`; its authority is selected and installed by the server.
             logger.warning(
                 f"Auto-registration of input documents failed (non-fatal): {e}"
             )
-
-    def _inject_datasource_index(self, ds_configs: list) -> None:
-        """Inject a compact connector index into the compatibility file datasources.md.
-
-        This ensures the agent always knows what connectors are available,
-        even before KB retrieval fires. Full details are in the knowledge base.
-        """
-        lines = ["\n\n## Available Connectors\n"]
-        for ds in ds_configs:
-            ds_type = ds.get("type", "unknown")
-            name = ds.get("name", "Unnamed")
-            is_ro = ds.get("project_read_only", False)
-
-            if ds_type == "generic":
-                cli = ds.get("cli_hint", "CLI via env vars")
-                lines.append(f"- **{name}** (generic) — {cli}")
-            elif ds_type == "repository":
-                import re
-
-                slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-                lines.append(f"- **{name}** (repository) — cloned at `./repos/{slug}/`")
-            elif ds_type == "webdav":
-                access = "read-only tools" if is_ro else "read-write tools"
-                lines.append(f"- **{name}** (webdav, {access})")
-            elif ds_type in ("postgresql", "neo4j", "mongodb"):
-                if is_ro:
-                    lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
-                else:
-                    lines.append(self._format_rw_cli_block(name, ds_type))
-            else:
-                lines.append(f"- **{name}** ({ds_type})")
-
-        try:
-            try:
-                existing = self._workspace_manager.read_file("datasources.md")
-            except (FileNotFoundError, ValueError, OSError):
-                existing = ""
-            self._workspace_manager.write_file(
-                "datasources.md", existing + "\n".join(lines)
-            )
-            logger.info(
-                f"Injected connector index ({len(ds_configs)} entries) into datasources.md"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to inject connector index: {e}")
-
-    @staticmethod
-    def _format_rw_cli_block(name: str, ds_type: str) -> str:
-        """Format an expanded CLI usage block for a read-write managed datasource."""
-        blocks = {
-            "postgresql": (
-                f"- **{name}** (postgresql, read-write):\n"
-                f"  Use `run_command` with `psql`. Credentials are pre-configured — do NOT pass connection flags.\n"
-                f"  ```\n"
-                f"  psql -c \"SELECT table_name FROM information_schema.tables WHERE table_schema='public'\"\n"
-                f'  psql -c "\\dt"\n'
-                f"  ```"
-            ),
-            "neo4j": (
-                f"- **{name}** (neo4j, read-write):\n"
-                f"  Use `run_command` with `cypher-shell`. Credentials are pre-configured — do NOT pass connection flags.\n"
-                f"  ```\n"
-                f'  cypher-shell --format plain "MATCH (n) RETURN labels(n), count(*)"\n'
-                f"  cypher-shell --format plain \"CREATE (n:Note {{text: 'hello'}}) RETURN n\"\n"
-                f"  ```"
-            ),
-            "mongodb": (
-                f"- **{name}** (mongodb, read-write):\n"
-                f"  Use `run_command` with `mongosh`. Credentials are pre-configured — do NOT pass connection flags.\n"
-                f"  ```\n"
-                f'  mongosh --quiet --eval "db.getCollectionNames()"\n'
-                f'  mongosh --quiet --eval "db.users.find().limit(5)"\n'
-                f"  ```"
-            ),
-        }
-        return blocks.get(
-            ds_type,
-            f"- **{name}** ({ds_type}, read-write) — CLI via env vars",
-        )
 
     def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
         """Inject well-known environment variables for managed connector CLI access."""

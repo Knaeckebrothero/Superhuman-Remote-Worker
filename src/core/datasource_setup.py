@@ -3,7 +3,7 @@
 Processes datasource configs received from the orchestrator: connects managed
 connectors, injects env vars for CLI access, clones repositories onto the
 workspace backend, materializes credential files (kubeconfig, ssh_key,
-generic_file), and builds a datasource index for datasources.md.
+generic_file), and renders the workspace-facts block in README.md.
 
 Repository datasources are cloned exclusively on the workspace via
 ``clone_repository_datasources()`` (GitManager + shell-capable backend).
@@ -833,8 +833,8 @@ def resolve_repo_clone_names(
     The directory under ``repos/`` uses the upstream repo name from the URL
     (falling back to the datasource-label slug), with a numeric suffix when
     two datasources resolve to the same name (e.g. forks of one upstream).
-    Shared by clone_repository_datasources() and inject_datasource_index()
-    so the datasources.md index always points at the real clone paths.
+    Shared by clone_repository_datasources() and inject_workspace_facts()
+    so the README.md connector list always points at the real clone paths.
     """
     from ..utils.git_url import repo_name_from_url
 
@@ -1126,7 +1126,7 @@ def clone_repository_datasources(
 
 
 # ---------------------------------------------------------------------------
-# Workspace index
+# Workspace facts (README.md)
 # ---------------------------------------------------------------------------
 
 
@@ -1141,23 +1141,42 @@ def _declared_ro_note(ds: Dict[str, Any]) -> str:
     return " (declared read-only — treat as no-write)" if ds.get("read_only") else ""
 
 
-def inject_datasource_index(
+WORKSPACE_FACTS_START = "<!-- srw:workspace-facts:start -->"
+WORKSPACE_FACTS_END = "<!-- srw:workspace-facts:end -->"
+# Gitea auto-inits per-job repos with a stub README of the form
+# "# job-xxxxxxxx\n\nWorkspace for job-xxxxxxxx"; anything else without our
+# markers is a real README (a human's, on a shared project repo) that is only
+# ever appended to.
+# Gitea auto-init READMEs for per-job repos: the legacy form
+# "# job-xxxxxxxx\n\nWorkspace for job-xxxxxxxx" and the current
+# `_repository_intent_description` form "SRW managed repository; creation-intent=<uuid>"
+# (orchestrator/services/gitea.py). Both are stubs to replace, never a human README.
+_GITEA_STUB_README_MARKERS = (
+    "Workspace for job-",
+    "SRW managed repository; creation-intent=",
+)
+MATERIALS_LIST_CAP = 30
+# Bounds on the documents/ walk so a pathological upload cannot turn the
+# facts block into thousands of SFTP round trips.
+_MATERIALS_MAX_DEPTH = 8
+_MATERIALS_MAX_ENTRIES = 2000
+
+
+def _repo_meta(workspace_manager: Any, clone_name: str) -> Dict[str, Any]:
+    """Forge metadata recorded by clone_repository_datasources(), or {}."""
+    meta = getattr(workspace_manager, "source_repo_meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    entry = meta.get(clone_name)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _render_connector_lines(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
-) -> None:
-    """Inject a compact connector index into the compatibility file datasources.md.
-
-    Lists every connector with its specific named access method so the
-    agent knows how to connect to each one. The system prompts point the
-    agent at datasources.md for connection names.
-
-    Rewrites rather than re-appends: any existing connector section, including
-    the legacy "## Available Datasources" heading, is cut before the new one is
-    written. The section is historically trailing because it is only appended
-    after workspace init. This keeps live connector changes from duplicating
-    the index.
-    """
-    lines = ["\n\n## Available Connectors\n"]
+) -> List[str]:
+    """Per-type connector lines with each connector's named access method."""
+    lines: List[str] = []
 
     # Group by category for readable output
     repos = [ds for ds in ds_configs if ds.get("type") == "repository"]
@@ -1193,12 +1212,31 @@ def inject_datasource_index(
 
     if repos:
         lines.append("### Repositories")
-        # Same name resolution as clone_repository_datasources() — the index
+        # Same name resolution as clone_repository_datasources() — the list
         # must point at the directories the clones actually land in.
         for ds, clone_name in zip(repos, resolve_repo_clone_names(repos)):
+            meta = _repo_meta(workspace_manager, clone_name)
+            default_branch = str(
+                meta.get("default_branch") or ds.get("default_branch") or ""
+            ).strip()
+            branch_clause = (
+                f"; base branch `{default_branch}`" if default_branch else ""
+            )
+            read_only = bool(
+                meta.get("read_only")
+                if "read_only" in meta
+                else (ds.get("project_read_only") or ds.get("read_only"))
+            )
+            access = (
+                "read-only — only repo_pull/repo_pr_status"
+                if read_only
+                else "writable — pull requests opened with repo_open_pr are "
+                "recorded for this job"
+            )
             lines.append(
-                f"- **{ds.get('name')}** — cloned at `./repos/{clone_name}/`, "
-                f"git pre-authenticated{_declared_ro_note(ds)}"
+                f"- **{ds.get('name')}** — repository cloned at "
+                f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '
+                f"repo_* tools){branch_clause}; {access}{_declared_ro_note(ds)}"
             )
         lines.append("")
 
@@ -1312,32 +1350,185 @@ def inject_datasource_index(
                 lines.append(f"- **{name}** ({ds_type}){_declared_ro_note(ds)}")
         lines.append("")
 
-    if not ds_configs:
+    if not lines:
         # A live remove-all still needs the section rewritten — an agent
         # re-reading the file must not act on connection names that no
         # longer resolve.
         lines.append("_No connectors attached._")
         lines.append("")
 
+    return lines
+
+
+def _list_materials(workspace_manager: Any) -> List[str]:
+    """Workspace-relative paths of the files under ``documents/``, sorted.
+
+    Walks through the workspace backend (the workspace is remote), bounded in
+    depth and entry count. Dotfiles are skipped. Any listing failure yields
+    an empty list — the facts block is advisory and never fatal.
+    """
+    list_files = getattr(workspace_manager, "list_files", None)
+    if not callable(list_files):
+        return []
+    files: List[str] = []
+    pending: List[Tuple[str, int]] = [("documents", 0)]
+    seen = 0
+    try:
+        while pending and seen < _MATERIALS_MAX_ENTRIES:
+            directory, depth = pending.pop()
+            entries = list_files(directory)
+            if not isinstance(entries, (list, tuple)):
+                return []
+            for entry in entries:
+                seen += 1
+                if seen > _MATERIALS_MAX_ENTRIES:
+                    break
+                rel = str(entry)
+                base = rel.rstrip("/").rsplit("/", 1)[-1]
+                if not base or base.startswith("."):
+                    continue
+                if rel.endswith("/"):
+                    if depth < _MATERIALS_MAX_DEPTH:
+                        pending.append((rel.rstrip("/"), depth + 1))
+                    continue
+                files.append(rel)
+    except Exception as e:
+        logger.warning("Could not list documents/ for the workspace facts: %s", e)
+        return []
+    return sorted(files)
+
+
+def _has_dir(workspace_manager: Any, relative_path: str) -> bool:
+    exists = getattr(workspace_manager, "exists", None)
+    if not callable(exists):
+        return False
+    try:
+        return bool(exists(relative_path))
+    except Exception:
+        return False
+
+
+def render_workspace_facts(
+    ds_configs: List[Dict[str, Any]],
+    workspace_manager: Any,
+    *,
+    project_name: Optional[str] = None,
+    expert: Optional[str] = None,
+) -> str:
+    """Render the marker-delimited workspace-facts block for README.md.
+
+    FACTS ONLY: what this workspace is, which connectors are attached and
+    where they live, what input materials were provided, and the layout.
+    Never the job id, description, kickoff, or todos — those stay in the
+    virtual ``task_brief.md``. Subjobs share their parent's workspace and
+    connector set, so the block is safe on shared workspaces.
+    """
+    lines: List[str] = [WORKSPACE_FACTS_START]
+
+    facts: List[str] = []
+    if isinstance(project_name, str) and project_name.strip():
+        facts.append(f"- **Project**: {project_name.strip()}")
+    if isinstance(expert, str) and expert.strip():
+        facts.append(f"- **Expert**: {expert.strip()}")
+    if facts:
+        lines += ["## Workspace", "", *facts, ""]
+
+    lines += ["## Connectors", ""]
+    lines += _render_connector_lines(list(ds_configs or []), workspace_manager)
+
+    lines += ["## Materials", ""]
+    materials = _list_materials(workspace_manager)
+    if materials:
+        lines += [f"- `{path}`" for path in materials[:MATERIALS_LIST_CAP]]
+        if len(materials) > MATERIALS_LIST_CAP:
+            lines.append(f"… and {len(materials) - MATERIALS_LIST_CAP} more")
+    else:
+        lines.append("_No input documents._")
+    lines.append("")
+
+    lines += ["## Layout", "", "- `output/` — deliverables"]
+    if _has_dir(workspace_manager, "notes"):
+        lines.append("- `notes/` — working notes")
+    lines += [
+        "- `tools/` — tool documentation (virtual)",
+        "- `skills/` — skills available via use_skill",
+        "- `archive/` — completed phases",
+        WORKSPACE_FACTS_END,
+    ]
+    return "\n".join(lines)
+
+
+def merge_workspace_facts(existing: Optional[str], block: str) -> str:
+    """Merge the facts block into an existing README, or create one.
+
+    1. README absent/empty → ``# Workspace`` + block.
+    2. README with markers → replace exactly the marked span; everything
+       else stays byte-identical.
+    3. README without markers that is the Gitea stub → replaced as in (1).
+    4. Any other README (a human's, on a shared project repo) → the block
+       is appended; the existing text is never modified.
+    """
+    fresh = f"# Workspace\n\n{block}\n"
+    if existing is None or not existing.strip():
+        return fresh
+    start = existing.find(WORKSPACE_FACTS_START)
+    end = existing.find(WORKSPACE_FACTS_END)
+    if start != -1 and end != -1 and end > start:
+        return existing[:start] + block + existing[end + len(WORKSPACE_FACTS_END) :]
+    if start != -1:
+        # Start marker without an end marker: the block ran to EOF.
+        return existing[:start] + block + "\n"
+    stripped = existing.strip()
+    if (
+        stripped.startswith("# job-")
+        and len(stripped) < 300
+        and any(marker in stripped for marker in _GITEA_STUB_README_MARKERS)
+    ):
+        return fresh
+    return existing.rstrip("\n") + "\n\n" + block + "\n"
+
+
+def inject_workspace_facts(
+    ds_configs: List[Dict[str, Any]],
+    workspace_manager: Any,
+    *,
+    project_name: Optional[str] = None,
+    expert: Optional[str] = None,
+) -> Optional[str]:
+    """Write the workspace-facts block into the workspace's README.md.
+
+    One on-disk file orients both the agent and a human opening the job
+    repo: the system prompts point the agent at README.md for connector
+    names and clone paths. Regenerated at every agent init and on every
+    live attach/detach, so the block always reflects the current connector
+    set (including the explicit "no connectors" state after a remove-all).
+
+    Non-fatal: a failure logs a warning. Returns the README content that was
+    written, or None when nothing was written.
+    """
     try:
         try:
-            existing = workspace_manager.read_file("datasources.md")
+            existing: Optional[str] = workspace_manager.read_file("README.md")
         except (FileNotFoundError, ValueError, OSError):
-            existing = ""
-        markers = (
-            existing.find(heading)
-            for heading in ("## Available Connectors", "## Available Datasources")
+            existing = None
+        if not isinstance(existing, str):
+            existing = None
+        block = render_workspace_facts(
+            ds_configs,
+            workspace_manager,
+            project_name=project_name,
+            expert=expert,
         )
-        marker = min((position for position in markers if position != -1), default=-1)
-        if marker != -1:
-            existing = existing[:marker].rstrip("\n")
-        workspace_manager.write_file("datasources.md", existing + "\n".join(lines))
+        content = merge_workspace_facts(existing, block)
+        workspace_manager.write_file("README.md", content)
         logger.info(
-            "Injected connector index (%d entries) into datasources.md",
-            len(ds_configs),
+            "Wrote workspace facts (%d connectors) into README.md",
+            len(ds_configs or []),
         )
+        return content
     except Exception as e:
-        logger.warning("Failed to inject connector index: %s", e)
+        logger.warning("Failed to write workspace facts into README.md: %s", e)
+        return None
 
 
 # NOTE: the former _format_rw_cli_entry (PGSERVICE/cypher-shell/mongosh usage

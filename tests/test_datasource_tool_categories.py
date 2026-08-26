@@ -444,11 +444,11 @@ class TestProcessDatasourcesConnectionRouting:
 
 
 class TestDatasourceIndexNotes:
-    """datasources.md must describe working access paths — the RW CLI usage
-    lines (PGSERVICE/cypher-shell/mongosh) advertised a dead path."""
+    """The README.md connector list must describe working access paths — the
+    RW CLI usage lines (PGSERVICE/cypher-shell/mongosh) advertised a dead path."""
 
     def _render_index(self, ds_configs):
-        from src.core.datasource_setup import inject_datasource_index
+        from src.core.datasource_setup import inject_workspace_facts
         from unittest.mock import MagicMock
 
         ws = MagicMock()
@@ -457,8 +457,8 @@ class TestDatasourceIndexNotes:
         ws.write_file.side_effect = lambda path, content: written.update(
             {path: content}
         )
-        inject_datasource_index(ds_configs, ws)
-        return written.get("datasources.md", "")
+        inject_workspace_facts(ds_configs, ws)
+        return written.get("README.md", "")
 
     def test_read_write_database_entry_describes_tools_not_cli(self):
         content = self._render_index(

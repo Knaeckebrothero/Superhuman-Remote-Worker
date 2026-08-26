@@ -107,7 +107,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         """Switch an attached repository to a branch, optionally creating it.
 
         Args:
-            repo: Clone-directory name, as listed in datasources.md.
+            repo: Clone-directory name, as listed in README.md.
             branch: Branch to check out.
             create: Create the branch if it does not exist yet.
         """
@@ -139,7 +139,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         """Stage all changes and commit them in an attached repository.
 
         Args:
-            repo: Clone-directory name, as listed in datasources.md.
+            repo: Clone-directory name, as listed in README.md.
             message: Commit message.
         """
         resolved = _resolve(repo)
@@ -357,7 +357,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         connectors.
 
         Args:
-            repo: Clone-directory name, as listed in datasources.md.
+            repo: Clone-directory name, as listed in README.md.
             number: Pull/merge request number in that repository.
         """
         resolved = _resolve(repo)
