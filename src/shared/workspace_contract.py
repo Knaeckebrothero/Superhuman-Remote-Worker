@@ -45,6 +45,25 @@ def vm_mode_from_env() -> str:
     return normalized if normalized in _VM_MODES else "external"
 
 
+def stateless_worker_backend_admissible(backend: object, *, vm_mode: str) -> bool:
+    """One truth for which workspace tiers the stateless worker lane serves.
+
+    Used by BOTH admission twins — the claim-side queue eligibility check and
+    the agent's workspace-creation guard — so they can never drift apart
+    again (the enqueue CAS admitting VM while the claim CAS rejected it was
+    an unbounded livelock). Sandbox is always admissible; VM only on the
+    pod network (``vm_mode == "same-cluster"``); lite tiers never, on this
+    lane. Aliases normalize; anything unrecognized is inadmissible.
+    """
+
+    if not isinstance(backend, str):
+        return False
+    canonical = _ALIASES.get(backend.strip().lower(), backend.strip().lower())
+    if canonical == "sandbox":
+        return True
+    return canonical == "vm" and vm_mode == "same-cluster"
+
+
 class WorkspaceContractError(ValueError):
     """The authoritative workspace contract is malformed or contradictory."""
 

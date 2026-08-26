@@ -41,6 +41,8 @@ from .workspace_contract import (
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WorkspaceContractError,
     resolve_workspace_contract,
+    stateless_worker_backend_admissible,
+    vm_mode_from_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -477,10 +479,15 @@ def _job_requests_vm(job: Any) -> bool:
     """
 
     try:
-        # The stateless worker plane supports exactly the sandbox tier. Treat
-        # malformed/ambiguous legacy state and every other tier as ineligible;
-        # a claimant must never infer authority from a ready container alone.
-        return resolve_workspace_contract(job).assigned_backend != "sandbox"
+        # The lane serves the sandbox tier everywhere and the VM tier on the
+        # pod network only (same predicate as the agent's workspace guard —
+        # keep them from drifting apart). Malformed/ambiguous legacy state
+        # and every other tier stay ineligible; a claimant must never infer
+        # authority from a ready container alone.
+        return not stateless_worker_backend_admissible(
+            resolve_workspace_contract(job).assigned_backend,
+            vm_mode=vm_mode_from_env(),
+        )
     except WorkspaceContractError:
         return True
 

@@ -3271,13 +3271,21 @@ Do not replace `origin`; its authority is selected and installed by the server.
         # SSH credentials injected by the orchestrator at dispatch time.
         from .core.backends.factory import LITE_BACKENDS, create_lite_backend
 
+        from .shared.workspace_contract import (
+            stateless_worker_backend_admissible,
+            vm_mode_from_env,
+        )
+
         if (
             self._worker_lease_token is not None
-            and self.config.workspace.backend != "sandbox"
+            and not stateless_worker_backend_admissible(
+                self.config.workspace.backend, vm_mode=vm_mode_from_env()
+            )
         ):
             raise RuntimeError(
                 "The stateless worker lane admits Kubernetes-pod sandbox "
-                "workspaces only; VM and lite jobs remain pinned"
+                "workspaces and same-cluster VM workspaces; external VM and "
+                "lite jobs remain pinned"
             )
 
         if self.config.workspace.backend in LITE_BACKENDS:
