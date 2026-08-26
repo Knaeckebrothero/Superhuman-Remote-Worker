@@ -231,6 +231,98 @@ async def test_non_object_legacy_metadata_is_invalid_not_a_roster_500(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_config", [[], 0, False, "", None])
+async def test_falsey_malformed_durable_post_blocks_downgrade_readiness(
+    db, as_user, monkeypatch, post_config
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(
+        return_value=[
+            _row(
+                thread_id=None,
+                thread_status=None,
+                thread_project_id=None,
+                metadata=None,
+                post_config_override=post_config,
+            )
+        ]
+    )
+
+    result = await list_officers(MagicMock())
+
+    officer = result["officers"][0]
+    assert officer["auto_pull_durable_valid"] is False
+    assert officer["auto_pull_mirror_consistent"] is False
+    assert result["auto_pull_downgrade"]["safe"] is False
+    assert result["auto_pull_downgrade"]["invalid_values"] == 1
+    assert result["auto_pull_downgrade"]["mirror_mismatches"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("officer_config", [[], 0, False, "", None])
+async def test_falsey_malformed_durable_officer_blocks_downgrade_readiness(
+    db, as_user, monkeypatch, officer_config
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(
+        return_value=[
+            _row(
+                thread_id=None,
+                thread_status=None,
+                thread_project_id=None,
+                metadata=None,
+                post_config_override={"officer": officer_config},
+            )
+        ]
+    )
+
+    result = await list_officers(MagicMock())
+
+    officer = result["officers"][0]
+    assert officer["auto_pull_durable_valid"] is False
+    assert officer["auto_pull_mirror_consistent"] is False
+    assert result["auto_pull_downgrade"]["safe"] is False
+    assert result["auto_pull_downgrade"]["invalid_values"] == 1
+    assert result["auto_pull_downgrade"]["mirror_mismatches"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_config", [{}, {"officer": {}}])
+async def test_absent_durable_officer_is_a_safe_false_default(
+    db, as_user, monkeypatch, post_config
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(
+        return_value=[
+            _row(
+                thread_id=None,
+                thread_status=None,
+                thread_project_id=None,
+                metadata=None,
+                post_config_override=post_config,
+            )
+        ]
+    )
+
+    result = await list_officers(MagicMock())
+
+    officer = result["officers"][0]
+    assert officer["auto_pull_durable"] is False
+    assert officer["auto_pull_durable_valid"] is True
+    assert officer["auto_pull_mirror_consistent"] is True
+    assert result["auto_pull_downgrade"]["safe"] is True
+
+
+@pytest.mark.asyncio
 async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
     db, as_user, monkeypatch
 ):

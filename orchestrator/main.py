@@ -37985,7 +37985,7 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
     if not officer_cfg_shape_valid:
         officer_cfg = {}
     raw_post_config_override = row.get("post_config_override")
-    post_config_override = raw_post_config_override or {}
+    post_config_override = raw_post_config_override
     post_config_shape_valid = isinstance(post_config_override, dict)
     if isinstance(post_config_override, str):
         try:
@@ -37996,8 +37996,13 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
             post_config_shape_valid = False
     if not post_config_shape_valid:
         post_config_override = {}
-    durable_officer_cfg = post_config_override.get("officer") or {}
-    durable_officer_shape_valid = isinstance(durable_officer_cfg, dict)
+    officer_missing = object()
+    durable_officer_cfg = post_config_override.get("officer", officer_missing)
+    durable_officer_shape_valid = durable_officer_cfg is officer_missing or isinstance(
+        durable_officer_cfg, dict
+    )
+    if durable_officer_cfg is officer_missing:
+        durable_officer_cfg = {}
     if not durable_officer_shape_valid:
         durable_officer_cfg = {}
     officer_state = metadata.get("officer_state") or {}
