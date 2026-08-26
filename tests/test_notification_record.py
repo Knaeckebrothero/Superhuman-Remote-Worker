@@ -26,6 +26,7 @@ from services.notification_service import (
     ActionUnregistered,
     NotificationNotFound,
     NotificationService,
+    RecordResult,
 )
 
 USER = "11111111-1111-1111-1111-111111111111"
@@ -62,7 +63,6 @@ def _service(
         return_value=datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc)
     )
     svc._resolve_delay_minutes = AsyncMock(return_value=5)
-    svc._queue_notification = AsyncMock()
     svc._broadcast_notification = MagicMock()
     svc._broadcast_update = MagicMock()
     if email:
@@ -180,7 +180,6 @@ class TestRecord:
         assert result.deliveries["deferred_until"] == "2026-08-27T06:00:00+00:00"
         svc._email_service.send_notification_email.assert_not_awaited()
         svc._claim_delivery.assert_not_awaited()
-        svc._queue_notification.assert_not_awaited()
         svc._record_suppressed.assert_not_awaited()
         svc._defer_steps.assert_awaited_once()
         nid, steps = svc._defer_steps.call_args.args
@@ -202,7 +201,6 @@ class TestRecord:
         assert "deferred_until" not in result.deliveries
         svc._email_service.send_notification_email.assert_awaited_once()
         svc._defer_steps.assert_not_awaited()
-        svc._queue_notification.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_category_channel_cell_overrides_the_channel_default(self):
@@ -576,28 +574,187 @@ class TestResolveSource:
         assert await svc.resolve_source("job", "job-1", resolved_by="system:x") == []
 
 
-class TestLegacyDispatchUntouched:
-    """Slice 1 leaves ``dispatch()`` alone; the officer-guards seam must hold."""
+class TestAgentMessage:
+    """``record_agent_message`` — the worker→owner producer as a shape over
+    ``record()``: normal by default, high when blocking, reply-routable by
+    mail, ledger-linked, and addressable to a contact who has no user row."""
 
-    @pytest.mark.asyncio
-    async def test_dispatch_still_queues_in_quiet_hours(self):
+    def _svc(self):
         svc = NotificationService.__new__(NotificationService)
         svc._available = True
-        svc._get_user_channels = AsyncMock(return_value={"email": False})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=True)
-        svc._queue_notification = AsyncMock()
-        svc._broadcast_sse = AsyncMock()
-        svc._cockpit_url = "https://cockpit"
-        svc._email_service = None
-        svc._transports = {}
-        results = await svc.dispatch(
-            user_id="u",
-            job_id="j" * 36,
+        svc.record = AsyncMock(
+            return_value=RecordResult(
+                "n-1", True, {"in_app": True, "email": True, "email_message_id": "<m>"}
+            )
+        )
+        return svc
+
+    async def _call(self, svc, **overrides):
+        kwargs = dict(
+            user_id=USER,
+            job={"description": "Publish the demo", "config_name": "worker_base"},
+            job_id="job-1",
+            thread_id="abc123",
+            sequence=3,
+            subject="Need input",
+            message_md="Which colour?",
+        )
+        kwargs.update(overrides)
+        return await svc.record_agent_message(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_shape(self):
+        svc = self._svc()
+        result = await self._call(svc)
+        kw = svc.record.await_args.kwargs
+        assert kw["category"] == "agent_message"
+        assert kw["severity"] is None  # the class default: normal → deferred
+        assert kw["dedup_key"] == "message:abc123:3"
+        assert (kw["source_kind"], kw["source_id"]) == ("message_thread", "abc123")
+        assert kw["action_params"] == {"job_id": "job-1", "thread_id": "abc123"}
+        payload = kw["payload"]
+        assert payload["reply_routing"] == {"job_id": "job-1", "thread_id": "abc123"}
+        assert payload["blocking"] is False and "deliver_to" not in payload
+        assert result.as_dispatch() == {
+            "in_app": True,
+            "email": True,
+            "email_message_id": "<m>",
+            "notification_id": "n-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_blocking_is_high_and_carries_the_ledger_id(self):
+        svc = self._svc()
+        await self._call(svc, blocking=True, message_log_id="ml-9")
+        kw = svc.record.await_args.kwargs
+        assert kw["severity"] == "high"
+        assert kw["payload"]["blocking"] is True
+        assert kw["payload"]["message_log_id"] == "ml-9"
+
+    @pytest.mark.asyncio
+    async def test_explicit_severity_key_and_contact_override(self):
+        svc = self._svc()
+        await self._call(
+            svc,
+            sequence=None,
+            severity="high",
+            dedup_key="route_escalation:r1:officer_sla_expired",
+            reason_line="officer_sla_expired",
+            deliver_to=("contact@example.org", "Contact"),
+        )
+        kw = svc.record.await_args.kwargs
+        assert kw["severity"] == "high"
+        assert kw["dedup_key"] == "route_escalation:r1:officer_sla_expired"
+        assert kw["payload"]["deliver_to"] == {
+            "email": "contact@example.org",
+            "name": "Contact",
+        }
+        assert kw["payload"]["reason_line"] == "officer_sla_expired"
+
+    @pytest.mark.asyncio
+    async def test_no_sequence_gets_a_random_key(self):
+        svc = self._svc()
+        await self._call(svc, sequence=None)
+        first = svc.record.await_args.kwargs["dedup_key"]
+        await self._call(svc, sequence=None)
+        assert first != svc.record.await_args.kwargs["dedup_key"]
+        assert first.startswith("message:abc123:")
+
+
+class TestReplyRoutingAndLedger:
+    """An agent message's mail must stay answerable: the Reply-To is the
+    IMAP sub-address for the thread, and the sent Message-ID is stamped onto
+    the ledger row so an In-Reply-To reply resolves to the thread."""
+
+    def _svc(self):
+        svc = _service()
+        svc._email_service.reply_address = MagicMock(
+            side_effect=lambda job_id, thread_id: f"agent+{job_id[:8]}+{thread_id}@srw"
+        )
+        svc._db.set_message_email_id = AsyncMock(return_value=True)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_reply_to_and_ledger_stamp_on_an_immediate_send(self):
+        svc = self._svc()
+        await svc.record_agent_message(
+            user_id=USER,
+            job={},
+            job_id="job-1",
+            thread_id="abc123",
+            sequence=1,
             subject="s",
             message_md="m",
-            job_description="d",
-            config_name="c",
+            blocking=True,  # high → immediate email
+            message_log_id="ml-1",
         )
-        assert results["queued"] is True
-        svc._queue_notification.assert_awaited_once()
+        send = svc._email_service.send_notification_email
+        send.assert_awaited_once()
+        assert send.call_args.kwargs["reply_to"] == "agent+job-1+abc123@srw"
+        svc._db.set_message_email_id.assert_awaited_once_with("ml-1", "<msg@srw>")
+
+    @pytest.mark.asyncio
+    async def test_other_categories_have_no_reply_lane(self):
+        svc = self._svc()
+        await _record(svc, category="budget_exceeded")
+        send = svc._email_service.send_notification_email
+        assert send.call_args.kwargs["reply_to"] is None
+        svc._db.set_message_email_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_contact_override_mails_the_contact_not_the_owner(self):
+        svc = self._svc()
+        await svc.record_agent_message(
+            user_id=USER,
+            job={},
+            job_id="job-1",
+            thread_id="abc123",
+            sequence=1,
+            subject="s",
+            message_md="m",
+            blocking=True,
+            deliver_to=("contact@example.org", "Contact"),
+        )
+        send = svc._email_service.send_notification_email
+        assert send.call_args.kwargs["to"] == "contact@example.org"
+        assert send.call_args.kwargs["to_name"] == "Contact"
+        svc._claim_delivery.assert_awaited_once_with(
+            svc._persist_notification.call_args.args[0]["id"],
+            "email",
+            address="contact@example.org",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_batch_splits_by_override_address(self):
+        svc = self._svc()
+        svc._claim_delivery = AsyncMock(side_effect=lambda *a, **k: "c")
+        members = [
+            {
+                "id": 1,
+                "notification_id": "n-1",
+                "step_index": 0,
+                "recipient_id": USER,
+                "subject": "to owner",
+                "body": "b",
+                "category": "agent_message",
+                "payload": {},
+            },
+            {
+                "id": 2,
+                "notification_id": "n-2",
+                "step_index": 0,
+                "recipient_id": USER,
+                "subject": "to contact",
+                "body": "b",
+                "category": "agent_message",
+                "payload": {"deliver_to": {"email": "c@x", "name": "C"}},
+            },
+        ]
+        out = await svc.send_step_group(members, channel="email")
+        send = svc._email_service.send_notification_email
+        assert send.await_count == 2
+        assert {c.kwargs["to"] for c in send.call_args_list} == {
+            "legate@example.org",
+            "c@x",
+        }
+        assert sorted(out["attempted"]) == [1, 2] and out["ok"] is True

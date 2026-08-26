@@ -28949,185 +28949,6 @@ class PostgresDB:
     # Notification Queue (Phase 3 Live Communication)
     # =========================================================================
 
-    async def queue_notification(
-        self,
-        user_id: str,
-        job_id: str,
-        thread_id: str | None,
-        subject: str,
-        message: str,
-        channels: dict,
-    ) -> Dict[str, Any]:
-        """Queue a notification for later digest delivery (quiet hours)."""
-        import json as _json
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO notification_queue
-                    (user_id, job_id, thread_id, subject, message, channels)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                RETURNING id, user_id, job_id, thread_id, subject, queued_at
-                """,
-                UUID(user_id),
-                UUID(job_id) if job_id else None,
-                thread_id,
-                subject,
-                message,
-                _json.dumps(channels),
-            )
-        return dict(row)
-
-    async def get_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Get undelivered notifications for a user."""
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, user_id, job_id, thread_id, subject, message, channels,
-                       queued_at
-                FROM notification_queue
-                WHERE user_id = $1 AND delivered_at IS NULL
-                ORDER BY queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notifications_delivered(self, ids: List[str]) -> int:
-        """Mark notifications as delivered. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NOW()
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        # result is like "UPDATE N"
-        return int(result.split()[-1]) if result else 0
-
-    async def claim_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Atomically claim a user's undelivered notifications for a digest.
-
-        Stamps ``delivered_at = NOW()`` and RETURNs only the rows THIS call
-        flipped (``delivered_at`` was NULL). Two quiet-hours digest loops in
-        the transient dual-leader window therefore split the pending set
-        disjointly — in practice one claims all and the other gets none — so a
-        digest email is never sent twice. If dispatch then fails, release the
-        claim with ``unmark_notifications_delivered`` so it retries next cycle.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE notification_queue
-                   SET delivered_at = NOW()
-                 WHERE user_id = $1 AND delivered_at IS NULL
-                RETURNING id, user_id, job_id, thread_id, subject, message,
-                          channels, queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def unmark_notifications_delivered(self, ids: List[str]) -> int:
-        """Release a digest claim (``delivered_at`` → NULL) so the
-        notifications are retried next cycle. Used when dispatch fails after
-        ``claim_pending_notifications`` won them. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NULL
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        return int(result.split()[-1]) if result else 0
-
-    async def get_users_exiting_quiet_hours(
-        self,
-        check_window_minutes: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """Find users whose quiet hours ended within the check window
-        and who have pending notifications.
-
-        Returns list of dicts with user_id and settings.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT u.id AS user_id, u.settings
-                FROM users u
-                JOIN notification_queue nq ON nq.user_id = u.id AND nq.delivered_at IS NULL
-                WHERE u.settings->'communication'->'quiet_hours'->>'enabled' = 'true'
-                """,
-            )
-        return [dict(r) for r in rows]
-
-    # =========================================================================
-    # Notification Read Tracking (Phase 3)
-    # =========================================================================
-
-    async def get_user_notifications(
-        self,
-        user_id: str,
-        limit: int = 50,
-        unread_only: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Get notifications (outbound messages) for a user."""
-        where = "WHERE ml.user_id = $1 AND ml.direction = 'outbound'"
-        if unread_only:
-            where += " AND ml.read_at IS NULL"
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT ml.id, ml.job_id, ml.thread_id, ml.subject, ml.message,
-                       ml.status, ml.created_at, ml.read_at,
-                       j.description AS job_description, j.config_name
-                FROM message_log ml
-                LEFT JOIN jobs j ON j.id = ml.job_id
-                {where}
-                ORDER BY ml.created_at DESC
-                LIMIT $2
-                """,
-                UUID(user_id),
-                limit,
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notification_read(self, message_id: str, user_id: str) -> bool:
-        """Mark a notification as read. Returns True if updated."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE message_log SET read_at = NOW()
-                WHERE id = $1 AND user_id = $2 AND read_at IS NULL
-                """,
-                UUID(message_id),
-                UUID(user_id),
-            )
-        return result == "UPDATE 1"
-
-    async def get_unread_count(self, user_id: str) -> int:
-        """Count unread notifications for a user."""
-        async with self.acquire() as conn:
-            count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM message_log
-                WHERE user_id = $1 AND direction = 'outbound' AND read_at IS NULL
-                """,
-                UUID(user_id),
-            )
-        return count or 0
-
     # =========================================================================
     # Notifications (unified feed) — feature:unified-notifications
     # knowledge-base/knowledge/features/unified_notification_system.md
@@ -29353,10 +29174,14 @@ class PostgresDB:
         limit: int = 50,
         categories: Optional[List[str]] = None,
         status: str = "all",
+        source_kind: Optional[str] = None,
+        source_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Keyset page, newest first. ``before`` is ``"{created_at_iso}|{id}"``
         from a previous page; returns ``(rows, next_before)`` with the cursor
-        set only when a ``limit + 1`` probe row proved there is more."""
+        set only when a ``limit + 1`` probe row proved there is more. A
+        ``source_kind``/``source_id`` pair narrows to one source (the officer
+        card's "pages about this officer")."""
         status_clause = self._NOTIFICATION_STATUS_CLAUSES.get(status)
         if status_clause is None:
             raise ValueError(f"unknown notification status filter {status!r}")
@@ -29365,6 +29190,11 @@ class PostgresDB:
         if categories:
             params.append([str(c) for c in categories])
             where.append(f"category = ANY(${len(params)}::text[])")
+        if source_kind is not None and source_id is not None:
+            params.append(str(source_kind))
+            where.append(f"source_kind = ${len(params)}::text")
+            params.append(str(source_id))
+            where.append(f"source_id = ${len(params)}::text")
         if before:
             ts_text, _, id_text = before.partition("|")
             params.append(datetime.fromisoformat(ts_text))
@@ -30697,74 +30527,6 @@ class PostgresDB:
                     [UUID(job_id) for job_id in job_ids],
                 )
             )
-
-    async def log_project_loop_message_once(
-        self,
-        *,
-        message_id: str,
-        job_id: str,
-        user_id: str,
-        thread_id: str,
-        subject: str,
-        message: str,
-    ) -> bool:
-        """Insert one immutable loop notification, validating any replay.
-
-        Returns ``True`` only for the inserting caller. A response-lost retry
-        sees the deterministic primary key, validates the complete immutable
-        payload/owner, and returns ``False`` so SSE is not broadcast twice.
-        """
-
-        args = (
-            UUID(message_id),
-            UUID(job_id),
-            UUID(user_id),
-            thread_id,
-            subject,
-            message,
-        )
-        async with self.transaction_scope():
-            async with self.acquire() as conn:
-                inserted = await conn.fetchval(
-                    """
-                    INSERT INTO message_log (
-                        id, job_id, user_id, thread_id, direction,
-                        subject, message, mode, status
-                    ) VALUES (
-                        $1::uuid, $2::uuid, $3::uuid, $4::text, 'outbound',
-                        $5::text, $6::text, 'async', 'sent'
-                    )
-                    ON CONFLICT (id) DO NOTHING
-                    RETURNING TRUE
-                    """,
-                    *args,
-                )
-            if inserted:
-                return True
-            # Separate statement is deliberate: if ON CONFLICT waited for a
-            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
-            # and can see the row whose conflict it observed.
-            async with self.acquire() as conn:
-                matches = await conn.fetchval(
-                    """
-                    SELECT job_id = $2::uuid
-                       AND user_id = $3::uuid
-                       AND thread_id = $4::text
-                       AND direction = 'outbound'
-                       AND subject = $5::text
-                       AND message = $6::text
-                       AND mode = 'async'
-                       AND status = 'sent'
-                    FROM message_log
-                    WHERE id = $1::uuid
-                    """,
-                    *args,
-                )
-        if not matches:
-            raise RuntimeError(
-                "project-loop notification replay identity matched a different payload"
-            )
-        return False
 
     async def list_pending_project_loop_handoffs(
         self, *, limit: int = 50

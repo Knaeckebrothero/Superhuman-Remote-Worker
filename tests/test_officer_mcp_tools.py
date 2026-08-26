@@ -41,7 +41,6 @@ POST = {
     "kit": {"build": {"count": 1, "in_flight": 1}},
     "next_wake_at": "2026-08-17T09:30:00+00:00",
     "pending_events": 0,
-    "pages_today": {"used": 0, "budget": 3},
     "backlog": {"auto_pull": False},
 }
 

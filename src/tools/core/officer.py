@@ -117,14 +117,16 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
         Three tiers — pick the LOWEST that serves the purpose:
           * ``log``: for the record only. Costs nothing, interrupts nobody.
             The default; most observations belong here.
-          * ``digest``: queued for the next briefing/conference. For things
-            the Legate should know but not be woken for.
-          * ``page``: immediate out-of-band notification (email/push). For
-            things that cannot wait: repeated failures you cannot fix, a
-            blocked decision above your authority, capacity exhausted with
-            work queued. Pages are budgeted per day; over budget the message
-            downgrades to digest — so spend them like the scarce resource
-            they are.
+          * ``digest``: lands on the Legate's notification center to be read
+            at their next look. For things the Legate should know but not be
+            woken for.
+          * ``page``: reaches the Legate now, out of band (email/push per
+            their preferences). For things that cannot wait: repeated
+            failures you cannot fix, a blocked decision above your authority,
+            capacity exhausted with work queued. The platform throttles
+            repeats (identical text on one day is one notification), but a
+            page still interrupts a human — spend them like the scarce
+            resource they are.
 
         Args:
             message: What the Legate needs to know, in 1-5 sentences.
@@ -132,7 +134,7 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
             subject: Short subject line (page/digest only).
 
         Returns:
-            How the message was delivered (including budget state for pages).
+            How the message was delivered.
         """
         # Local import: the shared client helpers live in the orchestrator
         # tool family; importing at call time keeps this module free of an
@@ -161,17 +163,9 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
         data = resp.json()
         delivered = data.get("delivered")
         if delivered == "page":
-            return (
-                f"Paged the Legate ({data.get('pages_used_today')}/"
-                f"{data.get('pages_budget')} pages used today)."
-            )
-        if data.get("downgraded"):
-            return (
-                "Page budget exhausted or undeliverable — queued as digest "
-                f"({data.get('queued')} items pending)."
-            )
+            return "Paged the Legate (notification recorded; reaches them now)."
         if delivered == "digest":
-            return f"Queued for the digest ({data.get('queued')} items pending)."
+            return "Recorded on the Legate's notification center for their next look."
         return "Logged."
 
     return [sleep, notify_user]

@@ -7,28 +7,3 @@
 #
 # <file>  <enclosing qualname>  <kind>  #<ordinal>
 
-orchestrator/main.py  _escalate_target  notify_helper  #1
-orchestrator/main.py  _notify_loop_event  feed_frame  #1
-orchestrator/main.py  _notify_loop_event  log_outbound  #1
-orchestrator/main.py  _notify_loop_event  loop_once  #1
-orchestrator/main.py  _run_critic_verdict_followups  notify_helper  #1
-orchestrator/main.py  _run_verification_critic_handoff  notify_helper  #1
-orchestrator/main.py  _send_officer_routed_message  log_outbound  #1
-orchestrator/main.py  _send_officer_routed_message  log_outbound  #2
-orchestrator/main.py  _send_officer_routed_message._dispatch_user_leg  dispatch  #1
-orchestrator/main.py  agent_officer_notify  digest_ring  #1
-orchestrator/main.py  send_agent_message  dispatch  #1
-orchestrator/main.py  send_agent_message  log_outbound  #1
-orchestrator/main.py  send_agent_message._reserve_delivery  log_outbound  #1
-orchestrator/main.py  thread_permission_notify_sweeper  headless_email  #1
-orchestrator/security/auth.py  _notify_admins_of_registration  notify_helper  #1
-orchestrator/services/cron_dispatcher.py  _emit_auto_disable_notification  notify_helper  #1
-orchestrator/services/message_routing.py  deliver_route_to_user  dispatch  #1
-orchestrator/services/message_routing.py  deliver_route_to_user  log_outbound  #1
-orchestrator/services/notification_service.py  NotificationService._broadcast_sse  feed_frame  #1
-orchestrator/services/notification_service.py  NotificationService._queue_notification  queue_row  #1
-orchestrator/services/notification_service.py  NotificationService.notify_automation_auto_disabled  feed_frame  #1
-orchestrator/services/notification_service.py  NotificationService.notify_review_returned_to_manual  feed_frame  #1
-orchestrator/services/session_wake.py  _note_ceiling_breach  digest_ring  #1
-orchestrator/services/session_wake.py  _notify_owner  dispatch  #1
-orchestrator/services/stale_verification_sweeper.py  _sweep_tick  notify_helper  #1

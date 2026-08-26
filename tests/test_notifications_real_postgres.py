@@ -768,3 +768,150 @@ class TestStepsEndToEnd:
             (1, "failed"),
             (2, "sent"),
         ]
+
+
+class TestCutoverBackfill:
+    """Migration 0193: the items the legacy joins derived on read become feed
+    rows, minted with the same uuid5 the orchestrator uses, with the same
+    action shapes the catalog serialises, and only for OPEN items."""
+
+    MIGRATION = (
+        Path(__file__).resolve().parents[1]
+        / "orchestrator/database/migrations/app/0193_notifications_cutover.sql"
+    )
+
+    async def _seed(self, db):
+        owner = uuid.uuid4()
+        other = uuid.uuid4()
+        job_review = uuid.uuid4()
+        job_done = uuid.uuid4()
+        job_sudo = uuid.uuid4()
+        sudo_req = uuid.uuid4()
+        thread_key = f"th-{uuid.uuid4().hex[:6]}"
+        async with db.acquire() as conn:
+            for uid in (owner, other):
+                await conn.execute(
+                    "INSERT INTO users (id, display_name) VALUES ($1, 'Owner')", uid
+                )
+            for jid, status in (
+                (job_review, "pending_review"),
+                (job_done, "completed"),
+                (job_sudo, "processing"),
+            ):
+                await conn.execute(
+                    "INSERT INTO jobs (id, description, status, user_id, config_name) "
+                    "VALUES ($1, 'Publish the demo', $2, $3, 'worker_base')",
+                    jid,
+                    status,
+                    owner,
+                )
+            await conn.execute(
+                "INSERT INTO sudo_approval_requests "
+                "(id, job_id, vm_name, command, arguments, requesting_user, "
+                " target_user, status, request_type) "
+                "VALUES ($1, $2, 'vm-1', 'apt-get install jq', '{}', 'agent', "
+                "        'root', 'pending', 'sudo_command')",
+                sudo_req,
+                job_sudo,
+            )
+            # An outbound agent message with no later human reply …
+            await conn.execute(
+                "INSERT INTO message_log (job_id, user_id, thread_id, direction, "
+                " subject, message, status) VALUES ($1, $2, $3, 'outbound', "
+                " 'Need input', 'Which colour?', 'sent')",
+                job_sudo,
+                owner,
+                thread_key,
+            )
+            # … and one that was answered (latest row inbound) → not backfilled.
+            answered = f"th-{uuid.uuid4().hex[:6]}"
+            await conn.execute(
+                "INSERT INTO message_log (job_id, user_id, thread_id, direction, "
+                " subject, message, status, created_at) VALUES ($1, $2, $3, "
+                " 'outbound', 'Q', 'q', 'sent', now() - interval '2 minutes')",
+                job_sudo,
+                owner,
+                answered,
+            )
+            await conn.execute(
+                "INSERT INTO message_log (job_id, user_id, thread_id, direction, "
+                " subject, message, status) VALUES ($1, $2, $3, 'inbound', "
+                " 'Re: Q', 'blue', 'received')",
+                job_sudo,
+                owner,
+                answered,
+            )
+            # A job-less outbound row (an officer/session notice) has no reply
+            # path → not backfilled.
+            await conn.execute(
+                "INSERT INTO message_log (job_id, user_id, thread_id, direction, "
+                " subject, message, status) VALUES (NULL, $1, $2, 'outbound', "
+                " 'Officer notice', 'held', 'sent')",
+                owner,
+                f"th-{uuid.uuid4().hex[:6]}",
+            )
+        return {
+            "owner": owner,
+            "job_review": job_review,
+            "job_done": job_done,
+            "sudo_req": sudo_req,
+            "job_sudo": job_sudo,
+            "thread_key": thread_key,
+        }
+
+    @pytest.mark.asyncio
+    async def test_backfills_open_items_once_with_catalog_shaped_actions(self, db):
+        seed = await self._seed(db)
+        sql = self.MIGRATION.read_text()
+        async with db.acquire() as conn:
+            await conn.execute(sql)
+            await conn.execute(sql)  # idempotent: ON CONFLICT (id) DO NOTHING
+            rows = await conn.fetch(
+                "SELECT * FROM notifications WHERE recipient_id = $1 ORDER BY category",
+                seed["owner"],
+            )
+        by_cat = {r["category"]: db._notification_row(r) for r in rows}
+        assert set(by_cat) == {"review_queue", "sudo_request", "agent_message"}
+        assert len(rows) == 3
+
+        review = by_cat["review_queue"]
+        assert review["source_id"] == str(seed["job_review"])
+        assert review["dedup_key"] == f"backfill:job:{seed['job_review']}"
+        # Minted like notification_id(): the orchestrator lands on the same row.
+        assert str(review["id"]) == str(
+            notification_id("user", str(seed["owner"]), review["dedup_key"])
+        )
+        assert [a["type"] for a in review["actions"]] == ["approve", "resume", "open"]
+        assert review["actions"][1]["input_name"] == "feedback"
+        assert all(
+            a["params"] == {"job_id": str(seed["job_review"])}
+            for a in review["actions"]
+        )
+        assert review["payload"]["backfill"] is True
+
+        sudo = by_cat["sudo_request"]
+        assert sudo["severity"] == "critical"
+        assert sudo["source_id"] == str(seed["sudo_req"])
+        assert [a["type"] for a in sudo["actions"]] == ["approve", "deny", "open"]
+        assert sudo["actions"][0]["params"]["request_id"] == str(seed["sudo_req"])
+
+        message = by_cat["agent_message"]
+        assert message["source_kind"] == "message_thread"
+        assert message["source_id"] == seed["thread_key"]
+        assert message["subject"] == "Need input"
+        assert [a["type"] for a in message["actions"]] == ["reply", "open"]
+        assert message["actions"][0]["params"]["thread_id"] == seed["thread_key"]
+
+        # Nothing was recorded for the completed job or the answered thread.
+        async with db.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM notifications WHERE source_id = $1",
+                    str(seed["job_done"]),
+                )
+                == 0
+            )
+            comment = await conn.fetchval(
+                "SELECT obj_description('public.notification_queue'::regclass)"
+            )
+        assert comment and comment.startswith("RETIRED (0193")

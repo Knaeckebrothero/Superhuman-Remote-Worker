@@ -8024,6 +8024,13 @@ CREATE TABLE public.notification_queue (
 
 
 --
+-- Name: TABLE notification_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_queue IS 'RETIRED (0193, unified notification system slice 3): the quiet-hours digest queue. Deferred delivery is a notification_steps row now. Kept until a later DROP.';
+
+
+--
 -- Name: notification_steps; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -10494,7 +10501,7 @@ CREATE TABLE public.thread_notifications (
 -- Name: TABLE thread_notifications; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.thread_notifications IS 'Audit + dedup + rate-limit log for headless-session emails. One row per outbound email regardless of delivery status.';
+COMMENT ON TABLE public.thread_notifications IS 'RETIRED (0193, unified notification system slice 3): the headless permission-email audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
 
 
 --

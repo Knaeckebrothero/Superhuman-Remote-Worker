@@ -1,102 +1,89 @@
-"""Unit test for NotificationService.notify_review_returned_to_manual.
+"""``NotificationService.record_review_returned`` — the "nothing was approved,
+it is yours now" producer (verification gate escalation and the
+stale-verification sweeper), as a shape over ``record()``.
 
-Mirrors the notify_automation_auto_disabled setup in
-test_headless_notifications_phase4.py — mocked feed + email service, no real DB.
+The row is the notification (unified notification system): a
+``review_queue`` item about the job, resolved by whoever settles the job. The
+wording that used to live in an email body is now the row's body; the reason
+the gate gives is the only thing that tells the owner WHY nobody approved.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from orchestrator.services.notification_service import NotificationService
+from orchestrator.services.notification_service import (
+    NotificationService,
+    RecordResult,
+)
 
 
-def _connected_service(*, email_enabled=True, has_email=True):
-    svc = NotificationService()
-    feed = MagicMock()
-    feed.broadcast = MagicMock()
-    email = MagicMock()
-    email.send_system_notification = AsyncMock(return_value=True)
-    db = MagicMock()
-    db.get_user = AsyncMock(
-        return_value={"email": "owner@example.com", "display_name": "Owner"}
-        if has_email
-        else {"email": None}
-    )
-    svc.connect(db=db, email_service=email, notification_feed=feed)
-    svc._get_user_channels = AsyncMock(return_value={"email": email_enabled})
-    return svc, feed, email
+def _service():
+    svc = NotificationService.__new__(NotificationService)
+    svc._available = True
+    svc.record = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
+    return svc
 
 
-class TestNotifyReviewReturnedToManual:
+class TestRecordReviewReturned:
     @pytest.mark.asyncio
-    async def test_broadcasts_sse_and_sends_email(self):
-        svc, feed, email = _connected_service()
-
-        result = await svc.notify_review_returned_to_manual(
+    async def test_records_a_review_queue_row_about_the_job(self):
+        svc = _service()
+        result = await svc.record_review_returned(
             user_id="u1", job_id="job-123", config_name="scholar"
         )
-
-        assert result["sse"] is True
-        assert result["email"] is True
-        # SSE carries the job id + a review deep-link.
-        feed.broadcast.assert_called_once()
-        sse_kwargs = feed.broadcast.call_args.kwargs
-        assert sse_kwargs["event_type"] == "review_returned_to_manual"
-        assert sse_kwargs["data"]["job_id"] == "job-123"
-        # Email addressed to the owner, mentions the config label.
-        email.send_system_notification.assert_awaited_once()
-        mail_kwargs = email.send_system_notification.await_args.kwargs
-        assert mail_kwargs["to"] == "owner@example.com"
-        assert "scholar" in mail_kwargs["body_md"]
+        assert result.notification_id == "n-1"
+        svc.record.assert_awaited_once()
+        kwargs = svc.record.await_args.kwargs
+        assert kwargs["recipient_id"] == "u1"
+        assert kwargs["category"] == "review_queue"
+        assert kwargs["source_kind"] == "job" and kwargs["source_id"] == "job-123"
+        assert kwargs["action_params"] == {"job_id": "job-123"}
+        assert "scholar" in kwargs["body"]
+        assert kwargs["payload"]["returned_to_manual"] is True
 
     @pytest.mark.asyncio
-    async def test_skips_email_when_channel_disabled(self):
-        svc, feed, email = _connected_service(email_enabled=False)
-
-        result = await svc.notify_review_returned_to_manual(
-            user_id="u1", job_id="job-123", config_name="scholar"
-        )
-
-        assert result.get("sse") is True
-        email.send_system_notification.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_reason_reaches_the_owner_verbatim(self):
+    async def test_reason_reaches_the_owner_verbatim_and_keys_the_row(self):
         """The gate's escalation reason (round cap / no progress / no verdict)
-        is the only thing that tells the owner WHY nobody approved the job."""
-        svc, feed, email = _connected_service()
-
+        is the only thing that tells the owner WHY nobody approved the job —
+        and a different reason is a different notification."""
+        svc = _service()
         reason = "Round limit reached (3) with 1 finding(s) still open (F1)."
-        await svc.notify_review_returned_to_manual(
+        await svc.record_review_returned(
             user_id="u1", job_id="job-123", config_name="scholar", reason=reason
         )
-
-        assert reason in email.send_system_notification.await_args.kwargs["body_md"]
-        assert feed.broadcast.call_args.kwargs["data"]["reason"] == reason
+        kwargs = svc.record.await_args.kwargs
+        assert reason in kwargs["body"]
+        assert kwargs["payload"]["reason"] == reason
+        key_with_reason = kwargs["dedup_key"]
+        await svc.record_review_returned(
+            user_id="u1", job_id="job-123", config_name="scholar", reason="other"
+        )
+        assert svc.record.await_args.kwargs["dedup_key"] != key_with_reason
+        assert key_with_reason.startswith("review_returned:job-123:")
 
     @pytest.mark.asyncio
     async def test_without_a_reason_keeps_the_pipeline_died_wording(self):
         """The sweeper's caller passes no reason — its cause IS the pipeline,
         and that wording must not regress into a dangling empty quote."""
-        svc, feed, email = _connected_service()
-
-        await svc.notify_review_returned_to_manual(
+        svc = _service()
+        await svc.record_review_returned(
             user_id="u1", job_id="job-123", config_name="scholar"
         )
-
-        body = email.send_system_notification.await_args.kwargs["body_md"]
+        body = svc.record.await_args.kwargs["body"]
         assert "the review pipeline died" in body
         assert ">" not in body  # no empty blockquote
 
     @pytest.mark.asyncio
-    async def test_returns_error_when_not_connected(self):
-        svc = NotificationService()  # not connected → _available False
-
-        result = await svc.notify_review_returned_to_manual(
+    async def test_same_call_twice_is_the_same_row(self):
+        svc = _service()
+        await svc.record_review_returned(
             user_id="u1", job_id="job-123", config_name="scholar"
         )
-
-        assert "error" in result
+        first = svc.record.await_args.kwargs["dedup_key"]
+        await svc.record_review_returned(
+            user_id="u1", job_id="job-123", config_name="scholar"
+        )
+        assert svc.record.await_args.kwargs["dedup_key"] == first

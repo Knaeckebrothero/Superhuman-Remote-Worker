@@ -281,7 +281,6 @@ GET    /api/notifications                                                       
 GET    /api/notifications/events                                                        gated:require_approved_user
 POST   /api/notifications/seen                                                          gated:require_approved_user
 GET    /api/notifications/{notification_id}                                             gated:require_approved_user
-PATCH  /api/notifications/{notification_id}                                             gated:require_approved_user
 POST   /api/notifications/{notification_id}/act                                         gated:require_approved_user
 PATCH  /api/notifications/{notification_id}/archive                                     gated:require_approved_user
 PATCH  /api/notifications/{notification_id}/read                                        gated:require_approved_user

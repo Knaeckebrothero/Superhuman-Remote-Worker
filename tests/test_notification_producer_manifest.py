@@ -5,11 +5,12 @@ orchestrator tree and asserts the result matches the committed manifest at
 ``policy/notification_producers.txt``. Modelled on ``test_endpoint_inventory``.
 
 The unified notification system (knowledge-base/knowledge/features/
-unified_notification_system.md §6) is done only when this manifest is empty.
-Until then two things must hold: the manifest reflects the code, and the
-number of legacy call sites never goes up. Migrating a producer to
-``notification_service.record()`` shrinks the list; run ``--write`` and commit.
-Adding a new caller of a legacy path fails the second test on purpose.
+unified_notification_system.md §6) was done when this manifest became empty
+(slice 3, 2026-08-26). It must stay empty: the manifest reflects the code,
+and the legacy call-site count is zero. Every notification goes through
+``notification_service.record()``; a message-ledger ``log_message(direction=
+"outbound")`` write is allowed only under a ``# notification-ledger:`` line
+saying why it is a ledger row and not a feed write.
 """
 
 import difflib
@@ -65,31 +66,52 @@ def test_manifest_matches_code():
         )
 
 
-def test_legacy_call_sites_do_not_increase():
-    """A new caller of a retired path is a regression, not a feature.
+def test_no_legacy_call_sites_remain():
+    """One fewer system (§6): the legacy paths are gone and stay gone.
 
-    Record it through ``notification_service.record()`` instead — every
-    category, action and delivery rule lives in
-    ``orchestrator/services/notification_catalog.py``.
+    A new caller of a retired path is a regression, not a feature. Record it
+    through ``notification_service.record()`` instead — every category,
+    action and delivery rule lives in
+    ``orchestrator/services/notification_catalog.py``. An outbound
+    ``log_message`` that really is a message-ledger write (not a feed write)
+    is excused by a ``# notification-ledger: <reason>`` line above the call.
     """
     script = _load_script()
     current = script.collect_sites()
-    grandfathered = _manifest_sites()
-    assert len(current) <= len(grandfathered), (
-        f"Legacy notification call sites grew: {len(current)} now vs "
-        f"{len(grandfathered)} grandfathered. Use notification_service.record() "
-        "for new notifications; do not add callers of dispatch()/log_message "
-        "outbound/the officer digest ring/the quiet-hours queue."
+    assert current == [], (
+        "Legacy notification call sites reappeared: "
+        + ", ".join(f"{s.file}:{s.qualname} ({s.kind})" for s in current)
+        + ". Use notification_service.record(); do not add callers of "
+        "dispatch()/notify_*()/log_message outbound without a ledger note/"
+        "the officer digest ring/the quiet-hours queue/thread_notifications."
     )
+    assert _manifest_sites() == []
 
 
-def test_migrated_slice_one_paths_are_gone():
-    """Slice 1 retired these; a reappearance means a producer regressed."""
-    script = _load_script()
-    kinds = {s.kind for s in script.collect_sites()}
-    assert "notify_freeze" not in kinds, (
-        "a _notify_operator_freeze caller lost its dedup_key"
-    )
-    manifest_text = MANIFEST.read_text()
-    assert "_dispatch_officer_page  dispatch" not in manifest_text
-    assert "_dispatch_officer_page  log_outbound" not in manifest_text
+def test_retired_symbols_do_not_exist():
+    """The legacy fan-out is deleted, not merely unused."""
+    from services import notification_service as svc_mod
+
+    service = svc_mod.NotificationService
+    for name in (
+        "dispatch",
+        "dispatch_digest",
+        "notify_review_returned_to_manual",
+        "notify_automation_auto_disabled",
+        "notify_admins_user_registered",
+        "_queue_notification",
+        "_broadcast_sse",
+    ):
+        assert not hasattr(service, name), f"NotificationService.{name} came back"
+    from orchestrator.database.postgres import PostgresDB
+
+    for name in (
+        "queue_notification",
+        "claim_pending_notifications",
+        "get_users_exiting_quiet_hours",
+        "get_user_notifications",
+        "get_unread_count",
+        "mark_notification_read",
+        "log_project_loop_message_once",
+    ):
+        assert not hasattr(PostgresDB, name), f"PostgresDB.{name} came back"

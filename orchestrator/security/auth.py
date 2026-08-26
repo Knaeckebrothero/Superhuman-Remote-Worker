@@ -452,7 +452,7 @@ async def _notify_admins_of_registration(user: dict, email: str) -> None:
     try:
         from services.notification_service import notification_service
 
-        await notification_service.notify_admins_user_registered(
+        await notification_service.record_user_registered(
             new_user_id=str(user["id"]),
             display_name=user.get("display_name"),
             email=email or None,

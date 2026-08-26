@@ -618,56 +618,43 @@ async def _deliver_durable(
 async def _notify_owner(
     db: Any, thread: dict[str, Any], thread_id: str, row: dict[str, Any]
 ) -> None:
-    """Tell the owner out of band that a job their session launched finished.
-
-    The recipient MUST be resolved and passed explicitly.
-    ``notification_service.dispatch`` takes ``user_id`` for preference lookup
-    only — its email leg sends to ``recipient_email or ""``, so omitting it does
-    not fall back to the user's address; it hands the empty string to the email
-    service, which refuses to send and logs a warning. Nothing raises, so the
-    notification is silently dropped while the wake still reports success.
-    (Caught by the 2026-07-27 dev live gate: "Refusing to send email to
-    undeliverable recipient(s): ['']". Every other caller —
-    ``_notify_operator_freeze`` — resolves the user row first for this reason.)
-
-    This is the half of the durable branch that actually reaches a user who has
-    closed the tab, so a silent drop here defeats the branch's purpose.
+    """Tell the owner that a job their session launched finished while the
+    tab was closed — a ``session_wake`` feed row (unified notification
+    system). The row is the durable half that reaches a user who is gone:
+    in-app now, mail after the escalation window unless they looked.
     """
     from services.notification_service import notification_service
 
     user_id = thread.get("user_id")
     if not user_id:
         return
-    try:
-        user = await db.get_user(str(user_id))
-    except Exception:
-        user = None
-    if not user or not user.get("email"):
-        logger.info(
-            "session wake: owner %s has no email — skipping out-of-band notice",
-            str(user_id)[:8],
-        )
-        return
 
     job_id = str(row["id"])
     short = job_id[:8]
     description = (row.get("description") or "")[:100]
     status = effective_job_status(row, fallback="finished")
-    await notification_service.dispatch(
-        user_id=str(user_id),
-        job_id=job_id,
+    await notification_service.record(
+        recipient_id=str(user_id),
+        category="session_wake",
+        dedup_key=f"session_wake:{thread_id}:{job_id}",
         subject=f"Job {short} {status} — your session is waiting",
-        message_md=(
+        body=(
             f"**Job `{short}`** launched from your session "
             f"**{thread.get('title') or 'Untitled'}** is now `{status}`.\n\n"
             f"**Task:** {description}\n\n"
             "Reopen the session to pick the result up."
         ),
-        job_description=description,
-        config_name=str(row.get("config_name") or "worker_base"),
-        thread_id=thread_id,
-        recipient_email=user.get("email"),
-        recipient_name=user.get("display_name") or "User",
+        source_kind="thread",
+        source_id=str(thread_id),
+        action_params={"thread_id": str(thread_id), "job_id": job_id},
+        payload={
+            "thread_id": str(thread_id),
+            "job_id": job_id,
+            "job_description": description,
+            "config_name": str(row.get("config_name") or "worker_base"),
+            "status": status,
+            "title": thread.get("title"),
+        },
     )
 
 
@@ -984,38 +971,50 @@ async def _officer_ceiling_deferral(
 async def _note_ceiling_breach(
     db: Any, thread_id: str, thread: dict[str, Any], deferred_to: datetime
 ) -> None:
-    """One day-stamped digest entry when the ceiling brake engages.
+    """One day-stamped notice when the ceiling brake engages.
 
     The notify contract's 'force-sleep + digest notice': the Legate learns
-    the officer went quiet from the digest, not from silence. Idempotent per
-    UTC day via ``officer_state.ceiling_notice``.
+    the officer went quiet from his feed, not from silence — a ``low``
+    ``officer_runtime`` row (in-app only). Idempotent per UTC day via
+    ``officer_state.ceiling_notice`` and the row's dedup key.
     """
     try:
+        from services.notification_service import notification_service
+
         state = _as_dict(_as_dict(thread.get("metadata")).get("officer_state"))
         today = datetime.now(timezone.utc).date().isoformat()
         if state.get("ceiling_notice") == today:
             return
-        digest = state.get("digest") or []
-        if not isinstance(digest, list):
-            digest = []
-        digest = (
-            digest
-            + [
-                {
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "subject": "Daily token ceiling reached",
-                    "message": (
-                        "The officer's daily token ceiling was reached; his "
-                        "autonomous wakes are deferred until "
-                        f"{deferred_to.strftime('%Y-%m-%d %H:%M UTC')}. Your "
-                        "messages still reach him immediately."
+        owner_id = thread.get("user_id")
+        if owner_id:
+            await notification_service.record(
+                recipient_id=str(owner_id),
+                category="officer_runtime",
+                severity="low",
+                dedup_key=f"officer_ceiling:{thread_id}:{today}",
+                subject="Daily token ceiling reached",
+                body=(
+                    "The officer's daily token ceiling was reached; his "
+                    "autonomous wakes are deferred until "
+                    f"{deferred_to.strftime('%Y-%m-%d %H:%M UTC')}. Your "
+                    "messages still reach him immediately."
+                ),
+                source_kind="thread",
+                source_id=str(thread_id),
+                action_params={
+                    "thread_id": str(thread_id),
+                    "project_id": (
+                        str(thread.get("project_id"))
+                        if thread.get("project_id")
+                        else None
                     ),
-                }
-            ]
-        )[-50:]
-        await db.merge_thread_officer_state(
-            thread_id, {"digest": digest, "ceiling_notice": today}
-        )
+                },
+                payload={
+                    "thread_id": str(thread_id),
+                    "deferred_to": deferred_to.isoformat(),
+                },
+            )
+        await db.merge_thread_officer_state(thread_id, {"ceiling_notice": today})
         logger.warning(
             "officer %s: daily token ceiling reached — wakes deferred to %s",
             thread_id[:8],

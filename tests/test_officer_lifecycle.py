@@ -111,9 +111,9 @@ class TestPatchValidator:
 
     def test_int_fields_coerce_and_clamp(self):
         fragment, _, _ = _validated_officer_post_patch(
-            {"max_pages_per_day": "4", "daily_token_ceiling": -5}
+            {"max_actions_per_wake": "4", "daily_token_ceiling": -5}
         )
-        assert fragment["officer"]["max_pages_per_day"] == 4
+        assert fragment["officer"]["max_actions_per_wake"] == 4
         assert fragment["officer"]["daily_token_ceiling"] == 0
 
     def test_int_garbage_400s(self):
@@ -195,7 +195,6 @@ class TestPatchValidator:
             "slots": {"line": {"count": 1}},
             "max_concurrent_workers": 2,
             "daily_token_ceiling": 1,
-            "max_pages_per_day": 1,
             "sleep_min_minutes": 5,
             "sleep_max_minutes": 60,
             "max_actions_per_wake": 3,
@@ -206,7 +205,6 @@ class TestPatchValidator:
             "slots": "next dispatch",
             "max_concurrent_workers": "next dispatch",
             "daily_token_ceiling": "next delivery",
-            "max_pages_per_day": "next delivery",
             "sleep_min_minutes": "next sleep filing + watchdog immediately",
             "sleep_max_minutes": "next sleep filing + watchdog immediately",
             "max_actions_per_wake": "next respawn",
@@ -299,7 +297,6 @@ class TestEditorBlock:
                 "sleep_min_minutes": 10,
                 "sleep_max_minutes": 45,
                 "daily_token_ceiling": 500000,
-                "max_pages_per_day": 4,
                 "max_actions_per_wake": 6,
                 "max_concurrent_workers": 3,
             },
@@ -312,7 +309,6 @@ class TestEditorBlock:
         assert block["sleep_min_minutes"] == 10
         assert block["sleep_max_minutes"] == 45
         assert block["daily_token_ceiling"] == 500000
-        assert block["max_pages_per_day"] == 4
         assert block["max_actions_per_wake"] == 6
         assert block["max_concurrent_workers"] == 3
 
@@ -465,7 +461,7 @@ class TestAdminGate:
             lambda req: release_project_officer(req, PROJECT_ID),
             lambda req: recycle_project_officer(req, PROJECT_ID),
             lambda req: patch_project_officer(
-                req, PROJECT_ID, {"max_pages_per_day": 1}
+                req, PROJECT_ID, {"max_actions_per_wake": 1}
             ),
         ],
     )
@@ -646,17 +642,17 @@ class TestPatchEndpoint:
         self, db, as_project_admin, quiet_side_channels
     ):
         out = await patch_project_officer(
-            MagicMock(), PROJECT_ID, {"max_pages_per_day": 5}
+            MagicMock(), PROJECT_ID, {"daily_token_ceiling": 5}
         )
         db.update_project_officer_post.assert_awaited_once_with(
             PROJECT_ID,
-            config_updates={"officer": {"max_pages_per_day": 5}},
+            config_updates={"officer": {"daily_token_ceiling": 5}},
             communication_policy_patch=None,
         )
         db.merge_thread_config_override.assert_not_awaited()
         assert out["commissioned"] is False
         assert out["applied_to_thread"] is False
-        assert out["effects"] == {"max_pages_per_day": "next delivery"}
+        assert out["effects"] == {"daily_token_ceiling": "next delivery"}
 
     @pytest.mark.asyncio
     async def test_commissioned_post_mirrors_to_thread_and_notices_not_wakes(
@@ -864,13 +860,13 @@ class TestCommissionEndpoint:
             }
         )
 
-        body = {"max_pages_per_day": 4}
+        body = {"max_actions_per_wake": 4}
         out = await commission_project_officer(MagicMock(), PROJECT_ID, body)
 
         # Body validated + merged into the row under the post lock FIRST.
         db.update_project_officer_post.assert_awaited_once_with(
             PROJECT_ID,
-            config_updates={"officer": {"max_pages_per_day": 4}},
+            config_updates={"officer": {"max_actions_per_wake": 4}},
             communication_policy_patch=None,
             expected_vacant_updated_at=row["updated_at"],
         )
@@ -1021,7 +1017,7 @@ class TestCommissionEndpoint:
                     "enabled": True,
                     "slots": None,
                     "daily_token_ceiling": None,
-                    "max_pages_per_day": 2,
+                    "max_actions_per_wake": 2,
                 },
                 "llm": {"model": None, "reasoning_level": None},
             }
@@ -1038,7 +1034,7 @@ class TestCommissionEndpoint:
         officer_frag = req.config_override["officer"]
         assert "slots" not in officer_frag
         assert "daily_token_ceiling" not in officer_frag
-        assert officer_frag["max_pages_per_day"] == 2
+        assert officer_frag["max_actions_per_wake"] == 2
         assert officer_frag["enabled"] is True
         assert req.model is None
         assert req.reasoning_level is None

@@ -263,37 +263,68 @@ ACTION_UPGRADE_TO_VM = ActionSpec("approve_upgrade", A + "upgradeToVm", "primary
 ACTION_RESUME_WITHOUT_VM = ActionSpec("resume_without_vm", A + "resumeWithoutVm")
 ACTION_REPLY = ActionSpec("reply", A + "reply", "primary", "textarea", "message")
 ACTION_OPEN_CONFERENCE = ActionSpec("open_conference", A + "openConference")
+ACTION_DENY_PLAIN = ActionSpec("deny", A + "deny", "danger")
 ACTION_OPEN_JOB = ActionSpec("open", A + "openJob")
 ACTION_OPEN_THREAD = ActionSpec("open", A + "openThread")
 ACTION_OPEN_SESSION = ActionSpec("open_session", A + "openSession")
 ACTION_OPEN_PROJECT = ActionSpec("open", A + "openProject")
 ACTION_OPEN_AUTOMATIONS = ActionSpec("open", A + "openAutomations")
 ACTION_OPEN_ADMIN_USERS = ActionSpec("open", A + "openAdminUsers")
+ACTION_OPEN_SOURCE = ActionSpec("open", A + "open")
 
 
 # ---------------------------------------------------------------------------
-# Categories (slice 1; later slices append)
+# Categories — the whole vocabulary after the slice-3 cutover
 # ---------------------------------------------------------------------------
 
 CATEGORIES: dict[str, CategorySpec] = {
     spec.name: spec
     for spec in (
+        # A job waiting on a human decision (autonomy `review`, or automated
+        # verification that ended without approving).
         CategorySpec(
             "review_queue",
             "normal",
             (ACTION_APPROVE, ACTION_RESUME_WITH_FEEDBACK, ACTION_OPEN_JOB),
         ),
+        # 24 h TTL — miss it and the job dies.
         CategorySpec(
             "vm_upgrade",
             "high",
             (ACTION_UPGRADE_TO_VM, ACTION_RESUME_WITHOUT_VM, ACTION_DENY),
         ),
         CategorySpec("budget_exceeded", "high", (ACTION_RESUME, ACTION_OPEN_JOB)),
+        # The job already failed (LLM give-up, drain stall): latency costs.
         CategorySpec("incident", "critical", (ACTION_OPEN_JOB,)),
         CategorySpec(
             "officer_question", "high", (ACTION_REPLY, ACTION_OPEN_CONFERENCE)
         ),
         CategorySpec("officer_runtime", "high", (ACTION_OPEN_CONFERENCE,)),
+        # A worker's message to its owner (blocking sends record as `high`).
+        CategorySpec("agent_message", "normal", (ACTION_REPLY, ACTION_OPEN_JOB)),
+        # A job launched from a session finished while the tab was closed.
+        CategorySpec("session_wake", "normal", (ACTION_OPEN_SESSION,)),
+        # Loop questions/dispositions: in-app only (loop_campaign_scheduling
+        # Q3 — no email, no push).
+        CategorySpec("loop_event", "low", (ACTION_OPEN_PROJECT,)),
+        CategorySpec("automation_disabled", "normal", (ACTION_OPEN_AUTOMATIONS,)),
+        # Per admin; resolved when the user is approved.
+        CategorySpec("user_registered", "normal", (ACTION_OPEN_ADMIN_USERS,)),
+        # A headless session's permission gate waiting on its owner. The mail
+        # carries magic links, so `high` keeps the "approve from your phone"
+        # affordance the old thread_notifications email had.
+        CategorySpec(
+            "session_permission",
+            "high",
+            (ACTION_APPROVE, ACTION_DENY_PLAIN, ACTION_OPEN_SESSION),
+        ),
+        # A sudo request has a 300 s TTL: push channels now, never email.
+        CategorySpec(
+            "sudo_request",
+            "critical",
+            (ACTION_APPROVE, ACTION_DENY, ACTION_OPEN_SOURCE),
+            steps=_immediate("ntfy", "slack_webhook", "discord_webhook"),
+        ),
     )
 }
 

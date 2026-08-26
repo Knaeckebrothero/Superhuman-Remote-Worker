@@ -10,7 +10,10 @@ Since the unified notification system (slice 1) a page is a feed row recorded
 through ``notification_service.record()`` — ``officer_question`` at severity
 ``high`` — addressed to the thread owner with ``source_ref = thread:<id>``.
 Delivery (email per the owner's preferences) is the notification system's
-business; ``_dispatch_officer_page`` never chooses a channel.
+business; ``_dispatch_officer_page`` never chooses a channel. It returns the
+recorded row's notification id (new or replayed) and ``None`` when there is
+nobody to notify or the feed write failed — the notify endpoint turns that
+``None`` into a 503 and echoes the id otherwise.
 """
 
 import uuid
@@ -67,10 +70,10 @@ class TestDispatchOfficerPageLink:
     @pytest.mark.asyncio
     async def test_appends_link_when_base_url_set(self, thread, record, monkeypatch):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", BASE)
-        ok = await main._dispatch_officer_page(
+        notification_id = await main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
-        assert ok is True
+        assert notification_id == "n-1"
         body = record.call_args.kwargs["body"]
         assert body.startswith("He fell asleep on watch.")
         assert body.endswith(f"Open his log to reply: {BASE}/sessions/{THREAD_ID}")
@@ -80,10 +83,10 @@ class TestDispatchOfficerPageLink:
         self, thread, record, monkeypatch
     ):
         monkeypatch.delenv("COCKPIT_EXTERNAL_URL", raising=False)
-        ok = await main._dispatch_officer_page(
+        notification_id = await main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
-        assert ok is True
+        assert notification_id == "n-1"
         assert record.call_args.kwargs["body"] == "He fell asleep on watch."
 
 
@@ -93,10 +96,10 @@ class TestDispatchOfficerPageRecords:
         self, thread, record, monkeypatch
     ):
         monkeypatch.setenv("COCKPIT_EXTERNAL_URL", BASE)
-        ok = await main._dispatch_officer_page(
+        notification_id = await main._dispatch_officer_page(
             thread, THREAD_ID, "Centurion needs you", "He fell asleep on watch."
         )
-        assert ok is True
+        assert notification_id == "n-1"
         record.assert_awaited_once()
         kwargs = record.call_args.kwargs
         assert kwargs["recipient_id"] == "user-1"
@@ -115,8 +118,10 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_default_subject(self, thread, record):
-        ok = await main._dispatch_officer_page(thread, THREAD_ID, "", "Wake up.")
-        assert ok is True
+        notification_id = await main._dispatch_officer_page(
+            thread, THREAD_ID, "", "Wake up."
+        )
+        assert notification_id == "n-1"
         assert record.call_args.kwargs["subject"] == "Your centurion needs you"
 
     @pytest.mark.asyncio
@@ -131,7 +136,7 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_explicit_category_and_key_are_passed_through(self, thread, record):
-        ok = await main._dispatch_officer_page(
+        notification_id = await main._dispatch_officer_page(
             thread,
             THREAD_ID,
             "Officer authorization unavailable",
@@ -139,7 +144,7 @@ class TestDispatchOfficerPageRecords:
             category="officer_runtime",
             dedup_key="officer_runtime_auth:claim-1",
         )
-        assert ok is True
+        assert notification_id == "n-1"
         assert record.call_args.kwargs["category"] == "officer_runtime"
         assert record.call_args.kwargs["dedup_key"] == "officer_runtime_auth:claim-1"
 
@@ -150,12 +155,14 @@ class TestDispatchOfficerPageRecords:
 
     @pytest.mark.asyncio
     async def test_no_owner_means_nobody_to_notify(self, record):
-        ok = await main._dispatch_officer_page({"user_id": None}, THREAD_ID, "S", "M")
-        assert ok is False
+        notification_id = await main._dispatch_officer_page(
+            {"user_id": None}, THREAD_ID, "S", "M"
+        )
+        assert notification_id is None
         record.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_feed_write_failure_is_reported_not_raised(self, thread, record):
         record.side_effect = RuntimeError("pool down")
-        ok = await main._dispatch_officer_page(thread, THREAD_ID, "S", "M")
-        assert ok is False
+        notification_id = await main._dispatch_officer_page(thread, THREAD_ID, "S", "M")
+        assert notification_id is None

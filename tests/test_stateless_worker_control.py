@@ -1712,10 +1712,16 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     monkeypatch.setattr(main.postgres_db, "mark_route_user_delivery", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "create_routed_blocking_freeze", committed)
     monkeypatch.setattr(main.postgres_db, "acquire", acquire)
+    from services.notification_service import RecordResult
+
     monkeypatch.setattr(
         main.notification_service,
-        "dispatch",
-        AsyncMock(return_value={"email": True, "email_message_id": "m-1"}),
+        "record_agent_message",
+        AsyncMock(
+            return_value=RecordResult(
+                "n-1", True, {"in_app": True, "email": True, "email_message_id": "m-1"}
+            )
+        ),
     )
     body = main.MessageSendRequest(
         to="user",

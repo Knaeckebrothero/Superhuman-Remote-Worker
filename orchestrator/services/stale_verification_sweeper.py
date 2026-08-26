@@ -167,7 +167,7 @@ async def _sweep_tick(
 
     for row in all_rows:
         try:
-            await notifier.notify_review_returned_to_manual(
+            await notifier.record_review_returned(
                 user_id=str(row["user_id"]),
                 job_id=str(row["id"]),
                 config_name=row.get("config_name") or "",

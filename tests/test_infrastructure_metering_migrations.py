@@ -248,10 +248,13 @@ APP_NOTIFICATIONS_MIGRATION = (
 APP_NOTIFICATION_STEPS_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0192_notification_steps.sql"
 )
-# Unified notification feed (slice 2: the escalate-on-timeout step table) —
-# the head after the 0184-0190 managed-repository / stateless-input lane and
-# the slice-1 feed tables; bump when the next lands.
-APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATION_STEPS_MIGRATION
+APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0193_notifications_cutover.sql"
+)
+# Unified notification feed (slice 3: the cutover backfill) — the head after
+# the 0184-0190 managed-repository / stateless-input lane and the slice-1/2
+# feed tables; bump when the next lands.
+APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATIONS_CUTOVER_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

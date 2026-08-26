@@ -370,6 +370,14 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
     monkeypatch.setattr(main, "postgres_db", db)
     broadcast = MagicMock()
     monkeypatch.setattr(notification_feed, "broadcast", broadcast)
+    # The bell row is a feed row: wire the singleton to this DB + feed (attrs
+    # only, so nothing leaks past the test).
+    from services.notification_service import notification_service
+
+    monkeypatch.setattr(notification_service, "_db", db)
+    monkeypatch.setattr(notification_service, "_available", True)
+    monkeypatch.setattr(notification_service, "_notification_feed", notification_feed)
+    monkeypatch.setattr(notification_service, "_email_service", None)
     loop = {**loop, "owner_id": user_id}
     kwargs = {
         "job_id": str(member_id),
@@ -384,10 +392,13 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
     await main._notify_loop_event(loop, **kwargs)
 
     async with db.acquire() as conn:
+        # The durable bell row is a feed row now (unified notification system):
+        # keyed on the turn identity, so the replay lands on the same row.
         assert (
             await conn.fetchval(
-                "SELECT count(*) FROM message_log WHERE job_id=$1 AND subject=$2",
-                member_id,
+                "SELECT count(*) FROM notifications "
+                "WHERE recipient_id=$1 AND category='loop_event' AND subject=$2",
+                user_id,
                 kwargs["subject"],
             )
             == 1

@@ -3267,8 +3267,6 @@ def format_officer_roster(data: dict[str, Any]) -> str:
         counts = [
             f"{int(row.get('in_flight_jobs') or 0)} job(s) in flight",
             f"{int(row.get('pending_events') or 0)} event(s) pending on him",
-            f"pages today {int(row.get('pages_today') or 0)}",
-            f"digest {int(row.get('digest_waiting') or 0)}",
         ]
         lines.append(f"    {' | '.join(counts)}")
         if row.get("last_activity_at"):
@@ -3332,12 +3330,8 @@ def format_officer_post(
         f"Next wake: {data.get('next_wake_at') or 'not scheduled'} | "
         f"Pending events: {int(data.get('pending_events') or 0)}"
     )
-    pages = data.get("pages_today") or {}
     backlog = data.get("backlog") or {}
-    lines.append(
-        f"Pages today: {pages.get('used', 0)}/{pages.get('budget', '?')} | "
-        f"Backlog auto-pull: {'on' if backlog.get('auto_pull') else 'off'}"
-    )
+    lines.append(f"Backlog auto-pull: {'on' if backlog.get('auto_pull') else 'off'}")
     spend = data.get("spend_today") or {}
     if spend.get("tokens") is not None:
         ceiling = spend.get("ceiling")
@@ -3360,15 +3354,6 @@ def format_officer_post(
                 if entry.get("below_floor"):
                     line += " — BELOW FLOOR"
             lines.append(line)
-
-    digest = data.get("digest") or []
-    if digest:
-        lines.append(f"Digest ({len(digest)} waiting):")
-        for item in digest[-5:]:
-            subject = item.get("subject") or ""
-            message = (item.get("message") or "").replace("\n", " ")
-            stamp = item.get("at") or ""
-            lines.append(f"  - {stamp} {subject}: {message}"[:400])
 
     if recent and recent.get("messages"):
         lines.append("")

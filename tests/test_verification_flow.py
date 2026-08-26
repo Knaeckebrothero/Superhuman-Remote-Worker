@@ -1107,7 +1107,7 @@ def _patch_escalation_collaborators(monkeypatch, main_module):
     monkeypatch.setattr(main_module, "_kick_session_wake_drain", kick_mock)
     monkeypatch.setattr(
         main_module.notification_service,
-        "notify_review_returned_to_manual",
+        "record_review_returned",
         notify_mock,
     )
     return update_mock, wake_mock, kick_mock, notify_mock
