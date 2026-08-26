@@ -77,6 +77,12 @@ class FakeDB:
             for row in self.pending_rows
         ]
 
+    async def fetchval(self, sql: str, *args):
+        self.fetch_calls.append((sql, args))
+        if sql == te._PENDING_EVENT_EXISTS_SQL:
+            return any(row.get("delivery_id") for row in self.pending_rows)
+        return None
+
 
 class FakeSession:
     def __init__(
@@ -465,6 +471,57 @@ class TestHappyPath:
             "stop",
             "drain",
             "stop",  # idempotent claim-finally belt
+        ]
+
+    @pytest.mark.asyncio
+    async def test_event_input_keeps_role_and_stable_delivery_identity(self, harness):
+        unit = uuid4()
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 5,
+                "content": "[wake] inspect the job",
+                "turn_number": 1,
+                "role": "event",
+                "delivery_id": delivery_id,
+            }
+        ]
+        claim_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 5,
+                "claim_generation": 9,
+            }
+        )
+        harness.db.claim_stateless_input_delivery = claim_delivery
+
+        await harness.executor._serve_claim(
+            # A pre-0185 wake can sit below the old human-only watermark. The
+            # ledger identity, not seq>consumed alone, keeps it executable.
+            make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        claim_delivery.assert_awaited_once_with(
+            thread_id=str(unit),
+            delivery_id=delivery_id,
+            lease_token=7,
+            executor_id="test-pod",
+            pod_uid=harness.executor._pod_uid,
+        )
+        assert harness.consumed == [
+            {
+                "content": "[wake] inspect the job",
+                "id": row_id,
+                "role": "event",
+                "delivery_id": delivery_id,
+                "claim_generation": 9,
+            }
+        ]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 7, "consumed_seq": 5}
         ]
 
     @pytest.mark.asyncio
@@ -1000,20 +1057,27 @@ class TestStripRestoredPending:
         assert removed == 0
         assert len(msgs) == 2
 
-    def test_stops_at_unmatched_trailing_human(self):
+    def test_pending_event_excluded_from_restore_does_not_block_human_strip(self):
         from langchain_core.messages import HumanMessage
 
-        # An unanswered role='event' row restores as a HumanMessage but is
-        # never in pending_rows (orchestrator enqueues role='human' only) —
-        # it stays, and pending humans BELOW it also stay (documented).
-        msgs = [
-            HumanMessage(content="pending-1", id="p1"),
-            HumanMessage(content="[wake] job finished", id="ev"),
+        # Unadmitted ledger rows are excluded from passive restore. The event
+        # still appears in the executor's merged pending query after the human;
+        # it must not become an unmatched tail sentinel that leaves the human
+        # duplicated in memory when the executor injects it.
+        msgs = [HumanMessage(content="pending-1", id="p1")]
+        pending = [
+            {"id": "row-1", "seq": 10, "content": "pending-1", "role": "human"},
+            {
+                "id": "event-row",
+                "seq": 11,
+                "content": "[wake] job finished",
+                "role": "event",
+                "delivery_id": "delivery",
+            },
         ]
-        pending = [{"id": "row-1", "seq": 10, "content": "pending-1"}]
         removed = te.strip_restored_pending_humans(msgs, pending)
-        assert removed == 0
-        assert len(msgs) == 2
+        assert removed == 1
+        assert msgs == []
 
     def test_empty_inputs_are_noops(self):
         assert te.strip_restored_pending_humans([], [{"id": "a"}]) == 0
@@ -1201,6 +1265,49 @@ class TestAffinity:
             1,
             2,
         ]
+
+    @pytest.mark.asyncio
+    async def test_warm_attach_consumes_event_once_under_new_lease(self, harness):
+        unit = uuid4()
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 1, "content": "human", "turn_number": 1}
+        ]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=1, input_seq=1)
+        )
+
+        row_id = str(uuid4())
+        delivery_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 2,
+                "content": "event",
+                "turn_number": 2,
+                "role": "event",
+                "delivery_id": delivery_id,
+            }
+        ]
+        claim_delivery = AsyncMock(
+            return_value={
+                "message_id": row_id,
+                "seq": 2,
+                "claim_generation": 4,
+            }
+        )
+        harness.db.claim_stateless_input_delivery = claim_delivery
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=2, input_seq=2, consumed_seq=1)
+        )
+        await _finish(harness)
+
+        assert len(harness.calls["attach"]) == 1
+        assert [item.get("role", "human") for item in harness.consumed] == [
+            "human",
+            "event",
+        ]
+        claim_delivery.assert_awaited_once()
+        assert harness.calls["complete"][-1]["consumed_seq"] == 2
 
     @pytest.mark.asyncio
     async def test_warm_reuse_refuses_divergent_durable_turn_identity(self, harness):
@@ -1421,6 +1528,45 @@ def _db_with_conn(conn):
 
 
 class TestFencedPersistence:
+    @pytest.mark.asyncio
+    async def test_provider_delivery_callback_uses_exact_stateless_owner(
+        self, monkeypatch
+    ):
+        transition = AsyncMock(return_value=True)
+        db = SimpleNamespace(transition_stateless_input_delivery=transition)
+        thread_id = str(uuid4())
+        monkeypatch.setattr(pa, "_session", SimpleNamespace(postgres_conn=db))
+        monkeypatch.setattr(pa, "_thread_id", thread_id)
+        handle = LeaseHandle()
+        handle.update(
+            thread_id,
+            17,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+        )
+        token = current_lease.set(handle)
+        try:
+            assert await pa._transition_claimed_input(
+                "0d8a40c3-8f0f-4f2b-acab-8a07660ecf5d",
+                3,
+                "admitted",
+                turn_number=8,
+            )
+        finally:
+            current_lease.reset(token)
+
+        transition.assert_awaited_once_with(
+            thread_id=thread_id,
+            delivery_id="0d8a40c3-8f0f-4f2b-acab-8a07660ecf5d",
+            lease_token=17,
+            executor_id="executor-a",
+            pod_uid="pod-a",
+            claim_generation=3,
+            transition="admitted",
+            turn_number=8,
+            reason=None,
+        )
+
     @pytest.mark.asyncio
     async def test_fence_rejection_raises_and_marks_lost(self):
         conn = _FenceConn(fence_row=None)

@@ -5307,6 +5307,163 @@ COMMENT ON FUNCTION public.require_executed_persistent_wake() IS 'Rolling-upgrad
 
 
 --
+-- Name: require_input_delivery_lane_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_input_delivery_lane_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_lane TEXT;
+    message_role TEXT;
+BEGIN
+    SELECT thread.execution_lane
+      INTO current_lane
+      FROM public.threads AS thread
+     WHERE thread.id = NEW.thread_id
+     FOR NO KEY UPDATE;
+
+    IF current_lane IS NULL OR NEW.execution_lane IS DISTINCT FROM current_lane THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'input_delivery_lane_mismatch',
+            MESSAGE = 'Input delivery lane does not match its owning thread',
+            HINT = 'Retry from a lane-aware input-delivery writer.';
+    END IF;
+
+    IF current_lane = 'stateless' THEN
+        SELECT message.role
+          INTO message_role
+          FROM public.thread_messages AS message
+         WHERE message.id = NEW.message_id
+           AND message.thread_id = NEW.thread_id;
+        IF message_role IS DISTINCT FROM 'event'
+           OR NEW.source IS DISTINCT FROM 'officer_wake' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'stateless_input_delivery_event_only',
+                MESSAGE = 'Stateless durable input authority is reserved for server events';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_input_delivery_lane_authority(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_input_delivery_lane_authority() IS 'Rejects rolling-old or forged stateless input-ledger writers before queueing.';
+
+
+--
+-- Name: require_stateless_input_delivery_claim(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_stateless_input_delivery_claim() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    pending_event BOOLEAN := FALSE;
+BEGIN
+    IF NEW.unit_kind IS DISTINCT FROM 'session_turn' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.thread_input_deliveries AS delivery
+          JOIN public.thread_messages AS message
+            ON message.id = delivery.message_id
+         WHERE delivery.thread_id = NEW.unit_id
+           AND delivery.execution_lane = 'stateless'
+           AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+           AND message.rewound_at IS NULL
+    ) INTO pending_event;
+
+    IF pending_event
+       AND NEW.state = 'leased'
+       AND (
+           OLD.state IS DISTINCT FROM NEW.state
+           OR OLD.lease_token IS DISTINCT FROM NEW.lease_token
+       )
+       AND NEW.input_delivery_capable_lease_token
+            IS DISTINCT FROM NEW.lease_token THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'stateless_input_delivery_requires_capable_claim',
+            MESSAGE = 'Stateless event input requires a lane-aware executor claim',
+            HINT = 'Retry the claim from an input-ledger-aware runtime.';
+    END IF;
+
+    IF NEW.consumed_seq IS NOT NULL
+       AND (
+           OLD.consumed_seq IS NULL
+           OR NEW.consumed_seq > OLD.consumed_seq
+       )
+       AND EXISTS (
+           SELECT 1
+             FROM public.thread_input_deliveries AS delivery
+             JOIN public.thread_messages AS message
+               ON message.id = delivery.message_id
+            WHERE delivery.thread_id = NEW.unit_id
+              AND delivery.execution_lane = 'stateless'
+              AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+              AND message.rewound_at IS NULL
+              AND message.seq <= NEW.consumed_seq
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'stateless_input_delivery_requires_admission',
+            MESSAGE = 'A stateless event cannot be consumed before provider admission';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_stateless_input_delivery_claim(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_stateless_input_delivery_claim() IS 'Fences rolling-old stateless claims and refuses watermark consumption before the exact durable event reaches provider admission.';
+
+
+--
+-- Name: require_thread_lane_without_pending_input(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_thread_lane_without_pending_input() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.execution_lane IS DISTINCT FROM OLD.execution_lane
+       AND EXISTS (
+           SELECT 1
+             FROM public.thread_input_deliveries AS delivery
+            WHERE delivery.thread_id = NEW.id
+              AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'thread_lane_change_has_pending_input',
+            MESSAGE = 'Thread lane cannot change while durable input is pending',
+            HINT = 'Admit or settle the exact delivery before changing lanes.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_thread_lane_without_pending_input(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_thread_lane_without_pending_input() IS 'Serializes lane changes with durable input so one stable delivery cannot become unclaimable between the pinned and stateless authorities.';
+
+
+--
 -- Name: resource_inventory_snapshot_item_size_bytes(text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -9202,6 +9359,7 @@ CREATE TABLE public.run_queue (
     control_consumed_seq bigint DEFAULT 0 NOT NULL,
     interrupt_admission_lease_token bigint,
     interrupt_admission_turn_id integer,
+    input_delivery_capable_lease_token bigint,
     CONSTRAINT run_queue_interrupt_admission_shape CHECK ((((interrupt_admission_lease_token IS NULL) AND (interrupt_admission_turn_id IS NULL)) OR ((interrupt_admission_lease_token IS NOT NULL) AND (interrupt_admission_turn_id IS NOT NULL) AND (unit_kind = 'session_turn'::text) AND (state = 'leased'::text) AND (interrupt_admission_lease_token = lease_token) AND (interrupt_admission_lease_token > 0) AND (interrupt_admission_turn_id > 0))))
 );
 
@@ -9330,6 +9488,13 @@ COMMENT ON COLUMN public.run_queue.interrupt_admission_lease_token IS 'NULL clos
 --
 
 COMMENT ON COLUMN public.run_queue.interrupt_admission_turn_id IS 'Concrete active turn accepted by the exact interrupt lease window. NULL means closed. This is deliberately not a queue watermark: an interrupt for one turn must never wake or cancel a later turn.';
+
+
+--
+-- Name: COLUMN run_queue.input_delivery_capable_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.input_delivery_capable_lease_token IS '0185 rolling-upgrade marker. A session claim with pending event input must stamp the newly allocated lease token in the same UPDATE.';
 
 
 --
@@ -10329,10 +10494,15 @@ CREATE TABLE public.thread_input_deliveries (
     settled_at timestamp with time zone,
     deferred_at timestamp with time zone,
     updated_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    owner_run_queue_lease_token bigint,
+    owner_executor text,
+    owner_executor_pod_uid text,
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
-    CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))),
-    CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))),
+    CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
+    CONSTRAINT thread_input_deliveries_lane_check CHECK ((execution_lane = ANY (ARRAY['pinned'::text, 'stateless'::text]))),
+    CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((execution_lane = 'pinned'::text) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL) AND (((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))) OR ((execution_lane = 'stateless'::text) AND (owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL) AND (((claim_generation = 0) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL)) OR ((claim_generation > 0) AND (owner_run_queue_lease_token IS NOT NULL) AND (owner_run_queue_lease_token > 0) AND (owner_executor IS NOT NULL) AND (btrim(owner_executor) <> ''::text) AND (owner_executor_pod_uid IS NOT NULL) AND (btrim(owner_executor_pod_uid) <> ''::text)))))),
     CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
     CONSTRAINT thread_input_deliveries_state_check CHECK ((state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'admitted'::text, 'settled'::text, 'deferred'::text])))
 );
@@ -10357,6 +10527,34 @@ COMMENT ON COLUMN public.thread_input_deliveries.claim_generation IS 'Monotonic 
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.owner_runtime_generation IS 'Process generation inside one pod. A container restart may reclaim RAM-queued work even when the Kubernetes pod UID and agent row are unchanged.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.execution_lane IS 'Server-observed owning thread lane. A rolling-old writer defaults to pinned and is rejected when the live thread is stateless.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_run_queue_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_run_queue_lease_token IS 'Exact stateless session_turn fencing token that owns provider admission.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_executor; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_executor IS 'Stateless executor identity snapshot; paired with the exact run_queue lease.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_executor_pod_uid; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_executor_pod_uid IS 'Kubernetes Pod UID snapshot for the stateless delivery claimant.';
 
 
 --
@@ -15384,6 +15582,13 @@ CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs 
 
 
 --
+-- Name: thread_input_deliveries trg_input_delivery_lane_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_input_delivery_lane_authority BEFORE INSERT OR UPDATE OF thread_id, message_id, source, execution_lane ON public.thread_input_deliveries FOR EACH ROW EXECUTE FUNCTION public.require_input_delivery_lane_authority();
+
+
+--
 -- Name: jobs trg_job_deliverable_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -15507,6 +15712,20 @@ CREATE TRIGGER trg_runtime_actor_grants_officer_agent_binding BEFORE INSERT OR U
 --
 
 CREATE TRIGGER trg_session_wake_requires_execution_admission BEFORE UPDATE OF state ON public.session_wake_events FOR EACH ROW EXECUTE FUNCTION public.require_executed_persistent_wake();
+
+
+--
+-- Name: run_queue trg_stateless_input_delivery_claim; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_stateless_input_delivery_claim BEFORE UPDATE OF state, lease_token, consumed_seq ON public.run_queue FOR EACH ROW EXECUTE FUNCTION public.require_stateless_input_delivery_claim();
+
+
+--
+-- Name: threads trg_thread_lane_without_pending_input; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_thread_lane_without_pending_input BEFORE UPDATE OF execution_lane ON public.threads FOR EACH ROW EXECUTE FUNCTION public.require_thread_lane_without_pending_input();
 
 
 --

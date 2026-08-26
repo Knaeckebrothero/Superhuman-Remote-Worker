@@ -207,6 +207,10 @@ _CLAIM_UPDATE_TAIL = """
 UPDATE run_queue r SET
     state = 'leased',
     lease_token = lease_token + 1,
+    input_delivery_capable_lease_token = CASE
+        WHEN r.unit_kind = 'session_turn' THEN lease_token + 1
+        ELSE r.input_delivery_capable_lease_token
+    END,
     leased_by = $2::text,
     last_leased_by = $2::text,
     leased_until = now() + make_interval(secs => $3::float8),
@@ -316,12 +320,40 @@ WHERE queue.unit_id = $1::uuid
                       FROM thread_messages AS target
                       WHERE target.thread_id = queue.unit_id
                         AND target.seq = $4::bigint
-                        AND target.role = 'human'
                         AND target.rewound_at IS NULL
                         AND target.turn_number = $3::integer
+                        AND (
+                            target.role = 'human'
+                            OR (
+                                target.role = 'event'
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM thread_input_deliveries AS delivery
+                                    WHERE delivery.message_id = target.id
+                                      AND delivery.thread_id = queue.unit_id
+                                      AND delivery.execution_lane = 'stateless'
+                                      AND delivery.state IN ('admitted', 'settled')
+                                      AND delivery.owner_run_queue_lease_token
+                                            = $2::bigint
+                                )
+                            )
+                        )
                   )
                   AND (
                       COALESCE(queue.consumed_seq, -1) >= $4::bigint
+                      OR EXISTS (
+                          SELECT 1
+                          FROM thread_messages AS event_target
+                          JOIN thread_input_deliveries AS event_delivery
+                            ON event_delivery.message_id = event_target.id
+                          WHERE event_target.thread_id = queue.unit_id
+                            AND event_target.seq = $4::bigint
+                            AND event_target.role = 'event'
+                            AND event_delivery.execution_lane = 'stateless'
+                            AND event_delivery.state IN ('admitted', 'settled')
+                            AND event_delivery.owner_run_queue_lease_token
+                                  = $2::bigint
+                      )
                       OR (
                           queue.input_seq IS NOT NULL
                           AND $4::bigint <= queue.input_seq
@@ -359,12 +391,32 @@ RETURNING 1
 # that completion just changed to ``done``.
 _COMPLETE_SQL = """
 UPDATE run_queue SET
-    consumed_seq = $3::bigint,
+    consumed_seq = CASE
+        WHEN $3::bigint IS NULL THEN consumed_seq
+        ELSE GREATEST(COALESCE(consumed_seq, $3::bigint), $3::bigint)
+    END,
     attempts_since_completion = 0,
     queued_at = now(),
     state = CASE WHEN (input_seq IS NOT NULL
-                       AND ($3::bigint IS NULL OR input_seq > $3::bigint))
+                       AND (
+                           $3::bigint IS NULL
+                           OR input_seq > GREATEST(
+                               COALESCE(consumed_seq, $3::bigint), $3::bigint
+                           )
+                       ))
                       OR control_input_seq > control_consumed_seq
+                      OR EXISTS (
+                          SELECT 1
+                          FROM thread_input_deliveries AS delivery
+                          JOIN thread_messages AS message
+                            ON message.id = delivery.message_id
+                          WHERE delivery.thread_id = run_queue.unit_id
+                            AND delivery.execution_lane = 'stateless'
+                            AND delivery.state IN (
+                                'persisted', 'owned', 'queued', 'deferred'
+                            )
+                            AND message.rewound_at IS NULL
+                      )
                  THEN 'queued' ELSE 'done' END,
     leased_by = NULL,
     leased_until = NULL,

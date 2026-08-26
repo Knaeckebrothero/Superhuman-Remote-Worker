@@ -1,13 +1,13 @@
-"""Durable execution authority for pinned persistent-session input.
+"""Durable execution authority for persistent-session input.
 
 ``thread_messages`` is the transcript, not an inbox: restore presents those
 rows as context and never schedules them.  This module keeps the smallest
 separate state needed to make a persisted input reclaimable and to prove when
 its one paid turn crossed provider admission.
 
-All mutators use the repository lock order ``thread -> agent -> delivery``.
-The agent and pod identities are server-issued observations; no model-visible
-tool schema contains them.
+Pinned mutators use ``thread -> agent -> delivery``; stateless mutators use
+``thread -> run_queue -> delivery``. Runtime identities and queue leases are
+server-issued observations; no model-visible tool schema contains them.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ _THREAD_MESSAGE_ID_NAMESPACE = UUID("4b9d8f7e-2c3a-5d6b-8e1f-0a1b2c3d4e5f")
 
 
 class InputDeliveryAuthorityLost(RuntimeError):
-    """The calling runtime is not the exact current pinned thread owner."""
+    """The caller is not the exact current delivery authority."""
 
 
 class InputDeliveryConflict(RuntimeError):
@@ -45,7 +45,7 @@ async def lock_runtime_authority(
     thread_id: str | UUID,
     agent_id: str | UUID,
     pod_uid: str,
-) -> None:
+) -> dict[str, Any]:
     """Lock and prove exact reciprocal thread/agent/pod authority."""
 
     thread_uuid = UUID(str(thread_id))
@@ -55,7 +55,8 @@ async def lock_runtime_authority(
         raise InputDeliveryAuthorityLost("runtime pod identity is unavailable")
 
     thread = await conn.fetchrow(
-        "SELECT id, agent_id, status, execution_lane FROM threads "
+        "SELECT id, agent_id, status, execution_lane, user_id, total_turns "
+        "FROM threads "
         "WHERE id = $1 FOR UPDATE",
         thread_uuid,
     )
@@ -78,6 +79,57 @@ async def lock_runtime_authority(
         or str(agent["status"] or "") in {"offline", "deleted"}
     ):
         raise InputDeliveryAuthorityLost("agent runtime authority was lost")
+    return _dict(thread)
+
+
+async def _lock_stateless_runtime_authority(
+    conn: Any,
+    *,
+    thread_id: str | UUID,
+    lease_token: int,
+    executor_id: str,
+    pod_uid: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Lock and prove one exact stateless ``session_turn`` claimant.
+
+    Lock order is ``thread -> run_queue``. The delivery row is locked by the
+    caller only after this helper returns, matching orchestrator-side event
+    admission (``thread -> run_queue -> delivery``).
+    """
+
+    thread_uuid = UUID(str(thread_id))
+    executor = str(executor_id or "").strip()
+    pod = str(pod_uid or "").strip()
+    if int(lease_token) <= 0 or not executor or not pod:
+        raise InputDeliveryAuthorityLost("stateless runtime identity is incomplete")
+    thread = await conn.fetchrow(
+        "SELECT id, agent_id, status, execution_lane, user_id, total_turns "
+        "FROM threads WHERE id = $1 FOR SHARE",
+        thread_uuid,
+    )
+    if (
+        thread is None
+        or str(thread["execution_lane"] or "") != "stateless"
+        or thread["agent_id"] is not None
+        or str(thread["status"] or "") in {"ended", "suspended"}
+    ):
+        raise InputDeliveryAuthorityLost("stateless thread authority was lost")
+    queue = await conn.fetchrow(
+        "SELECT unit_id, unit_kind, state, lease_token, leased_by, "
+        "input_delivery_capable_lease_token FROM run_queue "
+        "WHERE unit_id = $1 FOR SHARE",
+        thread_uuid,
+    )
+    if (
+        queue is None
+        or str(queue["unit_kind"] or "") != "session_turn"
+        or str(queue["state"] or "") != "leased"
+        or int(queue["lease_token"] or 0) != int(lease_token)
+        or str(queue["leased_by"] or "") != executor
+        or int(queue["input_delivery_capable_lease_token"] or 0) != int(lease_token)
+    ):
+        raise InputDeliveryAuthorityLost("stateless queue lease was lost")
+    return _dict(thread), _dict(queue)
 
 
 async def persist_input_delivery(
@@ -110,7 +162,7 @@ async def persist_input_delivery(
         raise InputDeliveryAuthorityLost("incomplete runtime identity")
 
     if has_identity:
-        await lock_runtime_authority(
+        thread = await lock_runtime_authority(
             conn,
             thread_id=thread_uuid,
             agent_id=str(agent_id),
@@ -118,11 +170,87 @@ async def persist_input_delivery(
         )
     else:
         # Transcript FK + activity updates follow the same parent-first order.
-        exists = await conn.fetchval(
-            "SELECT id FROM threads WHERE id = $1 FOR UPDATE", thread_uuid
+        thread_row = await conn.fetchrow(
+            "SELECT id, agent_id, status, execution_lane, user_id, total_turns "
+            "FROM threads WHERE id = $1 FOR UPDATE",
+            thread_uuid,
         )
-        if exists is None:
+        if thread_row is None:
             raise InputDeliveryAuthorityLost("thread no longer exists")
+        thread = _dict(thread_row)
+
+    execution_lane = str(thread.get("execution_lane") or "pinned")
+    if execution_lane not in {"pinned", "stateless"}:
+        raise InputDeliveryAuthorityLost("thread execution lane is unsupported")
+
+    # A provider-admitted delivery is an immutable execution receipt. Its
+    # outbox response may have been lost and the thread may legitimately move
+    # lanes before the stable retry arrives. Resolve that retry against the
+    # historical ledger lane/identity, not the thread's new lane, and return
+    # without touching either queue. Pending rows deliberately stay on the
+    # current-lane path below so a lane mismatch cannot re-arm or launder them.
+    terminal_replay = await conn.fetchrow(
+        "SELECT delivery.*, message.seq, message.thread_id AS message_thread_id, "
+        "message.role, message.content, message.turn_number "
+        "FROM thread_input_deliveries AS delivery "
+        "JOIN thread_messages AS message ON message.id=delivery.message_id "
+        "WHERE delivery.delivery_id=$1 "
+        "AND delivery.state IN ('admitted','settled') "
+        "FOR UPDATE OF delivery",
+        delivery_uuid,
+    )
+    if terminal_replay is not None:
+        if (
+            str(terminal_replay["thread_id"]) != str(thread_uuid)
+            or str(terminal_replay["message_thread_id"]) != str(thread_uuid)
+            or str(terminal_replay["message_id"]) != str(row_id)
+            or str(terminal_replay["source"]) != source_value
+            or str(terminal_replay["role"]) != str(role)
+            or str(terminal_replay["execution_lane"] or "")
+            not in {"pinned", "stateless"}
+        ):
+            raise InputDeliveryConflict(
+                "stable input identity conflicts with terminal delivery"
+            )
+        stored_content = str(terminal_replay["content"] or "")
+        if stored_content != str(content) and source_value != "officer_wake":
+            raise InputDeliveryConflict(
+                "stable input identity conflicts with transcript"
+            )
+        result = _dict(terminal_replay)
+        result.update(
+            {
+                "message_id": str(row_id),
+                "message_row_id": str(row_id),
+                "seq": int(terminal_replay["seq"]),
+                "transcript_inserted": False,
+                "content": stored_content,
+                "role": str(terminal_replay["role"]),
+                "turn_number": terminal_replay["turn_number"],
+                # This is provenance, not the thread's newly selected lane.
+                "execution_lane": str(terminal_replay["execution_lane"]),
+                "queue_state": None,
+            }
+        )
+        return result
+
+    if has_identity and execution_lane != "pinned":
+        raise InputDeliveryAuthorityLost("pinned runtime cannot claim stateless input")
+    if not has_identity and execution_lane == "stateless":
+        if str(role) != "event" or source_value != "officer_wake":
+            raise InputDeliveryAuthorityLost(
+                "stateless durable input is reserved for server events"
+            )
+        if thread.get("agent_id") is not None:
+            raise InputDeliveryAuthorityLost("stateless thread is unexpectedly bound")
+
+    effective_turn_number = turn_number
+    if execution_lane == "stateless" and (
+        isinstance(effective_turn_number, bool)
+        or not isinstance(effective_turn_number, int)
+        or effective_turn_number <= 0
+    ):
+        effective_turn_number = int(thread.get("total_turns") or 0) + 1
 
     inserted = await conn.fetchrow(
         """
@@ -130,17 +258,18 @@ async def persist_input_delivery(
             (id, thread_id, role, content, turn_number)
         VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (id) DO NOTHING
-        RETURNING id, seq, thread_id, role, content
+        RETURNING id, seq, thread_id, role, content, turn_number
         """,
         row_id,
         thread_uuid,
         str(role),
         str(content),
-        turn_number,
+        effective_turn_number,
     )
     transcript_inserted = inserted is not None
     message = inserted or await conn.fetchrow(
-        "SELECT id, seq, thread_id, role, content FROM thread_messages WHERE id = $1",
+        "SELECT id, seq, thread_id, role, content, turn_number "
+        "FROM thread_messages WHERE id = $1",
         row_id,
     )
     if (
@@ -155,20 +284,94 @@ async def persist_input_delivery(
             "UPDATE threads SET last_activity = CURRENT_TIMESTAMP, "
             "total_turns = GREATEST(total_turns, COALESCE($2, 0)) WHERE id = $1",
             thread_uuid,
-            turn_number,
+            effective_turn_number,
         )
+
+    existing_delivery = await conn.fetchrow(
+        "SELECT * FROM thread_input_deliveries WHERE delivery_id = $1",
+        delivery_uuid,
+    )
+    existing_state = (
+        str(existing_delivery["state"] or "") if existing_delivery is not None else ""
+    )
+
+    queue_state: str | None = None
+    queue_deferred_reason: str | None = None
+    if (
+        not has_identity
+        and execution_lane == "stateless"
+        and existing_state not in {"admitted", "settled"}
+    ):
+        status = str(thread.get("status") or "")
+        if status == "suspended":
+            woke = await conn.fetchval(
+                "UPDATE threads SET status = 'created', agent_id = NULL, "
+                "control_admission_agent_id = NULL, awaiting_user_since = NULL, "
+                "extend_count = 0 WHERE id = $1 AND execution_lane = 'stateless' "
+                "AND status = 'suspended' RETURNING id",
+                thread_uuid,
+            )
+            if woke is None:
+                raise InputDeliveryAuthorityLost(
+                    "stateless suspended-input wake lost thread authority"
+                )
+            status = "created"
+        if status in {"created", "active", "awaiting_user"}:
+            queue = await conn.fetchrow(
+                "SELECT unit_kind, state, lease_token, "
+                "input_delivery_capable_lease_token FROM run_queue "
+                "WHERE unit_id = $1 FOR UPDATE",
+                thread_uuid,
+            )
+            # A rolling-old executor that already owns this unit cannot see an
+            # event row. Leave the durable input unqueued until that exact
+            # claim finishes; the outbox's stable retry then admits it without
+            # disturbing the old turn's watermark.
+            if queue is not None and str(queue["unit_kind"] or "") != "session_turn":
+                raise InputDeliveryAuthorityLost("run_queue unit kind is incompatible")
+            if (
+                queue is not None
+                and str(queue["state"] or "") == "leased"
+                and int(queue["input_delivery_capable_lease_token"] or 0)
+                != int(queue["lease_token"] or 0)
+            ):
+                queue_deferred_reason = "rolling_old_executor"
+            else:
+                from src.shared.run_queue import (
+                    UNIT_KIND_SESSION_TURN,
+                    record_input_seq,
+                )
+
+                queue_state = await record_input_seq(
+                    conn,
+                    unit_id=thread_uuid,
+                    unit_kind=UNIT_KIND_SESSION_TURN,
+                    input_seq=int(message["seq"]),
+                    fair_key=(
+                        str(thread["user_id"])
+                        if thread.get("user_id") is not None
+                        else None
+                    ),
+                )
+                if queue_state == "parked":
+                    queue_deferred_reason = "run_queue_parked"
+        elif status != "ended":
+            raise InputDeliveryAuthorityLost(
+                f"stateless thread does not accept event input ({status or 'unknown'})"
+            )
 
     await conn.execute(
         """
         INSERT INTO thread_input_deliveries
-            (delivery_id, thread_id, message_id, source)
-        VALUES ($1, $2, $3, $4)
+            (delivery_id, thread_id, message_id, source, execution_lane)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (delivery_id) DO NOTHING
         """,
         delivery_uuid,
         thread_uuid,
         row_id,
         source_value,
+        execution_lane,
     )
     delivery = await conn.fetchrow(
         "SELECT * FROM thread_input_deliveries WHERE delivery_id = $1 FOR UPDATE",
@@ -179,6 +382,7 @@ async def persist_input_delivery(
         or str(delivery["thread_id"]) != str(thread_uuid)
         or str(delivery["message_id"]) != str(row_id)
         or str(delivery["source"]) != source_value
+        or str(delivery["execution_lane"] or "") != execution_lane
     ):
         raise InputDeliveryConflict("stable input identity conflicts with delivery")
 
@@ -190,6 +394,34 @@ async def persist_input_delivery(
     stored_content = str(message["content"] or "")
     if stored_content != str(content) and source_value != "officer_wake":
         raise InputDeliveryConflict("stable input identity conflicts with transcript")
+
+    if (
+        not has_identity
+        and execution_lane == "stateless"
+        and str(delivery["state"]) not in {"admitted", "settled"}
+    ):
+        if queue_deferred_reason is not None:
+            delivery = await conn.fetchrow(
+                "UPDATE thread_input_deliveries SET state = 'deferred', "
+                "deferred_reason = $2, deferred_at = statement_timestamp(), "
+                "queued_at = NULL, updated_at = statement_timestamp() "
+                "WHERE delivery_id = $1 AND execution_lane = 'stateless' "
+                "AND state IN ('persisted', 'queued', 'deferred') RETURNING *",
+                delivery_uuid,
+                queue_deferred_reason,
+            )
+        elif queue_state is not None:
+            delivery = await conn.fetchrow(
+                "UPDATE thread_input_deliveries SET state = 'queued', "
+                "queued_at = COALESCE(queued_at, statement_timestamp()), "
+                "deferred_reason = NULL, deferred_at = NULL, "
+                "updated_at = statement_timestamp() "
+                "WHERE delivery_id = $1 AND execution_lane = 'stateless' "
+                "AND state IN ('persisted', 'queued', 'deferred') RETURNING *",
+                delivery_uuid,
+            )
+        if delivery is None:
+            raise InputDeliveryAuthorityLost("stateless input admission was lost")
 
     if has_identity and str(delivery["state"]) not in {"admitted", "settled"}:
         same_runtime = (
@@ -233,9 +465,168 @@ async def persist_input_delivery(
             "transcript_inserted": transcript_inserted,
             "content": stored_content,
             "role": str(role),
+            "turn_number": message.get("turn_number"),
+            "execution_lane": execution_lane,
+            "queue_state": queue_state,
         }
     )
     return result
+
+
+async def claim_stateless_input_delivery(
+    conn: Any,
+    *,
+    thread_id: str | UUID,
+    delivery_id: str | UUID,
+    lease_token: int,
+    executor_id: str,
+    pod_uid: str,
+) -> dict[str, Any] | None:
+    """Bind one pending event to the exact current stateless queue lease."""
+
+    thread_uuid = UUID(str(thread_id))
+    delivery_uuid = UUID(str(delivery_id))
+    await _lock_stateless_runtime_authority(
+        conn,
+        thread_id=thread_uuid,
+        lease_token=lease_token,
+        executor_id=executor_id,
+        pod_uid=pod_uid,
+    )
+    row = await conn.fetchrow(
+        "SELECT delivery.*, message.seq, message.role, message.content, "
+        "message.turn_number FROM thread_input_deliveries AS delivery "
+        "JOIN thread_messages AS message ON message.id = delivery.message_id "
+        "WHERE delivery.delivery_id = $1 AND delivery.thread_id = $2 "
+        "FOR UPDATE OF delivery",
+        delivery_uuid,
+        thread_uuid,
+    )
+    if (
+        row is None
+        or str(row["execution_lane"] or "") != "stateless"
+        or str(row["role"] or "") != "event"
+        or str(row["state"] or "") not in {"persisted", "queued", "deferred"}
+    ):
+        return None
+    same_claim = (
+        int(row["owner_run_queue_lease_token"] or 0) == int(lease_token)
+        and str(row["owner_executor"] or "") == str(executor_id)
+        and str(row["owner_executor_pod_uid"] or "") == str(pod_uid)
+    )
+    claimed = await conn.fetchrow(
+        "UPDATE thread_input_deliveries SET state = 'queued', "
+        "claim_generation = claim_generation + $2::bigint, "
+        "owner_run_queue_lease_token = $3, owner_executor = $4, "
+        "owner_executor_pod_uid = $5, owned_at = statement_timestamp(), "
+        "queued_at = COALESCE(queued_at, statement_timestamp()), "
+        "deferred_reason = NULL, deferred_at = NULL, "
+        "updated_at = statement_timestamp() WHERE delivery_id = $1 "
+        "AND execution_lane = 'stateless' "
+        "AND state IN ('persisted', 'queued', 'deferred') RETURNING *",
+        delivery_uuid,
+        0 if same_claim else 1,
+        int(lease_token),
+        str(executor_id),
+        str(pod_uid),
+    )
+    if claimed is None:
+        return None
+    result = _dict(claimed)
+    result.update(
+        {
+            "message_id": str(row["message_id"]),
+            "seq": int(row["seq"]),
+            "role": str(row["role"]),
+            "content": str(row["content"] or ""),
+            "turn_number": row["turn_number"],
+        }
+    )
+    return result
+
+
+async def transition_stateless_input_delivery(
+    conn: Any,
+    *,
+    thread_id: str | UUID,
+    delivery_id: str | UUID,
+    lease_token: int,
+    executor_id: str,
+    pod_uid: str,
+    claim_generation: int,
+    transition: str,
+    turn_number: int | None = None,
+    reason: str | None = None,
+) -> bool:
+    """CAS one stateless event through provider admission and settlement."""
+
+    await _lock_stateless_runtime_authority(
+        conn,
+        thread_id=thread_id,
+        lease_token=lease_token,
+        executor_id=executor_id,
+        pod_uid=pod_uid,
+    )
+    if transition == "admitted":
+        if (
+            isinstance(turn_number, bool)
+            or not isinstance(turn_number, int)
+            or turn_number <= 0
+        ):
+            raise ValueError("admitted input requires a positive turn number")
+        states = ("queued",)
+        assignments = (
+            "state = 'admitted', admitted_at = statement_timestamp(), "
+            "admitted_turn_number = input_params.turn_number, "
+            "deferred_reason = NULL, "
+            "deferred_at = NULL, updated_at = statement_timestamp()"
+        )
+    elif transition == "settled":
+        states = ("admitted",)
+        assignments = (
+            "state = 'settled', settled_at = statement_timestamp(), "
+            "updated_at = statement_timestamp()"
+        )
+    elif transition == "deferred":
+        states = ("queued",)
+        assignments = (
+            "state = 'deferred', deferred_reason = "
+            "LEFT(COALESCE(input_params.reason, 'retryable'), 120), "
+            "deferred_at = statement_timestamp(), queued_at = NULL, "
+            "updated_at = statement_timestamp()"
+        )
+    elif transition == "unadmit":
+        states = ("admitted",)
+        assignments = (
+            "state = 'deferred', admitted_at = NULL, admitted_turn_number = NULL, "
+            "deferred_reason = LEFT(COALESCE(input_params.reason, "
+            "'provider_not_started'), 120), "
+            "deferred_at = statement_timestamp(), queued_at = NULL, "
+            "updated_at = statement_timestamp()"
+        )
+    else:  # pragma: no cover - caller contract
+        raise ValueError(f"unsupported input delivery transition: {transition}")
+    updated = await conn.fetchval(
+        "WITH input_params AS ("
+        "SELECT $7::bigint AS turn_number, $8::text AS reason) "
+        f"UPDATE thread_input_deliveries SET {assignments} FROM input_params "
+        "WHERE delivery_id = $1 AND thread_id = $2 "
+        "AND execution_lane = 'stateless' AND state = ANY($3::text[]) "
+        "AND claim_generation = $4 "
+        "AND owner_run_queue_lease_token = $5 "
+        "AND owner_executor = $6 AND owner_executor_pod_uid = $9 "
+        "RETURNING delivery_id",
+        UUID(str(delivery_id)),
+        UUID(str(thread_id)),
+        list(states),
+        int(claim_generation),
+        int(lease_token),
+        str(executor_id),
+        turn_number,
+        reason,
+        str(pod_uid),
+    )
+    return updated is not None
 
 
 async def claim_pending_input_deliveries(

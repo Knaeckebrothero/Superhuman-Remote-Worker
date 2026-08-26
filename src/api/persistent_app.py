@@ -3936,6 +3936,27 @@ async def _transition_claimed_input(
     if _session is None or _session.postgres_conn is None or _thread_id is None:
         return False
     try:
+        live_lease = _current_lease_var.get()
+        if live_lease is not None and live_lease.active:
+            executor_id = str(live_lease.executor_id or "").strip()
+            pod_uid = str(live_lease.pod_uid or "").strip()
+            if (
+                str(live_lease.unit_id or "") != str(_thread_id)
+                or not executor_id
+                or not pod_uid
+            ):
+                return False
+            return await _session.postgres_conn.transition_stateless_input_delivery(
+                thread_id=_thread_id,
+                delivery_id=delivery_id,
+                lease_token=int(live_lease.lease_token),
+                executor_id=executor_id,
+                pod_uid=pod_uid,
+                claim_generation=claim_generation,
+                transition=transition,
+                turn_number=turn_number,
+                reason=reason,
+            )
         agent_id, pod_uid, runtime_generation = _pinned_input_runtime_identity()
         return await _session.postgres_conn.transition_pinned_input_delivery(
             thread_id=_thread_id,
@@ -3950,7 +3971,7 @@ async def _transition_claimed_input(
         )
     except Exception as exc:
         logger.warning(
-            "Pinned input %s transition failed (%s)",
+            "Durable input %s transition failed (%s)",
             transition,
             type(exc).__name__,
         )

@@ -476,6 +476,22 @@ async def test_failed_notification_does_not_undeliver_the_notice(monkeypatch):
     db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
 
 
+@pytest.mark.asyncio
+async def test_durable_retry_finishes_only_after_provider_admission():
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.persist_thread_input_delivery = AsyncMock(
+        return_value={
+            "transcript_inserted": False,
+            "state": "admitted",
+        }
+    )
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.defer_job_wake_for_input.assert_not_awaited()
+
+
 # --------------------------------------------------------------------------
 # Settle contract
 # --------------------------------------------------------------------------

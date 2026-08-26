@@ -188,6 +188,81 @@ class TestCeilingNotice:
 
 class TestDrainBrake:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("delivery_state", "expected_delivered"),
+        [("queued", 0), ("admitted", 1)],
+    )
+    async def test_durable_officer_wake_settles_only_after_provider_admission(
+        self,
+        monkeypatch,
+        delivery_state,
+        expected_delivered,
+    ):
+        event_id = 91
+        delivery_id = str(uuid.uuid4())
+        rows = [
+            {
+                "id": event_id,
+                "thread_id": THREAD_ID,
+                "source": "timer",
+                "dedup_key": "timer:durable",
+            }
+        ]
+        assigned = [{**rows[0], "delivery_id": delivery_id}]
+        db = SimpleNamespace(
+            claim_pending_session_wake_events=AsyncMock(return_value=rows),
+            assign_session_wake_delivery_groups=AsyncMock(return_value=assigned),
+            get_session_wake_delivery_group=AsyncMock(return_value=assigned),
+            get_thread=AsyncMock(return_value=_thread()),
+            persist_thread_input_delivery=AsyncMock(
+                return_value={
+                    "delivery_id": delivery_id,
+                    "state": delivery_state,
+                }
+            ),
+            finish_session_wake_events=AsyncMock(),
+            defer_session_wake_events_for_input=AsyncMock(),
+            release_session_wake_events=AsyncMock(),
+            merge_thread_officer_state=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            session_wake,
+            "_resolve_live_agent",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            session_wake,
+            "_officer_ceiling_deferral",
+            AsyncMock(return_value=None),
+        )
+        from services import sitrep
+
+        monkeypatch.setattr(
+            sitrep,
+            "build_wake_message",
+            AsyncMock(return_value=("durable wake", {"fingerprint": "new"})),
+        )
+
+        assert await session_wake.drain_pending_event_wakes(db) == expected_delivered
+        db.persist_thread_input_delivery.assert_awaited_once_with(
+            thread_id=THREAD_ID,
+            delivery_id=delivery_id,
+            role="event",
+            content="durable wake",
+            source="officer_wake",
+        )
+        if delivery_state == "admitted":
+            db.finish_session_wake_events.assert_awaited_once_with([event_id])
+            db.defer_session_wake_events_for_input.assert_not_awaited()
+            db.merge_thread_officer_state.assert_awaited_once_with(
+                THREAD_ID, {"fingerprint": "new"}
+            )
+        else:
+            db.finish_session_wake_events.assert_not_awaited()
+            db.defer_session_wake_events_for_input.assert_awaited_once()
+            db.merge_thread_officer_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_runtime_incident_defers_before_sitrep_or_live_delivery(
         self, monkeypatch
     ):

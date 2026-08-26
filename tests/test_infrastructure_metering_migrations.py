@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -246,7 +247,14 @@ APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
     ROOT
     / "orchestrator/database/migrations/app/0184_managed_repository_legacy_reconciliation.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION
+APP_STATELESS_INPUT_DELIVERIES = (
+    ROOT / "orchestrator/database/migrations/app/0185_stateless_input_deliveries.sql"
+)
+APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0186_stateless_input_delivery_validate.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_STATELESS_INPUT_DELIVERY_VALIDATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -819,6 +827,186 @@ def test_managed_repository_legacy_reconciliation_migration_is_additive() -> Non
     assert "UPDATE jobs" not in sql
     assert "UPDATE threads" not in sql
     assert "UPDATE project_repositories" not in sql
+
+
+def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None:
+    raw = APP_STATELESS_INPUT_DELIVERIES.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0184_managed_repository_legacy_reconciliation.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    thread_lock = "LOCK TABLE public.threads IN SHARE ROW EXCLUSIVE MODE"
+    queue_lock = "LOCK TABLE public.run_queue IN SHARE ROW EXCLUSIVE MODE"
+    delivery_lock = (
+        "LOCK TABLE public.thread_input_deliveries IN SHARE ROW EXCLUSIVE MODE"
+    )
+    assert thread_lock in sql
+    assert queue_lock in sql
+    assert delivery_lock in sql
+    assert sql.index(thread_lock) < sql.index(queue_lock) < sql.index(delivery_lock)
+    assert "ADD COLUMN execution_lane TEXT NOT NULL DEFAULT 'pinned'" in sql
+    assert sql.count("NOT VALID") == 3
+    assert "ADD COLUMN input_delivery_capable_lease_token BIGINT" in sql
+    assert "trg_input_delivery_lane_authority" in sql
+    assert "trg_stateless_input_delivery_claim" in sql
+    assert "stateless_input_delivery_requires_capable_claim" in sql
+    assert "stateless_input_delivery_requires_admission" in sql
+
+    validation = _compact(APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text())
+    assert "depends-on:    0185_stateless_input_deliveries.sql" in (
+        APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text()
+    )
+    assert validation.count("VALIDATE CONSTRAINT thread_input_deliveries_") == 3
+
+
+@pytest.mark.asyncio
+async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """A genuine 0184 delivery cannot cross the lane-backfill boundary."""
+
+    dbname = f"stateless_delivery_0185_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    through_0184 = tmp_path / "through-0184"
+    through_0184.mkdir()
+    blocker = updater = observer = None
+    migration_task = update_task = None
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        delivery_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','genuine pre-0185 wake',1)",
+                message_id,
+                thread_id,
+            )
+            # This is the exact shape the preceding release produced: 0174's
+            # pinned-only ledger had no lane column, while orchestrator-side
+            # wake persistence could still target a stateless thread.
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted')",
+                delivery_id,
+                thread_id,
+                message_id,
+            )
+
+        blocker = await asyncpg.connect(dsn)
+        updater = await asyncpg.connect(dsn)
+        observer = await asyncpg.connect(dsn)
+        await blocker.execute("BEGIN")
+        # Hold the migration after it takes the thread/run_queue prefix but
+        # before it can alter/backfill the delivery table.
+        await blocker.execute(
+            "LOCK TABLE thread_input_deliveries IN ACCESS EXCLUSIVE MODE"
+        )
+        migration_task = asyncio.create_task(
+            run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        )
+
+        for _ in range(100):
+            migration_holds_thread = await observer.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_locks "
+                "WHERE database=(SELECT oid FROM pg_database "
+                "WHERE datname=current_database()) "
+                "AND relation='public.threads'::regclass "
+                "AND mode='ShareRowExclusiveLock' AND granted)"
+            )
+            if migration_holds_thread:
+                break
+            await asyncio.sleep(0.005)
+        assert migration_holds_thread
+
+        update_task = asyncio.create_task(
+            updater.execute(
+                "UPDATE threads SET execution_lane='pinned' WHERE id=$1",
+                thread_id,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not update_task.done()
+
+        await blocker.execute("COMMIT")
+        await asyncio.wait_for(migration_task, timeout=15)
+        with pytest.raises(asyncpg.CheckViolationError, match="durable input"):
+            await asyncio.wait_for(update_task, timeout=5)
+
+        row = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "WHERE delivery.delivery_id=$1",
+            delivery_id,
+        )
+        assert dict(row) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "stateless",
+            "state": "persisted",
+        }
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERIES.name,
+        )
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+        )
+        assert (
+            await observer.fetchval(
+                "SELECT count(*) FROM pg_constraint "
+                "WHERE conname = ANY($1::text[]) AND convalidated",
+                [
+                    "thread_input_deliveries_lane_check",
+                    "thread_input_deliveries_owner_shape",
+                    "thread_input_deliveries_claim_shape",
+                ],
+            )
+            == 3
+        )
+    finally:
+        if migration_task is not None and not migration_task.done():
+            migration_task.cancel()
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
+        if blocker is not None:
+            await blocker.close()
+        if updater is not None:
+            await updater.close()
+        if observer is not None:
+            await observer.close()
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:

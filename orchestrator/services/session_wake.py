@@ -612,6 +612,8 @@ async def _deliver_durable(
             logger.warning(
                 "session wake: owner notification failed for thread %s", thread_id[:8]
             )
+    if str(result.get("state") or "") in {"admitted", "settled"}:
+        return WakeDeliveryResult.EXECUTED
     return WakeDeliveryResult.PERSISTED
 
 
@@ -1451,7 +1453,21 @@ async def drain_pending_event_wakes(
                 content=text,
                 source="officer_wake",
             )
-            if persisted:
+            if str((persisted or {}).get("state") or "") in {
+                "admitted",
+                "settled",
+            }:
+                await db.finish_session_wake_events(ids)
+                delivered += 1
+                if state_patch:
+                    try:
+                        await db.merge_thread_officer_state(thread_id, state_patch)
+                    except Exception:
+                        logger.exception(
+                            "officer wake: sitrep state merge failed "
+                            "(non-fatal; next sitrep re-diffs)"
+                        )
+            elif persisted:
                 await db.defer_session_wake_events_for_input(
                     ids,
                     fire_at=datetime.now(timezone.utc) + timedelta(seconds=5),

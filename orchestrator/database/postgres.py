@@ -18749,8 +18749,20 @@ class PostgresDB:
                             "_stateless_workspace_retirement_settled", None
                         )
                     queue = await conn.fetchrow(
-                        "SELECT unit_kind FROM run_queue "
+                        "SELECT unit_kind, state, input_seq, consumed_seq FROM run_queue "
                         "WHERE unit_id = $1::uuid FOR UPDATE",
+                        thread_id,
+                    )
+                    pending_delivery_seq = await conn.fetchval(
+                        "SELECT max(message.seq) "
+                        "FROM thread_input_deliveries AS delivery "
+                        "JOIN thread_messages AS message "
+                        "  ON message.id = delivery.message_id "
+                        "WHERE delivery.thread_id = $1::uuid "
+                        "AND delivery.execution_lane = 'stateless' "
+                        "AND delivery.state IN "
+                        "('persisted', 'owned', 'queued', 'deferred') "
+                        "AND message.rewound_at IS NULL",
                         thread_id,
                     )
                     if queue is not None:
@@ -18758,7 +18770,10 @@ class PostgresDB:
                             return False
                         revived = await conn.fetchval(
                             "UPDATE run_queue SET "
-                            "state = CASE WHEN (input_seq IS NOT NULL "
+                            "input_seq = CASE WHEN $2::bigint IS NULL "
+                            "THEN input_seq ELSE GREATEST(input_seq, $2::bigint) END, "
+                            "state = CASE WHEN $2::bigint IS NOT NULL "
+                            "OR (input_seq IS NOT NULL "
                             "AND input_seq > COALESCE(consumed_seq, -1)) "
                             "OR control_input_seq > control_consumed_seq "
                             "THEN 'queued' ELSE 'done' END, "
@@ -18770,8 +18785,21 @@ class PostgresDB:
                             "AND unit_kind = 'session_turn' AND state = 'done' "
                             "RETURNING unit_id",
                             thread_id,
+                            pending_delivery_seq,
                         )
                         if revived is None:
+                            return False
+                    elif pending_delivery_seq is not None:
+                        created_queue = await conn.fetchval(
+                            "INSERT INTO run_queue "
+                            "(unit_id, unit_kind, state, input_seq, consumed_seq) "
+                            "VALUES ($1::uuid, 'session_turn', 'queued', "
+                            "$2::bigint, $2::bigint - 1) "
+                            "ON CONFLICT (unit_id) DO NOTHING RETURNING unit_id",
+                            thread_id,
+                            pending_delivery_seq,
+                        )
+                        if created_queue is None:
                             return False
                 if stateless:
                     row = await conn.fetchval(
@@ -19672,7 +19700,7 @@ class PostgresDB:
         source: str,
         turn_number: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Persist an unclaimed pinned input for a future/current runtime."""
+        """Persist one unclaimed durable input for its authoritative lane."""
 
         from src.shared.persistent_input_delivery import persist_input_delivery
 

@@ -150,14 +150,37 @@ def _enabled_env(name: str, default: bool = False) -> bool:
 # answered. ``seq > COALESCE(consumed_seq, -1)`` — a NULL consumed watermark
 # means nothing was ever answered, so the oldest human row qualifies.
 _PENDING_INPUT_SQL = """
-    SELECT id, seq, content, turn_number
-    FROM thread_messages
-    WHERE thread_id = $1
-      AND role = 'human'
-      AND rewound_at IS NULL
-      AND seq > $2
+    SELECT message.id, message.seq, message.content, message.turn_number,
+           message.role, delivery.delivery_id
+    FROM thread_messages AS message
+    LEFT JOIN thread_input_deliveries AS delivery
+      ON delivery.message_id = message.id
+     AND delivery.thread_id = message.thread_id
+    WHERE message.thread_id = $1
+      AND message.rewound_at IS NULL
+      AND (
+          (message.role = 'human' AND message.seq > $2)
+          OR
+          (
+              message.role = 'event'
+              AND delivery.execution_lane = 'stateless'
+              AND delivery.state IN ('persisted', 'queued', 'deferred')
+          )
+      )
     ORDER BY seq ASC
     LIMIT $3
+"""
+
+_PENDING_EVENT_EXISTS_SQL = """
+SELECT EXISTS (
+    SELECT 1
+      FROM thread_input_deliveries AS delivery
+      JOIN thread_messages AS message ON message.id = delivery.message_id
+     WHERE delivery.thread_id = $1
+       AND delivery.execution_lane = 'stateless'
+       AND delivery.state IN ('persisted', 'queued', 'deferred')
+       AND message.rewound_at IS NULL
+)
 """
 
 
@@ -309,7 +332,11 @@ def strip_restored_pending_humans(
     pending_ids = {
         str(row["id"]): row for row in pending_rows if row.get("id") is not None
     }
-    remaining = list(pending_rows)
+    # Event deliveries are deliberately excluded by transcript restore until
+    # provider admission. Keep only rows that restore actually loaded, or an
+    # event after a human row would stop the tail matcher and duplicate the
+    # human on a fresh attach.
+    remaining = [row for row in pending_rows if row.get("role", "human") == "human"]
     removed = 0
     while messages and remaining:
         msg = messages[-1]
@@ -830,7 +857,12 @@ class StatelessTurnExecutor:
             if pa._session is not None:
                 await self._detach_cached_session("worker_claim_switch")
             self._scrub_process_residue()
-            self._lease.update(unit_id, token)
+            self._lease.update(
+                unit_id,
+                token,
+                executor_id=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
 
             timing["outcome"] = await self._serve_worker_claim_inner(
                 claim,
@@ -889,7 +921,12 @@ class StatelessTurnExecutor:
                 # nevertheless authoritative; publish this generation before
                 # its retry/give-up disposition rather than inheriting the old
                 # handle's lost bit.
-                self._lease.update(unit_id, token)
+                self._lease.update(
+                    unit_id,
+                    token,
+                    executor_id=self._pod_name,
+                    pod_uid=self._pod_uid,
+                )
             if (
                 unit.attempts_since_completion > claim.max_attempts
                 and not self._lease.lost.is_set()
@@ -2072,12 +2109,30 @@ class StatelessTurnExecutor:
         # (a) Skip-if-answered (§5.1): a steal can land between a
         # predecessor's final persist and its completion — the fence cannot
         # catch that (our lease is VALID), only the watermark can. No LLM.
-        if (
+        watermarks_answered = (
             claim.consumed_seq is not None
             and claim.input_seq is not None
             and claim.consumed_seq >= claim.input_seq
             and claim.control_consumed_seq >= claim.control_input_seq
-        ):
+        )
+        pending_event = False
+        if watermarks_answered:
+            try:
+                fetchval = getattr(self._db, "fetchval", None)
+                if fetchval is not None:
+                    pending_event = bool(
+                        await fetchval(_PENDING_EVENT_EXISTS_SQL, claim.unit_id)
+                    )
+            except Exception:
+                logger.warning(
+                    "pending-event authority query failed for unit %s; "
+                    "releasing instead of skipping",
+                    unit_id,
+                    exc_info=True,
+                )
+                await self._release(claim, reason="pending_event_query_failed")
+                return
+        if watermarks_answered and not pending_event:
             await self._detach_physical_before_transition("skip_if_answered")
             state = await complete_unit(
                 self._db,
@@ -2286,7 +2341,12 @@ class StatelessTurnExecutor:
             # persists, journal flushes) at THIS claim's token in place.
             # Physical sessions deliberately miss this path: detach retires
             # their old backend before a fresh object receives the new token.
-            self._lease.update(unit_id, token)
+            self._lease.update(
+                unit_id,
+                token,
+                executor_id=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
             if claim_lost.is_set():
                 self._lease.mark_lost()
                 return
@@ -2313,7 +2373,12 @@ class StatelessTurnExecutor:
                 await self._detach_cached_session("claim_switch")
             timing["detach"] = time.perf_counter() - t0
             self._scrub_process_residue()
-            self._lease.update(unit_id, token)
+            self._lease.update(
+                unit_id,
+                token,
+                executor_id=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
             if claim_lost.is_set():
                 self._lease.mark_lost()
                 return
@@ -2465,6 +2530,17 @@ class StatelessTurnExecutor:
                 )
 
         if not target["content"]:
+            if target.get("delivery_id") is not None:
+                logger.error(
+                    "durable event input is empty; refusing to consume it "
+                    "without provider admission (unit=%s seq=%s)",
+                    unit_id,
+                    target["seq"],
+                )
+                await pa._stop_thread_control_watcher()
+                await self._detach_cached_session("empty_event_input")
+                await self._release(claim, reason="empty_event_input")
+                return
             # An empty row can never produce a turn (the loop skips empty
             # input, and the completion hook would never fire) — consume it.
             await pa._stop_thread_control_watcher()
@@ -2547,10 +2623,53 @@ class StatelessTurnExecutor:
             await self._detach_cached_session("loop_not_ready")
             await self._release(claim, reason="loop_not_ready")
             return
+        delivery_id = target.get("delivery_id")
+        delivery_claim_generation: int | None = None
+        if delivery_id is not None:
+            try:
+                claimed_delivery = await self._db.claim_stateless_input_delivery(
+                    thread_id=unit_id,
+                    delivery_id=str(delivery_id),
+                    lease_token=token,
+                    executor_id=self._pod_name,
+                    pod_uid=self._pod_uid,
+                )
+            except Exception:
+                logger.warning(
+                    "stateless event-delivery claim failed for unit %s token=%d",
+                    unit_id,
+                    token,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("event_delivery_claim_failed")
+                await self._release(claim, reason="event_delivery_claim_failed")
+                return
+            if (
+                claimed_delivery is None
+                or int(claimed_delivery.get("seq") or -1) != int(target["seq"])
+                or str(claimed_delivery.get("message_id") or "") != str(target["id"])
+            ):
+                logger.warning(
+                    "stateless event-delivery authority changed before injection "
+                    "(unit=%s token=%d)",
+                    unit_id,
+                    token,
+                )
+                await self._detach_cached_session("event_delivery_claim_lost")
+                await self._release(claim, reason="event_delivery_claim_lost")
+                return
+            delivery_claim_generation = int(claimed_delivery["claim_generation"])
         loop_task = pa._loop_task
-        await pa._loop_user_queue.put(
-            {"content": target["content"], "id": target["id"]}
-        )
+        queue_item = {"content": target["content"], "id": target["id"]}
+        if delivery_id is not None and delivery_claim_generation is not None:
+            queue_item.update(
+                {
+                    "role": "event",
+                    "delivery_id": str(delivery_id),
+                    "claim_generation": delivery_claim_generation,
+                }
+            )
+        await pa._loop_user_queue.put(queue_item)
 
         # (i) Wait for the full-turn settlement hook (event, not a poll), the
         # lease-lost signal, or the loop dying under us. PersistentApp publishes
@@ -2580,18 +2699,22 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._await_cloud_push(pa)
             timing["push"] = time.perf_counter() - t0
+            completed_input_seq = max(
+                int(target["seq"]),
+                int(claim.consumed_seq) if claim.consumed_seq is not None else -1,
+            )
             self._pending_settled_close = (
                 str(claim.unit_id),
                 int(token),
                 int(interrupt_turn_id),
-                int(target["seq"]),
+                completed_input_seq,
             )
             try:
                 interrupt_closed = await self._close_interrupt_window(
                     pa,
                     claim,
                     target_turn_id=int(interrupt_turn_id),
-                    completed_input_seq=int(target["seq"]),
+                    completed_input_seq=completed_input_seq,
                 )
             except Exception:
                 self._lease.mark_lost()
@@ -2623,7 +2746,9 @@ class StatelessTurnExecutor:
             await self._detach_physical_before_transition("turn_complete")
             timing["detach_final"] = time.perf_counter() - t0
             t0 = time.perf_counter()
-            state = await self._complete_with_retry(claim, consumed_seq=target["seq"])
+            state = await self._complete_with_retry(
+                claim, consumed_seq=completed_input_seq
+            )
             timing["complete"] = time.perf_counter() - t0
             if state is None:
                 # Fenced out at completion: a steal beat us after the final
@@ -2643,7 +2768,7 @@ class StatelessTurnExecutor:
             logger.info(
                 "run_queue complete: unit=%s consumed_seq=%d state=%s",
                 unit_id,
-                target["seq"],
+                completed_input_seq,
                 state,
             )
             logger.info(
@@ -2909,6 +3034,12 @@ class StatelessTurnExecutor:
                 "seq": r["seq"],
                 "content": r["content"] or "",
                 "turn_number": r["turn_number"],
+                "role": str(r.get("role") or "human"),
+                "delivery_id": (
+                    str(r.get("delivery_id"))
+                    if r.get("delivery_id") is not None
+                    else None
+                ),
             }
             for r in rows
         ]

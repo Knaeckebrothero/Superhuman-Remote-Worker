@@ -1473,6 +1473,66 @@ class PostgresDB:
         async with self.acquire() as conn:
             return await get_input_delivery(conn, delivery_id)
 
+    async def claim_stateless_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        lease_token: int,
+        executor_id: str,
+        pod_uid: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Bind one event input to this exact stateless queue claimant."""
+
+        from src.shared.persistent_input_delivery import (
+            claim_stateless_input_delivery,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await claim_stateless_input_delivery(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                    executor_id=executor_id,
+                    pod_uid=pod_uid,
+                )
+
+    async def transition_stateless_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        lease_token: int,
+        executor_id: str,
+        pod_uid: str,
+        claim_generation: int,
+        transition: str,
+        turn_number: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Transition an event under its exact stateless queue lease."""
+
+        from src.shared.persistent_input_delivery import (
+            transition_stateless_input_delivery,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await transition_stateless_input_delivery(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                    executor_id=executor_id,
+                    pod_uid=pod_uid,
+                    claim_generation=claim_generation,
+                    transition=transition,
+                    turn_number=turn_number,
+                    reason=reason,
+                )
+
     async def save_thread_messages(
         self,
         thread_id: str,
