@@ -210,6 +210,58 @@ async def test_malformed_commissioned_mirror_fails_downgrade_readiness(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [[], "[]", '"legacy-scalar"', 7])
+async def test_non_object_legacy_metadata_is_invalid_not_a_roster_500(
+    db, as_user, monkeypatch, metadata
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(return_value=[_row(metadata=metadata)])
+
+    result = await list_officers(MagicMock())
+
+    officer = result["officers"][0]
+    assert officer["auto_pull_runtime_valid"] is False
+    assert officer["model"] is None
+    assert officer["pages_today"] == 0
+    assert result["auto_pull_downgrade"]["safe"] is False
+    assert result["auto_pull_downgrade"]["invalid_values"] == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
+    db, as_user, monkeypatch
+):
+    monkeypatch.setattr(
+        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
+    )
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    db.list_project_officer_posts = AsyncMock(
+        return_value=[
+            _row(
+                metadata={
+                    "config_override": {
+                        "officer": {"enabled": True, "auto_pull": False},
+                        "llm": ["legacy"],
+                    },
+                    "officer_state": ["legacy"],
+                }
+            )
+        ]
+    )
+
+    result = await list_officers(MagicMock())
+
+    officer = result["officers"][0]
+    assert officer["auto_pull_runtime_valid"] is True
+    assert officer["model"] is None
+    assert officer["pages_today"] == 0
+    assert result["auto_pull_downgrade"]["safe"] is True
+
+
+@pytest.mark.asyncio
 async def test_ended_but_linked_true_mirror_blocks_downgrade(db, as_user, monkeypatch):
     monkeypatch.setattr(
         orch_main, "user_visible_project_ids", AsyncMock(return_value="all")

@@ -37974,6 +37974,8 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             metadata = {}
             metadata_shape_valid = False
+    if not metadata_shape_valid:
+        metadata = {}
     config_override = metadata.get("config_override") or {}
     config_override_shape_valid = isinstance(config_override, dict)
     if not config_override_shape_valid:
@@ -37999,7 +38001,14 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
     if not durable_officer_shape_valid:
         durable_officer_cfg = {}
     officer_state = metadata.get("officer_state") or {}
+    if not isinstance(officer_state, dict):
+        officer_state = {}
     pages = officer_state.get("pages") or {}
+    if not isinstance(pages, dict):
+        pages = {}
+    llm_cfg = config_override.get("llm") or {}
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
     today = datetime.now(timezone.utc).date().isoformat()
     thread_id = row.get("thread_id")
     thread_status = row.get("thread_status")
@@ -38076,7 +38085,7 @@ def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
         "auto_pull_runtime_valid": runtime_auto_pull_valid,
         "auto_pull_mirror_consistent": mirror_consistent,
         "auto_pull_enable_available": OFFICER_AUTO_PULL_RELEASE_ENABLED,
-        "model": (config_override.get("llm") or {}).get("model"),
+        "model": llm_cfg.get("model"),
         "last_activity_at": _iso_or_none(row.get("last_agent_activity")),
     }
 
