@@ -8,9 +8,9 @@ torn down instead of leaking — the orphan that previously needed a manual
 
 - 404 on an unknown thread,
 - delete the VM when the provisioner is available,
-- ALWAYS mark ``metadata.vm.status='aborted'`` so the provisioning-in-progress
-  guard doesn't wedge a retry, even when the provisioner is down or the delete
-  raises.
+- Mark ``metadata.vm.status='aborted'`` only after exact process-zero-backed
+  deletion. A transport outage or unavailable provisioner must preserve the
+  owner/runtime binding and return a retryable refusal.
 """
 
 from types import SimpleNamespace
@@ -66,8 +66,7 @@ class TestAbortThreadVmUpgrade:
         assert out == {"status": "aborted", "thread_id": "tid", "vm_deleted": True}
 
     @pytest.mark.asyncio
-    async def test_provisioner_unavailable_still_marks_aborted(self):
-        """No VM to delete, but the in-progress marker must still be cleared."""
+    async def test_provisioner_unavailable_preserves_vm_authority(self):
         db = _db({"id": "tid"})
         prov = _provisioner(available=False)
         with (
@@ -75,17 +74,19 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "vm_provisioner", prov),
         ):
-            out = await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+            with pytest.raises(orch_main.HTTPException) as exc:
+                await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
 
         prov.delete_thread_vm.assert_not_called()
-        db.merge_thread_vm_context.assert_awaited_once_with(
-            "tid", {"status": "aborted"}
-        )
-        assert out["vm_deleted"] is False
+        db.merge_thread_vm_context.assert_not_awaited()
+        assert exc.value.status_code == 503
+        assert exc.value.detail == {
+            "code": "vm_process_zero_unproven",
+            "retryable": True,
+        }
 
     @pytest.mark.asyncio
-    async def test_delete_exception_swallowed_still_marks_aborted(self):
-        """A failed delete must not block clearing the retry guard."""
+    async def test_delete_exception_preserves_vm_authority(self):
         db = _db({"id": "tid"})
         prov = _provisioner(available=True, delete_exc=RuntimeError("nats down"))
         with (
@@ -93,9 +94,12 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "vm_provisioner", prov),
         ):
-            out = await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+            with pytest.raises(orch_main.HTTPException) as exc:
+                await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
 
-        db.merge_thread_vm_context.assert_awaited_once_with(
-            "tid", {"status": "aborted"}
-        )
-        assert out["vm_deleted"] is False
+        db.merge_thread_vm_context.assert_not_awaited()
+        assert exc.value.status_code == 503
+        assert exc.value.detail == {
+            "code": "vm_process_zero_unproven",
+            "retryable": True,
+        }

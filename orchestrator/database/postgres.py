@@ -94,9 +94,15 @@ _DOCKER_WORKSPACE_TRUST_KEY = "_docker_workspace_trust_mode"
 _DOCKER_WORKSPACE_ATTESTED_KEY = "_docker_workspace_attested"
 _STATELESS_RUNTIME_CREATION_KEY = "_stateless_runtime_creation"
 _STATELESS_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
+_STATELESS_PROCESS_ZERO_OBSERVATION_KEY = (
+    "_stateless_workspace_process_zero_observation"
+)
 _STATELESS_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
 _STATELESS_RUNTIME_CREATION_FIELDS = frozenset(
     {"generation", "mode", "attempted", "replaces_uid"}
+)
+_STATELESS_PROCESS_ZERO_OBSERVATION_FIELDS = frozenset(
+    {"runtime_incarnation", "observed_at"}
 )
 _DOCKER_INVENTORY_COLUMNS = (
     "host, port, status, lease_id, owner_kind, owner_id, trust_mode, "
@@ -133,6 +139,8 @@ _SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS = frozenset(
         "repository_auth",
         "repository_credentials",
         "_managed_repository_authority_pending",
+        "_managed_repository_process_zero",
+        "_stateless_workspace_process_zero_observation",
     }
 )
 
@@ -506,6 +514,40 @@ def _stateless_runtime_creation_marker(
         "mode": mode,
         "attempted": attempted,
         "replaces_uid": replaces_uid,
+    }
+
+
+def _stateless_process_zero_observation(
+    metadata: dict[str, Any],
+) -> dict[str, str] | None:
+    """Strictly parse one server-owned exact-Pod terminal observation."""
+
+    if _STATELESS_PROCESS_ZERO_OBSERVATION_KEY not in metadata:
+        return None
+    raw = metadata[_STATELESS_PROCESS_ZERO_OBSERVATION_KEY]
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != _STATELESS_PROCESS_ZERO_OBSERVATION_FIELDS
+    ):
+        raise RuntimeError("stateless process-zero observation is malformed")
+    runtime_incarnation = _canonical_uuid_text(
+        raw.get("runtime_incarnation"),
+        label="stateless process-zero runtime incarnation",
+    )
+    observed_at = raw.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at:
+        raise RuntimeError("stateless process-zero observation time is malformed")
+    try:
+        parsed_at = datetime.fromisoformat(observed_at)
+    except ValueError as exc:
+        raise RuntimeError(
+            "stateless process-zero observation time is malformed"
+        ) from exc
+    if parsed_at.tzinfo is None:
+        raise RuntimeError("stateless process-zero observation time is malformed")
+    return {
+        "runtime_incarnation": runtime_incarnation,
+        "observed_at": observed_at,
     }
 
 
@@ -7077,11 +7119,27 @@ class PostgresDB:
                     "ready": {"ready", "releasing", "quarantined"},
                     "releasing": {"released", "quarantined"},
                     "released": set(),
-                    "quarantined": {"quarantined"},
+                    # A terminal owner can retry only the two exact
+                    # repository-process retirement reasons accepted below.
+                    # This transition claims the retry before external SSH;
+                    # arbitrary trust/inventory quarantines remain absorbing.
+                    "quarantined": {"quarantined", "releasing"},
                 }
                 inventory_status = str(inventory["status"])
                 if status not in allowed_targets[inventory_status]:
                     raise ValueError("Docker workspace lifecycle transition is invalid")
+                if (
+                    inventory_status == "quarantined"
+                    and status == "releasing"
+                    and inventory.get("quarantine_reason")
+                    not in {
+                        "container_recreation_required",
+                        "managed_repository_agent_retirement_failed",
+                    }
+                ):
+                    raise ValueError(
+                        "Docker workspace quarantine is not retirement-retryable"
+                    )
 
                 owner_matches = False
                 if current is not None:
@@ -7190,8 +7248,40 @@ class PostgresDB:
                     quarantine_reason = str(
                         updates.get("quarantine_reason") or "lease_quarantined"
                     )
+                elif status == "releasing":
+                    raw_reason = updates.get("quarantine_reason")
+                    if raw_reason is not None and raw_reason != (
+                        "managed_repository_agent_retirement_claimed"
+                    ):
+                        raise ValueError("Docker workspace releasing reason is invalid")
+                    quarantine_reason = raw_reason
                 else:
                     quarantine_reason = None
+
+                if current is not None and (
+                    status == "released"
+                    or (
+                        status == "quarantined"
+                        and quarantine_reason
+                        == "container_recreation_required_process_zero"
+                    )
+                ):
+                    receipt_exists = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = 'docker_workspace' "
+                        "AND provisioner = 'docker' "
+                        "AND runtime_incarnation = $3)",
+                        owner_kind,
+                        owner_uuid,
+                        str(inventory["lease_id"]),
+                    )
+                    if not receipt_exists:
+                        raise ValueError(
+                            "Docker workspace release requires prior exact "
+                            "process-zero authority"
+                        )
 
                 inventory_result = await conn.execute(
                     """
@@ -7256,6 +7346,368 @@ class PostgresDB:
                         )
                 return replacement
 
+    async def record_docker_workspace_process_zero(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        lease_id: str,
+    ) -> bool:
+        """Record process-zero only for one exact claimed Docker lease.
+
+        The caller performs the external, host-key-pinned retirement first.
+        This transaction does not infer success from a requested status or
+        quarantine reason: it requires both the locked inventory row and its
+        locked owner mirror to still name the same ``releasing`` lease with the
+        server-owned retirement claim marker.  Generic lease transitions can
+        consume this receipt, but can never create it.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            lease_uuid = UUID(str(lease_id))
+        except (TypeError, ValueError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        column = "context" if owner_kind == "job" else "metadata"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                owner_row = await conn.fetchrow(
+                    f"SELECT {column}->'workspace_container' AS workspace "
+                    f"FROM {table} WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                inventory = await conn.fetchrow(
+                    "SELECT host, port, owner_kind, owner_id, lease_id, "
+                    "status::text AS status, quarantine_reason "
+                    "FROM docker_workspace_leases "
+                    "WHERE owner_kind = $1 AND owner_id = $2 AND lease_id = $3 "
+                    "FOR UPDATE",
+                    owner_kind,
+                    owner_uuid,
+                    lease_uuid,
+                )
+                if owner_row is None or inventory is None:
+                    return False
+                workspace = owner_row.get("workspace") or {}
+                if isinstance(workspace, str):
+                    try:
+                        workspace = json.loads(workspace)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(workspace, dict):
+                    return False
+                claimed = (
+                    workspace.get("provisioner") == "docker"
+                    and workspace.get("status") == "releasing"
+                    and workspace.get("quarantine_reason")
+                    == "managed_repository_agent_retirement_claimed"
+                    and str(workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                    == str(lease_uuid)
+                    and str(workspace.get("host") or "")
+                    == str(inventory.get("host") or "")
+                    and not isinstance(workspace.get("port"), bool)
+                    and str(workspace.get("port") or "")
+                    == str(inventory.get("port") or "")
+                    and inventory.get("status") == "releasing"
+                    and inventory.get("quarantine_reason")
+                    == "managed_repository_agent_retirement_claimed"
+                )
+                if not claimed:
+                    return False
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ($1, $2, "
+                    "'docker_workspace', 'docker', $3) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    owner_kind,
+                    owner_uuid,
+                    str(lease_uuid),
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def docker_workspace_process_zero_is_current(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        lease_id: str,
+    ) -> bool:
+        """Verify Docker process-zero against the exact locked inventory lease."""
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            lease_uuid = UUID(str(lease_id))
+        except (TypeError, ValueError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        column = "context" if owner_kind == "job" else "metadata"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                row = await conn.fetchrow(
+                    f"SELECT {column}->'workspace_container' AS workspace "
+                    f"FROM {table} WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                workspace = row.get("workspace") or {}
+                if isinstance(workspace, str):
+                    try:
+                        workspace = json.loads(workspace)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(workspace, dict):
+                    return False
+                workspace_status = str(workspace.get("status") or "")
+                if workspace.get("provisioner") != "docker" or str(
+                    workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or ""
+                ) != str(lease_uuid):
+                    return False
+                if workspace_status == "quarantined":
+                    if (
+                        workspace.get("quarantine_reason")
+                        != "container_recreation_required_process_zero"
+                    ):
+                        return False
+                elif workspace_status != "released":
+                    return False
+                receipt_exists = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = 'docker_workspace' "
+                        "AND provisioner = 'docker' "
+                        "AND runtime_incarnation = $3)",
+                        owner_kind,
+                        owner_uuid,
+                        str(lease_uuid),
+                    )
+                )
+                if not receipt_exists:
+                    return False
+                try:
+                    inventory = await conn.fetchrow(
+                        "SELECT owner_kind, owner_id, lease_id, "
+                        "status::text AS status, quarantine_reason "
+                        "FROM docker_workspace_leases "
+                        "WHERE host = $1 AND port = $2 FOR UPDATE",
+                        str(workspace.get("host") or ""),
+                        int(workspace.get("port", 22)),
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if inventory is None:
+                    return False
+                if str(inventory.get("lease_id") or "") == str(lease_uuid):
+                    return bool(
+                        inventory.get("owner_kind") == owner_kind
+                        and inventory.get("owner_id") == owner_uuid
+                        and inventory.get("status") == workspace_status
+                        and (
+                            workspace_status != "quarantined"
+                            or inventory.get("quarantine_reason")
+                            == "container_recreation_required_process_zero"
+                        )
+                    )
+                # Only a released lease may have been safely reallocated.  Its
+                # exact owner/lease receipt remains authoritative for replay;
+                # an absorbing quarantine can never lose inventory ownership.
+                return workspace_status == "released"
+
+    async def claim_terminal_docker_workspace_retirements(
+        self,
+        *,
+        limit: int = 20,
+        stale_releasing_seconds: int = 120,
+    ) -> list[Dict[str, Any]]:
+        """Claim static workspaces whose repo agents need process-zero.
+
+        A lifecycle transition and the external SSH retirement cannot be one
+        transaction. The exact inventory lease, still-present owner, and typed
+        ``managed_repository_agent_retirement_claimed`` marker are therefore
+        the durable retry owner even when the server died before it could make
+        the job/thread terminal. This claim runs
+        under the same pool advisory lock as allocation/transition, mirrors
+        ``releasing`` to the owner row atomically, and reclaims a crashed claim
+        only after the bounded SSH operation's deadline has elapsed.
+
+        Successful new releases use the distinct
+        ``container_recreation_required_process_zero`` quarantine reason and
+        are intentionally absent from this query.  Arbitrary inventory/trust
+        quarantines are also excluded.
+        """
+
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_stale = max(60, min(int(stale_releasing_seconds), 1800))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                rows = await conn.fetch(
+                    """
+                    SELECT d.host,
+                           d.port,
+                           d.owner_kind,
+                           d.owner_id,
+                           d.lease_id,
+                           d.status::text AS status,
+                           d.trust_mode,
+                           d.host_key_fingerprint,
+                           d.quarantine_reason,
+                           CASE
+                             WHEN d.owner_kind = 'job' THEN j.status::text
+                             ELSE t.status::text
+                           END AS owner_status,
+                           CASE
+                             WHEN d.owner_kind = 'job'
+                               THEN j.context->'workspace_container'
+                             ELSE t.metadata->'workspace_container'
+                           END AS owner_workspace
+                    FROM docker_workspace_leases d
+                    LEFT JOIN jobs j
+                      ON d.owner_kind = 'job' AND j.id = d.owner_id
+                    LEFT JOIN threads t
+                      ON d.owner_kind = 'thread' AND t.id = d.owner_id
+                    WHERE d.lease_id IS NOT NULL
+                      AND (
+                        (
+                          (
+                            (d.owner_kind = 'job'
+                             AND j.status IN ('completed', 'failed', 'cancelled'))
+                            OR
+                            (d.owner_kind = 'thread' AND t.status = 'ended')
+                          )
+                          AND (
+                            d.status = 'ready'
+                            OR (
+                              d.status = 'quarantined'
+                              AND d.quarantine_reason IN (
+                                'container_recreation_required',
+                                'managed_repository_agent_retirement_failed'
+                              )
+                            )
+                          )
+                        )
+                        OR (
+                          d.status = 'releasing'
+                          AND d.quarantine_reason =
+                              'managed_repository_agent_retirement_claimed'
+                          AND d.updated_at < CURRENT_TIMESTAMP
+                              - ($1::int * INTERVAL '1 second')
+                        )
+                      )
+                    ORDER BY d.updated_at, d.host, d.port
+                    LIMIT $2
+                    FOR UPDATE OF d SKIP LOCKED
+                    """,
+                    bounded_stale,
+                    bounded_limit,
+                )
+                claimed: list[Dict[str, Any]] = []
+                for row in rows:
+                    candidate = dict(row)
+                    raw_workspace = candidate.pop("owner_workspace", None) or {}
+                    if isinstance(raw_workspace, str):
+                        try:
+                            raw_workspace = json.loads(raw_workspace)
+                        except (TypeError, ValueError):
+                            continue
+                    if not isinstance(raw_workspace, dict):
+                        continue
+                    workspace = dict(raw_workspace)
+                    try:
+                        exact_owner = (
+                            workspace.get("provisioner") == "docker"
+                            and str(workspace.get("host") or "")
+                            == str(candidate["host"])
+                            and int(workspace.get("port", 22)) == int(candidate["port"])
+                            and str(workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                            == str(candidate["lease_id"])
+                            and str(workspace.get("status") or "")
+                            == str(candidate["status"])
+                        )
+                    except (TypeError, ValueError):
+                        exact_owner = False
+                    if not exact_owner:
+                        continue
+
+                    inventory_result = await conn.execute(
+                        """
+                        UPDATE docker_workspace_leases
+                        SET status = 'releasing',
+                            quarantine_reason =
+                                'managed_repository_agent_retirement_claimed',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE host = $1 AND port = $2 AND lease_id = $3
+                        """,
+                        candidate["host"],
+                        candidate["port"],
+                        candidate["lease_id"],
+                    )
+                    if inventory_result != "UPDATE 1":
+                        raise RuntimeError("Docker terminal retirement claim was lost")
+                    replacement = {
+                        **workspace,
+                        "status": "releasing",
+                        "quarantine_reason": (
+                            "managed_repository_agent_retirement_claimed"
+                        ),
+                    }
+                    if candidate["owner_kind"] == "thread":
+                        replacement[_DOCKER_WORKSPACE_GENERATION_KEY] = None
+                        owner_result = await conn.execute(
+                            "UPDATE threads SET metadata = jsonb_set("
+                            "COALESCE(metadata, '{}'::jsonb), "
+                            "'{workspace_container}', $2::jsonb), "
+                            "last_activity = CURRENT_TIMESTAMP "
+                            "WHERE id = $1 AND status::text = $3",
+                            candidate["owner_id"],
+                            json.dumps(replacement),
+                            candidate["owner_status"],
+                        )
+                    else:
+                        owner_result = await conn.execute(
+                            "UPDATE jobs SET context = jsonb_set("
+                            "COALESCE(context, '{}'::jsonb), "
+                            "'{workspace_container}', $2::jsonb), "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = $1 "
+                            "AND status::text = $3",
+                            candidate["owner_id"],
+                            json.dumps(replacement),
+                            candidate["owner_status"],
+                        )
+                    if owner_result != "UPDATE 1":
+                        raise RuntimeError(
+                            "Docker terminal retirement owner disappeared"
+                        )
+                    claimed.append(
+                        {
+                            **candidate,
+                            "owner_id": str(candidate["owner_id"]),
+                            "lease_id": str(candidate["lease_id"]),
+                            "status": "releasing",
+                        }
+                    )
+                return claimed
+
     async def merge_thread_workspace_context(
         self, thread_id: str, container_updates: Dict[str, Any]
     ) -> bool:
@@ -7295,6 +7747,474 @@ class PostgresDB:
             )
 
         return result == "UPDATE 1"
+
+    async def record_stateless_thread_workspace_process_zero(
+        self,
+        thread_id: str,
+        *,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Durably bind exact Kubernetes terminal proof to the current UID.
+
+        The caller observes all containers terminated on the exact Pod object
+        before entering this transaction. Persisting that observation before
+        finalizer removal closes the committed-patch/lost-response window: a
+        retry may combine this receipt with a later 404, while a bare 404 can
+        never manufacture process-zero authority.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            expected_runtime = _canonical_uuid_text(
+                runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT execution_lane, metadata FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if row is None or str(row.get("execution_lane") or "") != "stateless":
+                    return False
+                try:
+                    metadata = _strict_json_object(
+                        row.get("metadata"), label="thread metadata"
+                    )
+                except RuntimeError:
+                    return False
+                raw_workspace = metadata.get("workspace_container")
+                if not isinstance(raw_workspace, dict):
+                    return False
+                workspace = dict(raw_workspace)
+                if workspace.get("provisioner") != "k8s":
+                    return False
+                try:
+                    current_runtime = _canonical_uuid_text(
+                        workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY),
+                        label="stateless workspace runtime incarnation",
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                workspace["status"] = "retiring_process_zero"
+                metadata["workspace_container"] = workspace
+                updated = await conn.execute(
+                    "UPDATE threads SET metadata = $2::jsonb, "
+                    "last_activity = CURRENT_TIMESTAMP WHERE id = $1",
+                    thread_uuid,
+                    json.dumps(metadata),
+                )
+                if updated != "UPDATE 1":
+                    raise RuntimeError(
+                        "Stateless workspace retirement state update was lost"
+                    )
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ('thread', $1, "
+                    "'stateless_workspace', 'k8s', $2) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    thread_uuid,
+                    expected_runtime,
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def get_stateless_thread_workspace_process_zero(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_incarnation: str | None = None,
+    ) -> str | None:
+        """Return the current UID only when its terminal receipt is exact."""
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            expected_runtime = (
+                _canonical_uuid_text(
+                    expected_runtime_incarnation,
+                    label="stateless workspace runtime incarnation",
+                )
+                if expected_runtime_incarnation is not None
+                else None
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT execution_lane, metadata FROM threads "
+                    "WHERE id = $1 FOR SHARE",
+                    thread_uuid,
+                )
+                if row is None or str(row.get("execution_lane") or "") != "stateless":
+                    return None
+                try:
+                    metadata = _strict_json_object(
+                        row.get("metadata"), label="thread metadata"
+                    )
+                except RuntimeError:
+                    return None
+                raw_workspace = metadata.get("workspace_container")
+                if (
+                    not isinstance(raw_workspace, dict)
+                    or raw_workspace.get("provisioner") != "k8s"
+                ):
+                    return None
+                try:
+                    current_runtime = _canonical_uuid_text(
+                        raw_workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY),
+                        label="stateless workspace runtime incarnation",
+                    )
+                except RuntimeError:
+                    return None
+                if expected_runtime is not None and current_runtime != expected_runtime:
+                    return None
+                has_receipt = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 "
+                    "FROM managed_repository_process_zero_receipts "
+                    "WHERE owner_kind = 'thread' AND owner_id = $1 "
+                    "AND scope = 'stateless_workspace' "
+                    "AND provisioner = 'k8s' AND runtime_incarnation = $2)",
+                    thread_uuid,
+                    current_runtime,
+                )
+                return current_runtime if has_receipt is True else None
+
+    async def claim_managed_repository_workspace_retirement(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Fence one exact runtime before remote credential-process retirement.
+
+        The owner row is the serialization point.  A claimed runtime becomes
+        ``retiring_process_zero`` before any SSH side effect, so dispatch,
+        attach, and credential materialization cannot reopen the same runtime
+        while a later process-zero receipt is being established.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        valid_scopes = {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }
+        if (scope, provisioner) not in valid_scopes:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {json_column} AS state FROM {table} "
+                    "WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                try:
+                    state = _strict_json_object(row.get("state"), label=json_column)
+                except RuntimeError:
+                    return False
+                raw_runtime = state.get(state_key)
+                if not isinstance(raw_runtime, dict):
+                    return False
+                if (
+                    scope == "workspace_container"
+                    and raw_runtime.get("provisioner") != "k8s"
+                ):
+                    return False
+                current_runtime = raw_runtime.get(runtime_key)
+                try:
+                    current_runtime = (
+                        str(current_runtime)
+                        if scope == "ide_local"
+                        else _canonical_uuid_text(
+                            current_runtime,
+                            label="managed repository workspace runtime",
+                        )
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                has_receipt = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = $3 AND provisioner = $4 "
+                        "AND runtime_incarnation = $5)",
+                        owner_kind,
+                        owner_uuid,
+                        scope,
+                        provisioner,
+                        expected_runtime,
+                    )
+                )
+                if has_receipt:
+                    return True
+                if str(raw_runtime.get("status") or "") in {
+                    "aborted",
+                    "deleted",
+                    "expired",
+                    "released",
+                }:
+                    return False
+                raw_runtime = dict(raw_runtime)
+                raw_runtime["status"] = "retiring_process_zero"
+                state[state_key] = raw_runtime
+                result = await conn.execute(
+                    f"UPDATE {table} SET {json_column} = $2::jsonb, "
+                    + (
+                        "updated_at = CURRENT_TIMESTAMP "
+                        if owner_kind == "job"
+                        else "last_activity = CURRENT_TIMESTAMP "
+                    )
+                    + "WHERE id = $1",
+                    owner_uuid,
+                    json.dumps(state),
+                )
+                return result == "UPDATE 1"
+
+    async def record_managed_repository_workspace_process_zero(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Persist exact remote repository-agent process-zero authority.
+
+        Kubernetes/VM deletion acknowledgements are control-plane facts, not
+        proof that a partitioned node or guest stopped using a delivered
+        deploy key. The provisioner records this receipt only after an exact
+        endpoint retirement plus an independent zero scan. A later ambiguous
+        delete response may replay only when the receipt still matches the
+        server-owned runtime generation in the same owner row.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        if (scope, provisioner) not in {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        if not await self.claim_managed_repository_workspace_retirement(
+            owner_id,
+            owner_kind=owner_kind,
+            scope=scope,
+            provisioner=provisioner,
+            runtime_incarnation=expected_runtime,
+        ):
+            return False
+
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {json_column} AS state FROM {table} "
+                    "WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                try:
+                    state = _strict_json_object(row.get("state"), label=json_column)
+                except RuntimeError:
+                    return False
+                raw_runtime = state.get(state_key)
+                if not isinstance(raw_runtime, dict):
+                    return False
+                if scope == "workspace_container" and raw_runtime.get(
+                    "provisioner"
+                ) not in {"k8s", None}:
+                    return False
+                try:
+                    current_runtime = (
+                        str(raw_runtime.get(runtime_key))
+                        if scope == "ide_local"
+                        else _canonical_uuid_text(
+                            raw_runtime.get(runtime_key),
+                            label="managed repository workspace runtime",
+                        )
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                if str(raw_runtime.get("status") or "") != ("retiring_process_zero"):
+                    # An existing receipt may be observed after the supported
+                    # delete already published its terminal state.  New
+                    # receipts, however, are admitted only from the absorbing
+                    # retirement claim.
+                    existing = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = $3 AND provisioner = $4 "
+                        "AND runtime_incarnation = $5)",
+                        owner_kind,
+                        owner_uuid,
+                        scope,
+                        provisioner,
+                        expected_runtime,
+                    )
+                    return bool(existing)
+
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    owner_kind,
+                    owner_uuid,
+                    scope,
+                    provisioner,
+                    expected_runtime,
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def managed_repository_workspace_process_zero_is_current(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Verify a receipt against the current server-owned runtime row."""
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        if (scope, provisioner) not in {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {json_column} AS state, EXISTS ("
+                "SELECT 1 FROM managed_repository_process_zero_receipts r "
+                "WHERE r.owner_kind = $2 AND r.owner_id = $1 "
+                "AND r.scope = $3 AND r.provisioner = $4 "
+                "AND r.runtime_incarnation = $5) AS has_receipt "
+                f"FROM {table} WHERE id = $1",
+                owner_uuid,
+                owner_kind,
+                scope,
+                provisioner,
+                expected_runtime,
+            )
+        if row is None or row.get("has_receipt") is not True:
+            return False
+        try:
+            state = _strict_json_object(row.get("state"), label=json_column)
+            raw_runtime = state.get(state_key)
+            return bool(
+                isinstance(raw_runtime, dict)
+                and (
+                    str(raw_runtime.get(runtime_key))
+                    if scope == "ide_local"
+                    else _canonical_uuid_text(
+                        raw_runtime.get(runtime_key),
+                        label="managed repository workspace runtime",
+                    )
+                )
+                == expected_runtime
+            )
+        except RuntimeError:
+            return False
 
     async def stateless_thread_workspace_creation_requires_authority(
         self, thread_id: str
@@ -17249,7 +18169,11 @@ class PostgresDB:
             initial_workspace = dict(initial_workspace)
             initial_workspace.pop("repo_name", None)
             metadata["workspace_container"] = initial_workspace
-        if "datasource_ids" in metadata or "datasource_selection" in metadata:
+        if (
+            "datasource_ids" in metadata
+            or "datasource_selection" in metadata
+            or _STATELESS_PROCESS_ZERO_OBSERVATION_KEY in metadata
+        ):
             raise ValueError("initial thread metadata contains reserved fields")
         metadata["datasource_ids"] = selected_ids
         if execution_lane == "stateless":

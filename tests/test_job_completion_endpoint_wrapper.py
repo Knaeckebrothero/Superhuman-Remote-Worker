@@ -1826,6 +1826,129 @@ async def test_legacy_recovery_delete_keeps_name_based_best_effort_contract(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("release_disposition", "expected_reset"),
+    (("completed", True), ("process_zero_unproven", False)),
+)
+async def test_vm_recovery_retires_exact_runtime_before_context_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    release_disposition: str,
+    expected_reset: bool,
+) -> None:
+    from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    generation = "00000000-0000-4000-8000-000000000001"
+    job = _route_job()
+    job["context"] = {
+        "vm": {
+            "requested": True,
+            "status": "ready",
+            "provision_generation": generation,
+            "vm_uid": "vm-uid-a",
+            "rootdisk_pvc_uid": "root-uid-a",
+            "ssh_host": "vm.internal",
+            "ssh_port": 22,
+            "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
+        }
+    }
+    database = _RouteDB(job)
+    database.merge_job_context = AsyncMock(return_value=True)
+    database.pause_job = AsyncMock(return_value=True)
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
+    identity = VMTeardownIdentity(
+        generation,
+        "vm-uid-a",
+        "root-uid-a",
+        ssh_host="vm.internal",
+        ssh_port=22,
+        ssh_host_key_fingerprint="SHA256:" + ("A" * 43),
+    )
+    calls: list[str] = []
+
+    async def capture(*_args, **_kwargs):
+        calls.append("capture")
+        return identity
+
+    async def release(*_args, **_kwargs):
+        calls.append("release")
+        return VMTeardownResult(
+            release_disposition,
+            release_disposition == "completed",
+        )
+
+    async def merge(*_args, **_kwargs):
+        calls.append("reset")
+        return True
+
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "capture_vm_teardown_identity",
+        AsyncMock(side_effect=capture),
+    )
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "release_vm_captured",
+        AsyncMock(side_effect=release),
+    )
+    database.merge_job_context.side_effect = merge
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            error={"type": "workspace_unavailable", "message": "sshd gone"},
+        ),
+        _authorized=True,
+    )
+
+    assert calls == (
+        ["capture", "release", "reset"] if expected_reset else ["capture", "release"]
+    )
+    main.vm_provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
+        JOB_ID,
+        entity_type="job",
+    )
+    main.vm_provisioner.release_vm_captured.assert_awaited_once_with(
+        JOB_ID,
+        identity,
+        purge_disk=False,
+        entity_type="job",
+        capture_snapshot=False,
+    )
+    if expected_reset:
+        database.merge_job_context.assert_awaited_once_with(
+            JOB_ID,
+            {
+                "vm": {
+                    "requested": True,
+                    "recovering": True,
+                    "previous_error": "workspace_unavailable",
+                    "rootdisk": "kept",
+                }
+            },
+        )
+        main._trigger_dispatch.assert_called_once_with()
+    else:
+        database.merge_job_context.assert_not_awaited()
+        main._trigger_dispatch.assert_not_called()
+    assert result["actions"] == [
+        (
+            "vm recovery: old VM deleted, new VM will be provisioned, job re-queued"
+            if expected_reset
+            else "vm recovery: old VM delete REFUSED — recreate will likely fail on the stale cloud-init Secret"
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_terminal_delivery_failure_does_not_block_teardown_and_replays_only_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2107,6 +2230,7 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
 ) -> None:
     from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 
+    host_key = "SHA256:" + ("A" * 43)
     job = _route_job()
     job["context"] = {
         "vm": {
@@ -2116,6 +2240,7 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
             "rootdisk_pvc_uid": "root-uid-a",
             "ssh_host": "100.64.0.8",
             "ssh_port": 22,
+            "ssh_host_key_fingerprint": host_key,
         }
     }
     database = _RouteDB(job)
@@ -2124,6 +2249,9 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         "00000000-0000-4000-8000-000000000001",
         "vm-uid-a",
         "root-uid-a",
+        ssh_host="100.64.0.8",
+        ssh_port=22,
+        ssh_host_key_fingerprint=host_key,
     )
     capture = AsyncMock(return_value=identity)
     release = AsyncMock(return_value=VMTeardownResult("completed", True))
@@ -2151,6 +2279,7 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         "rootdisk_pvc_uid": "root-uid-a",
         "ssh_host": "100.64.0.8",
         "ssh_port": 22,
+        "ssh_host_key_fingerprint": host_key,
     }
     capture.assert_awaited_once_with(JOB_ID)
     release.assert_awaited_once_with(
@@ -2169,6 +2298,7 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
     from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 
     generation = "00000000-0000-4000-8000-000000000001"
+    host_key = "SHA256:" + ("A" * 43)
     job = _route_job()
     job["context"] = {"vm": {"status": "ready"}}
     database = _RouteDB(job)
@@ -2180,6 +2310,7 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
         "rootdisk_pvc_uid": "old-root-uid",
         "ssh_host": "100.64.0.8",
         "ssh_port": 22,
+        "ssh_host_key_fingerprint": host_key,
     }
     release = AsyncMock(return_value=VMTeardownResult("identity_superseded", False))
     monkeypatch.setattr(main, "postgres_db", database)
@@ -2196,7 +2327,14 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
     assert runner.superseded_names == {"workspace_archive_teardown"}
     release.assert_awaited_once_with(
         JOB_ID,
-        VMTeardownIdentity(generation, "old-vm-uid", "old-root-uid"),
+        VMTeardownIdentity(
+            generation,
+            "old-vm-uid",
+            "old-root-uid",
+            ssh_host="100.64.0.8",
+            ssh_port=22,
+            ssh_host_key_fingerprint=host_key,
+        ),
         ssh_host="100.64.0.8",
         ssh_port=22,
     )
@@ -2256,7 +2394,14 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         pod_ip="10.0.0.8",
         ssh_host_key_fingerprint=host_key,
     )
-    vm_identity = VMTeardownIdentity(generation, "vm-uid-a", "root-uid-a")
+    vm_identity = VMTeardownIdentity(
+        generation,
+        "vm-uid-a",
+        "root-uid-a",
+        ssh_host="100.64.0.8",
+        ssh_port=22,
+        ssh_host_key_fingerprint=host_key,
+    )
     job = _route_job()
     job["context"] = {
         "workspace_container": {"status": "ready", "provisioner": "k8s"},
@@ -2265,6 +2410,7 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
             "provisioner": "kubevirt",
             "ssh_host": "100.64.0.8",
             "ssh_port": 22,
+            "ssh_host_key_fingerprint": host_key,
         },
     }
     runner = _RecordingRunner()
@@ -2319,6 +2465,7 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         "rootdisk_pvc_uid": "root-uid-a",
         "ssh_host": "100.64.0.8",
         "ssh_port": 22,
+        "ssh_host_key_fingerprint": host_key,
     }
     assert intent["kubernetes"] == {
         "pod_uid": "pod-uid-a",
@@ -2360,6 +2507,7 @@ async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
             "provisioner": "kubevirt",
             "ssh_host": "100.64.0.8",
             "ssh_port": 22,
+            "ssh_host_key_fingerprint": host_key,
         },
     }
     runner = _RecordingRunner()
@@ -2373,7 +2521,14 @@ async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
         main.vm_provisioner,
         "capture_vm_teardown_identity",
         AsyncMock(
-            return_value=VMTeardownIdentity(generation, "old-vm-uid", "old-root-uid")
+            return_value=VMTeardownIdentity(
+                generation,
+                "old-vm-uid",
+                "old-root-uid",
+                ssh_host="100.64.0.8",
+                ssh_port=22,
+                ssh_host_key_fingerprint=host_key,
+            )
         ),
     )
     release_vm = AsyncMock(

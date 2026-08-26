@@ -4,8 +4,10 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +16,11 @@ from unittest.mock import patch
 import pytest
 
 import src.services.cloud_mount as cloud_mount_module
-from src.services.cloud_mount import RcloneMountError, RcloneMountManager
+from src.services.cloud_mount import (
+    RcloneMountCleanFailure,
+    RcloneMountError,
+    RcloneMountManager,
+)
 from src.services.keycloak_token import BearerToken
 
 
@@ -119,6 +125,7 @@ def test_starts_rclone_mount_and_installs_workspace_symlink():
     assert "--vfs-cache-mode full" in script
     assert "--vfs-cache-max-size 10G" in script
     assert "cat srw-thread-1-home:.cloudignore" in script
+    assert "timeout 15 rclone --config" in script
     assert "MOUNT_ARGS+=(--exclude-from" in script
     assert "fusermount3 -u /cloud/home" in script
     assert "/cloud/home" in script
@@ -814,6 +821,102 @@ export -f mountpoint findmnt fusermount3 fusermount sleep timeout
     return script, env
 
 
+def _zero_proof_unmount_runtime(
+    tmp_path: Path,
+    *,
+    creating_identity_without_pid: bool,
+) -> tuple[RcloneMountManager, object, Path]:
+    """Build a real-shell strict unmount case with no usable PID identity."""
+
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=tmp_path / "workspace",
+    )
+    original = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+    state_dir = tmp_path / "resident"
+    target = tmp_path / "target"
+    state_dir.mkdir()
+    target.mkdir()
+    state = replace(
+        original,
+        state_dir=str(state_dir),
+        target_path=str(target),
+        config_path=str(state_dir / "rclone.conf"),
+        pid_file=str(state_dir / "rclone.pid"),
+        identity_file=str(state_dir / "resident.identity"),
+        token_path=str(state_dir / "bearer.token"),
+        token_helper_path=str(state_dir / "bearer-helper.sh"),
+    )
+    if creating_identity_without_pid:
+        Path(state.identity_file).write_text(
+            "|".join(
+                (
+                    "1",
+                    state.resident_spec_digest,
+                    "creating",
+                    state.resident_generation,
+                    "0",
+                    state.rc_pass,
+                )
+            )
+            + "\n"
+        )
+    script_path = tmp_path / "unmount-zero-proof.sh"
+    script_path.write_text(manager._unmount_script(state))
+    return manager, state, script_path
+
+
+@pytest.mark.parametrize(
+    "creating_identity_without_pid",
+    [False, True],
+    ids=["missing-identity", "creating-pid-zero-no-pidfile"],
+)
+def test_stateless_unmount_refuses_live_exact_process_without_pid_identity(
+    tmp_path, creating_identity_without_pid
+):
+    _manager, state, script_path = _zero_proof_unmount_runtime(
+        tmp_path,
+        creating_identity_without_pid=creating_identity_without_pid,
+    )
+    resident = subprocess.Popen(
+        [
+            "rclone",
+            "-c",
+            "while :; do sleep 1; done",
+            "mount",
+            state.config_path,
+            state.target_path,
+            state.rc_addr,
+        ],
+        executable="/bin/bash",
+        start_new_session=True,
+    )
+    try:
+        for _ in range(50):
+            if (
+                Path(f"/proc/{resident.pid}/cmdline")
+                .read_bytes()
+                .startswith(b"rclone\0")
+            ):
+                break
+            time.sleep(0.01)
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            text=True,
+            capture_output=True,
+        )
+
+        assert result.returncode == 85, result.stderr
+        assert resident.poll() is None
+        if creating_identity_without_pid:
+            assert Path(state.identity_file).exists()
+    finally:
+        os.killpg(resident.pid, signal.SIGKILL)
+        resident.wait(timeout=2)
+
+
 def test_stateless_dead_resident_pid_unmounts_stale_target(tmp_path):
     dead_pid = 2_147_483_647
     assert not Path(f"/proc/{dead_pid}").exists()
@@ -1256,6 +1359,56 @@ async def test_failed_new_generation_rolls_back_with_its_exact_identity():
     assert "candidatePass_123456789012" not in rollback
 
 
+@pytest.mark.asyncio
+async def test_stateless_failed_mount_reports_clean_only_after_strict_rollback():
+    backend = FakeFencedRemoteBackend()
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\n"
+    )
+    backend.outputs_by_script["mount_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=124\n"
+    )
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+
+    with pytest.raises(RcloneMountCleanFailure):
+        await manager.start_all()
+
+    assert any(
+        operation.endswith("unmount_srw-thread-1-home.sh")
+        for operation in backend.resource_operations
+    )
+
+
+@pytest.mark.asyncio
+async def test_stateless_failed_rollback_never_reports_clean_failure():
+    backend = FakeFencedRemoteBackend()
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\n"
+    )
+    backend.outputs_by_script["mount_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=124\n"
+    )
+    backend.outputs_by_script["unmount_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=1\n"
+    )
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+
+    with pytest.raises(RcloneMountError) as exc_info:
+        await manager.start_all()
+
+    assert not isinstance(exc_info.value, RcloneMountCleanFailure)
+
+
 def test_pinned_mount_script_has_no_resident_identity_protocol():
     backend = FakeRemoteBackend()
     manager = RcloneMountManager(
@@ -1296,3 +1449,23 @@ def test_script_staging_paths_are_controller_unique():
     assert any(
         f"/scripts/{two._script_nonce}/" in path for path in two.workspace_backend.files
     )
+
+
+def test_staged_script_has_remote_kill_budget_before_ssh_timeout():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+
+    manager._run_remote_script(
+        "bounded.sh",
+        "echo __SRW_RCLONE_MOUNT_OK__",
+        timeout=17,
+    )
+
+    command, ssh_timeout = backend.commands[-1]
+    assert "timeout --signal=TERM --kill-after=5s 17s bash" in command
+    assert ssh_timeout == 57

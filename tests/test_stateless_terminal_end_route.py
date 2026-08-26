@@ -505,6 +505,84 @@ async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> N
 
 
 @pytest.mark.asyncio
+async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_path() -> (
+    None
+):
+    acknowledged_thread = _release_authorized_live_thread()
+    unacknowledged_thread = _release_authorized_live_thread()
+    marker = unacknowledged_thread["metadata"]["_stateless_claim_retirement"]
+    marker.update(
+        {
+            "residents_retired": False,
+            "residents_retired_by": None,
+            "remote_retired": False,
+            "remote_retired_by": None,
+        }
+    )
+    unacknowledged_thread["metadata"].pop("_stateless_resident_retirement_ack", None)
+    unacknowledged_thread["metadata"].pop("_stateless_shell_retirement_ack", None)
+    awaiting_ack = {
+        "state": "closed",
+        "terminal_token": 8,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": True,
+        "resident_acknowledged": False,
+        "shell_retirement_required": True,
+        "remote_acknowledged": False,
+        "permanent": False,
+        "workspace_absence_proven": False,
+        "retry": True,
+    }
+    acknowledged = {
+        **awaiting_ack,
+        "resident_acknowledged": True,
+        "remote_acknowledged": True,
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            side_effect=[
+                unacknowledged_thread,
+                acknowledged_thread,
+                acknowledged_thread,
+            ]
+        ),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            side_effect=[awaiting_ack, acknowledged, acknowledged]
+        ),
+        acknowledge_stateless_thread_shell_absent=AsyncMock(return_value=True),
+        finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value="exact_terminal"),
+        delete_workspace=AsyncMock(return_value=True),
+        release_absent_workspace=AsyncMock(return_value=True),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+    ):
+        result = await main._reconcile_stateless_thread_retirement(
+            THREAD_ID, force=True, permanent=False
+        )
+
+    assert result["state"] == "settled"
+    db.acknowledge_stateless_thread_shell_absent.assert_awaited_once_with(
+        THREAD_ID,
+        terminal_token=8,
+        runtime_incarnation=RUNTIME,
+    )
+    provisioner.delete_workspace.assert_awaited_once()
+    assert provisioner.delete_workspace.await_args.kwargs == {
+        "expected_runtime_incarnation": RUNTIME,
+        "wait_for_exact_absence": True,
+    }
+    provisioner.release_absent_workspace.assert_awaited_once()
+    db.finish_stateless_thread_workspace_retirement.assert_awaited_once_with(THREAD_ID)
+
+
+@pytest.mark.asyncio
 async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> None:
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=True)

@@ -556,6 +556,50 @@ class TestWorkspacePodAuthority:
             == "unknown"
         )
 
+    @pytest.mark.asyncio
+    async def test_deleting_exact_uid_never_scheduled_is_process_zero(self):
+        provisioner = self._provisioner()
+        pod = self._pod(regular_terminated=False, deleting=True)
+        pod.status.phase = "Pending"
+        pod.status.container_statuses = []
+        pod.spec.node_name = None
+        provisioner._core_api.read_namespaced_pod.return_value = pod
+
+        assert (
+            await provisioner.workspace_pod_authority(
+                WorkspaceOwner.session("t1"),
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == "exact_terminal"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ambiguity",
+        ["assigned", "running", "ready"],
+    )
+    async def test_deleting_pending_pod_with_runtime_ambiguity_is_unknown(
+        self, ambiguity
+    ):
+        provisioner = self._provisioner()
+        pod = self._pod(regular_terminated=False, deleting=True)
+        pod.status.phase = "Pending"
+        pod.spec.node_name = "worker-a" if ambiguity == "assigned" else None
+        if ambiguity == "assigned":
+            pod.status.container_statuses = []
+        elif ambiguity == "ready":
+            pod.status.container_statuses[0].state.running = None
+            pod.status.container_statuses[0].ready = True
+        provisioner._core_api.read_namespaced_pod.return_value = pod
+
+        assert (
+            await provisioner.workspace_pod_authority(
+                WorkspaceOwner.session("t1"),
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == "unknown"
+        )
+
 
 class TestReleaseWorkspace:
     """Owner-keyed release_workspace: snapshot (if ready) then delete pod, and —
@@ -921,6 +965,30 @@ class TestPodManifest:
         )
         ann = manifest["metadata"].get("annotations", {})
         assert ann.get("srw.io/managed-by") == "lifecycle-reconciler"
+        assert manifest["metadata"]["finalizers"] == [
+            "lifecycle.srw.dev/stateless-process-zero"
+        ]
+
+    def test_stateless_manifest_uses_universal_process_zero_finalizer(self):
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="ws-thread-aaaaaaaa-bbb",
+            owner=WorkspaceOwner.session("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            image="test-image:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+            stateless_creation_generation=("11111111-2222-4333-8444-555555555555"),
+        )
+
+        assert manifest["metadata"]["finalizers"] == [
+            "lifecycle.srw.dev/stateless-process-zero"
+        ]
 
     def test_manifest_tier_label_home_allowed(self):
         """Explicitly passing network_tier='home-allowed' propagates to the pod label."""
@@ -1744,6 +1812,8 @@ class _StrictCreationDB:
         self.completed = {
             "workspace_generation": "44444444-4444-4444-8444-444444444444"
         }
+        self.process_zero_recorded = True
+        self.process_zero_uid = None
 
     async def validate_stateless_thread_workspace_creation_attempt(
         self, thread_id, **kwargs
@@ -1788,6 +1858,35 @@ class _StrictCreationDB:
 
     async def get_thread(self, *_args):
         return {"user_id": None}
+
+    async def record_stateless_thread_workspace_process_zero(self, thread_id, **kwargs):
+        self.events.append(("record_process_zero", thread_id, kwargs))
+        if self.process_zero_recorded:
+            self.process_zero_uid = kwargs["runtime_incarnation"]
+        return self.process_zero_recorded
+
+    async def get_stateless_thread_workspace_process_zero(self, _thread_id, **kwargs):
+        expected = kwargs.get("expected_runtime_incarnation")
+        if expected is not None and expected != self.process_zero_uid:
+            return None
+        return self.process_zero_uid
+
+    async def claim_managed_repository_workspace_retirement(self, owner_id, **kwargs):
+        self.events.append(("claim_managed_process_zero", owner_id, kwargs))
+        return True
+
+    async def record_managed_repository_workspace_process_zero(
+        self, owner_id, **kwargs
+    ):
+        self.events.append(("record_managed_process_zero", owner_id, kwargs))
+        if self.process_zero_recorded:
+            self.process_zero_uid = kwargs["runtime_incarnation"]
+        return self.process_zero_recorded
+
+    async def managed_repository_workspace_process_zero_is_current(
+        self, _owner_id, **kwargs
+    ):
+        return kwargs.get("runtime_incarnation") == self.process_zero_uid
 
 
 class _DirectSessionLaneDB:
@@ -2251,6 +2350,9 @@ class TestStrictStatelessWorkspaceCreation:
             ]
             == self.GENERATION
         )
+        assert created_body["metadata"]["finalizers"] == [
+            "lifecycle.srw.dev/stateless-process-zero"
+        ]
         publish = next(event for event in events if event[0] == "publish")
         assert publish[2]["runtime_incarnation"] == self.RUNTIME
         wait_kwargs = p._wait_for_ready.await_args.kwargs
@@ -2258,6 +2360,179 @@ class TestStrictStatelessWorkspaceCreation:
         assert wait_kwargs["expected_creation_generation"] == self.GENERATION
         p._resolve_ide_needs_state.assert_not_awaited()
         p._seed_workspace_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_requires_exact_terminal_uid(self):
+        p = self._provisioner()
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = [
+            "foreign.example/keep",
+            "lifecycle.srw.dev/stateless-process-zero",
+        ]
+        pod.status.phase = "Failed"
+        pod.status.container_statuses[0].state.terminated = SimpleNamespace(exit_code=0)
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+
+        patch_call = p._core_api.patch_namespaced_pod.call_args
+        assert patch_call.kwargs["name"] == self._owner().pod_name
+        assert patch_call.kwargs["body"] == [
+            {"op": "test", "path": "/metadata/uid", "value": self.RUNTIME},
+            {
+                "op": "test",
+                "path": "/metadata/finalizers/1",
+                "value": "lifecycle.srw.dev/stateless-process-zero",
+            },
+            {"op": "remove", "path": "/metadata/finalizers/1"},
+        ]
+        assert patch_call.kwargs["_content_type"] == ("application/json-patch+json")
+        assert p._db.events[-1] == (
+            "record_process_zero",
+            self.THREAD_ID,
+            {"runtime_incarnation": self.RUNTIME},
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_releases_never_scheduled_pending_pod(self):
+        p = self._provisioner()
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.spec.node_name = None
+        pod.status.phase = "Pending"
+        pod.status.container_statuses = []
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+
+        p._core_api.patch_namespaced_pod.assert_called_once()
+        assert p._db.events[-1] == (
+            "record_process_zero",
+            self.THREAD_ID,
+            {"runtime_incarnation": self.RUNTIME},
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_refuses_without_durable_receipt(self):
+        db = _StrictCreationDB()
+        db.process_zero_recorded = False
+        p = self._provisioner(db)
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.status.phase = "Failed"
+        pod.status.container_statuses[0].state.terminated = SimpleNamespace(exit_code=0)
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert not await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        p._core_api.patch_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dynamic_mock_method_cannot_forge_process_zero_receipt(self):
+        p = self._provisioner(MagicMock())
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.status.phase = "Failed"
+        pod.status.container_statuses[0].state.terminated = SimpleNamespace(exit_code=0)
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert not await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        p._core_api.patch_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_recovers_lost_finalizer_response_from_durable_receipt(self):
+        class _NotFound(Exception):
+            status = 404
+
+        db = _StrictCreationDB()
+        db.process_zero_uid = self.RUNTIME
+        p = self._provisioner(db)
+        p._core_api.read_namespaced_pod.side_effect = _NotFound()
+        p._set_context = AsyncMock()
+
+        with patch(
+            "orchestrator.services.container_provisioner.workspace_metering.close_interval",
+            new=AsyncMock(return_value=None),
+        ):
+            assert await p.delete_workspace(self._owner())
+
+        p._core_api.delete_namespaced_pod.assert_not_called()
+        p._delete_seed_configmap.assert_awaited_once_with(
+            self._owner().pod_name,
+            expected_owner=self._owner(),
+            expected_pod_uid=self.RUNTIME,
+        )
+        p._set_context.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_refuses_live_or_replacement_pod(self):
+        p = self._provisioner()
+        live = self._pod()
+        live.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        p._core_api.read_namespaced_pod.return_value = live
+
+        assert not await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        assert not await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation="bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+        )
+        p._core_api.patch_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_strict_delete_waits_for_terminal_then_removes_finalizer(self):
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        live = self._pod()
+        live.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        terminal = self._pod()
+        terminal.metadata.deletion_timestamp = "now"
+        terminal.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        terminal.status.phase = "Failed"
+        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
+            exit_code=0
+        )
+        p._core_api.read_namespaced_pod.side_effect = [
+            live,
+            terminal,
+            terminal,
+            _NotFound(),
+        ]
+        p._set_context = AsyncMock()
+
+        with patch(
+            "orchestrator.services.container_provisioner.workspace_metering.close_interval",
+            new=AsyncMock(return_value=None),
+        ):
+            assert await p.delete_workspace(
+                self._owner(),
+                expected_runtime_incarnation=self.RUNTIME,
+                wait_for_exact_absence=True,
+                exact_absence_timeout_seconds=1,
+            )
+
+        p._core_api.delete_namespaced_pod.assert_called_once()
+        p._core_api.patch_namespaced_pod.assert_called_once()
+        p._set_context.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_conflict_adopts_only_matching_nonce_pod_once(self):
@@ -2731,6 +3006,14 @@ class TestStrictStatelessWorkspaceCreation:
         db = _StrictCreationDB(events)
         p = self._provisioner(db)
         p.workspace_pod_authority = AsyncMock(return_value="exact_terminal")
+        terminal = self._pod()
+        terminal.metadata.deletion_timestamp = "now"
+        terminal.status.phase = "Failed"
+        terminal.spec.containers = [SimpleNamespace(name="workspace")]
+        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
+            exit_code=0
+        )
+        p._core_api.read_namespaced_pod.return_value = terminal
 
         def delete(**kwargs):
             events.append(("delete", kwargs))
@@ -2751,7 +3034,14 @@ class TestStrictStatelessWorkspaceCreation:
 
         assert isinstance(generation, str)
         names = [event[0] for event in events]
-        assert names == ["prepare", "validate", "delete", "wait_absent", "clear"]
+        assert names == [
+            "prepare",
+            "validate",
+            "record_managed_process_zero",
+            "delete",
+            "wait_absent",
+            "clear",
+        ]
         delete_kwargs = next(event[1] for event in events if event[0] == "delete")
         assert delete_kwargs["body"] == {"preconditions": {"uid": self.RUNTIME}}
         clear = next(event for event in events if event[0] == "clear")
@@ -2766,6 +3056,13 @@ class TestStrictStatelessWorkspaceCreation:
         events = []
         db = _StrictCreationDB(events)
         p = self._provisioner(db)
+        terminal = self._pod()
+        terminal.metadata.deletion_timestamp = "now"
+        terminal.status.phase = "Failed"
+        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
+            exit_code=0
+        )
+        p._core_api.read_namespaced_pod.return_value = terminal
         p._core_api.delete_namespaced_pod.return_value = None
         p._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=False)
 
@@ -3750,6 +4047,9 @@ class TestDeleteWorkspace:
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
         provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
+            return_value=True
+        )
 
         mock_core_api = MagicMock()
         mock_core_api.delete_namespaced_pod = MagicMock()
@@ -3778,6 +4078,9 @@ class TestDeleteWorkspace:
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
         provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db.managed_repository_workspace_process_zero_is_current = (
+            AsyncMock(return_value=True)
+        )
 
         mock_404 = MagicMock()
         mock_404.status = 404
@@ -3792,8 +4095,10 @@ class TestDeleteWorkspace:
         mock_core_api.delete_namespaced_pod = MagicMock(side_effect=error)
         mock_core_api.read_namespaced_pod = MagicMock(side_effect=error)
 
+        runtime = "11111111-1111-4111-8111-111111111111"
         result = await provisioner.delete_workspace(
-            WorkspaceOwner.job("test-job-123456")
+            WorkspaceOwner.job("test-job-123456"),
+            expected_runtime_incarnation=runtime,
         )
         assert result is True
         provisioner._db.merge_workspace_container_context.assert_awaited_once_with(
@@ -3824,6 +4129,9 @@ class TestDeleteWorkspace:
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
         provisioner._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
+            return_value=True
+        )
         provisioner._core_api = MagicMock()
         provisioner._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=False)
         owner = WorkspaceOwner.session("test-thread-123456")
@@ -3858,6 +4166,9 @@ class TestDeleteWorkspace:
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
         provisioner._db.merge_thread_workspace_context = AsyncMock(return_value=True)
+        provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
+            return_value=True
+        )
         provisioner._core_api = MagicMock()
         provisioner._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=True)
         provisioner._delete_seed_configmap = AsyncMock(return_value=True)
@@ -4404,6 +4715,15 @@ class TestWorkspaceNamedResourceAuthority:
         p = ContainerProvisioner()
         p._k8s_available = True
         p._core_api = MagicMock()
+        p._db = SimpleNamespace(
+            managed_repository_workspace_process_zero_is_current=AsyncMock(
+                return_value=True
+            ),
+            record_managed_repository_workspace_process_zero=AsyncMock(
+                return_value=True
+            ),
+        )
+        p._retire_managed_repository_agents = AsyncMock(return_value=True)
         return p
 
     @classmethod
@@ -4524,6 +4844,7 @@ class TestWorkspaceNamedResourceAuthority:
                 service_uid=self.RESOURCE_UID,
             )
         )
+        p.workspace_pod_authority = AsyncMock(return_value="exact_live")
 
         captured = await p.capture_terminal_workspace_identity(self.OWNER)
 
@@ -4590,7 +4911,7 @@ class TestWorkspaceNamedResourceAuthority:
             await p.capture_workspace_teardown_identity(self.OWNER)
 
     @pytest.mark.asyncio
-    async def test_s36_release_without_pod_uid_cleans_only_captured_residuals(self):
+    async def test_s36_release_without_pod_uid_refuses_process_zero_inference(self):
         from orchestrator.services.container_provisioner import (
             WorkspaceTeardownIdentity,
         )
@@ -4607,26 +4928,18 @@ class TestWorkspaceNamedResourceAuthority:
             service_uid=self.RESOURCE_UID,
         )
 
-        assert await p.release_workspace(
+        assert not await p.release_workspace(
             self.OWNER,
             teardown_identity=identity,
             capture_snapshot=False,
             strict=True,
         )
 
-        assert p._captured_teardown_pod_is_absent.await_count == 2
+        assert p._captured_teardown_pod_is_absent.await_count == 1
         p.workspace_pod_authority.assert_not_awaited()
         p.delete_workspace.assert_not_awaited()
-        p.delete_workspace_pvc.assert_awaited_once_with(
-            self.OWNER,
-            require_exact_owner=True,
-            expected_uid=self.RESOURCE_UID,
-        )
-        p._delete_service.assert_awaited_once_with(
-            self.OWNER,
-            require_exact_owner=True,
-            expected_uid=self.RESOURCE_UID,
-        )
+        p.delete_workspace_pvc.assert_not_awaited()
+        p._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_s36_release_without_pod_uid_refuses_when_pod_name_reappears(self):
@@ -4746,7 +5059,9 @@ class TestWorkspaceNamedResourceAuthority:
 
         p = self._provisioner()
         p._snapshot_service = MagicMock(is_available=False)
-        p.workspace_pod_authority = AsyncMock(side_effect=["exact_live", "replacement"])
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["exact_live", "exact_live", "replacement"]
+        )
         p.get_workspace_status = AsyncMock(
             return_value={
                 "runtime_incarnation": self.POD_UID,
@@ -4784,7 +5099,7 @@ class TestWorkspaceNamedResourceAuthority:
         p = self._provisioner()
         p._snapshot_service = MagicMock(is_available=False)
         p.workspace_pod_authority = AsyncMock(
-            side_effect=["exact_live", "exact_terminal"]
+            side_effect=["exact_live", "exact_terminal", "exact_terminal"]
         )
         p.get_workspace_status = AsyncMock(
             return_value={
@@ -4826,7 +5141,7 @@ class TestWorkspaceNamedResourceAuthority:
 
         p = self._provisioner()
         p.workspace_pod_authority = AsyncMock(
-            side_effect=["exact_live", "exact_terminal"]
+            side_effect=["exact_live", "exact_terminal", "exact_terminal"]
         )
         p.get_workspace_status = AsyncMock(
             return_value={
@@ -4915,7 +5230,7 @@ class TestWorkspaceNamedResourceAuthority:
         )
         p._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=True)
         p.workspace_pod_authority = AsyncMock(
-            side_effect=["exact_live", "exact_terminal"]
+            side_effect=["exact_live", "exact_terminal", "exact_terminal"]
         )
         p.get_workspace_status = AsyncMock(
             return_value={
@@ -4974,9 +5289,7 @@ class TestWorkspaceNamedResourceAuthority:
             return_value=(True, "complete")
         )
         p._snapshot_service.capture_vm_snapshot = AsyncMock()
-        p.workspace_pod_authority = AsyncMock(
-            side_effect=["exact_absent", "exact_absent"]
-        )
+        p.workspace_pod_authority = AsyncMock(return_value="exact_absent")
         p.delete_workspace = AsyncMock()
         p.delete_workspace_pvc = AsyncMock(return_value=True)
         p._delete_service = AsyncMock(return_value=True)
@@ -5442,6 +5755,7 @@ class TestIdePodResourceAuthority:
 
         p = ContainerProvisioner()
         p._k8s_available = True
+        p._db = SimpleNamespace(merge_ide_session_context=AsyncMock(return_value=True))
         p._core_api = MagicMock()
         p._resolve_network_tier = AsyncMock(return_value="internet-only")
         p._resolve_ide_seed_files = AsyncMock(return_value={})
@@ -5451,6 +5765,13 @@ class TestIdePodResourceAuthority:
         p._delete_seed_configmap = AsyncMock(return_value=True)
         p._adopt_configmap = AsyncMock(return_value=True)
         p._wait_for_ready = AsyncMock(return_value="10.42.0.30")
+        p._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(
+                f"k8s-pod:{p._namespace}:{cls.RUNTIME}",
+                "SHA256:" + ("A" * 43),
+                cls.RUNTIME,
+            )
+        )
         p._seed_workspace_state = AsyncMock(return_value=None)
         return p
 
@@ -5560,6 +5881,81 @@ class TestIdePodResourceAuthority:
         p._delete_seed_configmap.assert_not_awaited()
         p._wait_for_ready.assert_not_awaited()
 
+    def test_ide_manifest_installs_universal_process_zero_finalizer(self):
+        p = self._provisioner()
+        manifest = p._build_pod_manifest(
+            pod_name=f"ide-{self.JOB_ID[:12]}",
+            owner=self._owner(),
+            image=p._workspace_image,
+            cpu="250m",
+            memory="512Mi",
+            cpu_limit="1000m",
+            memory_limit="2Gi",
+            network_tier="internet-only",
+        )
+        manifest["metadata"]["labels"]["srw/component"] = "ide-session"
+
+        assert manifest["metadata"]["finalizers"] == [
+            "lifecycle.srw.dev/stateless-process-zero"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_ide_pod_releases_only_exact_terminal_uid(self):
+        p = self._provisioner()
+        live = self._pod(p)
+        live.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        terminal = self._pod(p)
+        terminal.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        terminal.metadata.deletion_timestamp = "now"
+        terminal.status.phase = "Failed"
+        terminal.spec.containers = [SimpleNamespace(name="workspace")]
+        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
+            exit_code=0
+        )
+        p._core_api.read_namespaced_pod.side_effect = [live, terminal]
+        p._ide_pod_authority = AsyncMock(side_effect=["exact_terminal", "exact_absent"])
+        p._db = SimpleNamespace(
+            record_managed_repository_workspace_process_zero=AsyncMock(
+                return_value=True
+            )
+        )
+
+        assert await p.delete_ide_pod(self.JOB_ID)
+
+        delete_call = p._core_api.delete_namespaced_pod.call_args
+        assert delete_call.kwargs["body"] == {"preconditions": {"uid": self.RUNTIME}}
+        patch_call = p._core_api.patch_namespaced_pod.call_args
+        assert patch_call.kwargs["body"] == [
+            {"op": "test", "path": "/metadata/uid", "value": self.RUNTIME},
+            {
+                "op": "test",
+                "path": "/metadata/finalizers/0",
+                "value": "lifecycle.srw.dev/stateless-process-zero",
+            },
+            {"op": "remove", "path": "/metadata/finalizers/0"},
+        ]
+        p._db.record_managed_repository_workspace_process_zero.assert_awaited_once_with(
+            self.JOB_ID,
+            owner_kind="job",
+            scope="ide",
+            provisioner="k8s",
+            runtime_incarnation=self.RUNTIME,
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_ide_pod_refuses_same_name_replacement_before_finalizer(self):
+        p = self._provisioner()
+        live = self._pod(p)
+        live.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        p._core_api.read_namespaced_pod.return_value = live
+        p._ide_pod_authority = AsyncMock(return_value="replacement")
+        p._db = SimpleNamespace()
+
+        assert not await p.delete_ide_pod(self.JOB_ID)
+
+        p._core_api.patch_namespaced_pod.assert_not_called()
+        p._delete_seed_configmap.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_delete_initial_404_never_sends_name_only_pod_delete(self):
         class _NotFound(Exception):
@@ -5567,6 +5963,16 @@ class TestIdePodResourceAuthority:
 
         p = self._provisioner()
         p._core_api.read_namespaced_pod.side_effect = _NotFound()
+        p._db = SimpleNamespace(
+            get_job=AsyncMock(
+                return_value={
+                    "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
+                }
+            ),
+            managed_repository_workspace_process_zero_is_current=AsyncMock(
+                return_value=True
+            ),
+        )
 
         assert await p.delete_ide_pod(self.JOB_ID)
         p._core_api.delete_namespaced_pod.assert_not_called()
@@ -5574,4 +5980,26 @@ class TestIdePodResourceAuthority:
         cleanup = p._delete_seed_configmap.await_args
         assert cleanup.args == (f"ide-{self.JOB_ID[:12]}",)
         assert cleanup.kwargs["expected_owner"].id == self.JOB_ID
-        assert cleanup.kwargs["expected_pod_uid"] is None
+        assert cleanup.kwargs["expected_pod_uid"] == self.RUNTIME
+
+    @pytest.mark.asyncio
+    async def test_delete_initial_404_refuses_without_exact_durable_receipt(self):
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.side_effect = _NotFound()
+        p._db = SimpleNamespace(
+            get_job=AsyncMock(
+                return_value={
+                    "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
+                }
+            ),
+            managed_repository_workspace_process_zero_is_current=AsyncMock(
+                return_value=False
+            ),
+        )
+
+        assert not await p.delete_ide_pod(self.JOB_ID)
+        p._core_api.delete_namespaced_pod.assert_not_called()
+        p._delete_seed_configmap.assert_not_awaited()

@@ -1893,6 +1893,24 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                         _suspend_thread_resources(thread_id),
                     )
 
+            # Static Docker containers survive owner termination.  Their
+            # exact inventory lease plus the terminal job/thread row is the
+            # durable retry owner for managed-repository ssh-agent process
+            # retirement.  This sweep closes crashes between a terminal DB
+            # transition and cleanup, retries typed retirement failures, and
+            # reclaims an external operation whose bounded deadline elapsed.
+            docker_retirement_claims = await _step(
+                "terminal_docker_workspace_retirement_claim",
+                postgres_db.claim_terminal_docker_workspace_retirements(),
+            )
+            for claim in docker_retirement_claims or []:
+                await _step(
+                    "terminal_docker_workspace_retirement_settle",
+                    docker_provisioner.settle_claimed_terminal_workspace_retirement(
+                        claim
+                    ),
+                )
+
             # 4. Legacy compatibility: pre-lease pinned jobs assigned to
             # offline/non-working agents -> paused. The database predicate
             # excludes every non-NULL lease; ordering cannot steal a leased
@@ -7697,6 +7715,8 @@ _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS = {
     "repository_auth",
     "repository_credentials",
     "_managed_repository_authority_pending",
+    "_managed_repository_process_zero",
+    "_stateless_workspace_process_zero_observation",
 }
 _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
     _SERVER_OWNED_OFFICER_CONTEXT_KEYS
@@ -8254,16 +8274,31 @@ async def _archive_and_cleanup_workspace(
         # Workspace container cleanup (snapshot + delete)
         if ws_ctx.get("status") not in ("deleted", "deleting", "released", None):
             if ws_ctx.get("provisioner") == "docker":
-                await docker_provisioner.release_thread_workspace(entity_id)
-                actions.append("docker thread workspace released")
+                released = await docker_provisioner.release_thread_workspace(entity_id)
+                if not released:
+                    raise RuntimeError(
+                        "Docker thread workspace authority retirement is incomplete"
+                    )
+                actions.append("docker thread workspace authority retired")
             elif container_provisioner.is_available:
                 # reclaim_volume=False snapshots + deletes the pod but KEEPS the
                 # PVC, so a resumable `ended` thread comes back to its own files
                 # instead of an empty volume (see the docstring above).
-                await container_provisioner.release_workspace(
+                teardown_identity = (
+                    await container_provisioner.capture_terminal_workspace_identity(
+                        WorkspaceOwner.session(entity_id)
+                    )
+                )
+                released = await container_provisioner.release_workspace(
                     WorkspaceOwner.session(entity_id),
                     reclaim_volume=reclaim_volume,
+                    teardown_identity=teardown_identity,
+                    strict=True,
                 )
+                if not released:
+                    raise RuntimeError(
+                        "Kubernetes thread workspace exact teardown is incomplete"
+                    )
                 actions.append(
                     "k8s thread workspace released"
                     + ("" if reclaim_volume else " (volume kept)")
@@ -8272,12 +8307,43 @@ async def _archive_and_cleanup_workspace(
         # VM cleanup (snapshot + delete)
         if _vm_needs_release(vm_ctx):
             if vm_provisioner.is_available:
-                await vm_provisioner.release_thread_vm(entity_id)
+                teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
+                    entity_id,
+                    entity_type="thread",
+                )
+                outcome = await vm_provisioner.release_vm_captured(
+                    entity_id,
+                    teardown_identity,
+                    ssh_host=vm_ctx.get("ssh_host"),
+                    ssh_port=vm_ctx.get("ssh_port"),
+                    entity_type="thread",
+                )
+                if outcome.disposition != "completed":
+                    raise RuntimeError(
+                        "Thread VM exact teardown remains " + outcome.disposition
+                    )
                 actions.append("thread vm released")
 
     else:
         job = await postgres_db.get_job(entity_id)
         if not job:
+            return actions
+        raw_context = job.get("context") or {}
+        if isinstance(raw_context, str):
+            try:
+                raw_context = json.loads(raw_context)
+            except (TypeError, ValueError):
+                raw_context = {}
+        if (
+            job.get("parent_job_id")
+            and isinstance(raw_context, dict)
+            and raw_context.get("inherits_parent_workspace") is True
+        ):
+            # Inherited subjobs carry a diagnostic copy of the root runtime,
+            # but the stable Pod/VM/Docker owner remains the root job. A child
+            # terminal transition owns only its worktree/claim—not namespace-
+            # wide credential retirement or compute deletion.
+            actions.append("inherited workspace retained by root owner")
             return actions
         ws_ctx = _get_container_context(job)
         vm_ctx = _get_vm_context(job)
@@ -8285,7 +8351,19 @@ async def _archive_and_cleanup_workspace(
         # VM cleanup (snapshot + delete)
         if _vm_needs_release(vm_ctx):
             if vm_provisioner.is_available:
-                await vm_provisioner.release_vm(entity_id)
+                teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
+                    entity_id
+                )
+                outcome = await vm_provisioner.release_vm_captured(
+                    entity_id,
+                    teardown_identity,
+                    ssh_host=vm_ctx.get("ssh_host"),
+                    ssh_port=vm_ctx.get("ssh_port"),
+                )
+                if outcome.disposition != "completed":
+                    raise RuntimeError(
+                        "VM exact teardown remains " + outcome.disposition
+                    )
                 actions.append("vm released")
 
         # Workspace container cleanup (snapshot + delete)
@@ -8296,12 +8374,27 @@ async def _archive_and_cleanup_workspace(
             None,
         ):
             if ws_ctx.get("provisioner") == "docker":
-                await docker_provisioner.release_workspace(entity_id)
-                actions.append("docker workspace released")
+                released = await docker_provisioner.release_workspace(entity_id)
+                if not released:
+                    raise RuntimeError(
+                        "Docker workspace authority retirement is incomplete"
+                    )
+                actions.append("docker workspace authority retired")
             else:
-                await container_provisioner.release_workspace(
-                    WorkspaceOwner.job(entity_id)
+                teardown_identity = (
+                    await container_provisioner.capture_terminal_workspace_identity(
+                        WorkspaceOwner.job(entity_id)
+                    )
                 )
+                released = await container_provisioner.release_workspace(
+                    WorkspaceOwner.job(entity_id),
+                    teardown_identity=teardown_identity,
+                    strict=True,
+                )
+                if not released:
+                    raise RuntimeError(
+                        "Kubernetes workspace exact teardown is incomplete"
+                    )
                 actions.append("k8s workspace released")
 
     return actions
@@ -8372,7 +8465,10 @@ async def _detach_agent_session(thread_id: str, timeout: float = 150.0) -> bool:
 
 
 async def _release_thread_resources(
-    thread_id: str, *, reclaim_volume: bool = False
+    thread_id: str,
+    *,
+    reclaim_volume: bool = False,
+    require_workspace_retirement: bool = False,
 ) -> None:
     """Release a thread's workspace container/VM and agent pod.
 
@@ -8398,11 +8494,13 @@ async def _release_thread_resources(
     # for the orphan reaper (agent not in 'session' status).
     await _detach_agent_session(thread_id)
 
+    workspace_error: Exception | None = None
     try:
         await _archive_and_cleanup_workspace(
             thread_id, entity_type="threads", reclaim_volume=reclaim_volume
         )
-    except Exception:
+    except Exception as exc:
+        workspace_error = exc
         logger.exception("Workspace cleanup failed for thread %s", thread_id)
 
     # BOTH provisioners, not either/or: a thread can have pods from both over
@@ -8435,6 +8533,15 @@ async def _release_thread_resources(
                 await persistent_provisioner.delete_agent_pvc(thread_id)
     except Exception:
         logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
+
+    # The supported End path must not report a terminal transition while a
+    # static workspace can still hold a live repo-scoped ssh-agent, or while a
+    # Pod/VM delete has not proved the captured compute incarnation gone.  The
+    # background orphan path retains its historical best-effort behavior so a
+    # failed snapshot cannot block unrelated agent-pod cleanup; its error stays
+    # visible for lifecycle reconciliation.
+    if require_workspace_retirement and workspace_error is not None:
+        raise workspace_error
 
 
 # Threads with a suspend currently in flight. Two triggers can race on the
@@ -8482,13 +8589,33 @@ async def _suspend_thread_resources_inner(thread_id: str) -> None:
         )
         return
     suspended = False
-    try:
-        if workspace_suspension_service.is_enabled:
-            suspended = await workspace_suspension_service.suspend_thread_workspace(
-                thread_id
+    metadata = thread_metadata_object(thread or {})
+    workspace = metadata.get("workspace_container") or {}
+    if workspace.get("provisioner") == "docker":
+        # Static Docker suspension cannot destroy the process namespace.  It
+        # must nevertheless retire and independently prove zero repo-scoped
+        # ssh-agents before the persistent runtime Pod is removed.  The deploy
+        # key remains server-side and can be delivered again on a supported
+        # resume; only this resident bearer process is retired.
+        try:
+            if not await docker_provisioner.release_thread_workspace(thread_id):
+                logger.error(
+                    "Docker workspace authority retirement failed for ended thread %s",
+                    thread_id,
+                )
+        except Exception:
+            logger.exception(
+                "Docker workspace authority retirement raised for ended thread %s",
+                thread_id,
             )
-    except Exception:
-        logger.exception("Workspace suspend failed for thread %s", thread_id)
+    else:
+        try:
+            if workspace_suspension_service.is_enabled:
+                suspended = await workspace_suspension_service.suspend_thread_workspace(
+                    thread_id
+                )
+        except Exception:
+            logger.exception("Workspace suspend failed for thread %s", thread_id)
 
     if suspended:
         # suspend_thread_workspace already deletes the agent pod.
@@ -13843,6 +13970,7 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     if "config_override" in md:
         md["config_override"] = redact_config_override(md["config_override"])
     md.pop("_workspace_binding", None)
+    md.pop("_stateless_workspace_process_zero_observation", None)
     thread["metadata"] = md
     return thread
 
@@ -14817,8 +14945,19 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
         # knowledge-history/done/deleted_job_orphans_workspace_pod.md).
         try:
             await _archive_and_cleanup_workspace(job_id)
-        except Exception as e:
-            logger.warning(f"Workspace cleanup failed for deleted job {job_id}: {e}")
+        except Exception as exc:
+            # Retain the owning row as the durable retry handle.  In
+            # particular, a static Docker container may still hold a live
+            # repo-scoped ssh-agent even after its lease is quarantined; and a
+            # Pod/VM transport acknowledgement is not exact compute absence.
+            # Deleting the row here would make either residue ownerless.
+            logger.warning(
+                "Workspace cleanup is incomplete for job %s: %s", job_id, exc
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace authority retirement is incomplete",
+            ) from exc
         # A deleted job can never be restored, so its S3 snapshots (including
         # the one release_workspace may have just captured) are garbage.
         if snapshot_service.is_available:
@@ -14999,30 +15138,36 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
         return True
 
     # Signal processing agents concurrently
-    async def _signal_cancel(child: dict) -> None:
+    async def _signal_cancel(child: dict) -> bool:
         child_id = str(child["id"])
         agent_id = child.get("assigned_agent_id")
-        if child["status"] != "processing" or not agent_id:
-            return
+        if child["status"] != "processing":
+            return True
+        if not agent_id:
+            return False
         agent = await postgres_db.get_agent(str(agent_id))
         if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
-            return
+            return False
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
         try:
             async with httpx.AsyncClient(timeout=130.0) as client:
-                await client.post(
+                response = await client.post(
                     agent_url,
                     json={"reason": f"Parent job {job_id} cancelled"},
                 )
+            return response.status_code == 200
         except Exception as e:
             logger.warning(f"Could not reach agent to cancel child {child_id}: {e}")
+            return False
 
-    async def _cleanup_child(child: dict) -> None:
+    async def _cleanup_child(child: dict) -> bool:
         child_id = str(child["id"])
         try:
             await _archive_and_cleanup_workspace(child_id)
-        except Exception as e:
-            logger.warning(f"Workspace cleanup failed for child {child_id}: {e}")
+        except Exception as exc:
+            logger.warning("Workspace cleanup failed for child %s: %s", child_id, exc)
+            return False
+        return True
 
     pinned_children = [c for c in children if c.get("execution_lane") != "stateless"]
     stateless_children = [c for c in children if c.get("execution_lane") == "stateless"]
@@ -15039,17 +15184,33 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
             )
             if not won:
                 refreshed = await postgres_db.get_job(child_id)
-                return not refreshed or refreshed.get("status") in (
+                if not refreshed or refreshed.get("status") in (
                     "completed",
                     "failed",
-                    "cancelled",
-                )
-            await asyncio.gather(
+                ):
+                    return True
+                if refreshed.get("status") != "cancelled":
+                    return False
+                # A previous caller may have committed cancellation and died
+                # before external retirement.  The terminal row remains the
+                # retry owner; never treat status alone as cleanup success.
+                return await _cleanup_child(refreshed)
+            signal_result, cleanup_result = await asyncio.gather(
                 _signal_cancel(child),
                 _cleanup_child(child),
                 return_exceptions=True,
             )
-            return True
+            if isinstance(signal_result, BaseException):
+                logger.warning(
+                    "Cascade cancellation signal raised for child %s",
+                    child_id,
+                    exc_info=(
+                        type(signal_result),
+                        signal_result,
+                        signal_result.__traceback__,
+                    ),
+                )
+            return signal_result is True and cleanup_result is True
 
         pinned_results = await asyncio.gather(
             *[_cancel_pinned_child(c) for c in pinned_children],
@@ -15065,10 +15226,15 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
                 child.get("id"),
             )
     else:
-        await asyncio.gather(
+        legacy_results = await asyncio.gather(
             *[_signal_cancel(c) for c in pinned_children],
             *[_cleanup_child(c) for c in pinned_children],
             return_exceptions=True,
+        )
+        signal_results = legacy_results[: len(pinned_children)]
+        cleanup_results = legacy_results[len(pinned_children) :]
+        pinned_settled = all(result is True for result in signal_results) and all(
+            result is True for result in cleanup_results
         )
 
     async def _cancel_stateless_child(child: dict) -> bool:
@@ -15118,7 +15284,7 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
 
     # Bulk cancel in DB
     pinned_ids = [str(c["id"]) for c in pinned_children]
-    if pinned_ids and not COMPLETION_COMMANDS_ENABLED:
+    if pinned_ids and not COMPLETION_COMMANDS_ENABLED and pinned_settled:
         async with postgres_db.acquire() as conn:
             await conn.execute(
                 """
@@ -15410,6 +15576,12 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                         "descendant worker was not proven quiescent",
                         job_id,
                     )
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Descendant workspace authority retirement is incomplete"
+                        ),
+                    )
 
                 job["status"] = "cancelled"
                 try:
@@ -15486,13 +15658,32 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                     # Agent might be unreachable — still cancel in DB
                     logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
+        # Descendants can share the root Pod/VM/Docker namespace. Quiesce and
+        # terminalize every child before the root performs namespace-wide
+        # repository-agent retirement or compute deletion.
+        if not await _cascade_cancel_to_children(job_id):
+            raise HTTPException(
+                status_code=503,
+                detail="Descendant workspace authority retirement is incomplete",
+            )
+
         # Archive workspace (snapshot to S3) and clean up VM/container
         try:
             await _archive_and_cleanup_workspace(job_id)
-        except Exception as e:
+        except Exception as exc:
+            # ``linearize_pinned_cancel`` may already have published the
+            # terminal status.  Keep the row as the durable retry owner and
+            # make the caller retry cleanup; the Docker lifecycle sweep also
+            # owns any exact static-workspace residue.
             logger.warning(
-                "Workspace cleanup failed for cancelled job %s: %s", job_id, e
+                "Workspace cleanup remains pending for cancelled job %s: %s",
+                job_id,
+                exc,
             )
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace authority retirement is incomplete",
+            ) from exc
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -15510,9 +15701,6 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 await postgres_db.delete_checkpoint_thread(job_id)
             except Exception as exc:
                 logger.debug("checkpoint prune skipped for %s: %s", job_id, exc)
-
-        # Cascade cancel to all child/subjobs
-        await _cascade_cancel_to_children(job_id)
 
         # If this was a scholar, unblock the parent job
         job["status"] = "cancelled"
@@ -26060,6 +26248,7 @@ async def _run_completion_workspace_teardown(
             rootdisk_uid = intent.get("rootdisk_pvc_uid")
             ssh_host = intent.get("ssh_host")
             ssh_port = intent.get("ssh_port")
+            ssh_host_key_fingerprint = intent.get("ssh_host_key_fingerprint")
             if not isinstance(generation, str) or str(UUID(generation)) != generation:
                 raise RuntimeError(
                     "VM teardown intent has invalid provision generation"
@@ -26086,12 +26275,21 @@ async def _run_completion_workspace_teardown(
                 or not 1 <= ssh_port <= 65535
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH port")
+            if (
+                not isinstance(ssh_host_key_fingerprint, str)
+                or not ssh_host_key_fingerprint.startswith("SHA256:")
+                or any(character.isspace() for character in ssh_host_key_fingerprint)
+            ):
+                raise RuntimeError("VM teardown intent has invalid SSH host key")
             return await vm_provisioner.release_vm_captured(
                 job_id,
                 VMTeardownIdentity(
                     provision_generation=generation,
                     vm_uid=vm_uid,
                     rootdisk_pvc_uid=rootdisk_uid,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    ssh_host_key_fingerprint=ssh_host_key_fingerprint,
                 ),
                 ssh_host=ssh_host,
                 ssh_port=ssh_port,
@@ -26269,8 +26467,11 @@ async def _run_completion_workspace_teardown(
                             "provision_generation": (captured_vm.provision_generation),
                             "vm_uid": captured_vm.vm_uid,
                             "rootdisk_pvc_uid": captured_vm.rootdisk_pvc_uid,
-                            "ssh_host": vm_context.get("ssh_host"),
-                            "ssh_port": vm_context.get("ssh_port"),
+                            "ssh_host": captured_vm.ssh_host,
+                            "ssh_port": captured_vm.ssh_port,
+                            "ssh_host_key_fingerprint": (
+                                captured_vm.ssh_host_key_fingerprint
+                            ),
                         }
                     if kubernetes_detail is not None and vm_detail is not None:
                         intent_detail = {
@@ -27180,51 +27381,59 @@ async def _complete_job_legacy(
                     )
                     if not paused:
                         await _raise_completion_control_race()
-                # Set recovering flag *before* issuing delete to prevent re-entry.
-                # Replace context.vm wholesale (recovery intentionally resets the
-                # vm object) via a top-level merge that preserves other keys.
-                await postgres_db.merge_job_context(
-                    job_id,
-                    {
-                        "vm": {
-                            "requested": True,
-                            "recovering": True,
-                            "previous_error": "workspace_unavailable",
-                            "rootdisk": "kept",
-                            # Carried across the reset on purpose. delete_vm()
-                            # re-reads context.vm.provision_generation to fence
-                            # the request, so a wholesale wipe here made it send
-                            # a generation-less delete that never reached the
-                            # controller at all. The old VM survived, and with
-                            # it the per-VM cloud-init Secret it owns, so the
-                            # next create died on a 409 AlreadyExists and the
-                            # job failed permanently instead of recovering with
-                            # its kept rootdisk. Found by the live k3d VM gate.
-                            "provision_generation": (
-                                (vm_ctx or {}).get("provision_generation")
-                            ),
-                        }
-                    },
-                )
-
-                # Delete the old VM but retain the persistent root disk. The
-                # boolean matters: a refused delete leaves the cloud-init Secret
-                # behind, which is fatal to the recreate, so do not report a
-                # recovery we did not actually perform.
+                # Retire the exact credential-capable runtime before replacing
+                # its authority-bearing VM context.  The old flow published a
+                # small ``recovering`` object first and thereby erased the UID,
+                # SSH host-key fingerprint, and endpoint that the process-zero
+                # protocol needs.  The retirement claim itself is the absorbing
+                # pre-I/O fence; only a completed captured release may publish
+                # the fresh-provision marker.
                 vm_deleted = True
-                if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                    vm_deleted = await vm_provisioner.delete_vm(
-                        job_id, purge_disk=False
-                    )
+                if vm_ctx:
+                    try:
+                        identity = await vm_provisioner.capture_vm_teardown_identity(
+                            job_id,
+                            entity_type="job",
+                        )
+                        release = await vm_provisioner.release_vm_captured(
+                            job_id,
+                            identity,
+                            purge_disk=False,
+                            entity_type="job",
+                            capture_snapshot=False,
+                        )
+                        vm_deleted = release.disposition == "completed"
+                    except Exception:
+                        vm_deleted = False
+                        logger.exception(
+                            "VM recovery for job %s: exact retirement failed",
+                            job_id,
+                        )
                     if not vm_deleted:
                         logger.error(
                             "VM recovery for job %s: delete was refused; the "
                             "stale cloud-init Secret will fail the recreate",
                             job_id,
                         )
+                if vm_deleted:
+                    # Replace context.vm only after exact retirement.  The
+                    # controller keeps the deterministic rootdisk; the next
+                    # dispatch mints a new provision generation.
+                    await postgres_db.merge_job_context(
+                        job_id,
+                        {
+                            "vm": {
+                                "requested": True,
+                                "recovering": True,
+                                "previous_error": "workspace_unavailable",
+                                "rootdisk": "kept",
+                            }
+                        },
+                    )
                 if not COMPLETION_COMMANDS_ENABLED:
                     await postgres_db.pause_job(job_id)
-                _trigger_dispatch()
+                if vm_deleted:
+                    _trigger_dispatch()
                 return {
                     "status": "handled",
                     "job_id": job_id,
@@ -40881,8 +41090,18 @@ async def agent_abort_thread_vm_upgrade(
             logger.warning(
                 "abort-vm-upgrade: delete_thread_vm failed for %s: %s", thread_id, e
             )
-    # Clear the in-progress marker regardless of delete outcome so a retry isn't
-    # blocked by the idempotency guard.
+    if not deleted:
+        # An accepted/absent control-plane response is not process-zero for a
+        # partitioned guest. Preserve the exact generation and retry handle;
+        # marking it aborted would hide a potentially credential-capable VM
+        # from both the lifecycle owner and migration 0187.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "vm_process_zero_unproven",
+                "retryable": True,
+            },
+        )
     await postgres_db.merge_thread_vm_context(thread_id, {"status": "aborted"})
     return {"status": "aborted", "thread_id": thread_id, "vm_deleted": deleted}
 
@@ -43513,6 +43732,7 @@ def _build_protected_cloud_mount(
         "cloud_root": "/cloud",
         "workspace_entry": "cloud",
         "protected": True,
+        "required": True,
         # The overlay manager owns workspace/cloud -> merged; the rclone manager
         # must NOT install its own workspace/cloud -> lower symlink.
         "skip_workspace_links": True,
@@ -43665,6 +43885,7 @@ async def _build_agent_cloud_mount(
         "cloud_root": "/cloud",
         "workspace_entry": "cloud",
         "fallback": fallback,
+        "required": False,
         "mounts": mounts_out,
     }
 
@@ -45405,7 +45626,11 @@ async def _end_thread_flow(
         officer_handoff = await _stand_down(thread)
         if officer_handoff and officer_handoff.get("blocked_by_in_flight"):
             return _officer_in_flight_decommission_response(officer_handoff)
-        await _release_thread_resources(thread_id, reclaim_volume=permanent)
+        await _release_thread_resources(
+            thread_id,
+            reclaim_volume=permanent,
+            require_workspace_retirement=True,
+        )
         if permanent:
             await _delete_auxiliary_state(thread)
             await postgres_db.delete_thread(thread_id)

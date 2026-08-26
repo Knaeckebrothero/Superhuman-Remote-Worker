@@ -1658,7 +1658,9 @@ class VMController:
         except ApiException as exc:
             if exc.status != 404:
                 raise
+            vmi_observed = False
         else:
+            vmi_observed = True
             vmi_status = vmi.get("status", {})
             interfaces = vmi_status.get("interfaces") or []
             pod_ip = interfaces[0].get("ipAddress") if interfaces else None
@@ -1675,6 +1677,13 @@ class VMController:
                     active_pod_uid = getattr(items[0].metadata, "uid", None)
             result["pod_ip"] = pod_ip
             result["active_pod_uid"] = active_pod_uid
+        # Authenticated teardown callers may skip guest SSH only when this VM
+        # generation has never created a VMI and none exists now.  KubeVirt's
+        # durable `status.created` bit prevents a stopped/restarting guest from
+        # being misclassified as never credential-capable.
+        result["credential_runtime_started"] = bool(
+            status.get("created") is True or vmi_observed
+        )
         if exact_absence:
             rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
                 _rootdisk_name(job_id),

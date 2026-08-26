@@ -15,6 +15,9 @@ from uuid import UUID, uuid4
 import httpx
 
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from services.managed_repository_process_retirement import (
+    retire_managed_repository_processes,
+)
 
 from .container_provisioner import (
     DEFAULT_NETWORK_TIER,
@@ -44,6 +47,10 @@ class VMTeardownIdentity:
     provision_generation: str
     vm_uid: str | None
     rootdisk_pvc_uid: str | None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_host_key_fingerprint: str | None = None
+    credential_runtime_started: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +302,8 @@ class VMProvisioner:
             )
         if (root_uid := _safe_vm_uid(data.get("rootdisk_pvc_uid"))) is not None:
             updates["rootdisk_pvc_uid"] = root_uid
+        if type(data.get("credential_runtime_started")) is bool:
+            updates["credential_runtime_started"] = data["credential_runtime_started"]
         return await self._set_context_if_generation(
             entity_type,
             entity_id,
@@ -568,7 +577,12 @@ class VMProvisioner:
 
         return False
 
-    async def capture_vm_teardown_identity(self, job_id: str) -> VMTeardownIdentity:
+    async def capture_vm_teardown_identity(
+        self,
+        job_id: str,
+        *,
+        entity_type: str = "job",
+    ) -> VMTeardownIdentity:
         """Capture one authenticated VM generation/UID tuple for replay.
 
         The provision generation is mandatory on every backend.  Immutable VM
@@ -579,10 +593,24 @@ class VMProvisioner:
 
         if not self._db:
             raise RuntimeError("VM teardown identity database is unavailable")
-        row = await self._db.get_job(job_id)
+        if entity_type not in {"job", "thread"}:
+            raise ValueError("VM teardown entity type is invalid")
+        row = (
+            await self._db.get_thread(job_id)
+            if entity_type == "thread"
+            else await self._db.get_job(job_id)
+        )
         if not isinstance(row, dict):
-            raise RuntimeError("VM teardown job no longer exists")
-        context = _extract_vm_context(row)
+            raise RuntimeError(f"VM teardown {entity_type} no longer exists")
+        if entity_type == "thread":
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            context = metadata.get("vm") if isinstance(metadata, Mapping) else None
+            if not isinstance(context, Mapping):
+                context = {}
+        else:
+            context = _extract_vm_context(row)
         generation = _provision_generation(context.get("provision_generation"))
         if generation is None:
             raise RuntimeError("VM teardown provision generation is unavailable")
@@ -595,6 +623,29 @@ class VMProvisioner:
         vm_uid = _safe_vm_uid(context.get("vm_uid")) if authenticated else None
         rootdisk_uid = (
             _safe_vm_uid(context.get("rootdisk_pvc_uid")) if authenticated else None
+        )
+        ssh_host = context.get("ssh_host")
+        if (
+            not isinstance(ssh_host, str)
+            or not ssh_host
+            or ssh_host != ssh_host.strip()
+            or len(ssh_host) > 512
+            or any(character.isspace() for character in ssh_host)
+        ):
+            ssh_host = None
+        raw_ssh_port = context.get("ssh_port")
+        ssh_port = (
+            int(raw_ssh_port)
+            if not isinstance(raw_ssh_port, bool)
+            and isinstance(raw_ssh_port, (int, str))
+            and str(raw_ssh_port).isdigit()
+            and 1 <= int(raw_ssh_port) <= 65535
+            else None
+        )
+        host_key_fingerprint = (
+            _safe_ssh_host_key_fingerprint(context.get("ssh_host_key_fingerprint"))
+            if authenticated
+            else None
         )
         if vm_uid is None or rootdisk_uid is None:
             probe = await self._probe_vm_teardown_identity(job_id, generation)
@@ -627,6 +678,9 @@ class VMProvisioner:
             provision_generation=generation,
             vm_uid=vm_uid,
             rootdisk_pvc_uid=rootdisk_uid,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            ssh_host_key_fingerprint=host_key_fingerprint,
         )
 
     async def _probe_vm_teardown_identity(
@@ -665,6 +719,11 @@ class VMProvisioner:
             provision_generation=generation,
             vm_uid=_safe_vm_uid(result.get("vm_uid")),
             rootdisk_pvc_uid=_safe_vm_uid(result.get("rootdisk_pvc_uid")),
+            credential_runtime_started=(
+                result.get("credential_runtime_started")
+                if type(result.get("credential_runtime_started")) is bool
+                else None
+            ),
         )
         if status == "not_found":
             return _VMTeardownProbe(
@@ -743,15 +802,31 @@ class VMProvisioner:
         identity: VMTeardownIdentity,
         *,
         purge_disk: bool = True,
+        entity_type: str = "job",
     ) -> VMTeardownResult:
         """Delete only the VM/rootdisk incarnation captured in an intent."""
 
         generation = _provision_generation(identity.provision_generation)
         if generation is None:
             return VMTeardownResult("identity_invalid", False)
-        current_generation = await self._current_provision_generation("job", job_id)
+        if entity_type not in {"job", "thread"}:
+            return VMTeardownResult("identity_invalid", False)
+        current_generation = await self._current_provision_generation(
+            entity_type, job_id
+        )
         if current_generation != generation:
             return VMTeardownResult("identity_superseded", False)
+        if (
+            not self._db
+            or not await self._db.managed_repository_workspace_process_zero_is_current(
+                job_id,
+                owner_kind=entity_type,
+                scope="vm",
+                provisioner="vm",
+                runtime_incarnation=generation,
+            )
+        ):
+            return VMTeardownResult("process_zero_unproven", False)
         probe = await self._probe_vm_teardown_identity(job_id, generation)
         classification = self._classify_captured_probe(
             probe, identity, purge_disk=purge_disk
@@ -762,13 +837,16 @@ class VMProvisioner:
             return VMTeardownResult("completed", True)
         if classification != "matched":
             return VMTeardownResult("identity_unknown", False)
-        await self._delete_vm_with_identity(
-            job_id,
-            purge_disk=purge_disk,
-            provision_generation=generation,
-            expected_vm_uid=_safe_vm_uid(identity.vm_uid),
-            expected_rootdisk_pvc_uid=_safe_vm_uid(identity.rootdisk_pvc_uid),
-        )
+
+        delete_kwargs: dict[str, Any] = {
+            "purge_disk": purge_disk,
+            "provision_generation": generation,
+            "expected_vm_uid": _safe_vm_uid(identity.vm_uid),
+            "expected_rootdisk_pvc_uid": _safe_vm_uid(identity.rootdisk_pvc_uid),
+        }
+        if entity_type != "job":
+            delete_kwargs["entity_type"] = entity_type
+        await self._delete_vm_with_identity(job_id, **delete_kwargs)
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
             reprobe, identity, purge_disk=purge_disk
@@ -779,7 +857,12 @@ class VMProvisioner:
             return VMTeardownResult("identity_superseded", False)
         return VMTeardownResult("retry_pending", False)
 
-    async def _terminal_snapshot_already_captured(self, job_id: str) -> bool:
+    async def _terminal_snapshot_already_captured(
+        self,
+        job_id: str,
+        *,
+        entity_type: str = "job",
+    ) -> bool:
         """True when this VM incarnation's terminal snapshot is already in S3.
 
         A captured teardown is retried whenever the controller has not yet
@@ -791,14 +874,26 @@ class VMProvisioner:
         if not self._db:
             return False
         try:
-            row = await self._db.get_job(job_id)
+            row = (
+                await self._db.get_thread(job_id)
+                if entity_type == "thread"
+                else await self._db.get_job(job_id)
+            )
             if not isinstance(row, dict):
                 return False
-            ctx = row.get("context") or {}
+            ctx = (
+                row.get("metadata") or {}
+                if entity_type == "thread"
+                else row.get("context") or {}
+            )
             if isinstance(ctx, str):
                 ctx = json.loads(ctx)
             snapshot = ctx.get("snapshot") or {}
-            vm_ctx = _extract_vm_context(row)
+            vm_ctx = (
+                ctx.get("vm") or {}
+                if entity_type == "thread" and isinstance(ctx, Mapping)
+                else _extract_vm_context(row)
+            )
             if (
                 snapshot.get("status") != "available"
                 or snapshot.get("source_type") != "vm"
@@ -833,36 +928,94 @@ class VMProvisioner:
         *,
         ssh_host: str | None = None,
         ssh_port: int | None = None,
+        entity_type: str = "job",
+        purge_disk: bool = True,
+        capture_snapshot: bool = True,
     ) -> VMTeardownResult:
         """Best-effort archive, then release only the captured VM incarnation."""
 
         generation = _provision_generation(identity.provision_generation)
         if generation is None:
             return VMTeardownResult("identity_invalid", False)
-        if await self._current_provision_generation("job", job_id) != generation:
+        if entity_type not in {"job", "thread"}:
+            return VMTeardownResult("identity_invalid", False)
+        if await self._current_provision_generation(entity_type, job_id) != generation:
             return VMTeardownResult("identity_superseded", False)
+        if (
+            ssh_host is not None
+            and identity.ssh_host is not None
+            and (ssh_host != identity.ssh_host)
+        ):
+            return VMTeardownResult("identity_invalid", False)
+        if (
+            ssh_port is not None
+            and identity.ssh_port is not None
+            and (int(ssh_port) != identity.ssh_port)
+        ):
+            return VMTeardownResult("identity_invalid", False)
+        effective_ssh_host = identity.ssh_host or ssh_host
+        effective_ssh_port = identity.ssh_port or ssh_port
         probe = await self._probe_vm_teardown_identity(job_id, generation)
-        classification = self._classify_captured_probe(probe, identity, purge_disk=True)
+        classification = self._classify_captured_probe(
+            probe,
+            identity,
+            purge_disk=purge_disk,
+        )
         if classification == "superseded":
             return VMTeardownResult("identity_superseded", False)
         if classification == "completed":
-            return VMTeardownResult("completed", True)
+            contained = bool(
+                self._db
+                and await self._db.managed_repository_workspace_process_zero_is_current(
+                    job_id,
+                    owner_kind=entity_type,
+                    scope="vm",
+                    provisioner="vm",
+                    runtime_incarnation=generation,
+                )
+            )
+            return VMTeardownResult(
+                "completed" if contained else "process_zero_unproven",
+                contained,
+            )
         if classification != "matched":
             return VMTeardownResult("identity_unknown", False)
 
         if (
+            self._db
+            and await self._db.managed_repository_workspace_process_zero_is_current(
+                job_id,
+                owner_kind=entity_type,
+                scope="vm",
+                provisioner="vm",
+                runtime_incarnation=generation,
+            )
+        ):
+            return await self.delete_vm_captured(
+                job_id,
+                identity,
+                purge_disk=purge_disk,
+                entity_type=entity_type,
+            )
+
+        if (
             self._snapshot_service
             and self._snapshot_service.is_available
-            and ssh_host
-            and ssh_port
-            and not await self._terminal_snapshot_already_captured(job_id)
+            and capture_snapshot
+            and effective_ssh_host
+            and effective_ssh_port
+            and not await self._terminal_snapshot_already_captured(
+                job_id,
+                entity_type=entity_type,
+            )
         ):
             try:
                 captured = await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,
-                    ssh_host=ssh_host,
-                    ssh_port=int(ssh_port),
+                    ssh_host=effective_ssh_host,
+                    ssh_port=int(effective_ssh_port),
                     source_type="vm",
+                    **({"entity_type": "threads"} if entity_type == "thread" else {}),
                 )
                 if not captured:
                     logger.warning(
@@ -876,7 +1029,65 @@ class VMProvisioner:
                     "incarnation under terminal teardown policy",
                     job_id,
                 )
-        return await self.delete_vm_captured(job_id, identity, purge_disk=True)
+
+        if (
+            self._db is None
+            or not await self._db.claim_managed_repository_workspace_retirement(
+                job_id,
+                owner_kind=entity_type,
+                scope="vm",
+                provisioner="vm",
+                runtime_incarnation=generation,
+            )
+        ):
+            return VMTeardownResult("process_zero_unproven", False)
+        current_identity = probe.identity
+        never_started = bool(
+            current_identity is not None
+            and current_identity.credential_runtime_started is False
+        )
+        if not never_started:
+            if (
+                not effective_ssh_host
+                or not effective_ssh_port
+                or not identity.ssh_host_key_fingerprint
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            retired = await retire_managed_repository_processes(
+                host=effective_ssh_host,
+                port=int(effective_ssh_port),
+                host_key_fingerprint=identity.ssh_host_key_fingerprint,
+                operation="VM managed repository process retirement",
+            )
+            if not retired:
+                return VMTeardownResult("process_zero_unproven", False)
+        reprobe = await self._probe_vm_teardown_identity(job_id, generation)
+        if (
+            self._classify_captured_probe(
+                reprobe,
+                identity,
+                purge_disk=purge_disk,
+            )
+            != "matched"
+        ):
+            return VMTeardownResult("process_zero_unproven", False)
+        if (
+            not self._db
+            or not await self._db.record_managed_repository_workspace_process_zero(
+                job_id,
+                owner_kind=entity_type,
+                scope="vm",
+                provisioner="vm",
+                runtime_incarnation=generation,
+            )
+        ):
+            return VMTeardownResult("process_zero_unproven", False)
+        return await self.delete_vm_captured(
+            job_id,
+            identity,
+            purge_disk=purge_disk,
+            entity_type=entity_type,
+        )
 
     async def delete_orphan_vm_captured(
         self,
@@ -906,6 +1117,16 @@ class VMProvisioner:
             return VMTeardownResult("identity_superseded", False)
         if classification != "matched":
             return VMTeardownResult("identity_unknown", False)
+        current_identity = probe.identity
+        if (
+            current_identity is None
+            or current_identity.credential_runtime_started is not False
+        ):
+            # With no owning row there is no endpoint/grant authority from
+            # which to prove resident process-zero. Preserve a credential-
+            # capable historical VM rather than turning inventory ownership
+            # or API deletion into containment evidence.
+            return VMTeardownResult("process_zero_unproven", False)
         await self._delete_vm_with_identity(
             job_id,
             purge_disk=purge_disk,
@@ -937,12 +1158,23 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
-        generation = await self._current_provision_generation("job", job_id)
-        return await self._delete_vm_with_identity(
+        try:
+            identity = await self.capture_vm_teardown_identity(job_id)
+        except Exception:
+            logger.warning(
+                "VM delete refused without captured repository-process authority "
+                "for job %s",
+                job_id,
+                exc_info=True,
+            )
+            return False
+        outcome = await self.release_vm_captured(
             job_id,
+            identity,
             purge_disk=purge_disk,
-            provision_generation=generation,
+            capture_snapshot=False,
         )
+        return outcome.disposition == "completed"
 
     async def _delete_vm_with_identity(
         self,
@@ -952,13 +1184,14 @@ class VMProvisioner:
         provision_generation: str | None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        entity_type: str = "job",
     ) -> bool:
         generation = _provision_generation(provision_generation)
         if self._nats_available:
             kwargs: dict[str, Any] = {
                 "purge_disk": purge_disk,
                 "provision_generation": generation,
-                "entity_type": "job",
+                "entity_type": entity_type,
             }
             if expected_vm_uid is not None:
                 kwargs["expected_vm_uid"] = expected_vm_uid
@@ -968,7 +1201,7 @@ class VMProvisioner:
 
         if self._http_available:
             kwargs = {
-                "entity_type": "job",
+                "entity_type": entity_type,
                 "purge_disk": purge_disk,
                 "provision_generation": generation,
             }
@@ -1785,24 +2018,27 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
-        generation = await self._current_provision_generation("thread", thread_id)
-        if self._nats_available:
-            return await nats_bridge.request_vm_delete(
-                thread_id,
-                purge_disk=purge_disk,
-                provision_generation=generation,
-                entity_type="thread",
-            )
-
-        if self._http_available:
-            return await self._delete_http(
+        try:
+            identity = await self.capture_vm_teardown_identity(
                 thread_id,
                 entity_type="thread",
-                purge_disk=purge_disk,
-                provision_generation=generation,
             )
-
-        return False
+        except Exception:
+            logger.warning(
+                "VM delete refused without captured repository-process authority "
+                "for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            return False
+        outcome = await self.release_vm_captured(
+            thread_id,
+            identity,
+            entity_type="thread",
+            purge_disk=purge_disk,
+            capture_snapshot=False,
+        )
+        return outcome.disposition == "completed"
 
     async def _set_thread_vm_context(self, thread_id: str, updates: dict) -> None:
         """Atomically merge updates into thread's metadata.vm key."""

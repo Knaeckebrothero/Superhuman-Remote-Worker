@@ -709,14 +709,18 @@ class PersistentSession:
                         "retry_timeouts_as_booting", False
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
+                    # Current pinned attaches also carry the provisioner-owned
+                    # backing/runtime pair.  Shell fencing remains stateless-
+                    # only, but managed-repository receipts use this pair to
+                    # distinguish a remounted PVC from same-runtime PID reuse.
                     workspace_generation=(
                         workspace_generation
-                        if self.shell_owner_token is not None
+                        if workspace_generation and workspace_runtime_incarnation
                         else None
                     ),
                     runtime_incarnation=(
                         workspace_runtime_incarnation
-                        if self.shell_owner_token is not None
+                        if workspace_generation and workspace_runtime_incarnation
                         else None
                     ),
                     expected_host_key_fingerprint=(
@@ -928,9 +932,11 @@ class PersistentSession:
         prior agent may have left workspace-side rclone/overlay processes for
         this thread, and using the workspace before the new claimant has
         adopted or healed them would expose stale credentials or a dead FUSE
-        mount.  ``RcloneMountManager.start_all`` therefore includes the first
-        real directory probe and this method propagates failures for stateless
-        claims so :meth:`setup` stops before shell/tool construction.
+        mount. ``RcloneMountManager.start_all`` therefore includes the first
+        real directory probe and this method propagates ambiguous failures for
+        stateless claims so :meth:`setup` stops before shell/tool construction.
+        An ordinary non-protected mount may degrade only after the manager
+        proves exact rollback of every newly-owned resident.
         """
         if not cloud_mount_cfg:
             return
@@ -953,9 +959,12 @@ class PersistentSession:
                     "stateless cloud mount requires an attached workspace"
                 )
             return
-        try:
-            from src.services.cloud_mount import RcloneMountManager
+        from src.services.cloud_mount import (
+            RcloneMountCleanFailure,
+            RcloneMountManager,
+        )
 
+        try:
             self.cloud_mount_manager = RcloneMountManager(
                 thread_id=self.thread_id,
                 cloud_cfg=cloud_mount_cfg,
@@ -972,6 +981,23 @@ class PersistentSession:
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
             if self.shell_owner_token is not None:
+                # A stateless workspace normally fails closed because an
+                # attach error may conceal an old resident/FUSE mount.  The
+                # manager emits this subtype only after strict, exact cleanup
+                # of every newly-owned resident. Optional ordinary cloud can
+                # then degrade without blocking unrelated repository/shell
+                # work. Protected cloud never degrades.
+                if (
+                    isinstance(e, RcloneMountCleanFailure)
+                    and cloud_mount_cfg.get("required") is False
+                    and not bool(cloud_mount_cfg.get("protected"))
+                ):
+                    logger.warning(
+                        "Stateless optional cloud mount degraded after exact "
+                        "resident cleanup: %s",
+                        e,
+                    )
+                    return
                 raise
             return
 

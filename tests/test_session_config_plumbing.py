@@ -1528,9 +1528,15 @@ class TestEndedSessionKeepsItsVolume:
         """
         seen: dict = {}
 
-        async def _release(thread_id, *, reclaim_volume=False):
+        async def _release(
+            thread_id,
+            *,
+            reclaim_volume=False,
+            require_workspace_retirement=False,
+        ):
             seen["thread_id"] = thread_id
             seen["reclaim_volume"] = reclaim_volume
+            seen["require_workspace_retirement"] = require_workspace_retirement
 
         db = SimpleNamespace(
             end_thread=AsyncMock(),
@@ -1571,6 +1577,7 @@ class TestEndedSessionKeepsItsVolume:
 
         assert result == {"status": "ended"}
         assert seen["reclaim_volume"] is False
+        assert seen["require_workspace_retirement"] is True
         db.end_thread.assert_awaited_once_with("t1")
         db.delete_thread.assert_not_awaited()
 
@@ -1583,7 +1590,42 @@ class TestEndedSessionKeepsItsVolume:
 
         assert result == {"status": "deleted"}
         assert seen["reclaim_volume"] is True
+        assert seen["require_workspace_retirement"] is True
         db.delete_thread.assert_awaited_once_with("t1")
+
+    @pytest.mark.asyncio
+    async def test_end_does_not_advance_when_exact_workspace_retirement_fails(self):
+        thread = self._thread()
+        db = SimpleNamespace(
+            end_thread=AsyncMock(),
+            delete_thread=AsyncMock(),
+            get_thread=AsyncMock(return_value=thread),
+            merge_thread_config_override=AsyncMock(),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"sub": "u1"}, thread)),
+            ),
+            patch.object(
+                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            ),
+            patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
+            patch.object(
+                orch_main,
+                "_release_thread_resources",
+                AsyncMock(side_effect=RuntimeError("exact delete pending")),
+            ),
+            patch.object(orch_main, "postgres_db", db),
+        ):
+            with pytest.raises(RuntimeError, match="exact delete pending"):
+                await orch_main.end_thread(
+                    "t1", SimpleNamespace(), permanent=False, force=True
+                )
+
+        db.end_thread.assert_not_awaited()
+        db.delete_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stateless_end_refuses_unattested_workspace_before_cleanup(self):
@@ -1752,7 +1794,13 @@ class TestEndedSessionKeepsItsVolume:
                 "metadata": {"workspace_container": {"status": "ready"}},
             }
             provisioner = SimpleNamespace(
-                is_available=True, release_workspace=AsyncMock(return_value=True)
+                is_available=True,
+                capture_terminal_workspace_identity=AsyncMock(
+                    return_value=SimpleNamespace(
+                        pod_uid="pod-uid", pvc_uid="pvc-uid", service_uid="svc-uid"
+                    )
+                ),
+                release_workspace=AsyncMock(return_value=True),
             )
             with (
                 patch.object(
@@ -1770,5 +1818,49 @@ class TestEndedSessionKeepsItsVolume:
                 )
 
             provisioner.release_workspace.assert_awaited_once_with(
-                WorkspaceOwner.session("t1"), reclaim_volume=reclaim
+                WorkspaceOwner.session("t1"),
+                reclaim_volume=reclaim,
+                teardown_identity=(
+                    provisioner.capture_terminal_workspace_identity.return_value
+                ),
+                strict=True,
             )
+
+    @pytest.mark.asyncio
+    async def test_archive_refuses_false_kubernetes_teardown_result(self):
+        from services.workspace_lifecycle import WorkspaceOwner
+
+        thread = {
+            "id": "t1",
+            "metadata": {"workspace_container": {"status": "ready"}},
+        }
+        identity = SimpleNamespace(
+            pod_uid="pod-uid", pvc_uid="pvc-uid", service_uid="svc-uid"
+        )
+        provisioner = SimpleNamespace(
+            is_available=True,
+            capture_terminal_workspace_identity=AsyncMock(return_value=identity),
+            release_workspace=AsyncMock(return_value=False),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "postgres_db",
+                SimpleNamespace(get_thread=AsyncMock(return_value=thread)),
+            ),
+            patch.object(orch_main, "container_provisioner", provisioner),
+            patch.object(
+                orch_main, "vm_provisioner", SimpleNamespace(is_available=False)
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="exact teardown is incomplete"):
+                await orch_main._archive_and_cleanup_workspace(
+                    "t1", entity_type="threads", reclaim_volume=False
+                )
+
+        provisioner.release_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1"),
+            reclaim_volume=False,
+            teardown_identity=identity,
+            strict=True,
+        )

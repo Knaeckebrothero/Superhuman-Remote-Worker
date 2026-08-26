@@ -476,17 +476,25 @@ class WorkspaceSuspensionService:
             }
 
             if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
-                await self._vm_provisioner.delete_vm(
+                deleted = await self._vm_provisioner.delete_vm(
                     job_id, purge_disk=not disk_survives_teardown
                 )
+                if not deleted:
+                    raise RuntimeError(
+                        "VM suspension process-zero retirement is incomplete"
+                    )
                 if disk_survives_teardown:
                     suspended_ctx["rootdisk"] = "kept"
                 await self._db.merge_vm_context(job_id, suspended_ctx)
             else:
                 # K8s container (default)
-                await self._container_provisioner.delete_workspace(
+                deleted = await self._container_provisioner.delete_workspace(
                     WorkspaceOwner.job(job_id)
                 )
+                if not deleted:
+                    raise RuntimeError(
+                        "workspace suspension process-zero retirement is incomplete"
+                    )
                 suspended_ctx.update({"pod_ip": None, "pod_name": None})
                 await self._db.merge_workspace_container_context(job_id, suspended_ctx)
 
@@ -1033,9 +1041,13 @@ class WorkspaceSuspensionService:
                 suspended_ctx[WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY] = True
 
             if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
-                await self._vm_provisioner.delete_thread_vm(
+                deleted = await self._vm_provisioner.delete_thread_vm(
                     thread_id, purge_disk=not disk_survives_teardown
                 )
+                if not deleted:
+                    raise RuntimeError(
+                        "thread VM suspension process-zero retirement is incomplete"
+                    )
                 if disk_survives_teardown:
                     # Optimistic; the vm.lifecycle.status handler overwrites it
                     # with what the controller actually did. Restore reads it to
@@ -1044,7 +1056,11 @@ class WorkspaceSuspensionService:
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
                 owner = WorkspaceOwner.session(thread_id)
-                await self._container_provisioner.delete_workspace(owner)
+                deleted = await self._container_provisioner.delete_workspace(owner)
+                if not deleted:
+                    raise RuntimeError(
+                        "thread workspace suspension process-zero retirement is incomplete"
+                    )
                 # Reclaim-on-idle (opt-in, fail-safe): drop the hot-cache PVC
                 # once the snapshot is confirmed restorable, so idle sessions
                 # stop pinning volumes (knowledge-base/knowledge/features/

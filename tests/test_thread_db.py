@@ -244,6 +244,28 @@ class TestCreateThread:
         assert call_args[0][8] == "pinned"  # execution_lane
 
     @pytest.mark.asyncio
+    async def test_process_zero_receipt_is_stripped_at_common_create_funnel(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
+        db = _make_db_with_conn(conn)
+
+        await db.create_thread(
+            execution_lane="stateless",
+            initial_metadata={
+                "config_override": {"workspace": {"backend": "virtual"}},
+                "_stateless_workspace_process_zero_observation": {
+                    "runtime_incarnation": ("22222222-2222-4222-8222-222222222222"),
+                    "observed_at": "2026-08-26T12:00:00+00:00",
+                },
+            },
+        )
+
+        stored = json.loads(conn.fetchrow.await_args.args[7])
+        assert "_stateless_workspace_process_zero_observation" not in stored
+
+    @pytest.mark.asyncio
     async def test_explicit_stateless_lane_is_written_in_creation_insert(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
@@ -1789,6 +1811,95 @@ class TestMergeThreadWorkspaceContext:
         # First param is the JSON-serialized updates
         json_param = conn.execute.call_args[0][1]
         assert json.loads(json_param) == {"status": "ready"}
+
+
+class TestStatelessWorkspaceProcessZeroObservation:
+    THREAD_ID = "aaaaaaaa-1111-4222-8333-444444444444"
+    RUNTIME = "22222222-2222-4222-8222-222222222222"
+
+    @staticmethod
+    def _row(*, runtime: str, observation=None):
+        metadata = {
+            "workspace_container": {
+                "provisioner": "k8s",
+                "_runtime_incarnation": runtime,
+            }
+        }
+        if observation is not None:
+            metadata["_stateless_workspace_process_zero_observation"] = observation
+        return {"execution_lane": "stateless", "metadata": metadata}
+
+    @pytest.mark.asyncio
+    async def test_record_is_exact_uid_bound_and_idempotent(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(return_value=self._row(runtime=self.RUNTIME))
+        conn.execute = AsyncMock(side_effect=["UPDATE 1", "INSERT 0 1"])
+        db = _make_db_with_conn(conn)
+
+        assert await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        payload = json.loads(conn.execute.await_args_list[0].args[2])
+        assert payload["workspace_container"]["status"] == "retiring_process_zero"
+        receipt_insert = conn.execute.await_args_list[1]
+        assert receipt_insert.args[2] == self.RUNTIME
+
+        conn.reset_mock()
+        conn.fetchrow = AsyncMock(return_value=self._row(runtime=self.RUNTIME))
+        conn.execute = AsyncMock(side_effect=["UPDATE 1", "INSERT 0 0"])
+        assert await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        assert conn.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_record_refuses_runtime_drift(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(runtime="33333333-3333-4333-8333-333333333333")
+        )
+        db = _make_db_with_conn(conn)
+
+        assert not await db.record_stateless_thread_workspace_process_zero(
+            self.THREAD_ID,
+            runtime_incarnation=self.RUNTIME,
+        )
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_read_requires_receipt_and_current_runtime_match(self):
+        receipt = {
+            "runtime_incarnation": self.RUNTIME,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(runtime=self.RUNTIME, observation=receipt)
+        )
+        conn.fetchval = AsyncMock(
+            side_effect=lambda _query, _thread_id, runtime: runtime == self.RUNTIME
+        )
+        db = _make_db_with_conn(conn)
+
+        assert (
+            await db.get_stateless_thread_workspace_process_zero(
+                self.THREAD_ID,
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == self.RUNTIME
+        )
+
+        conn.fetchrow = AsyncMock(
+            return_value=self._row(
+                runtime="33333333-3333-4333-8333-333333333333",
+                observation=receipt,
+            )
+        )
+        assert (
+            await db.get_stateless_thread_workspace_process_zero(self.THREAD_ID) is None
+        )
 
 
 class TestMergeThreadVmContext:

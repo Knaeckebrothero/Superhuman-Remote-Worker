@@ -3112,7 +3112,14 @@ async def _attach_session(
     # Restore deliberately excludes persisted-but-unadmitted delivery rows:
     # they are executable inbox work, not passive conversation context. Claim
     # and queue them after the exact reciprocal binding is active.
-    await _reclaim_pending_pinned_inputs()
+    # Pinned input deliveries are owned by the reciprocal thread/agent/pod
+    # binding.  A stateless turn is instead owned by its run_queue lease and
+    # deliberately has no registered agent row; trying to enter the pinned
+    # reclaimer here makes every pooled attach fail after all of its durable
+    # setup has already completed.  The turn executor reads the stateless
+    # inbox through input_seq/consumed_seq after this attach returns.
+    if not _stateless_mode():
+        await _reclaim_pending_pinned_inputs()
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
@@ -12739,10 +12746,14 @@ async def _handle_workspace_upgrade(
             retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
             workspace_generation=(
-                workspace_generation if shell_owner_token is not None else None
+                workspace_generation
+                if workspace_generation and workspace_runtime_incarnation
+                else None
             ),
             runtime_incarnation=(
-                workspace_runtime_incarnation if shell_owner_token is not None else None
+                workspace_runtime_incarnation
+                if workspace_generation and workspace_runtime_incarnation
+                else None
             ),
             expected_host_key_fingerprint=(
                 workspace_ssh_host_key_fingerprint

@@ -21,6 +21,21 @@ LAUNCHER_POD_UID = "00000000-0000-4000-8000-000000000002"
 TEST_HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
+def _ready_vm_context(**overrides):
+    context = {
+        "provision_generation": PROVISION_GENERATION,
+        "identity_provision_generation": PROVISION_GENERATION,
+        "identity_authenticated": True,
+        "vm_uid": "captured-vm-uid",
+        "rootdisk_pvc_uid": "captured-root-uid",
+        "ssh_host": "100.64.1.9",
+        "ssh_port": 22,
+        "ssh_host_key_fingerprint": TEST_HOST_KEY_FINGERPRINT,
+    }
+    context.update(overrides)
+    return context
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -47,14 +62,13 @@ def mock_db():
     db.merge_thread_vm_context = AsyncMock()
     db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
-    db.get_job = AsyncMock(
-        return_value={"context": {"vm": {"provision_generation": PROVISION_GENERATION}}}
+    db.managed_repository_workspace_process_zero_is_current = AsyncMock(
+        return_value=True
     )
-    db.get_thread = AsyncMock(
-        return_value={
-            "metadata": {"vm": {"provision_generation": PROVISION_GENERATION}}
-        }
-    )
+    db.claim_managed_repository_workspace_retirement = AsyncMock(return_value=True)
+    db.record_managed_repository_workspace_process_zero = AsyncMock(return_value=True)
+    db.get_job = AsyncMock(return_value={"context": {"vm": _ready_vm_context()}})
+    db.get_thread = AsyncMock(return_value={"metadata": {"vm": _ready_vm_context()}})
     return db
 
 
@@ -70,6 +84,29 @@ def provisioner_with_nats(mock_nats_bridge, mock_db):
 
         prov = VMProvisioner()
         prov._db = mock_db
+
+        async def _query_exact_vm(*_args, **_kwargs):
+            delete_call = mock_nats_bridge.request_vm_delete.await_args
+            deleted = (
+                delete_call is not None
+                and mock_nats_bridge.request_vm_delete.return_value is not False
+            )
+            purge_disk = bool(
+                delete_call is None or delete_call.kwargs.get("purge_disk", True)
+            )
+            return {
+                "_identity_authenticated": True,
+                "status": "not_found" if deleted else "running",
+                "provision_generation": PROVISION_GENERATION,
+                "vm_uid": None if deleted else "captured-vm-uid",
+                "rootdisk_pvc_uid": (
+                    None if deleted and purge_disk else "captured-root-uid"
+                ),
+                "rootdisk_identity_known": True,
+                "credential_runtime_started": False,
+            }
+
+        mock_nats_bridge.query_vm_status.side_effect = _query_exact_vm
         yield prov
 
 
@@ -650,6 +687,8 @@ class TestDeleteVm:
             purge_disk=True,
             provision_generation=PROVISION_GENERATION,
             entity_type="job",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
     @pytest.mark.asyncio
@@ -696,15 +735,17 @@ class TestQueryStatus:
     async def test_nats_status_persists_late_rootdisk_identity(
         self, provisioner_with_nats, mock_nats_bridge, mock_db
     ):
-        mock_nats_bridge.query_vm_status.return_value = {
-            "job_id": "late-nats",
-            "vm_name": "agent-vm-late-nats",
-            "namespace": "agent-vms",
-            "vm_uid": "late-nats-vm-uid",
-            "rootdisk_pvc_uid": "late-nats-root-pvc-uid",
-            "provision_generation": PROVISION_GENERATION,
-            "_identity_authenticated": True,
-        }
+        mock_nats_bridge.query_vm_status = AsyncMock(
+            return_value={
+                "job_id": "late-nats",
+                "vm_name": "agent-vm-late-nats",
+                "namespace": "agent-vms",
+                "vm_uid": "late-nats-vm-uid",
+                "rootdisk_pvc_uid": "late-nats-root-pvc-uid",
+                "provision_generation": PROVISION_GENERATION,
+                "_identity_authenticated": True,
+            }
+        )
 
         result = await provisioner_with_nats.query_status("late-nats")
 
@@ -1065,7 +1106,9 @@ class TestReleaseReportsSnapshotOutcome:
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
         provisioner_with_nats._db.get_thread = AsyncMock(
             return_value={
-                "metadata": {"vm": {"ssh_host": "100.64.1.6", "ssh_port": 22}}
+                "metadata": {
+                    "vm": _ready_vm_context(ssh_host="100.64.1.6", ssh_port=22)
+                }
             }
         )
 
@@ -1085,7 +1128,9 @@ class TestReleaseReportsSnapshotOutcome:
     ):
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=True)
         provisioner_with_nats._db.get_thread = AsyncMock(
-            return_value={"metadata": {"vm": {"ssh_host": "10.0.0.9", "ssh_port": 22}}}
+            return_value={
+                "metadata": {"vm": _ready_vm_context(ssh_host="10.0.0.9", ssh_port=22)}
+            }
         )
 
         with caplog.at_level("INFO"):
@@ -1100,7 +1145,7 @@ class TestReleaseReportsSnapshotOutcome:
         """release_vm carries the identical pattern for jobs."""
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
         provisioner_with_nats._db.get_job = AsyncMock(
-            return_value={"context": {"vm": {"ssh_host": "100.64.1.9", "ssh_port": 22}}}
+            return_value={"context": {"vm": _ready_vm_context()}}
         )
 
         with caplog.at_level("INFO"):
@@ -1130,6 +1175,8 @@ class TestPurgeDiskIntent:
             purge_disk=True,
             provision_generation=PROVISION_GENERATION,
             entity_type="job",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
     @pytest.mark.asyncio
@@ -1142,6 +1189,8 @@ class TestPurgeDiskIntent:
             purge_disk=False,
             provision_generation=PROVISION_GENERATION,
             entity_type="job",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
     @pytest.mark.asyncio
@@ -1154,6 +1203,8 @@ class TestPurgeDiskIntent:
             purge_disk=False,
             provision_generation=PROVISION_GENERATION,
             entity_type="thread",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
     @pytest.mark.asyncio
@@ -1166,6 +1217,8 @@ class TestPurgeDiskIntent:
             purge_disk=True,
             provision_generation=PROVISION_GENERATION,
             entity_type="job",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
     @pytest.mark.asyncio
@@ -1177,6 +1230,8 @@ class TestPurgeDiskIntent:
             purge_disk=True,
             provision_generation=PROVISION_GENERATION,
             entity_type="thread",
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
         )
 
 
@@ -1192,7 +1247,14 @@ class TestCapturedVmTeardown:
         )
 
     @staticmethod
-    def _probe(disposition: str, *, vm_uid=None, root_uid=None, known=True):
+    def _probe(
+        disposition: str,
+        *,
+        vm_uid=None,
+        root_uid=None,
+        known=True,
+        credential_runtime_started=None,
+    ):
         from orchestrator.services.vm_provisioner import (
             VMTeardownIdentity,
             _VMTeardownProbe,
@@ -1200,7 +1262,12 @@ class TestCapturedVmTeardown:
 
         return _VMTeardownProbe(
             disposition,
-            VMTeardownIdentity(PROVISION_GENERATION, vm_uid, root_uid),
+            VMTeardownIdentity(
+                PROVISION_GENERATION,
+                vm_uid,
+                root_uid,
+                credential_runtime_started=credential_runtime_started,
+            ),
             rootdisk_identity_known=known,
         )
 
@@ -1233,6 +1300,158 @@ class TestCapturedVmTeardown:
         assert identity.rootdisk_pvc_uid == "late-root-uid"
 
     @pytest.mark.asyncio
+    async def test_thread_capture_and_delete_use_exact_thread_generation(
+        self, provisioner_with_db, mock_db
+    ):
+        mock_db.get_thread.return_value = {
+            "metadata": {
+                "vm": {
+                    "provision_generation": PROVISION_GENERATION,
+                    "identity_provision_generation": PROVISION_GENERATION,
+                    "identity_authenticated": True,
+                    "vm_uid": "captured-vm-uid",
+                    "rootdisk_pvc_uid": "captured-root-uid",
+                }
+            }
+        }
+        identity = await provisioner_with_db.capture_vm_teardown_identity(
+            "thread-1", entity_type="thread"
+        )
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+            credential_runtime_started=False,
+        )
+        absent = self._probe("absent", vm_uid=None, root_uid=None, known=True)
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, absent]
+        )
+        provisioner_with_db._delete_vm_with_identity = AsyncMock(return_value=True)
+
+        outcome = await provisioner_with_db.delete_vm_captured(
+            "thread-1", identity, entity_type="thread"
+        )
+
+        assert outcome.disposition == "completed"
+        provisioner_with_db._delete_vm_with_identity.assert_awaited_once_with(
+            "thread-1",
+            purge_disk=True,
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid="captured-vm-uid",
+            expected_rootdisk_pvc_uid="captured-root-uid",
+            entity_type="thread",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("credential_runtime_started", [False, True])
+    async def test_release_records_process_zero_before_captured_delete(
+        self,
+        provisioner_with_db,
+        mock_db,
+        credential_runtime_started,
+    ):
+        from orchestrator.services.vm_provisioner import (
+            VMTeardownIdentity,
+            VMTeardownResult,
+        )
+
+        identity = VMTeardownIdentity(
+            provision_generation=PROVISION_GENERATION,
+            vm_uid="captured-vm-uid",
+            rootdisk_pvc_uid="captured-root-uid",
+            ssh_host="vm.internal",
+            ssh_port=22,
+            ssh_host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
+        )
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+            credential_runtime_started=credential_runtime_started,
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, present]
+        )
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        provisioner_with_db.delete_vm_captured = AsyncMock(
+            return_value=VMTeardownResult("completed", True)
+        )
+
+        with patch(
+            "orchestrator.services.vm_provisioner.retire_managed_repository_processes",
+            new=AsyncMock(return_value=True),
+        ) as retire:
+            outcome = await provisioner_with_db.release_vm_captured(
+                "job-1",
+                identity,
+                capture_snapshot=False,
+            )
+
+        assert (outcome.disposition, outcome.deleted) == ("completed", True)
+        mock_db.claim_managed_repository_workspace_retirement.assert_awaited_once_with(
+            "job-1",
+            owner_kind="job",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=PROVISION_GENERATION,
+        )
+        mock_db.record_managed_repository_workspace_process_zero.assert_awaited_once_with(
+            "job-1",
+            owner_kind="job",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=PROVISION_GENERATION,
+        )
+        if credential_runtime_started:
+            retire.assert_awaited_once_with(
+                host="vm.internal",
+                port=22,
+                host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
+                operation="VM managed repository process retirement",
+            )
+        else:
+            retire.assert_not_awaited()
+        provisioner_with_db.delete_vm_captured.assert_awaited_once_with(
+            "job-1",
+            identity,
+            purge_disk=True,
+            entity_type="job",
+        )
+
+    @pytest.mark.asyncio
+    async def test_started_vm_without_retirement_endpoint_fails_closed(
+        self, provisioner_with_db, mock_db
+    ):
+        identity = self._identity()
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+            credential_runtime_started=True,
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            return_value=present
+        )
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        provisioner_with_db.delete_vm_captured = AsyncMock()
+
+        outcome = await provisioner_with_db.release_vm_captured(
+            "job-1", identity, capture_snapshot=False
+        )
+
+        assert (outcome.disposition, outcome.deleted) == (
+            "process_zero_unproven",
+            False,
+        )
+        mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
+        provisioner_with_db.delete_vm_captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_delete_acceptance_waits_for_exact_vm_and_rootdisk_absence(
         self, provisioner_with_db
     ):
@@ -1240,6 +1459,7 @@ class TestCapturedVmTeardown:
             "present",
             vm_uid="captured-vm-uid",
             root_uid="captured-root-uid",
+            credential_runtime_started=False,
         )
         provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
             side_effect=[present, present]
@@ -1302,6 +1522,7 @@ class TestCapturedVmTeardown:
             "present",
             vm_uid="captured-vm-uid",
             root_uid="captured-root-uid",
+            credential_runtime_started=False,
         )
         provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
             side_effect=[present, present]
@@ -1359,6 +1580,7 @@ class TestCapturedVmTeardown:
             "present",
             vm_uid="captured-vm-uid",
             root_uid="captured-root-uid",
+            credential_runtime_started=False,
         )
         provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
             side_effect=[present, present]
@@ -1379,6 +1601,7 @@ class TestCapturedVmTeardown:
             "present",
             vm_uid="captured-vm-uid",
             root_uid="captured-root-uid",
+            credential_runtime_started=False,
         )
         absent = self._probe("absent", vm_uid=None, root_uid=None, known=True)
         provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
@@ -1391,6 +1614,31 @@ class TestCapturedVmTeardown:
         )
 
         assert (outcome.disposition, outcome.deleted) == ("completed", True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("runtime_started", [True, None])
+    async def test_orphan_with_possible_credential_runtime_is_preserved(
+        self, provisioner_with_db, runtime_started
+    ):
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe(
+                "present",
+                vm_uid="captured-vm-uid",
+                root_uid="captured-root-uid",
+                credential_runtime_started=runtime_started,
+            )
+        )
+        provisioner_with_db._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_db.delete_orphan_vm_captured(
+            "job-1", self._identity(), purge_disk=True
+        )
+
+        assert (outcome.disposition, outcome.deleted) == (
+            "process_zero_unproven",
+            False,
+        )
+        provisioner_with_db._delete_vm_with_identity.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_orphan_replacement_supersedes_without_delete(

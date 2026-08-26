@@ -402,12 +402,36 @@ class TestReleaseWorkspace:
         ok = await provisioner.release_workspace("job-1")
         assert ok is True
         calls = provisioner._db.transition_docker_workspace_lease.await_args_list
-        assert calls[0].kwargs["updates"] == {"status": "releasing"}
+        assert calls[0].kwargs["updates"] == {
+            "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
+        }
         assert calls[1].kwargs["updates"] == {
             "status": "released",
             "quarantine_reason": None,
             "_docker_workspace_trust_mode": "trusted_dev",
             "_docker_workspace_attested": False,
+        }
+        provisioner._db.record_docker_workspace_process_zero.assert_awaited_once_with(
+            "job-1",
+            owner_kind="job",
+            lease_id="lease-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_never_publishes_reuse_when_receipt_is_refused(
+        self, provisioner
+    ):
+        """A successful shell reset is not durable process-zero by itself."""
+
+        provisioner._db.record_docker_workspace_process_zero.return_value = False
+
+        assert await provisioner.release_workspace("job-1") is False
+        calls = provisioner._db.transition_docker_workspace_lease.await_args_list
+        assert calls[0].kwargs["updates"]["status"] == "releasing"
+        assert calls[1].kwargs["updates"] == {
+            "status": "quarantined",
+            "quarantine_reason": "dev_cleanup_failed",
         }
 
     @pytest.mark.asyncio
@@ -552,6 +576,11 @@ class TestReleaseThreadWorkspace:
         )
         provisioner._reset_workspace_via_ssh.assert_awaited_once_with(
             "thread-inventory-host", 30022
+        )
+        db.record_docker_workspace_process_zero.assert_awaited_once_with(
+            "thread-1",
+            owner_kind="thread",
+            lease_id="lease-thread-authoritative",
         )
 
 

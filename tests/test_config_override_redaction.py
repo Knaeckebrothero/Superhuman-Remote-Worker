@@ -177,9 +177,19 @@ class TestRedactThreadMetadataShape:
     def test_workspace_binding_dropped(self):
         main = self._main()
         out = main._redact_thread_metadata(
-            {"id": "t", "metadata": {"_workspace_binding": {"x": 1}, "keep": True}}
+            {
+                "id": "t",
+                "metadata": {
+                    "_workspace_binding": {"x": 1},
+                    "_stateless_workspace_process_zero_observation": {
+                        "runtime_incarnation": "server-owned"
+                    },
+                    "keep": True,
+                },
+            }
         )
         assert "_workspace_binding" not in out["metadata"]
+        assert "_stateless_workspace_process_zero_observation" not in out["metadata"]
         assert out["metadata"]["keep"] is True
 
 

@@ -255,7 +255,11 @@ APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
     ROOT
     / "orchestrator/database/migrations/app/0186_stateless_input_delivery_validate.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_STATELESS_INPUT_DELIVERY_VALIDATION
+APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0187_managed_repository_process_zero_authority.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

@@ -683,6 +683,15 @@ def test_workspace_materialization_never_places_private_key_in_command_or_file()
     assert "IdentityAgent" in ordinary_text
     assert "IdentitiesOnly" not in ordinary_text
     assert "@" not in payload["clone_url"]
+    materialize_command = next(
+        command for command, secret in backend.commands if secret
+    )
+    assert materialize_command.index("flock -x 9") < materialize_command.index(
+        f"Host {payload['alias']}"
+    )
+    assert materialize_command.index("present") < materialize_command.index(
+        f"Host {payload['alias']}"
+    )
 
 
 def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
@@ -711,6 +720,7 @@ def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
         lambda _payload: validated,
     )
     backend = _RecordingBackend()
+    # Setup fails before any key transfer/agent launch.
     backend.execute_with_secret_stdin = MagicMock(return_value=False)
 
     with pytest.raises(ManagedRepositoryMaterializationError) as exc:

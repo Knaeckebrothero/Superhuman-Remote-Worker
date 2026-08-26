@@ -1588,6 +1588,103 @@ class TestStatelessCloudMountClaimSetup:
         assert "ENOTCONN" in session.cloud_mount_error
 
     @pytest.mark.asyncio
+    async def test_exactly_rolled_back_optional_mount_degrades_stateless_setup(self):
+        from src.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=24,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            await session._setup_cloud_mount(
+                {
+                    "driver": "rclone",
+                    "protected": False,
+                    "required": False,
+                    "mounts": [{}],
+                }
+            )
+
+        assert session.cloud_mount_manager is None
+        assert session.cloud_mount_error == "exact resident cleanup"
+
+    @pytest.mark.asyncio
+    async def test_clean_failure_still_fails_closed_for_protected_cloud(self):
+        from src.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=25,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RcloneMountCleanFailure):
+                await session._setup_cloud_mount(
+                    {
+                        "driver": "rclone",
+                        "protected": True,
+                        "required": True,
+                        "mounts": [{}],
+                    }
+                )
+
+        assert session.cloud_mount_manager is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [True, None, "false"])
+    async def test_clean_failure_cannot_mask_required_or_untyped_mount(self, required):
+        from src.services.cloud_mount import RcloneMountCleanFailure
+
+        session = _make_session(
+            shell_owner_token=26,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RcloneMountCleanFailure("exact resident cleanup")
+        )
+        payload = {
+            "driver": "rclone",
+            "protected": False,
+            "mounts": [{}],
+        }
+        if required is not None:
+            payload["required"] = required
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RcloneMountCleanFailure):
+                await session._setup_cloud_mount(payload)
+
+        assert session.cloud_mount_manager is None
+
+    @pytest.mark.asyncio
     async def test_pinned_mount_failure_retains_historical_degraded_mode(self):
         session = _make_session(
             shell_owner_token=None,
