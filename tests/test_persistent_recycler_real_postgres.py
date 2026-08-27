@@ -1057,6 +1057,148 @@ async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
 
 
 @pytest.mark.asyncio
+async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
+    """Actual soft cleanup leaves an exact PVC shell permanent End may reclaim."""
+
+    import main as orch_main
+    from services.container_provisioner import WorkspaceTeardownIdentity
+
+    ids = await _seed(db)
+    thread = await db.get_thread(ids["thread"])
+    generation = str(thread["runtime_generation"])
+    attempt_id = str(uuid4())
+    pod_name = f"ws-thread-{ids['thread'][:12]}"
+    pvc_name = f"pvc-{pod_name}"
+    pod_uid = str(uuid4())
+    pvc_uid = str(uuid4())
+    service_uid = str(uuid4())
+    assert await db.reserve_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_workspace_context=None,
+        expected_binding_context=None,
+        attempt_id=attempt_id,
+        namespace="default",
+        pod_name=pod_name,
+        pvc_name=pvc_name,
+        seed_configmap_name=None,
+        service_name=pod_name,
+        retained_service_uid=None,
+        network_tier="internet-only",
+        manifest_fingerprint="a" * 64,
+    )
+    for resource, resource_uid in (
+        ("pod", pod_uid),
+        ("pvc", pvc_uid),
+        ("service", service_uid),
+    ):
+        assert await db.publish_pinned_thread_workspace_provision_resource(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            attempt_id=attempt_id,
+            resource=resource,
+            resource_uid=resource_uid,
+        )
+    published = await db.complete_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        expected_pod_uid=pod_uid,
+        expected_pvc_uid=pvc_uid,
+        expected_seed_configmap_uid=None,
+        expected_service_uid=service_uid,
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=f"SHA256:{'A' * 43}",
+    )
+    assert published is not None
+
+    soft = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    await _authorize_and_ack(db, ids, soft)
+    # This is the exact DB mirror written by strict captured workspace release:
+    # Pod and Service are gone, while Resume retains the original PVC binding.
+    await db.merge_thread_workspace_context(
+        ids["thread"],
+        {
+            "status": "deleted",
+            "pod_ip": None,
+            "_runtime_incarnation": None,
+        },
+    )
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=soft["token"],
+        generation=soft["generation"],
+        final_status="ended",
+    )
+
+    permanent = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert permanent["state"] == "pending"
+    assert permanent["context"]["retained_soft_workspace"] == {
+        "version": 1,
+        "runtime_generation": generation,
+        "workspace_generation": published["workspace_generation"],
+        "attempt_id": attempt_id,
+        "namespace": "default",
+        "pod_name": pod_name,
+        "pvc_name": pvc_name,
+        "pvc_uid": pvc_uid,
+    }
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+
+    provisioner = MagicMock(is_available=True)
+    identity = WorkspaceTeardownIdentity(
+        pod_uid=None,
+        pvc_uid=pvc_uid,
+        service_uid=None,
+    )
+    provisioner.capture_workspace_teardown_identity = AsyncMock(return_value=identity)
+    provisioner.release_workspace = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "container_provisioner", provisioner),
+        patch.object(
+            orch_main.session_router,
+            "teardown_route",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        await orch_main._cleanup_pinned_thread_retirement(
+            permanent,
+            cleanup_agent_pod=False,
+        )
+
+    provisioner.release_workspace.assert_awaited_once_with(
+        orch_main.WorkspaceOwner.session(ids["thread"]),
+        reclaim_volume=True,
+        capture_snapshot=True,
+        strict=True,
+        teardown_identity=identity,
+    )
+    await db.delete_thread(
+        ids["thread"],
+        expected_runtime_retirement_token=permanent["token"],
+        expected_runtime_generation=permanent["generation"],
+    )
+    assert await db.get_thread(ids["thread"]) is None
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM thread_runtime_retirement_outcomes "
+                "WHERE thread_id=$1",
+                UUID(ids["thread"]),
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
 async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
     """Exact Pod absence may receipt a permanent bound sandbox retirement."""
 

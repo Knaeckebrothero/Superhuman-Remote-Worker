@@ -11500,6 +11500,12 @@ async def _cleanup_pinned_thread_retirement(
     binding = {} if binding is None else binding
     if not isinstance(binding, Mapping):
         raise RuntimeError("captured workspace binding is malformed")
+    retained_soft_workspace = context.get("retained_soft_workspace")
+    retained_soft_workspace = (
+        {} if retained_soft_workspace is None else retained_soft_workspace
+    )
+    if not isinstance(retained_soft_workspace, Mapping):
+        raise RuntimeError("captured retained workspace authority is malformed")
     virtual_binding_present = bool(binding and binding.get("kind") == "virtual")
     sandbox_identity_present = bool(
         _retirement_json_field_is_nonnull(ws, WORKSPACE_RUNTIME_INCARNATION_KEY)
@@ -11607,9 +11613,10 @@ async def _cleanup_pinned_thread_retirement(
         captured_runtime = str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
         captured_generation = str(binding.get("generation") or "")
         captured_backing = str(binding.get("backing_id") or "")
+        retained_pvc_uid = str(retained_soft_workspace.get("pvc_uid") or "")
+        retained_authority = bool(retained_soft_workspace)
         if (
-            not captured_runtime
-            or not captured_generation
+            not captured_generation
             or binding.get("kind") != "remote"
             or not (
                 captured_backing.startswith("k8s-pvc:")
@@ -11618,13 +11625,59 @@ async def _cleanup_pinned_thread_retirement(
         ):
             raise RuntimeError("exact Kubernetes cleanup authority is incomplete")
         try:
-            UUID(captured_runtime)
             UUID(captured_generation)
             backing_resource_uid = str(UUID(captured_backing.rsplit(":", 1)[-1]))
+            if captured_runtime:
+                UUID(captured_runtime)
+            if retained_authority:
+                UUID(str(retained_soft_workspace.get("attempt_id") or ""))
+                UUID(retained_pvc_uid)
         except (TypeError, ValueError):
             raise RuntimeError(
                 "exact Kubernetes cleanup authority is malformed"
             ) from None
+        if retained_authority:
+            expected_owner = WorkspaceOwner.session(thread_id)
+            expected_pvc_name = f"pvc-{expected_owner.pod_name}"
+            if (
+                not permanent
+                or context.get("entry_status") != "ended"
+                or retained_soft_workspace.get("version") != 1
+                or str(retained_soft_workspace.get("runtime_generation") or "")
+                != generation
+                or str(retained_soft_workspace.get("workspace_generation") or "")
+                != captured_generation
+                or str(retained_soft_workspace.get("namespace") or "")
+                != str(ws.get("namespace") or "")
+                or str(retained_soft_workspace.get("pod_name") or "")
+                != expected_owner.pod_name
+                or str(ws.get("pod_name") or "") != expected_owner.pod_name
+                or str(retained_soft_workspace.get("pvc_name") or "")
+                != expected_pvc_name
+                or retained_pvc_uid != backing_resource_uid
+                or captured_backing
+                != (
+                    f"k8s-pvc:{retained_soft_workspace.get('namespace')}:"
+                    f"{retained_pvc_uid}"
+                )
+                or ws.get("status") != "deleted"
+                or ws.get("provisioner") != "k8s"
+                or ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) is not None
+                or ws.get("pod_ip") is not None
+                or ws.get("ide_host") is not None
+                or ws.get("ide_port") is not None
+                or str(ws.get("_canvas_workspace_generation") or "")
+                != captured_generation
+                or captured_runtime
+                or workspace_identity.pod_uid is not None
+                or workspace_identity.service_uid is not None
+                or workspace_identity.pvc_uid != retained_pvc_uid
+            ):
+                raise RuntimeError(
+                    "retained Kubernetes workspace authority changed before deletion"
+                )
+        elif not captured_runtime:
+            raise RuntimeError("exact Kubernetes cleanup authority is incomplete")
         if (
             workspace_identity.pod_uid is not None
             and workspace_identity.pod_uid != captured_runtime
