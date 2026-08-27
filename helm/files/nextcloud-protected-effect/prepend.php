@@ -5,8 +5,9 @@ declare(strict_types=1);
 require_once __DIR__ . '/common.php';
 
 // The capability endpoint runs in the same hard-bounded FPM pool but creates
-// no Nextcloud authority.  It signs its own response and never boots NC.
-if (($_SERVER['SCRIPT_FILENAME'] ?? '') === __DIR__ . '/capability.php') {
+// no Nextcloud authority. Nginx supplies this non-HTTP FastCGI marker only in
+// its exact GET-only capability location; request headers cannot forge it.
+if (($_SERVER['SRW_PROTECTED_EFFECT_CAPABILITY'] ?? '') === '1') {
     return;
 }
 try {
