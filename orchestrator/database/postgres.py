@@ -22350,7 +22350,7 @@ class PostgresDB:
                 ):
                     return False
                 status = str(claim["status"] or "")
-                if status in {"revoking", "fenced"}:
+                if status in {"revoking", "fenced", "reclaimed"}:
                     return True
                 if status not in {"planned", "ready"}:
                     return False

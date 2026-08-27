@@ -2054,6 +2054,71 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
 
 
 @pytest.mark.asyncio
+async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(db):
+    """Exact post-horizon fence GC remains complete while Begin is pending."""
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    entry = await db.get_thread(ids["thread"])
+    generation = str(entry["runtime_generation"])
+    attempt_id = str(uuid4())
+    claim_name = f"pvc-agent-s-{ids['thread'][:12]}"
+    intent = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=f"srw-agent-s-{attempt_id[:8]}",
+        provisioner="agent",
+        pvc_name=claim_name,
+    )
+    assert intent is not None
+    claim_id = str(intent["workspace_claim"]["claim_id"])
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    revoke = {
+        "expected_runtime_generation": retirement["generation"],
+        "expected_retirement_token": retirement["token"],
+        "expected_claim_id": claim_id,
+        "expected_pvc_name": claim_name,
+    }
+    assert await db.revoke_pinned_agent_workspace_claim(ids["thread"], **revoke)
+    assert await db.fence_pinned_agent_workspace_claim(
+        ids["thread"],
+        **revoke,
+        fence_pvc_uid="fence-pvc-uid",
+    )
+    async with db.acquire() as conn:
+        # Build the post-GC fixture without spending the production ten-minute
+        # request horizon. Other tests exercise the real fenced -> reclaimed
+        # transition; this one isolates replay of its terminal row.
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_workspace_claims "
+                "SET status='reclaimed',resolved_at=now() "
+                "WHERE claim_id=$1::uuid",
+                UUID(claim_id),
+            )
+    assert await db.revoke_pinned_agent_workspace_claim(ids["thread"], **revoke)
+
+
+@pytest.mark.asyncio
 async def test_k8s_create_fence_rows_cannot_be_forged_terminal_at_insert(db):
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])

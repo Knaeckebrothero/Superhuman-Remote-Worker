@@ -284,6 +284,34 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence():
 
 
 @pytest.mark.asyncio
+async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
+    """A later retirement retry treats terminal fence GC as completed."""
+
+    retirement = _claim_retirement(
+        permanent=True, status="ready", pvc_uid="original-pvc-uid"
+    )
+    provider = MagicMock(is_available=True)
+    provider.agent_workspace_claim_authority = AsyncMock()
+    provider.fence_agent_workspace_claim = AsyncMock()
+    provider.delete_agent_workspace_claim_exact = AsyncMock()
+    db = MagicMock()
+    db.revoke_pinned_agent_workspace_claim = AsyncMock(return_value=True)
+    db.fetchrow = AsyncMock(
+        return_value={"status": "reclaimed", "pvc_uid": "fence-pvc-uid"}
+    )
+
+    with (
+        patch.object(main, "agent_provisioner", provider),
+        patch.object(main, "postgres_db", db),
+    ):
+        await main._reconcile_agent_workspace_claim_for_retirement(retirement)
+
+    provider.agent_workspace_claim_authority.assert_not_awaited()
+    provider.fence_agent_workspace_claim.assert_not_awaited()
+    provider.delete_agent_workspace_claim_exact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("foreign_kind", [None, "pvc", "pod"])
 async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind):
     shutdown = main.asyncio.Event()

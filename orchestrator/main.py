@@ -10833,6 +10833,13 @@ async def _reconcile_agent_workspace_claim_for_retirement(
         raise RuntimeError("agent workspace claim disappeared")
     claim_status = str(claim_row["status"] or "")
     fence_uid = str(claim_row["pvc_uid"] or "")
+    if claim_status == "reclaimed":
+        # The post-horizon GC reconciler already deleted the exact fence UID
+        # and durably closed this immutable claim. This can happen when an
+        # earlier retirement attempt finished name fencing but failed in a
+        # later obligation. The row-locked revoke call above revalidated the
+        # captured claim tuple, so terminal replay has nothing left to actuate.
+        return
     if claim_status == "fenced":
         observed = await provider.agent_workspace_claim_authority(
             claim["pvc_name"],
