@@ -11117,6 +11117,7 @@ async def _recover_captured_sandbox_process_zero(
         )
         fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
         host = str(workspace.get("pod_ip") or workspace.get("host") or "")
+        workspace_status = str(workspace.get("status") or "")
         raw_port = workspace.get("port", 30022)
         try:
             UUID(thread_id)
@@ -11133,7 +11134,6 @@ async def _recover_captured_sandbox_process_zero(
             not host
             or not 1 <= port <= 65535
             or not fingerprint.startswith("SHA256:")
-            or workspace.get("status") != "ready"
             or binding.get("kind") != "remote"
             or str(workspace.get("_canvas_workspace_generation") or "")
             != workspace_generation
@@ -11147,7 +11147,12 @@ async def _recover_captured_sandbox_process_zero(
         # workspace process namespace left to contact.  Receipt that actuator
         # proof before the ordinary retirement cleanup removes the residual
         # PVC/Service.  Replacement and ambiguous observations stay refused.
-        if permanent:
+        if permanent and workspace_status in {
+            "ready",
+            "suspending",
+            "suspended",
+            "deleted",
+        }:
             workspace_authority = await container_provisioner.workspace_pod_authority(
                 WorkspaceOwner.session(thread_id),
                 expected_runtime_incarnation=runtime_incarnation,
@@ -11168,6 +11173,12 @@ async def _recover_captured_sandbox_process_zero(
                     quiescence_actor="orchestrator",
                 )
                 return receipt is not None
+
+        # SSH is a live-runtime actuator. A captured suspension/deletion state
+        # may use exact Pod absence above, but may never dial its stale endpoint
+        # when the Kubernetes observation is live, replaced, or ambiguous.
+        if workspace_status != "ready":
+            return False
 
         from services import resolve_ssh_key_path
         from src.core.backends.remote import RemoteBackend
