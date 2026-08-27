@@ -52,16 +52,31 @@ def _render_orchestrator(*extra_args: str) -> dict:
     return next(doc for doc in yaml.safe_load_all(rendered) if doc)
 
 
-def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
-    deployment = _render_orchestrator()
-    assert deployment["spec"]["strategy"] == {"type": "RollingUpdate"}
-    orchestrator = next(
-        container
-        for container in deployment["spec"]["template"]["spec"]["containers"]
-        if container["name"] == "orchestrator"
+def _orchestrator_env(deployment: dict) -> dict:
+    container = next(
+        entry
+        for entry in deployment["spec"]["template"]["spec"]["containers"]
+        if entry["name"] == "orchestrator"
     )
-    env = {entry["name"]: entry.get("value") for entry in orchestrator["env"]}
-    assert env["MIGRATION_MAINTENANCE_GATES"] == ""
+    return {entry["name"]: entry.get("value") for entry in container["env"]}
+
+
+def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
+    # Recreate is the chart default, but it comes from the independent
+    # 0195/0196 ServiceAccount cutover flag -- not from acknowledging the
+    # runtime-authority migration. Both halves matter: with every cutover flag
+    # off the orchestrator is back on RollingUpdate, and an unacknowledged
+    # migration gate stays empty either way, so a rolling rollout can never
+    # silently pick up the maintenance-gated migration.
+    rolling = _render_orchestrator(
+        "--set", "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false"
+    )
+    assert rolling["spec"]["strategy"] == {"type": "RollingUpdate"}
+    assert _orchestrator_env(rolling)["MIGRATION_MAINTENANCE_GATES"] == ""
+
+    default = _render_orchestrator()
+    assert default["spec"]["strategy"] == {"type": "Recreate"}
+    assert _orchestrator_env(default)["MIGRATION_MAINTENANCE_GATES"] == ""
 
 
 def test_runtime_authority_ack_uses_same_value_for_gate_and_recreate() -> None:

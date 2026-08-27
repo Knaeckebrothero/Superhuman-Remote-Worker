@@ -26,6 +26,10 @@ from src.shared.runtime_actor import (
     RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
     RUNTIME_ACTOR_REFRESH_HEADER,
 )
+from tests._previous_release_seed import (
+    PINNED_BINDING_AUTHORITY_TRIGGERS,
+    previous_release_writer,
+)
 
 
 SCHEMA_FILE = (
@@ -104,6 +108,7 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
         "user_id": str(uuid4()),
         "attach_token": str(uuid4()),
     }
+    ids["pod_uid"] = f"officer-proof-{ids['agent_id']}"
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (id, display_name, email) VALUES ($1, $2, $3)",
@@ -137,32 +142,46 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
         await conn.execute(
             """
             INSERT INTO agents (
-                id, config_name, hostname, pod_ip, status, agent_mode,
+                id, config_name, hostname, pod_ip, pod_uid, status, agent_mode,
                 last_heartbeat
             )
             VALUES ($1, 'persistent_defaults', 'officer-proof', '127.0.0.1',
-                    'session', 'persistent', now())
+                    $2, 'session', 'persistent', now())
             """,
             UUID(ids["agent_id"]),
+            ids["pod_uid"],
         )
-        async with conn.transaction():
-            # These fixtures model a pinned binding already live when 0198
-            # lands; their subject is runtime-actor liveness, not the bind
-            # authority, which has its own suites.
-            await conn.execute("SET LOCAL session_replication_role = 'replica'")
-            await conn.execute(
-                "UPDATE threads SET agent_id = $2, "
-                "control_admission_agent_id = $2, runtime_attach_token = $3 "
-                "WHERE id = $1",
-                UUID(ids["thread_id"]),
-                UUID(ids["agent_id"]),
-                UUID(ids["attach_token"]),
-            )
-            await conn.execute(
-                "UPDATE agents SET thread_id = $2 WHERE id = $1",
-                UUID(ids["agent_id"]),
-                UUID(ids["thread_id"]),
-            )
+        # These fixtures model a pinned binding already live when 0198 lands;
+        # their subject is runtime-actor liveness, not the bind authority,
+        # which has its own suites. Only 0198's named bind edge is stood down
+        # -- never every trigger and foreign key in the statement.
+        async with previous_release_writer(
+            conn, "threads", *PINNED_BINDING_AUTHORITY_TRIGGERS
+        ):
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE threads SET agent_id = $2, "
+                    "control_admission_agent_id = $2, runtime_attach_token = $3, "
+                    # An already-adopted 0198 binding: Begin refuses a bound
+                    # pinned thread whose Pod marker is absent
+                    # (`agent_warm_binding_adoption_required`), and legacy
+                    # adoption has its own suites.
+                    "metadata = COALESCE(metadata, '{}'::jsonb) || "
+                    "jsonb_build_object('agent_pod', jsonb_build_object("
+                    "'pod_name', 'officer-proof', 'pod_uid', $4::text, "
+                    "'namespace', 'srw', "
+                    "'protection_protocol', 'finalizer_v1')) "
+                    "WHERE id = $1",
+                    UUID(ids["thread_id"]),
+                    UUID(ids["agent_id"]),
+                    UUID(ids["attach_token"]),
+                    ids["pod_uid"],
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id = $2 WHERE id = $1",
+                    UUID(ids["agent_id"]),
+                    UUID(ids["thread_id"]),
+                )
         await conn.execute(
             "INSERT INTO project_officers (project_id, thread_id) VALUES ($1, $2)",
             UUID(ids["project_id"]),

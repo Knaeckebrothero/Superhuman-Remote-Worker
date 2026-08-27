@@ -50,6 +50,9 @@ from src.shared.workspace_contract import (
     resolve_workspace_runtime,
 )
 from src.shared.worker_queue import claim_worker_batch
+from tests._previous_release_seed import (
+    seed_previous_release_row as _seed_previous_release_row,
+)
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -457,8 +460,9 @@ async def test_opposite_tier_callbacks_cannot_change_effective_backend(db):
         requested_workspace_backend="vm",
         workspace_assignment_source="request",
     )
-    await db.merge_workspace_container_context(
-        str(vm_job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        vm_job["id"],
         {
             "status": "ready",
             "host": "stale-container.internal",
@@ -496,8 +500,9 @@ async def test_opposite_tier_callbacks_cannot_change_effective_backend(db):
                 "provision_generation": str(uuid4()),
             },
         ),
-        db.merge_workspace_container_context(
-            str(sandbox_job["id"]),
+        _merge_previous_release_workspace(
+            db,
+            sandbox_job["id"],
             {
                 "status": "ready",
                 "host": "current-container.internal",
@@ -519,8 +524,9 @@ async def test_stateless_admission_cannot_claim_vm_or_ambiguous_legacy_job(db):
         workspace_assignment_source="request",
         execution_lane="stateless",
     )
-    await db.merge_workspace_container_context(
-        str(vm_job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        vm_job["id"],
         {
             "status": "ready",
             "provisioner": "k8s",
@@ -538,7 +544,9 @@ async def test_stateless_admission_cannot_claim_vm_or_ambiguous_legacy_job(db):
         execution_lane="stateless",
     )
     async with db.acquire() as conn:
-        await conn.execute(
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET context = (context - '_workspace_contract')
@@ -576,8 +584,9 @@ async def test_stateless_claim_is_bound_to_exact_queue_lease_and_tier(db):
         workspace_assignment_source="request",
         execution_lane="stateless",
     )
-    await db.merge_workspace_container_context(
-        str(job["id"]),
+    await _merge_previous_release_workspace(
+        db,
+        job["id"],
         {
             "status": "ready",
             "provisioner": "k8s",
@@ -858,6 +867,39 @@ async def test_legacy_workspace_claim_is_conservative_and_fenced(db):
     assert marker["assigned_backend"] == "sandbox"
 
 
+# 0195/0196 fence a *writer* that publishes Kubernetes runtime authority with
+# no durable reservation behind it.  Rows written by the previous release were
+# never subject to that fence -- the trigger did not exist yet.  Reproducing
+# that ordering means seeding with the exact named trigger absent and then
+# putting it back, which is also the proof that installing the migration over
+# historical data is accepted.  This is deliberately not
+# `session_replication_role = replica`: that would silently drop foreign keys
+# and every other trigger in the statement, including the ones these tests are
+# about.
+
+
+async def _merge_previous_release_workspace(db, job_id, payload):
+    """Land a workspace_container callback the way the previous release did.
+
+    0196 now requires exact creation-reservation authority behind any Pod UID
+    a writer publishes.  The tier-resolution and stateless-admission proofs
+    below are about what the *reader* concludes from such a projection, not
+    about how it came to exist, so they install it as a pre-tranche writer.
+    """
+
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = jsonb_set("
+            "COALESCE(context, '{}'::jsonb), '{workspace_container}', "
+            "COALESCE(context->'workspace_container', '{}'::jsonb) "
+            "|| $2::jsonb, true) WHERE id = $1",
+            job_id if not isinstance(job_id, str) else UUID(job_id),
+            json.dumps(payload),
+        )
+
+
 async def _seed_exact_pre_0175_k8s_job(db, *, status="created"):
     """Persist the exact K8s job-runtime JSON emitted by the prior release."""
 
@@ -875,7 +917,9 @@ async def _seed_exact_pre_0175_k8s_job(db, *, status="created"):
         }
     }
     async with db.acquire() as conn:
-        await conn.execute(
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET status=$2,
@@ -1015,7 +1059,13 @@ async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
     await asyncio.wait_for(started.wait(), timeout=2)
     vm_generation = str(uuid4())
     async with db.acquire() as conn:
-        await conn.execute(
+        # The racing writer is the previous release's tier transition: it
+        # abandons a UID-less Kubernetes projection wholesale, which 0196 now
+        # governs.  The subject here is the adoption CAS yielding to it, so
+        # seed it the way the migration met such a writer.
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
             """
             UPDATE jobs
                SET config_override='{"workspace":{"backend":"vm"}}'::jsonb,
@@ -1086,7 +1136,17 @@ async def test_pre_0175_post_cas_pod_replacement_reverts_tentative_stamp(db):
 
 
 @pytest.mark.asyncio
-async def test_adopted_deleted_runtime_reprovisions_and_refreshes_exact_cas(db):
+async def test_adoption_is_one_shot_and_a_replacement_needs_creation_authority(db):
+    """Adoption converts one historical row once, and never reopens it.
+
+    The previous release could hand the same deterministic name to a fresh
+    Pod, so re-adoption used to be the recovery path for a replaced runtime.
+    Once a row carries a durable reservation and a proven Pod UID it is no
+    longer historical: a replacement is an ordinary creation and must present
+    exact creation authority.  Adoption must not remain available as a second,
+    evidence-lighter door onto the same row.
+    """
+
     from services.job_workspace_adoption import (
         LegacyK8sAdoptionOutcome,
         ensure_legacy_k8s_job_runtime_authority,
@@ -1100,43 +1160,78 @@ async def test_adopted_deleted_runtime_reprovisions_and_refreshes_exact_cas(db):
     adopted = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
     assert adopted.outcome is LegacyK8sAdoptionOutcome.ADOPTED
 
-    assert await db.merge_workspace_container_context(
-        str(job["id"]), {"status": "deleted"}
-    )
-    provisioner.attest_workspace_runtime.reset_mock()
-    deleted = await ensure_legacy_k8s_job_runtime_authority(
-        db, provisioner, await db.get_job(str(job["id"]))
-    )
-    assert deleted.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
-    provisioner.attest_workspace_runtime.assert_not_awaited()
+    # Leaving the adopted runtime is the cleanup fence's business now.
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.merge_workspace_container_context(
+            str(job["id"]), {"status": "deleted"}
+        )
 
+    # A replacement Pod UID is a creation, and creations need a reservation.
     replacement = _k8s_job_attestation(
         host="workspace-replacement.internal", pod_ip="10.42.2.19"
     )
-    assert await db.merge_workspace_container_context(
-        str(job["id"]),
-        {
-            "status": "ready",
-            "provisioner": "k8s",
-            "host": replacement.host,
-            "pod_ip": replacement.pod_ip,
-            "port": replacement.port,
-            "_runtime_incarnation": replacement.runtime_incarnation,
-        },
-    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.merge_workspace_container_context(
+            str(job["id"]),
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": replacement.host,
+                "pod_ip": replacement.pod_ip,
+                "port": replacement.port,
+                "_runtime_incarnation": replacement.runtime_incarnation,
+            },
+        )
+
+    # And the bridge itself refuses to open a second generation over a row
+    # that is no longer the exact UID-less historical shape.
     provisioner.attest_workspace_runtime.return_value = replacement
-    refreshed = await ensure_legacy_k8s_job_runtime_authority(
+    again = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(str(job["id"]))
+    )
+    assert again.outcome is LegacyK8sAdoptionOutcome.RETRY
+    assert again.reason == "adoption_reservation_unavailable"
+
+    stored = await db.get_job(str(job["id"]))
+    runtime = _json(stored["context"])["workspace_container"]
+    assert runtime["_runtime_incarnation"] == predecessor.runtime_incarnation
+    assert runtime[LEGACY_K8S_RUNTIME_ADOPTION_KEY]["workspace_generation"] == (
+        predecessor.workspace_generation
+    )
+    assert resolve_workspace_runtime(stored).ready
+
+
+@pytest.mark.asyncio
+async def test_historical_non_ready_k8s_job_is_never_adopted(db):
+    """A previous-release row that is not ready is not an adoption candidate.
+
+    Ordinary workspace recovery must stay free to delete and recreate it
+    rather than wait for an attestation that cannot succeed, so the bridge
+    refuses before it reads Kubernetes at all.
+    """
+
+    from services.job_workspace_adoption import (
+        LegacyK8sAdoptionOutcome,
+        ensure_legacy_k8s_job_runtime_authority,
+    )
+
+    job = await _seed_exact_pre_0175_k8s_job(db, status="paused")
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = jsonb_set(context, "
+            "'{workspace_container,status}', '\"deleted\"'::jsonb) WHERE id = $1",
+            job["id"],
+        )
+    provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock())
+
+    outcome = await ensure_legacy_k8s_job_runtime_authority(
         db, provisioner, await db.get_job(str(job["id"]))
     )
 
-    assert refreshed.outcome is LegacyK8sAdoptionOutcome.ADOPTED
-    stored = await db.get_job(str(job["id"]))
-    runtime = _json(stored["context"])["workspace_container"]
-    assert runtime["_runtime_incarnation"] == replacement.runtime_incarnation
-    assert runtime[LEGACY_K8S_RUNTIME_ADOPTION_KEY]["workspace_generation"] == (
-        replacement.workspace_generation
-    )
-    assert resolve_workspace_runtime(stored).ready
+    assert outcome.outcome is LegacyK8sAdoptionOutcome.NOT_NEEDED
+    provisioner.attest_workspace_runtime.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1151,24 +1246,31 @@ async def test_stamped_sandbox_residue_adopts_but_unstamped_both_tier_refuses(db
         config_override={"workspace": {"backend": "sandbox"}},
     )
     vm_generation = str(uuid4())
-    await db.merge_job_context(
-        str(stamped["id"]),
-        {
-            "workspace_container": {
-                "status": "ready",
-                "provisioner": "k8s",
-                "pod_ip": "10.42.1.17",
-                "port": 30022,
-                "host": "workspace-job.internal",
-            },
-            "vm": {
-                "status": "ready",
-                "ssh_host": "stale-vm.internal",
-                "ssh_port": 22,
-                "provision_generation": vm_generation,
-            },
-        },
-    )
+    async with db.acquire() as conn:
+        await _seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) "
+            "|| $2::jsonb WHERE id = $1",
+            stamped["id"],
+            json.dumps(
+                {
+                    "workspace_container": {
+                        "status": "ready",
+                        "provisioner": "k8s",
+                        "pod_ip": "10.42.1.17",
+                        "port": 30022,
+                        "host": "workspace-job.internal",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "stale-vm.internal",
+                        "ssh_port": 22,
+                        "provision_generation": vm_generation,
+                    },
+                }
+            ),
+        )
     ambiguous = await _seed_exact_pre_0175_k8s_job(db)
     await db.merge_job_context(
         str(ambiguous["id"]),
