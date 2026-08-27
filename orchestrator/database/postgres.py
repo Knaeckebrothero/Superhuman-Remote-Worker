@@ -1239,25 +1239,15 @@ def _json_runtime_status_is_absent(value: dict[str, Any]) -> bool:
     return isinstance(value["status"], str) and value["status"] in {"", "deleted"}
 
 
-async def _settled_pinned_workspace_predecessor_generation(
-    conn,
+def _retained_pinned_workspace_pvc_identity(
     *,
-    thread_id: UUID,
-    current_generation: UUID,
     workspace: Mapping[str, Any],
     binding: Mapping[str, Any],
     namespace: str,
     pod_name: str,
     pvc_name: str | None,
-) -> str | None:
-    """Prove one retained-PVC workspace shell belongs to a retired generation.
-
-    Soft pinned retirement deletes the exact Pod and Service but deliberately
-    keeps the PVC binding for Resume. Its terminal context retains the former
-    stable endpoint strings while clearing the Pod UID. A successor create may
-    discard those strings only when the published provision intent and the
-    append-only soft-retirement outcome agree on that exact predecessor.
-    """
+) -> tuple[str, str] | None:
+    """Parse one exact post-soft-End Kubernetes PVC shell."""
 
     if (
         pvc_name is None
@@ -1303,6 +1293,39 @@ async def _settled_pinned_workspace_predecessor_generation(
         )
     except RuntimeError:
         return None
+    return binding_generation, pvc_uid
+
+
+async def _settled_pinned_workspace_predecessor_generation(
+    conn,
+    *,
+    thread_id: UUID,
+    current_generation: UUID,
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    namespace: str,
+    pod_name: str,
+    pvc_name: str | None,
+) -> str | None:
+    """Prove one retained-PVC workspace shell belongs to a retired generation.
+
+    Soft pinned retirement deletes the exact Pod and Service but deliberately
+    keeps the PVC binding for Resume. Its terminal context retains the former
+    stable endpoint strings while clearing the Pod UID. A successor create may
+    discard those strings only when the published provision intent and the
+    append-only soft-retirement outcome agree on that exact predecessor.
+    """
+
+    identity = _retained_pinned_workspace_pvc_identity(
+        workspace=workspace,
+        binding=binding,
+        namespace=namespace,
+        pod_name=pod_name,
+        pvc_name=pvc_name,
+    )
+    if identity is None:
+        return None
+    _binding_generation, pvc_uid = identity
 
     row = await conn.fetchrow(
         """
@@ -1341,6 +1364,76 @@ async def _settled_pinned_workspace_predecessor_generation(
         )
     except RuntimeError:
         return None
+
+
+async def _settled_pinned_workspace_current_generation(
+    conn,
+    *,
+    thread_id: UUID,
+    current_generation: UUID,
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Capture an exact retained PVC from this generation's soft End."""
+
+    namespace = str(workspace.get("namespace") or "")
+    pod_name = str(workspace.get("pod_name") or "")
+    pvc_name = f"pvc-{pod_name}" if pod_name else None
+    identity = _retained_pinned_workspace_pvc_identity(
+        workspace=workspace,
+        binding=binding,
+        namespace=namespace,
+        pod_name=pod_name,
+        pvc_name=pvc_name,
+    )
+    if identity is None:
+        return None
+    workspace_generation, pvc_uid = identity
+    row = await conn.fetchrow(
+        """
+        SELECT intent.attempt_id::text AS attempt_id,
+               intent.pod_uid,
+               intent.service_uid
+          FROM thread_workspace_provision_intents AS intent
+          JOIN thread_runtime_retirement_outcomes AS outcome
+            ON outcome.thread_id = intent.thread_id
+           AND outcome.runtime_generation = intent.runtime_generation
+         WHERE intent.thread_id = $1::uuid
+           AND intent.runtime_generation = $2::uuid
+           AND intent.namespace = $3
+           AND intent.pod_name = $4
+           AND intent.pvc_name = $5
+           AND intent.service_name = $4
+           AND intent.pvc_uid = $6
+           AND intent.pod_uid IS NOT NULL
+           AND intent.service_uid IS NOT NULL
+           AND intent.status = 'published'
+           AND outcome.disposition = 'ended'
+           AND outcome.permanent = false
+           AND outcome.outcome = 'settled'
+         ORDER BY intent.resolved_at DESC NULLS LAST, intent.created_at DESC
+         LIMIT 1
+         FOR SHARE OF intent, outcome
+        """,
+        thread_id,
+        current_generation,
+        namespace,
+        pod_name,
+        pvc_name,
+        pvc_uid,
+    )
+    if row is None:
+        return None
+    return {
+        "version": 1,
+        "runtime_generation": str(current_generation),
+        "workspace_generation": workspace_generation,
+        "attempt_id": str(row["attempt_id"]),
+        "namespace": namespace,
+        "pod_name": pod_name,
+        "pvc_name": pvc_name,
+        "pvc_uid": pvc_uid,
+    }
 
 
 def _pinned_retirement_local_quiescence_matches(
@@ -24197,6 +24290,7 @@ class PostgresDB:
                         "state": "malformed",
                         "reason": "workspace_backend_malformed",
                     }
+                retained_soft_workspace: dict[str, Any] | None = None
                 try:
                     if vm_evidence:
                         _canonical_uuid_text(
@@ -24273,43 +24367,67 @@ class PostgresDB:
                                     "Docker workspace authority is malformed"
                                 )
                         else:
-                            runtime_uid = _canonical_uuid_text(
-                                workspace_context.get("_runtime_incarnation"),
-                                label="workspace runtime incarnation",
+                            runtime_identity = workspace_context.get(
+                                "_runtime_incarnation"
                             )
-                            generation_id = _canonical_uuid_text(
-                                workspace_binding_context.get("generation"),
-                                label="workspace binding generation",
-                            )
-                            backing_id = str(
-                                workspace_binding_context.get("backing_id") or ""
-                            )
-                            try:
-                                backing_uid = str(UUID(backing_id.rsplit(":", 1)[-1]))
-                            except (TypeError, ValueError):
-                                raise RuntimeError(
-                                    "workspace backing authority is malformed"
-                                ) from None
-                            if (
-                                workspace_binding_context.get("kind") != "remote"
-                                or not (
-                                    backing_id.startswith("k8s-pvc:")
-                                    or backing_id.startswith("k8s-pod:")
-                                )
-                                or (
-                                    backing_id.startswith("k8s-pod:")
-                                    and backing_uid != runtime_uid
-                                )
-                                or (
-                                    workspace_context.get(
-                                        "_canvas_workspace_generation"
+                            if runtime_identity is None:
+                                if not (permanent and status == "ended"):
+                                    raise RuntimeError(
+                                        "Kubernetes workspace authority is malformed"
                                     )
-                                    not in (None, generation_id)
+                                retained_soft_workspace = (
+                                    await _settled_pinned_workspace_current_generation(
+                                        conn,
+                                        thread_id=parsed_thread_id,
+                                        current_generation=UUID(generation),
+                                        workspace=workspace_context,
+                                        binding=workspace_binding_context,
+                                    )
                                 )
-                            ):
-                                raise RuntimeError(
-                                    "Kubernetes workspace authority is malformed"
+                                if retained_soft_workspace is None:
+                                    raise RuntimeError(
+                                        "Kubernetes workspace authority is malformed"
+                                    )
+                            else:
+                                runtime_uid = _canonical_uuid_text(
+                                    runtime_identity,
+                                    label="workspace runtime incarnation",
                                 )
+                                generation_id = _canonical_uuid_text(
+                                    workspace_binding_context.get("generation"),
+                                    label="workspace binding generation",
+                                )
+                                backing_id = str(
+                                    workspace_binding_context.get("backing_id") or ""
+                                )
+                                try:
+                                    backing_uid = str(
+                                        UUID(backing_id.rsplit(":", 1)[-1])
+                                    )
+                                except (TypeError, ValueError):
+                                    raise RuntimeError(
+                                        "workspace backing authority is malformed"
+                                    ) from None
+                                if (
+                                    workspace_binding_context.get("kind") != "remote"
+                                    or not (
+                                        backing_id.startswith("k8s-pvc:")
+                                        or backing_id.startswith("k8s-pod:")
+                                    )
+                                    or (
+                                        backing_id.startswith("k8s-pod:")
+                                        and backing_uid != runtime_uid
+                                    )
+                                    or (
+                                        workspace_context.get(
+                                            "_canvas_workspace_generation"
+                                        )
+                                        not in (None, generation_id)
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "Kubernetes workspace authority is malformed"
+                                    )
                     elif virtual_binding:
                         generation_id = _canonical_uuid_text(
                             workspace_binding_context.get("generation"),
@@ -24385,6 +24503,7 @@ class PostgresDB:
                     "agent_pod_provision_intent": provision_intent,
                     "agent_workspace_claim": workspace_claim,
                     "workspace_provision_intent": workspace_provision_intent,
+                    "retained_soft_workspace": retained_soft_workspace,
                     "workspace_container": metadata.get("workspace_container"),
                     "workspace_binding": metadata.get("_workspace_binding"),
                     "vm": metadata.get("vm"),
