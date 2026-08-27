@@ -11033,14 +11033,22 @@ class PostgresDB:
                 captured_claim = {} if captured_claim is None else captured_claim
                 if not isinstance(captured_claim, dict):
                     return False
-                claim_rows = await conn.fetch(
-                    "SELECT claim_id,thread_id,created_runtime_generation,"
-                    "create_attempt,provisioner,pvc_name,status,pvc_uid "
-                    "FROM thread_agent_workspace_claims "
-                    "WHERE thread_id=$1::uuid AND status<>'reclaimed' FOR SHARE",
-                    thread_uuid,
-                )
                 if captured_claim:
+                    try:
+                        captured_claim_uuid = UUID(
+                            str(captured_claim.get("claim_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return False
+                    claim_rows = await conn.fetch(
+                        "SELECT claim_id,thread_id,created_runtime_generation,"
+                        "create_attempt,provisioner,pvc_name,status,pvc_uid "
+                        "FROM thread_agent_workspace_claims "
+                        "WHERE thread_id=$1::uuid "
+                        "AND (status<>'reclaimed' OR claim_id=$2::uuid) FOR SHARE",
+                        thread_uuid,
+                        captured_claim_uuid,
+                    )
                     if len(claim_rows) != 1:
                         return False
                     claim_row = claim_rows[0]
@@ -11056,13 +11064,21 @@ class PostgresDB:
                         == str(captured_claim.get("provisioner") or "")
                         and str(claim_row["pvc_name"])
                         == str(captured_claim.get("pvc_name") or "")
-                        and str(claim_row["status"]) == "fenced"
+                        # A later obligation may replay after post-horizon GC
+                        # exact-deleted this same captured fence. Its immutable
+                        # row remains the authority in terminal ``reclaimed``.
+                        and str(claim_row["status"]) in {"fenced", "reclaimed"}
                         and bool(str(claim_row["pvc_uid"] or ""))
                         and external_receipt.get("agent_workspace_cleanup_protocol")
                         == "k8s_pvc_name_tombstone_v1"
                     ):
                         return False
-                elif claim_rows:
+                elif await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "thread_agent_workspace_claims WHERE "
+                    "thread_id=$1::uuid AND status<>'reclaimed')",
+                    thread_uuid,
+                ):
                     return False
 
                 captured_workspace_intent = context.get("workspace_provision_intent")
@@ -11456,6 +11472,10 @@ class PostgresDB:
                             current_workspace_status is None
                             or isinstance(current_workspace_status, str)
                             and current_workspace_status in {"", "deleting", "deleted"}
+                            or (
+                                captured_workspace_status == "suspending"
+                                and current_workspace_status == "suspended"
+                            )
                         )
                 elif external_protocol == "workspace_provision_fence_v1":
                     accepted_workspace_status_change = bool(
@@ -17881,6 +17901,13 @@ class PostgresDB:
                 workspace = metadata.get("workspace_container")
                 current_binding = metadata.get("_workspace_binding")
                 current_binding = {} if current_binding is None else current_binding
+                try:
+                    previous_binding = _strict_json_object(
+                        intent["previous_binding"],
+                        label="workspace provision intent previous binding",
+                    )
+                except RuntimeError:
+                    return None
                 if not (
                     str(intent["status"]) == "planned"
                     and str(intent["runtime_generation"]) == str(parsed_generation)
@@ -17918,7 +17945,7 @@ class PostgresDB:
                     and str(workspace.get("_workspace_provision_generation") or "")
                     == str(parsed_generation)
                     and isinstance(current_binding, dict)
-                    and current_binding == dict(intent["previous_binding"] or {})
+                    and current_binding == previous_binding
                 ):
                     return None
                 pod_uid = str(intent["pod_uid"])
@@ -17928,7 +17955,7 @@ class PostgresDB:
                     if pvc_uid is not None
                     else f"k8s-pod:{intent['namespace']}:{pod_uid}"
                 )
-                previous = dict(intent["previous_binding"] or {})
+                previous = previous_binding
                 if (
                     intent["retained_binding_generation"] is not None
                     and str(intent["retained_pvc_uid"] or "") == str(pvc_uid or "")
@@ -29299,7 +29326,7 @@ class PostgresDB:
                 ):
                     return False
                 status = str(claim["status"] or "")
-                if status in {"revoking", "fenced"}:
+                if status in {"revoking", "fenced", "reclaimed"}:
                     return True
                 if status not in {"planned", "ready"}:
                     return False
@@ -32266,6 +32293,7 @@ class PostgresDB:
             not in {
                 "workspace_process_zero_v1",
                 "agent_runtime_zero_v1",
+                "sandbox_actuator_zero_v1",
                 "workspace_actuator_zero_v1",
             }
             or quiescence_actor not in {"agent", "orchestrator"}
@@ -32283,6 +32311,7 @@ class PostgresDB:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT runtime_retirement_token, "
+                    "runtime_retirement_permanent, "
                     "runtime_retirement_context, "
                     "runtime_retirement_local_quiescence "
                     "FROM threads WHERE id=$1::uuid "
@@ -32368,8 +32397,16 @@ class PostgresDB:
                 elif workspace_backend == "sandbox":
                     if bool(sandbox_generation) != bool(sandbox_runtime):
                         return None
+                    orchestrator_absence_proof = bool(
+                        row["runtime_retirement_permanent"] is True
+                        and expected_settle_status == "ended"
+                        and quiescence_actor == "orchestrator"
+                        and expected_quiescence_protocol == "sandbox_actuator_zero_v1"
+                    )
                     expected_protocol = (
-                        "workspace_process_zero_v1"
+                        "sandbox_actuator_zero_v1"
+                        if orchestrator_absence_proof
+                        else "workspace_process_zero_v1"
                         if sandbox_generation
                         else "agent_runtime_zero_v1"
                     )

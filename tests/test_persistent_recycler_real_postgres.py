@@ -1916,6 +1916,71 @@ async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
 
 
 @pytest.mark.asyncio
+async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
+    """Exact Pod absence may receipt a permanent bound sandbox retirement."""
+
+    ids = await _seed(db)
+    workspace_generation = str(uuid4())
+    workspace_runtime = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=metadata || jsonb_build_object("
+            "'workspace_container',jsonb_build_object("
+            "'status','ready','provisioner','k8s','namespace','default',"
+            "'pod_name','workspace-absent-retirement',"
+            "'_runtime_incarnation',$2::text,"
+            "'_canvas_workspace_generation',$3::text),"
+            "'_workspace_binding',jsonb_build_object("
+            "'generation',$3::text,'kind','remote','backing_id',"
+            "'k8s-pod:default:' || $2::text,"
+            "'ssh_host_key_fingerprint','SHA256:test'),"
+            "'config_override',jsonb_build_object('officer',jsonb_build_object("
+            "'enabled',true),'workspace',jsonb_build_object('backend','sandbox'))) "
+            "WHERE id=$1",
+            UUID(ids["thread"]),
+            workspace_runtime,
+            workspace_generation,
+        )
+    authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=authority["token"],
+        generation=authority["generation"],
+        settle_status="ended",
+    )
+    assert (
+        await db.acknowledge_pinned_thread_local_quiescence(
+            ids["thread"],
+            expected_runtime_generation=authority["generation"],
+            expected_retirement_token=authority["token"],
+            expected_agent_id=ids["agent"],
+            expected_attach_token=ids["attach_token"],
+            expected_settle_status="ended",
+            expected_quiescence_protocol="sandbox_actuator_zero_v1",
+            expected_workspace_generation=workspace_generation,
+            expected_workspace_runtime_incarnation=workspace_runtime,
+            quiescence_actor="agent",
+        )
+        is None
+    )
+    receipt = await db.acknowledge_pinned_thread_local_quiescence(
+        ids["thread"],
+        expected_runtime_generation=authority["generation"],
+        expected_retirement_token=authority["token"],
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="sandbox_actuator_zero_v1",
+        expected_workspace_generation=workspace_generation,
+        expected_workspace_runtime_incarnation=workspace_runtime,
+        quiescence_actor="orchestrator",
+    )
+    assert receipt is not None
+    assert receipt["quiescence_protocol"] == "sandbox_actuator_zero_v1"
+    assert receipt["quiescence_actor"] == "orchestrator"
+
+
+@pytest.mark.asyncio
 async def test_unexposed_permanent_delete_waits_for_external_runtime_cleanup(db):
     ids = await _seed(db, bind_agent=False)
     runtime_uid = str(uuid4())
@@ -1971,6 +2036,59 @@ async def test_unexposed_permanent_delete_waits_for_external_runtime_cleanup(db)
         expected_runtime_generation=authority["generation"],
     )
     assert await db.get_thread(ids["thread"]) is None
+
+
+@pytest.mark.asyncio
+async def test_physical_cleanup_accepts_only_captured_suspend_completion(db):
+    """The fenced suspending generation may finish; a ready capture may not."""
+
+    for captured_status, expected in (("suspending", True), ("ready", False)):
+        ids = await _seed(db, bind_agent=False)
+        runtime_uid = str(uuid4())
+        binding_generation = str(uuid4())
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_build_object("
+                "'config_override',jsonb_build_object('workspace',jsonb_build_object("
+                "'backend','sandbox')),'workspace_container',jsonb_build_object("
+                "'status',$2::text,'provisioner','k8s','namespace','default',"
+                "'pod_name','workspace-suspend-completion',"
+                "'_runtime_incarnation',$3::text,"
+                "'_canvas_workspace_generation',$4::text),"
+                "'_workspace_binding',jsonb_build_object("
+                "'generation',$4::text,'kind','remote','backing_id',"
+                "'k8s-pod:default:' || $3::text,"
+                "'ssh_host_key_fingerprint','SHA256:test')) WHERE id=$1",
+                UUID(ids["thread"]),
+                captured_status,
+                runtime_uid,
+                binding_generation,
+            )
+        authority = await db.begin_pinned_thread_retirement(
+            ids["thread"], permanent=True
+        )
+        assert await db.authorize_pinned_thread_retirement(
+            ids["thread"],
+            token=authority["token"],
+            generation=authority["generation"],
+            settle_status="ended",
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set("
+                "metadata,'{workspace_container,status}','\"suspended\"'::jsonb) "
+                "WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        assert (
+            await db.clear_pinned_retirement_physical_runtime_endpoint(
+                ids["thread"],
+                runtime_generation=authority["generation"],
+                retirement_token=authority["token"],
+                completed_external_cleanup_protocol="sandbox_actuator_zero_v1",
+            )
+            is expected
+        )
 
 
 @pytest.mark.asyncio
@@ -2849,6 +2967,95 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
                     UUID(ids["thread"]),
                 )
         assert blocked.value.constraint_name == "threads_resume_create_fence_authority"
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(db):
+    """Exact post-horizon fence GC remains complete through physical CAS."""
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    entry = await db.get_thread(ids["thread"])
+    generation = str(entry["runtime_generation"])
+    attempt_id = str(uuid4())
+    claim_name = f"pvc-agent-s-{ids['thread'][:12]}"
+    intent = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=f"srw-agent-s-{attempt_id[:8]}",
+        provisioner="agent",
+        pvc_name=claim_name,
+    )
+    assert intent is not None
+    claim_id = str(intent["workspace_claim"]["claim_id"])
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    revoke = {
+        "expected_runtime_generation": retirement["generation"],
+        "expected_retirement_token": retirement["token"],
+        "expected_claim_id": claim_id,
+        "expected_pvc_name": claim_name,
+    }
+    assert await db.revoke_pinned_agent_workspace_claim(ids["thread"], **revoke)
+    assert await db.fence_pinned_agent_workspace_claim(
+        ids["thread"],
+        **revoke,
+        fence_pvc_uid="fence-pvc-uid",
+    )
+    pod_revoke = {
+        "expected_runtime_generation": retirement["generation"],
+        "expected_retirement_token": retirement["token"],
+        "expected_attempt_id": attempt_id,
+        "expected_pod_name": f"srw-agent-s-{attempt_id[:8]}",
+    }
+    assert await db.revoke_pinned_agent_pod_provision_intent(
+        ids["thread"], **pod_revoke
+    )
+    assert await db.fence_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        **pod_revoke,
+        fence_pod_uid="pod-fence-uid",
+    )
+    assert await db.acknowledge_pinned_agent_pod_provision_intent_zero(
+        ids["thread"],
+        **pod_revoke,
+        observed_pod_uid="pod-fence-uid",
+    )
+    async with db.acquire() as conn:
+        # Build the post-GC fixture without spending the production ten-minute
+        # request horizon. Other tests exercise the real fenced -> reclaimed
+        # transition; this one isolates replay of its terminal row.
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_workspace_claims "
+                "SET status='reclaimed',resolved_at=now() "
+                "WHERE claim_id=$1::uuid",
+                UUID(claim_id),
+            )
+    assert await db.revoke_pinned_agent_workspace_claim(ids["thread"], **revoke)
+    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
 
 
 @pytest.mark.asyncio

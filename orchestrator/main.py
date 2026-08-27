@@ -11919,6 +11919,13 @@ async def _reconcile_agent_workspace_claim_for_retirement(
         raise RuntimeError("agent workspace claim disappeared")
     claim_status = str(claim_row["status"] or "")
     fence_uid = str(claim_row["pvc_uid"] or "")
+    if claim_status == "reclaimed":
+        # The post-horizon GC reconciler already deleted the exact fence UID
+        # and durably closed this immutable claim. This can happen when an
+        # earlier retirement attempt finished name fencing but failed in a
+        # later obligation. The row-locked revoke call above revalidated the
+        # captured claim tuple, so terminal replay has nothing left to actuate.
+        return
     if claim_status == "fenced":
         observed = await provider.agent_workspace_claim_authority(
             claim["pvc_name"],
@@ -12110,6 +12117,7 @@ async def _recover_captured_sandbox_process_zero(
         return True
 
     thread_id = str(context.get("thread_id") or "")
+    permanent = bool(retirement.get("permanent"))
     current = await postgres_db.get_thread(thread_id)
     if current and _agent_pod_provision_intent_zero_candidate(retirement, current):
         async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
@@ -12212,6 +12220,7 @@ async def _recover_captured_sandbox_process_zero(
         )
         fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
         host = str(workspace.get("pod_ip") or workspace.get("host") or "")
+        workspace_status = str(workspace.get("status") or "")
         raw_port = workspace.get("port", 30022)
         try:
             UUID(thread_id)
@@ -12228,11 +12237,50 @@ async def _recover_captured_sandbox_process_zero(
             not host
             or not 1 <= port <= 65535
             or not fingerprint.startswith("SHA256:")
-            or workspace.get("status") != "ready"
             or binding.get("kind") != "remote"
             or str(workspace.get("_canvas_workspace_generation") or "")
             != workspace_generation
         ):
+            return False
+
+        # A permanent retirement token prevents a same-name successor from
+        # being admitted.  After the exact captured agent Pod is stopped, a
+        # Kubernetes 404 (or an exact UID whose containers are all terminal)
+        # is therefore a stronger process-zero proof than SSH: there is no
+        # workspace process namespace left to contact.  Receipt that actuator
+        # proof before the ordinary retirement cleanup removes the residual
+        # PVC/Service.  Replacement and ambiguous observations stay refused.
+        if permanent and workspace_status in {
+            "ready",
+            "suspending",
+            "suspended",
+            "deleted",
+        }:
+            workspace_authority = await container_provisioner.workspace_pod_authority(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=runtime_incarnation,
+            )
+            if workspace_authority in {"exact_absent", "exact_terminal"}:
+                receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+                    thread_id,
+                    expected_runtime_generation=generation,
+                    expected_retirement_token=token,
+                    expected_agent_id=str(context.get("agent_id") or ""),
+                    expected_attach_token=str(
+                        context.get("runtime_attach_token") or ""
+                    ),
+                    expected_settle_status=str(context.get("settle_status") or ""),
+                    expected_quiescence_protocol="sandbox_actuator_zero_v1",
+                    expected_workspace_generation=workspace_generation,
+                    expected_workspace_runtime_incarnation=runtime_incarnation,
+                    quiescence_actor="orchestrator",
+                )
+                return receipt is not None
+
+        # SSH is a live-runtime actuator. A captured suspension/deletion state
+        # may use exact Pod absence above, but may never dial its stale endpoint
+        # when the Kubernetes observation is live, replaced, or ambiguous.
+        if workspace_status != "ready":
             return False
 
         from services import resolve_ssh_key_path
@@ -12534,7 +12582,15 @@ async def _cleanup_pinned_thread_retirement(
                 raise RuntimeError(
                     "workspace PVC appeared outside captured retirement authority"
                 )
-        elif workspace_identity.pvc_uid != backing_resource_uid:
+        elif (
+            workspace_identity.pvc_uid is not None
+            and workspace_identity.pvc_uid != backing_resource_uid
+        ):
+            # A present same-name PVC must still be the exact captured UID.
+            # Absence is an idempotent replay after an earlier exact release
+            # deleted the volume but a later retirement obligation remained
+            # retryable; _release_captured_workspace rechecks Pod absence and
+            # never adopts a deterministic-name successor.
             raise RuntimeError("workspace PVC identity changed before retirement")
         released = await container_provisioner.release_workspace(
             WorkspaceOwner.session(thread_id),

@@ -30,12 +30,23 @@ if "WORKSPACE_PATH" not in os.environ:
     _test_workspace = tempfile.mkdtemp(prefix="srw_test_workspace_")
     os.environ["WORKSPACE_PATH"] = _test_workspace
 
-# Provide a deterministic encryption key so any code path that touches
-# orchestrator.security.crypto during tests has a working cipher. Real
-# credentials never run through this key.
+# Provide a deterministic encryption key so any code path that touches the
+# orchestrator's canonical ``security.crypto`` module during tests has a working
+# cipher. Real credentials never run through this key.
 os.environ.setdefault(
     "APP_ENCRYPTION_KEY", "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
 )
+
+from security import crypto as _encryption_crypto  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_encryption_cipher_cache():
+    """Prevent a test-specific encryption key from leaking between tests."""
+    _encryption_crypto.reset_cipher_cache()
+    yield
+    _encryption_crypto.reset_cipher_cache()
+
 
 # orchestrator/main.py also guards on vector-DB credentials at import time.
 # Tests only exercise its utility functions / pure models, never the vector

@@ -2076,7 +2076,9 @@ class TestEndedSessionKeepsItsVolume:
             },
         }
 
-    async def _run_end_thread(self, *, permanent: bool):
+    async def _run_end_thread(
+        self, *, permanent: bool, observed_pvc_uid: str | None = "captured"
+    ):
         """Drive the real DELETE endpoint, capturing the reclaim decision.
 
         Returns ``(result, release_workspace, db)`` so the assertion reaches
@@ -2124,7 +2126,11 @@ class TestEndedSessionKeepsItsVolume:
         )
         teardown_identity = SimpleNamespace(
             pod_uid=self.workspace_runtime,
-            pvc_uid=self.workspace_pvc_uid,
+            pvc_uid=(
+                self.workspace_pvc_uid
+                if observed_pvc_uid == "captured"
+                else observed_pvc_uid
+            ),
         )
         release_workspace = AsyncMock(return_value=True)
         provisioner = SimpleNamespace(
@@ -2218,6 +2224,33 @@ class TestEndedSessionKeepsItsVolume:
             expected_runtime_retirement_token=self.retirement_token,
             expected_runtime_generation=self.runtime_generation,
         )
+
+    @pytest.mark.asyncio
+    async def test_permanent_retry_accepts_captured_workspace_volume_already_absent(
+        self,
+    ):
+        """A lost response after exact PVC deletion must replay to completion."""
+
+        result, release_workspace, db = await self._run_end_thread(
+            permanent=True,
+            observed_pvc_uid=None,
+        )
+
+        assert result == {"status": "deleted"}
+        assert release_workspace.await_args.kwargs["teardown_identity"].pvc_uid is None
+        db.delete_thread.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_permanent_retry_refuses_replacement_workspace_volume(self):
+        """A present same-name PVC with another UID is never adopted."""
+
+        with pytest.raises(HTTPException) as exc:
+            await self._run_end_thread(
+                permanent=True,
+                observed_pvc_uid="70000000-0000-4000-8000-000000000007",
+            )
+
+        assert exc.value.status_code == 503
 
     @pytest.mark.asyncio
     async def test_stateless_end_refuses_unattested_workspace_before_cleanup(self):

@@ -30,7 +30,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.security import crypto
+from security import crypto
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
