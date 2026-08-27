@@ -1536,8 +1536,7 @@ def _pinned_retirement_local_quiescence_matches(
             not pre_registration_pod_zero
             or (
                 str(receipt.get("quiescence_actor") or "") == "orchestrator"
-                and str(receipt.get("quiescence_protocol") or "")
-                == "agent_runtime_zero_v1"
+                and str(receipt.get("quiescence_protocol") or "") == expected_protocol
                 and str(receipt.get("agent_pod_name") or "")
                 == str(agent_pod.get("pod_name") or "")
                 and str(receipt.get("agent_pod_uid") or "")
