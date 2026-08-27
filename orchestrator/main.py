@@ -10587,16 +10587,34 @@ async def _recover_pre_registration_agent_pod_zero(
     thread_id = str(context.get("thread_id") or "")
     # Sanctioned registration takes the same advisory lifecycle lock as End;
     # this pre-effect check therefore cannot race its unbound-agent insert.
-    # The post-effect receipt CAS repeats it against direct/legacy writers.
-    matching_agent = await postgres_db.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM agents "
-        "WHERE thread_id=$1::uuid OR hostname=$2 OR pod_uid=$3)",
+    # The post-effect receipt CAS repeats it against direct/legacy writers. A
+    # registration that lost publication can leave one exact offline row
+    # behind after its Pod is gone; retain that identity and delete it only
+    # through the atomic offline+unbound predicate after exact Pod-zero.
+    matching_agents = await postgres_db.fetch(
+        "SELECT id::text,hostname,pod_uid::text,status,thread_id::text,"
+        "current_job_id::text FROM agents "
+        "WHERE thread_id=$1::uuid OR hostname=$2 OR pod_uid=$3 ORDER BY id",
         thread_id,
         pod[0],
         pod[1],
     )
-    if matching_agent:
+    if len(matching_agents) > 1:
         return False
+    orphan_agent_id: str | None = None
+    if matching_agents:
+        matching = matching_agents[0]
+        if not (
+            str(matching.get("hostname") or "") == pod[0]
+            and str(matching.get("pod_uid") or "") == pod[1]
+            and str(matching.get("status") or "") in {"offline", "failed"}
+            and matching.get("thread_id") is None
+            and matching.get("current_job_id") is None
+        ):
+            return False
+        orphan_agent_id = str(matching.get("id") or "")
+        if not orphan_agent_id:
+            return False
     try:
         await _stop_captured_retirement_agent(retirement)
     except Exception:
@@ -10604,6 +10622,12 @@ async def _recover_pre_registration_agent_pod_zero(
             "Pre-registration agent Pod stop remains retryable for thread %s",
             thread_id,
         )
+        return False
+    if orphan_agent_id and not await postgres_db.delete_exact_offline_unbound_agent(
+        orphan_agent_id,
+        expected_hostname=pod[0],
+        expected_pod_uid=pod[1],
+    ):
         return False
     receipt = await postgres_db.acknowledge_pinned_thread_pre_registration_pod_zero(
         thread_id,
