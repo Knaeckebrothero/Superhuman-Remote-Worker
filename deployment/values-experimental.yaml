@@ -70,9 +70,9 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-9e44ad5
+    tag: sha-4f6fdc4
   agent:
-    tag: sha-588a55c
+    tag: sha-4f6fdc4
   cockpit:
     tag: sha-ad39de5
   mcp:
@@ -83,14 +83,14 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-9e44ad5a1ad68f13f51d7813aa2247511e227034"
+  releaseVersion: "0.0.0-dev.sha-4f6fdc4433ec2bfb60e9c8bed8304d984bf196da"
   components:
     orchestrator:
-      sourceRevision: 9e44ad5a1ad68f13f51d7813aa2247511e227034
-      releaseVersion: "0.0.0-dev.sha-9e44ad5a1ad68f13f51d7813aa2247511e227034"
+      sourceRevision: 4f6fdc4433ec2bfb60e9c8bed8304d984bf196da
+      releaseVersion: "0.0.0-dev.sha-4f6fdc4433ec2bfb60e9c8bed8304d984bf196da"
     agent:
-      sourceRevision: 588a55c22063955bbc1296b55a831ed29aba296e
-      releaseVersion: "0.0.0-dev.sha-588a55c22063955bbc1296b55a831ed29aba296e"
+      sourceRevision: 4f6fdc4433ec2bfb60e9c8bed8304d984bf196da
+      releaseVersion: "0.0.0-dev.sha-4f6fdc4433ec2bfb60e9c8bed8304d984bf196da"
     cockpit:
       sourceRevision: ad39de5116caf88430c2b0f3de60fae2ddc654ca
       releaseVersion: "0.0.0-dev.sha-ad39de5116caf88430c2b0f3de60fae2ddc654ca"
@@ -620,9 +620,9 @@ databases:
       limits:
         cpu: "2"
         memory: "2Gi"
-    # To externalize later, add externalUrl to THIS block — a second
-    # `postgres:` key further down would silently shadow the storageSize
-    # above and re-arm the shrink failure.
+        # To externalize later, add externalUrl to THIS block — a second
+        # `postgres:` key further down would silently shadow the storageSize
+        # above and re-arm the shrink failure.
   # Vector store (srw-pgvector) — the same story a third time. The 16Gi volume
   # filled 2026-08-14 and crashlooped pgvector on "No space left on device"
   # writing pg_wal/xlogtemp during WAL recovery. That loop is unescapable
