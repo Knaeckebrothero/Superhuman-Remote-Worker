@@ -1,0 +1,10 @@
+# Temporary, explicit maintenance overlay for the 0185/0186 runtime-authority
+# cutover. Keep the old mutating orchestrator and dynamic warm pool at zero
+# until the acknowledgement is enabled and every writer runs post-0185 code.
+orchestrator:
+  replicas: 0
+
+agent:
+  pool:
+    minAgents: "0"
+    buffer: "0"
