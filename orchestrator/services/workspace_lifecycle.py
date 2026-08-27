@@ -81,6 +81,7 @@ async def _create(
     *,
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
+    pinned_runtime_lock_held: bool = False,
 ) -> "EnsureResult":
     strict_kwargs: dict[str, Any] = {}
     if stateless_creation_generation is not None:
@@ -93,7 +94,10 @@ async def _create(
         if not callable(pinned_create):
             ok = False
         else:
-            ok = await pinned_create(owner.id, **(ws_config or {}))
+            pinned_kwargs = dict(ws_config or {})
+            if pinned_runtime_lock_held:
+                pinned_kwargs["runtime_lock_held"] = True
+            ok = await pinned_create(owner.id, **pinned_kwargs)
     else:
         ok = await provisioner.create_workspace(
             owner,
@@ -333,6 +337,7 @@ async def ensure_workspace(
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
     stateless_creation_refused: bool = False,
+    pinned_runtime_lock_held: bool = False,
 ) -> "EnsureResult":
     """Idempotently drive owner's workspace toward 'ready'. Owner-agnostic
     extraction of the job dispatcher's container branch (main.py).
@@ -410,6 +415,7 @@ async def ensure_workspace(
             ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
+            pinned_runtime_lock_held=pinned_runtime_lock_held,
         )
     if require_runtime_incarnation and s in ("suspended", "restoring"):
         # Stateless restore is authorized only by the exact-true marker handled
@@ -426,6 +432,7 @@ async def ensure_workspace(
                 ws_config,
                 stateless_creation_generation=stateless_creation_generation,
                 allow_stateless_create=allow_stateless_create,
+                pinned_runtime_lock_held=pinned_runtime_lock_held,
             )
         return EnsureResult(EnsureOutcome.FAILED, status="failed")
     if s == "suspended":
@@ -446,13 +453,19 @@ async def ensure_workspace(
             ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
+            pinned_runtime_lock_held=pinned_runtime_lock_held,
         )
     if owner.kind == "session" and s == "pending":
         # Pinned K8s creates publish a durable multi-resource attempt before the
         # first API effect.  An SSH/readiness timeout deliberately leaves that
         # marker pending; re-enter the exact attempt instead of treating it as a
         # self-progressing phase with no recovery owner.
-        return await _create(owner, provisioner, ws_config)
+        return await _create(
+            owner,
+            provisioner,
+            ws_config,
+            pinned_runtime_lock_held=pinned_runtime_lock_held,
+        )
     # "Already progressing" set — keep in sync with the NOT IN clause in
     # PostgresDB.list_threads_needing_workspace (database/postgres.py).
     if s in ("created", "creating", "restoring", "suspending"):
@@ -479,6 +492,7 @@ async def ensure_workspace(
                     ws_config,
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=allow_stateless_create,
+                    pinned_runtime_lock_held=pinned_runtime_lock_held,
                 )
         return EnsureResult(EnsureOutcome.READY, status="ready")
     # Unknown / unexpected status — wait (the dispatcher skips and retries).
