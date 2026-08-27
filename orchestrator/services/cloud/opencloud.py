@@ -168,6 +168,12 @@ class OpenCloudBackend:
             raise RuntimeError("OpenCloud backend instance authority changed")
         self._backend_instance_id = backend_instance_id
 
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        """OpenCloud's provider proof does not depend on the proposed UUID."""
+
+        if not isinstance(backend_instance_id, str) or not backend_instance_id:
+            raise ValueError("OpenCloud attestation instance is missing")
+
     @property
     def webdav_credentials(self) -> dict[str, str]:
         """OpenCloud WebDAV is OAuth bearer-based, not user+password.

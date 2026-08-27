@@ -136,6 +136,15 @@ class MainCloudBackend(Protocol):
         """Bind the exact DB installation UUID after remote attestation."""
         ...
 
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        """Supply a proposed UUID for an installation-bound remote probe.
+
+        This is not routing authority and must not populate
+        :attr:`backend_instance_id`; a racing first-boot replica may ultimately
+        adopt a different UUID from the database.
+        """
+        ...
+
     # ------------------------------------------------------------------ Lifecycle
     @property
     def is_configured(self) -> bool: ...

@@ -245,6 +245,9 @@ class MainCloudRouter:
                     return cached
             backend = build_backend_from_instance(authority)
             try:
+                backend.prepare_backend_instance_attestation(
+                    authority.backend_instance_id
+                )
                 initialized = await backend.ensure_initialized()
                 if (
                     not initialized

@@ -44,6 +44,7 @@ from uuid import UUID
 
 
 PROTECTED_EFFECT_CAPABILITY_VERSION = 1
+PROTECTED_EFFECT_INSTALLATION_ATTESTATION_VERSION = 1
 PROTECTED_EFFECT_REQUEST_VERSION = 1
 PROTECTED_EFFECT_FENCE_INTENT_VERSION = 1
 PROTECTED_EFFECT_HORIZON_VERSION = 1
@@ -52,6 +53,9 @@ PROTECTED_EFFECT_HORIZON_VERSION = 1
 # before canonical UTF-8 JSON.  The NUL terminator makes concatenation
 # unambiguous and the separate labels prevent cross-protocol substitution.
 PROTECTED_EFFECT_CAPABILITY_HMAC_DOMAIN = b"srw-nextcloud-effect-capability-v1\0"
+PROTECTED_EFFECT_INSTALLATION_ATTESTATION_HMAC_DOMAIN = (
+    b"srw-nextcloud-installation-attestation-v1\0"
+)
 PROTECTED_EFFECT_REQUEST_HMAC_DOMAIN = b"srw-nextcloud-effect-request-v1\0"
 
 # These are protocol hard limits, not deployment defaults.  An attested
@@ -74,6 +78,16 @@ _CAPABILITY_KEYS = frozenset(
         "clock_skew_bound_seconds",
         "safety_margin_seconds",
         "capability_max_age_seconds",
+        "server_time",
+    }
+)
+_INSTALLATION_ATTESTATION_KEYS = frozenset(
+    {
+        "version",
+        "backend_instance_id",
+        "config_sha256",
+        "installation_proof_sha256",
+        "capability_sha256",
         "server_time",
     }
 )
@@ -344,25 +358,35 @@ class NextcloudEffectCapability:
             return None
         return parsed if parsed.binding == dict(binding) else None
 
-    def _validated_database_window(
+    def _validated_clock_window(
         self,
         *,
-        db_before: datetime,
-        db_after: datetime,
+        trusted_before: datetime,
+        trusted_after: datetime,
+        clock_name: str,
         expected_backend_instance_id: str,
         expected_config_sha256: str,
     ) -> tuple[datetime, datetime, datetime]:
-        """Validate freshness against DB timestamps bracketing the HTTP fetch.
+        """Validate freshness against trusted timestamps around the fetch.
 
-        ``db_before`` and ``db_after`` must come from PostgreSQL's clock, not
-        from the application process.  The response must fit both the maximum
-        fetch age and the attested cross-host skew.  The caller-supplied pinned
-        installation/configuration identity is mandatory so a self-consistent
-        response from another installation cannot be adopted.
+        Effect authority supplies PostgreSQL timestamps; the startup-only
+        installation probe supplies the orchestrator's UTC timestamps. The
+        response must fit both the maximum fetch age and the attested
+        cross-host skew. The caller-supplied pinned installation/configuration
+        identity is mandatory so a self-consistent response from another
+        installation cannot be adopted.
         """
 
-        before = _utc_datetime(db_before, coordinate="database time before fetch")
-        after = _utc_datetime(db_after, coordinate="database time after fetch")
+        if clock_name not in {"database", "client"}:
+            raise ValueError("protected effect trusted clock is unsupported")
+        before = _utc_datetime(
+            trusted_before,
+            coordinate=f"{clock_name} time before fetch",
+        )
+        after = _utc_datetime(
+            trusted_after,
+            coordinate=f"{clock_name} time after fetch",
+        )
         expected_instance = _canonical_uuid(
             expected_backend_instance_id,
             coordinate="expected backend instance",
@@ -377,7 +401,7 @@ class NextcloudEffectCapability:
         ):
             raise ValueError("protected effect capability identity does not match")
         if after < before:
-            raise ValueError("protected effect database window runs backwards")
+            raise ValueError(f"protected effect {clock_name} window runs backwards")
 
         fetch_age = after - before
         maximum_age = timedelta(seconds=self.capability_max_age_seconds)
@@ -391,7 +415,7 @@ class NextcloudEffectCapability:
         try:
             # If the remote clock is ahead by the full allowed skew, the
             # effect capability was really issued ``skew`` earlier.  This is
-            # the conservative DB-clock expiry, not a client-clock estimate.
+            # the conservative trusted-clock expiry.
             fresh_until = self.server_time + maximum_age - skew
         except OverflowError as exc:
             raise ValueError(
@@ -400,6 +424,100 @@ class NextcloudEffectCapability:
         if after > fresh_until:
             raise ValueError("protected effect capability server time is stale")
         return before, after, fresh_until
+
+
+@dataclass(frozen=True, slots=True)
+class NextcloudInstallationAttestation:
+    """A signed startup-only installation proof bound to one capability."""
+
+    backend_instance_id: str
+    config_sha256: str
+    installation_proof_sha256: str
+    capability_sha256: str
+    server_time: datetime
+    version: int = PROTECTED_EFFECT_INSTALLATION_ATTESTATION_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.version) is not int
+            or self.version != PROTECTED_EFFECT_INSTALLATION_ATTESTATION_VERSION
+        ):
+            raise ValueError(
+                "protected effect installation attestation version is unsupported"
+            )
+        object.__setattr__(
+            self,
+            "backend_instance_id",
+            _canonical_uuid(
+                self.backend_instance_id,
+                coordinate="installation attestation backend instance",
+            ),
+        )
+        for field_name, coordinate in (
+            ("config_sha256", "installation attestation configuration"),
+            ("installation_proof_sha256", "installation attestation proof"),
+            ("capability_sha256", "installation attestation capability"),
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _lowercase_sha256(
+                    getattr(self, field_name),
+                    coordinate=coordinate,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "server_time",
+            _utc_datetime(
+                self.server_time,
+                coordinate="installation attestation server time",
+            ),
+        )
+
+    @property
+    def binding(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "backend_instance_id": self.backend_instance_id,
+            "config_sha256": self.config_sha256,
+            "installation_proof_sha256": self.installation_proof_sha256,
+            "capability_sha256": self.capability_sha256,
+            "server_time": _format_utc(
+                self.server_time,
+                coordinate="installation attestation server time",
+            ),
+        }
+
+    @property
+    def canonical_json(self) -> str:
+        return _canonical_json(self.binding)
+
+    @classmethod
+    def from_binding(
+        cls,
+        binding: Mapping[str, Any] | None,
+    ) -> NextcloudInstallationAttestation | None:
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != _INSTALLATION_ATTESTATION_KEYS
+        ):
+            return None
+        try:
+            parsed = cls(
+                version=binding.get("version"),
+                backend_instance_id=binding.get("backend_instance_id"),
+                config_sha256=binding.get("config_sha256"),
+                installation_proof_sha256=binding.get("installation_proof_sha256"),
+                capability_sha256=binding.get("capability_sha256"),
+                server_time=_parse_canonical_utc(
+                    binding.get("server_time"),
+                    coordinate="installation attestation server time",
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return parsed if parsed.binding == dict(binding) else None
 
 
 class ValidatedNextcloudEffectCapability:
@@ -510,9 +628,10 @@ def adopt_protected_effect_capability(
     ):
         return None
     try:
-        before, after, fresh_until = capability._validated_database_window(
-            db_before=db_before,
-            db_after=db_after,
+        before, after, fresh_until = capability._validated_clock_window(
+            trusted_before=db_before,
+            trusted_after=db_after,
+            clock_name="database",
             expected_backend_instance_id=expected_backend_instance_id,
             expected_config_sha256=expected_config_sha256,
         )
@@ -526,6 +645,62 @@ def adopt_protected_effect_capability(
         fresh_until=fresh_until,
         _validation_marker=_VALIDATED_CAPABILITY_MARKER,
     )
+
+
+def adopt_protected_effect_installation_attestation(
+    capability_binding: Mapping[str, Any] | None,
+    *,
+    capability_signature: str,
+    attestation_binding: Mapping[str, Any] | None,
+    attestation_signature: str,
+    key: bytes,
+    client_before: datetime,
+    client_after: datetime,
+    expected_backend_instance_id: str,
+    expected_config_sha256: str,
+) -> str | None:
+    """Authenticate one fresh startup proof without granting effect authority.
+
+    Protected mutations use PostgreSQL's clock and receive the sealed
+    :class:`ValidatedNextcloudEffectCapability` marker. Startup installation
+    attestation happens before the adapter is registered with the database, so
+    it instead brackets the fetch with the orchestrator's UTC clock and returns
+    only the signed, non-secret installation digest. The result can never be
+    passed to the mutation/fence APIs as a validated capability.
+    """
+
+    capability = NextcloudEffectCapability.from_binding(capability_binding)
+    if capability is None or not verify_protected_effect_capability_signature(
+        capability,
+        signature=capability_signature,
+        key=key,
+    ):
+        return None
+    attestation = NextcloudInstallationAttestation.from_binding(attestation_binding)
+    if (
+        attestation is None
+        or not verify_protected_effect_installation_attestation_signature(
+            attestation,
+            signature=attestation_signature,
+            key=key,
+        )
+        or attestation.backend_instance_id != capability.backend_instance_id
+        or attestation.config_sha256 != capability.config_sha256
+        or attestation.capability_sha256 != capability.capability_sha256
+        or attestation.server_time != capability.server_time
+    ):
+        return None
+    try:
+        capability._validated_clock_window(
+            trusted_before=client_before,
+            trusted_after=client_after,
+            clock_name="client",
+            expected_backend_instance_id=expected_backend_instance_id,
+            expected_config_sha256=expected_config_sha256,
+        )
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return None
+    return attestation.installation_proof_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -742,6 +917,43 @@ def verify_protected_effect_capability_signature(
     ):
         return False
     expected = sign_protected_effect_capability(capability, key=key)
+    return hmac.compare_digest(expected, signature)
+
+
+def sign_protected_effect_installation_attestation(
+    attestation: NextcloudInstallationAttestation,
+    *,
+    key: bytes,
+) -> str:
+    """Sign the startup-only proof under its own HMAC domain."""
+
+    if not isinstance(attestation, NextcloudInstallationAttestation):
+        raise ValueError("protected effect installation attestation is missing")
+    return _hmac_sha256(
+        domain=PROTECTED_EFFECT_INSTALLATION_ATTESTATION_HMAC_DOMAIN,
+        canonical_json=attestation.canonical_json,
+        key=key,
+    )
+
+
+def verify_protected_effect_installation_attestation_signature(
+    attestation: NextcloudInstallationAttestation,
+    *,
+    signature: str,
+    key: bytes,
+) -> bool:
+    """Constant-time verify a strict lowercase startup-proof signature."""
+
+    if (
+        not isinstance(attestation, NextcloudInstallationAttestation)
+        or not isinstance(signature, str)
+        or not _SHA256_RE.fullmatch(signature)
+    ):
+        return False
+    expected = sign_protected_effect_installation_attestation(
+        attestation,
+        key=key,
+    )
     return hmac.compare_digest(expected, signature)
 
 
@@ -1245,6 +1457,8 @@ __all__ = [
     "MAX_PROTECTED_EFFECT_TIMING_SECONDS",
     "PROTECTED_EFFECT_CAPABILITY_HMAC_DOMAIN",
     "PROTECTED_EFFECT_CAPABILITY_VERSION",
+    "PROTECTED_EFFECT_INSTALLATION_ATTESTATION_HMAC_DOMAIN",
+    "PROTECTED_EFFECT_INSTALLATION_ATTESTATION_VERSION",
     "PROTECTED_EFFECT_FENCE_INTENT_VERSION",
     "PROTECTED_EFFECT_HORIZON_VERSION",
     "PROTECTED_EFFECT_REQUEST_HMAC_DOMAIN",
@@ -1253,12 +1467,16 @@ __all__ = [
     "NextcloudEffectFenceIntent",
     "NextcloudEffectHorizon",
     "NextcloudEffectRequestAuthority",
+    "NextcloudInstallationAttestation",
     "ValidatedNextcloudEffectCapability",
     "adopt_protected_effect_capability",
+    "adopt_protected_effect_installation_attestation",
     "calculate_protected_effect_safe_after",
     "normalize_protected_effect_path",
     "sign_protected_effect_capability",
+    "sign_protected_effect_installation_attestation",
     "sign_protected_effect_request",
     "verify_protected_effect_capability_signature",
+    "verify_protected_effect_installation_attestation_signature",
     "verify_protected_effect_request_signature",
 ]
