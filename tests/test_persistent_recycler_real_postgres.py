@@ -2150,6 +2150,12 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
         runtime_generation=retirement["generation"],
         retirement_token=retirement["token"],
     )
+    await db.delete_thread(
+        ids["thread"],
+        expected_runtime_retirement_token=retirement["token"],
+        expected_runtime_generation=retirement["generation"],
+    )
+    assert await db.get_thread(ids["thread"]) is None
 
 
 @pytest.mark.asyncio
