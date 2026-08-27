@@ -26986,6 +26986,71 @@ class PostgresDB:
                         raise RuntimeError(
                             "permanent pinned delete lacks physical quiescence"
                         )
+                    captured_ro = retirement_context.get("protected_ro")
+                    if captured_ro is not None:
+                        if not isinstance(captured_ro, dict):
+                            raise RuntimeError(
+                                "permanent pinned delete reader context is malformed"
+                            )
+                        try:
+                            captured_ro_id = UUID(str(captured_ro.get("id") or ""))
+                            captured_ro_generation = UUID(
+                                str(captured_ro.get("runtime_generation") or "")
+                            )
+                            captured_ro_attempt = UUID(
+                                str(captured_ro.get("engage_attempt") or "")
+                            )
+                            captured_ro_epoch = int(captured_ro["staged_epoch"])
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "permanent pinned delete reader context is malformed"
+                            ) from exc
+                        captured_source_sha = str(
+                            captured_ro.get("source_binding_sha256") or ""
+                        )
+                        captured_summary = captured_ro.get("staged_summary")
+                        if (
+                            captured_ro_generation != thread["runtime_generation"]
+                            or not re.fullmatch(r"[0-9a-f]{64}", captured_source_sha)
+                            or captured_summary is not None
+                            and not isinstance(captured_summary, dict)
+                        ):
+                            raise RuntimeError(
+                                "permanent pinned delete reader context is malformed"
+                            )
+                        cleared_staging = await conn.execute(
+                            "UPDATE cloud_ro_mounts SET staged_summary=NULL, "
+                            "staged_at=NULL WHERE id=$1::uuid "
+                            "AND thread_id=$2::uuid "
+                            "AND runtime_generation=$3::uuid "
+                            "AND engage_attempt=$4::uuid "
+                            "AND source_binding_sha256=$5 "
+                            "AND staged_epoch=$6 "
+                            "AND (staged_summary IS NOT DISTINCT FROM $7::jsonb "
+                            "OR staged_summary IS NULL) "
+                            "AND status='revoked' AND credentials IS NULL "
+                            "AND remote_absence_verified_at IS NOT NULL",
+                            captured_ro_id,
+                            thread_uuid,
+                            captured_ro_generation,
+                            captured_ro_attempt,
+                            captured_source_sha,
+                            captured_ro_epoch,
+                            (
+                                json.dumps(
+                                    captured_summary,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                                if captured_summary is not None
+                                else None
+                            ),
+                        )
+                        if cleared_staging != "UPDATE 1":
+                            raise RuntimeError(
+                                "permanent pinned delete reader staging cleanup "
+                                "lost exact authority"
+                            )
                 elif not stateless:
                     # Preserve only the historical cleanup of an already-ended,
                     # never-exposed ownerless row. Every live, exposed, owned,
