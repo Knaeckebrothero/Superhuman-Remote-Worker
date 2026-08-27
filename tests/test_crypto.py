@@ -10,6 +10,14 @@ import pytest
 from orchestrator.security import crypto
 
 
+@pytest.fixture(autouse=True)
+def _reset_cipher_between_tests():
+    """Do not leak a test-specific key through the process-wide cipher cache."""
+    crypto.reset_cipher_cache()
+    yield
+    crypto.reset_cipher_cache()
+
+
 def _set_key(monkeypatch, raw: str | None) -> None:
     if raw is None:
         monkeypatch.delenv(crypto.ENV_VAR, raising=False)
