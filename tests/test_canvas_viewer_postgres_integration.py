@@ -219,8 +219,12 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
             )
             await conn.execute(
                 """
-                INSERT INTO threads (id, title, user_id, status, metadata)
-                VALUES ($1, 'Canvas integration thread', $2, 'active', '{}'::jsonb)
+                INSERT INTO threads (
+                    id, title, user_id, status, execution_lane, metadata
+                ) VALUES (
+                    $1, 'Canvas integration thread', $2, 'active',
+                    'stateless', '{}'::jsonb
+                )
                 """,
                 thread_id,
                 user_id,
@@ -523,8 +527,12 @@ async def test_gateway_role_completes_the_bootstrap_it_serves(
         )
         await admin.execute(
             """
-            INSERT INTO threads (id, title, user_id, status, metadata)
-            VALUES ($1, 'Canvas gateway role thread', $2, 'active', '{}'::jsonb)
+            INSERT INTO threads (
+                id, title, user_id, status, execution_lane, metadata
+            ) VALUES (
+                $1, 'Canvas gateway role thread', $2, 'active',
+                'stateless', '{}'::jsonb
+            )
             """,
             thread_id,
             user_id,
