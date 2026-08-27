@@ -14,6 +14,7 @@ rare adopted row on live-attestation checks at every later network boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -163,6 +164,49 @@ def legacy_k8s_job_runtime_adoption_candidate(job: Mapping[str, Any]) -> bool:
     return True
 
 
+# Adoption is convergent repair, not a competitive lease: every replica that
+# meets the same historical row claims the *same* durable generation, and the
+# snapshot CAS below decides which one actually stamps it.  A per-process
+# claimant would make two replicas mint two generations for one Pod.
+_ADOPTION_CLAIMANT = "legacy-k8s-workspace-adoption"
+_ADOPTION_SCOPE = "workspace_container"
+# The identity fields the previous release published.  They are what the
+# reservation's manifest digest is *about*: one durable generation per exact
+# historical runtime plan, so a lease expiry can never silently re-point an
+# unfinished adoption at a different endpoint.
+_ADOPTION_IDENTITY_FIELDS = (
+    "status",
+    "provisioner",
+    "host",
+    "pod_ip",
+    "port",
+    "pod_name",
+    "container_name",
+    "namespace",
+    "restore_type",
+)
+
+
+def _adoption_manifest_digest(
+    owner: WorkspaceOwner, workspace: Mapping[str, Any]
+) -> str:
+    payload = {
+        "version": 1,
+        "operation": "adopt",
+        "owner_kind": owner.kind,
+        "owner_id": owner.id,
+        "scope": _ADOPTION_SCOPE,
+        "runtime": {
+            field: workspace.get(field)
+            for field in _ADOPTION_IDENTITY_FIELDS
+            if field in workspace
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _adoption_marker(attestation: WorkspaceRuntimeAttestation) -> dict[str, Any]:
     return {
         "version": 1,
@@ -304,6 +348,70 @@ async def ensure_legacy_k8s_job_runtime_authority(
             "kubernetes_runtime_changed",
         )
 
+    # Open the exact durable generation the create fence asks for *before*
+    # the owner row is stamped.  0196 authorises a new Pod UID only against a
+    # runtime-bound reservation, so an adoption that skipped this would have
+    # to be waved through by the trigger -- which would equally wave through
+    # any writer that invented a UID.  The reservation is refused outright
+    # unless the row still carries the genuine UID-less historical shape.
+    reservation_owner_kind = "job" if owner.kind == "job" else "thread"
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        owner.id,
+        owner_kind=reservation_owner_kind,
+        scope=_ADOPTION_SCOPE,
+        claimant=_ADOPTION_CLAIMANT,
+        operation_kind="adopt",
+        desired_manifest_digest=_adoption_manifest_digest(owner, workspace),
+    )
+    if reservation is None:
+        # The ledger refuses a generation over anything but the exact
+        # historical shape, so a refusal usually means the row moved on while
+        # the external attestation ran.  Re-read before reporting: a tier or
+        # lifecycle transition that won is authority, not a transient error.
+        moved_on = await db.get_job(owner.id)
+        try:
+            still_a_candidate = moved_on is not None and (
+                legacy_k8s_job_runtime_adoption_candidate(moved_on)
+            )
+        except WorkspaceContractError:
+            still_a_candidate = False
+        if not still_a_candidate:
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.NOT_NEEDED,
+                owner,
+                moved_on,
+                "workspace_snapshot_changed",
+            )
+        return LegacyK8sAdoptionResult(
+            LegacyK8sAdoptionOutcome.RETRY,
+            owner,
+            moved_on,
+            "adoption_reservation_unavailable",
+        )
+    reservation_generation = int(reservation["reservation_generation"])
+    claim_token = int(reservation["claim_token"])
+    reservation_fence = {
+        "owner_kind": reservation_owner_kind,
+        "scope": _ADOPTION_SCOPE,
+        "reservation_generation": reservation_generation,
+        "claimant": _ADOPTION_CLAIMANT,
+        "claim_token": claim_token,
+    }
+    # Publish the observed UID onto the generation. Adoption never creates a
+    # Pod, so this crosses no external-effect edge and the generation stays
+    # abortable if the confirmation below fails.
+    if not await db.authorize_managed_repository_workspace_creation_runtime(
+        owner.id,
+        **reservation_fence,
+        runtime_incarnation=confirmed.runtime_incarnation,
+    ):
+        return LegacyK8sAdoptionResult(
+            LegacyK8sAdoptionOutcome.RETRY,
+            owner,
+            current,
+            "adoption_runtime_authority_unavailable",
+        )
+
     adopted_workspace = dict(workspace)
     adopted_workspace.update(
         {
@@ -313,6 +421,8 @@ async def ensure_legacy_k8s_job_runtime_authority(
             "pod_ip": confirmed.pod_ip,
             "port": confirmed.port,
             "_runtime_incarnation": confirmed.runtime_incarnation,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(claim_token),
             LEGACY_K8S_RUNTIME_ADOPTION_KEY: _adoption_marker(confirmed),
         }
     )
@@ -354,19 +464,42 @@ async def ensure_legacy_k8s_job_runtime_authority(
         if settled != confirmed or not _attestation_matches_workspace(
             fresh_workspace, confirmed
         ):
-            await db.adopt_legacy_k8s_job_workspace_runtime(
+            reversed_stamp = await db.adopt_legacy_k8s_job_workspace_runtime(
                 owner.id,
                 **cas_fence,
                 expected_workspace=adopted_workspace,
                 adopted_workspace=workspace,
             )
+            if reversed_stamp:
+                # Only a generation whose owner projection no longer points at
+                # it may be discarded; a lost reverse CAS leaves the ledger
+                # entry to expire instead of stranding a live stamp.
+                await db.abort_managed_repository_workspace_creation_reservation(
+                    owner.id, **reservation_fence
+                )
             return LegacyK8sAdoptionResult(
                 LegacyK8sAdoptionOutcome.RETRY,
                 owner,
                 await db.get_job(owner.id),
                 "kubernetes_runtime_changed_after_persistence",
             )
-        return LegacyK8sAdoptionResult(LegacyK8sAdoptionOutcome.ADOPTED, owner, fresh)
+        if not await db.settle_managed_repository_workspace_creation_reservation(
+            owner.id,
+            **reservation_fence,
+            runtime_incarnation=confirmed.runtime_incarnation,
+        ):
+            # The stamp is durable and proven, but the generation is still
+            # open. Report retry so the caller comes back and closes it rather
+            # than treating an unsettled fence as a finished adoption.
+            return LegacyK8sAdoptionResult(
+                LegacyK8sAdoptionOutcome.RETRY,
+                owner,
+                fresh,
+                "adoption_reservation_unsettled",
+            )
+        return LegacyK8sAdoptionResult(
+            LegacyK8sAdoptionOutcome.ADOPTED, owner, await db.get_job(owner.id)
+        )
     if fresh is not None:
         fresh_workspace = _object(
             _object(fresh.get("context")).get("workspace_container")

@@ -13,6 +13,73 @@ SET LOCAL statement_timeout                   = '15min';
 SET LOCAL idle_in_transaction_session_timeout = '5min';
 SET LOCAL timezone                            = 'UTC';
 
+-- One `adopt` generation may put back exactly what it found.  Adoption
+-- creates no Pod: it publishes the UID of a Pod the previous release already
+-- made.  When the confirmation read after persistence no longer matches, that
+-- tentative stamp must be withdrawable, or the row keeps a durable claim on a
+-- Pod that was never ours and no later path can clear it -- process-zero
+-- cannot receipt a runtime this replica never created.  Nothing but the three
+-- stamped keys and the adoption marker may move, so this is a withdrawal of
+-- authority and never a route to a different runtime identity.
+CREATE FUNCTION public.managed_repo_adoption_reversal_authorized_now(
+    requested_owner_kind TEXT,
+    requested_owner_id UUID,
+    requested_scope TEXT,
+    requested_runtime TEXT,
+    requested_old_state JSONB,
+    requested_new_state JSONB
+)
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $adoption_reversal$
+DECLARE
+    state_key TEXT := CASE WHEN requested_scope = 'ide'
+        THEN 'ide_session' ELSE 'workspace_container' END;
+    authorized BOOLEAN;
+BEGIN
+    -- The reservation ledger arrives one migration later.  A plpgsql body is
+    -- not planned until the statement runs, so this guard keeps the function
+    -- installable here and fail-closed in the window before 0196.
+    IF to_regclass(
+        'public.managed_repository_workspace_creation_reservations'
+    ) IS NULL THEN
+        RETURN FALSE;
+    END IF;
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.managed_repository_workspace_creation_reservations
+               AS reservation
+         WHERE reservation.owner_kind = requested_owner_kind
+           AND reservation.owner_id = requested_owner_id
+           AND reservation.scope = requested_scope
+           AND reservation.operation_kind = 'adopt'
+           AND reservation.runtime_incarnation::TEXT = requested_runtime
+           AND reservation.phase = 'runtime_bound'
+           AND reservation.settled_at IS NULL
+           AND reservation.expires_at > now()
+           AND reservation.cancel_requested_at IS NULL
+           AND reservation.external_mutation_started_at IS NULL
+           AND requested_old_state #>> ARRAY[
+                   state_key, '_creation_reservation_id'
+               ] = reservation.id::TEXT
+           AND requested_old_state #>> ARRAY[
+                   state_key, '_creation_claim_token'
+               ] = reservation.claim_token::TEXT
+           AND (requested_new_state #> ARRAY[state_key]) = (
+                   (requested_old_state #> ARRAY[state_key]) - ARRAY[
+                       '_runtime_incarnation',
+                       '_creation_reservation_id',
+                       '_creation_claim_token',
+                       '_legacy_k8s_runtime_adoption',
+                       -- Conversion also retires the previous release's
+                       -- create marker; a withdrawal puts back the same
+                       -- projection minus that marker, never a different one.
+                       '_stateless_runtime_creation'
+                   ]
+               )
+    ) INTO authorized;
+    RETURN COALESCE(authorized, FALSE);
+END;
+$adoption_reversal$;
+
 CREATE OR REPLACE FUNCTION public.enforce_managed_repository_process_zero_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -38,6 +105,7 @@ DECLARE
     declared_inherited BOOLEAN := FALSE;
     inherited_scope BOOLEAN := FALSE;
     destructive_transition BOOLEAN;
+    pinned_thread BOOLEAN := FALSE;
 BEGIN
     IF TG_TABLE_NAME = 'jobs' THEN
         source_kind := 'job';
@@ -72,10 +140,7 @@ BEGIN
             parent_ide := COALESCE(parent_state->'ide_session', '{}'::JSONB);
         END IF;
     ELSE
-        -- Origin migration 0185 remains the sole pinned-thread authority.
-        IF OLD.execution_lane = 'pinned' THEN
-            RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
-        END IF;
+        pinned_thread := OLD.execution_lane = 'pinned';
         source_kind := 'thread';
         source_id := OLD.id;
         old_state := COALESCE(OLD.metadata, '{}'::JSONB);
@@ -86,6 +151,19 @@ BEGIN
 
     old_workspace := COALESCE(old_state->'workspace_container', '{}'::JSONB);
     new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
+
+    -- Origin migration 0185/0198 is the authority for a *pinned* thread's
+    -- Kubernetes agent runtime and for its VM evidence on an ended thread, so
+    -- those scopes are handed over here.  A pinned thread's *Docker* workspace
+    -- lease has no such owner: 0191 fenced it for every lane and nothing in
+    -- the pinned lane replaced that, so a blanket early return would silently
+    -- drop process-zero for every pinned Docker workspace.
+    IF pinned_thread
+       AND old_workspace->>'provisioner' IS DISTINCT FROM 'docker'
+       AND new_workspace->>'provisioner' IS DISTINCT FROM 'docker' THEN
+        old_workspace := '{}'::JSONB;
+        new_workspace := '{}'::JSONB;
+    END IF;
     inherited_scope := declared_inherited
         AND old_workspace <> '{}'::JSONB
         AND old_workspace->>'provisioner' = parent_workspace->>'provisioner'
@@ -208,7 +286,16 @@ BEGIN
                 CONSTRAINT = 'managed_repository_workspace_runtime_identity_required',
                 MESSAGE = 'Workspace runtime identity is required before destructive teardown';
         ELSIF destructive_transition AND runtime_id IS NOT NULL THEN
-            IF NOT receipt_ok THEN
+            -- An adoption withdrawing its own unconfirmed stamp is not a
+            -- teardown.  It never created this Pod, so no process-zero
+            -- receipt can exist and none is owed.  The predicate admits only
+            -- the exact reverse of that one stamp under the same live adopt
+            -- generation; nothing else may move with it.
+            IF NOT receipt_ok
+               AND NOT public.managed_repo_adoption_reversal_authorized_now(
+                   source_kind, source_id, 'workspace_container', runtime_id,
+                   old_state, new_state
+               ) THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '23514',
                     CONSTRAINT = 'managed_repository_workspace_process_zero_required',
@@ -333,6 +420,10 @@ BEGIN
 
     old_vm := COALESCE(old_state->'vm', '{}'::JSONB);
     new_vm := COALESCE(new_state->'vm', '{}'::JSONB);
+    IF pinned_thread THEN
+        old_vm := '{}'::JSONB;
+        new_vm := '{}'::JSONB;
+    END IF;
     inherited_scope := declared_inherited
         AND old_vm <> '{}'::JSONB
         AND (

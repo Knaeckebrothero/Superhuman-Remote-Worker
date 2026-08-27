@@ -1284,6 +1284,7 @@ DECLARE
     restore_projection_authorized BOOLEAN;
     cancelled_creation_projection_authorized BOOLEAN;
     cancel_claim_projection_authorized BOOLEAN;
+    adoption_reversal_authorized BOOLEAN;
     terminal_cancel_projection_authorized BOOLEAN;
     safe_retirement_projection BOOLEAN;
     managed_k8s_envelope BOOLEAN;
@@ -1439,6 +1440,12 @@ BEGIN
             public.managed_repo_terminal_cancel_projection_authorized_now(
                 source_kind, source_id, scope_name, new_runtime,
                 new_reservation, new_claim_token, old_state, new_state
+            );
+        adoption_reversal_authorized := old_runtime IS NOT NULL
+            AND new_runtime IS NULL
+            AND public.managed_repo_adoption_reversal_authorized_now(
+                source_kind, source_id, scope_name, old_runtime,
+                old_state, new_state
             );
         safe_retirement_projection := old_runtime IS NOT NULL
             AND new_runtime = old_runtime
@@ -1624,6 +1631,7 @@ BEGIN
            AND NOT cancel_claim_projection_authorized
            AND NOT terminal_cancel_projection_authorized
            AND NOT safe_retirement_projection
+           AND NOT adoption_reversal_authorized
            AND NOT initial_uidless_precreate
            AND NOT uidless_precreate_progress THEN
             RAISE EXCEPTION USING

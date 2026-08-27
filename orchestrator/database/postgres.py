@@ -118,6 +118,13 @@ _DOCKER_WORKSPACE_LEASE_KEY = "_docker_workspace_lease_id"
 _DOCKER_WORKSPACE_TRUST_KEY = "_docker_workspace_trust_mode"
 _DOCKER_WORKSPACE_ATTESTED_KEY = "_docker_workspace_attested"
 _STATELESS_RUNTIME_CREATION_KEY = "_runtime_creation"
+# The key the immediately previous release wrote for the same marker.  Its
+# contents are identical; only the name changed.  Reading it is a safety
+# requirement, not a compatibility nicety: a row still carrying it is an
+# in-flight creation from before the runtime-authority migrations, and code
+# that cannot see it would conclude "no create has been attempted" and make a
+# second Pod for a generation that may already own one.
+_LEGACY_STATELESS_RUNTIME_CREATION_KEY = "_stateless_runtime_creation"
 _STATELESS_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
 _STATELESS_PROCESS_ZERO_OBSERVATION_KEY = (
     "_stateless_workspace_process_zero_observation"
@@ -620,12 +627,32 @@ def _canonical_uuid_text(value: Any, *, label: str) -> str:
 
 def _stateless_runtime_creation_marker(
     workspace: dict[str, Any],
+    *,
+    allow_legacy: bool = False,
 ) -> dict[str, Any] | None:
-    """Strictly parse one durable, one-shot Kubernetes create authority."""
+    """Strictly parse one durable, one-shot Kubernetes create authority.
 
-    if _STATELESS_RUNTIME_CREATION_KEY not in workspace:
+    A marker written before the runtime-authority migrations is recognised but
+    never treated as current authority: it was minted without a durable
+    creation reservation, so nothing may progress on it.  Only the explicit
+    adoption bridge passes ``allow_legacy`` and it still has to prove the Pod
+    externally before anything is published.
+    """
+
+    legacy = False
+    if _STATELESS_RUNTIME_CREATION_KEY in workspace:
+        if _LEGACY_STATELESS_RUNTIME_CREATION_KEY in workspace:
+            raise RuntimeError("stateless runtime creation marker is contradictory")
+        raw = workspace[_STATELESS_RUNTIME_CREATION_KEY]
+    elif _LEGACY_STATELESS_RUNTIME_CREATION_KEY in workspace:
+        if not allow_legacy:
+            raise RuntimeError(
+                "stateless runtime creation marker predates runtime authority"
+            )
+        legacy = True
+        raw = workspace[_LEGACY_STATELESS_RUNTIME_CREATION_KEY]
+    else:
         return None
-    raw = workspace[_STATELESS_RUNTIME_CREATION_KEY]
     if not isinstance(raw, dict) or set(raw) != _STATELESS_RUNTIME_CREATION_FIELDS:
         raise RuntimeError("stateless runtime creation marker is malformed")
     marker = dict(raw)
@@ -649,7 +676,14 @@ def _stateless_runtime_creation_marker(
         "mode": mode,
         "attempted": attempted,
         "replaces_uid": replaces_uid,
+        "legacy": legacy,
     }
+
+
+def _persisted_creation_marker(marker: dict[str, Any]) -> dict[str, Any]:
+    """Only the four durable fields; ``legacy`` is a reader annotation."""
+
+    return {key: value for key, value in marker.items() if key != "legacy"}
 
 
 def _stateless_process_zero_observation(
@@ -9269,6 +9303,84 @@ class PostgresDB:
             )
         return row is not None
 
+    async def adopt_legacy_k8s_thread_workspace_runtime(
+        self,
+        thread_id: str,
+        *,
+        expected_status: str,
+        expected_execution_lane: str,
+        expected_runtime_generation: str,
+        expected_workspace: Mapping[str, Any],
+        adopted_workspace: Mapping[str, Any],
+    ) -> bool:
+        """CAS one live-attested pre-0195 Kubernetes session runtime.
+
+        The thread twin of the job CAS.  Kubernetes supplies the provenance;
+        PostgreSQL only proves that the status, lane, runtime generation and
+        exact UID-less workspace snapshot did not move while that external
+        attestation ran.  The generation fence is what stops a retirement or
+        recycle that already minted a successor generation from being
+        overwritten by an adoption of the predecessor's Pod.
+        """
+
+        import json as json_module
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            generation_uuid = UUID(str(expected_runtime_generation))
+        except (TypeError, ValueError):
+            return False
+        if expected_execution_lane != "stateless":
+            return False
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE threads
+                   SET metadata = jsonb_set(
+                           COALESCE(metadata, '{}'::jsonb),
+                           '{workspace_container}',
+                           $6::jsonb,
+                           true
+                       ),
+                       last_activity = CURRENT_TIMESTAMP
+                 WHERE id = $1::uuid
+                   AND status::text = $2::text
+                   AND execution_lane::text = $3::text
+                   AND runtime_generation = $4::uuid
+                   AND metadata->'workspace_container' = $5::jsonb
+                RETURNING id
+                """,
+                thread_uuid,
+                expected_status,
+                expected_execution_lane,
+                generation_uuid,
+                json_module.dumps(dict(expected_workspace)),
+                json_module.dumps(dict(adopted_workspace)),
+            )
+        return row is not None
+
+    async def list_uidless_k8s_thread_workspace_rows(self) -> list[dict[str, Any]]:
+        """Read-only rollout inventory for genuine pre-0195 session contexts."""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status::text AS status, execution_lane,
+                       runtime_generation, metadata, created_at
+                  FROM threads
+                 WHERE execution_lane = 'stateless'
+                   AND status::text IN ('created', 'active', 'awaiting_user')
+                   AND metadata->'workspace_container'->>'status' = 'ready'
+                   AND metadata->'workspace_container'->>'provisioner' = 'k8s'
+                   AND NOT (
+                       metadata->'workspace_container' ? '_runtime_incarnation'
+                   )
+                 ORDER BY created_at, id
+                """
+            )
+        return [dict(row) for row in rows]
+
     async def list_uidless_k8s_job_workspace_rows(self) -> list[dict[str, Any]]:
         """Read-only rollout inventory for genuine pre-0175 job contexts."""
 
@@ -12752,6 +12864,28 @@ class PostgresDB:
                     return None
                 raw_runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
                 existing_runtime = raw_runtime.get(_STATELESS_RUNTIME_INCARNATION_KEY)
+                # The single explicit adoption authority the guard below asks
+                # for.  It recognises only what the previous release could
+                # genuinely have written: a ready Kubernetes workspace with no
+                # Pod UID and no reservation keys at all.  Anything a
+                # post-0196 writer produced carries one of those keys, so an
+                # `adopt` generation can never be pointed at current
+                # authority, and the reservation it opens still proves nothing
+                # by itself -- the Pod UID is published only from an external
+                # attestation, exactly as a create does.
+                legacy_adoptable_runtime = bool(
+                    operation_kind == "adopt"
+                    and scope == "workspace_container"
+                    and existing_runtime is None
+                    and raw_runtime
+                    and "_creation_reservation_id" not in raw_runtime
+                    and "_creation_claim_token" not in raw_runtime
+                    and raw_runtime.get("provisioner") == "k8s"
+                    and str(raw_runtime.get("status") or "") == "ready"
+                )
+                if operation_kind == "adopt" and not legacy_adoptable_runtime:
+                    # Adoption is not a general escape from the create fence.
+                    return None
                 # A previous replica could leave a server-owned Kubernetes
                 # projection without publishing its Pod UID.  Such a row is
                 # not equivalent to an empty creation slot: failed/deleted or
@@ -12759,7 +12893,11 @@ class PostgresDB:
                 # names.  Only the narrow pre-create states may acquire their
                 # first reservation; every other historical shape needs
                 # explicit adoption or cleanup authority.
-                if existing_runtime is None and raw_runtime:
+                if (
+                    existing_runtime is None
+                    and raw_runtime
+                    and (not legacy_adoptable_runtime)
+                ):
                     runtime_status = str(raw_runtime.get("status") or "")
                     if runtime_status not in {
                         "pending",
@@ -14226,7 +14364,13 @@ class PostgresDB:
                     "AND reservation_generation = $4 AND claimed_by = $5 "
                     "AND claim_token = $6 AND settled_at IS NULL "
                     "AND expires_at > now() AND cancel_requested_at IS NULL "
-                    "AND phase IN ('mutating', 'runtime_bound') "
+                    # An adopt generation creates nothing.  It reads a Pod the
+                    # previous release already made and publishes that exact
+                    # observed UID, so it never crosses the external-effect
+                    # edge and must stay abortable afterwards.
+                    "AND (phase IN ('mutating', 'runtime_bound') "
+                    "OR (operation_kind = 'adopt' AND phase = 'reserved' "
+                    "AND external_mutation_started_at IS NULL)) "
                     "AND (runtime_incarnation IS NULL "
                     "OR runtime_incarnation = $7::uuid)",
                     owner_kind,
@@ -14639,6 +14783,7 @@ class PostgresDB:
         if owner_kind == "thread" and scope == "ide":
             return False
         table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
         async with self.acquire() as conn:
             async with conn.transaction():
                 # Keep the global owner -> reservation order.  An ownerless
@@ -14659,7 +14804,18 @@ class PostgresDB:
                     "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
                     "AND reservation_generation = $4 AND claimed_by = $5 "
                     "AND claim_token = $6 AND settled_at IS NULL "
-                    "AND phase = 'reserved' "
+                    # 'runtime_bound' is abortable only for an adoption, and
+                    # only once the owner projection has already been returned
+                    # to the exact shape the adoption found.  A create that
+                    # bound a UID made that Pod; an adoption did not.
+                    "AND (phase = 'reserved' OR (operation_kind = 'adopt' "
+                    "AND phase = 'runtime_bound' AND NOT EXISTS ("
+                    "SELECT 1 FROM " + table + " AS owner_row "
+                    "WHERE owner_row.id = $2 AND COALESCE(owner_row."
+                    + json_column
+                    + " #>> ARRAY[$7::text, '_creation_reservation_id'], '') "
+                    "= managed_repository_workspace_creation_reservations.id::text"
+                    "))) "
                     "AND external_mutation_started_at IS NULL",
                     owner_kind,
                     owner_uuid,
@@ -14667,6 +14823,7 @@ class PostgresDB:
                     reservation_generation,
                     claimant,
                     claim_token,
+                    "ide_session" if scope == "ide" else "workspace_container",
                 )
         return result == "UPDATE 1"
 
@@ -16966,7 +17123,9 @@ class PostgresDB:
                 ):
                     return False
                 marker["attempted"] = True
-                workspace[_STATELESS_RUNTIME_CREATION_KEY] = marker
+                workspace[_STATELESS_RUNTIME_CREATION_KEY] = _persisted_creation_marker(
+                    marker
+                )
                 metadata["workspace_container"] = workspace
                 result = await conn.execute(
                     "UPDATE threads SET metadata = $2::jsonb, "
@@ -17098,7 +17257,9 @@ class PostgresDB:
                         _STATELESS_WORKSPACE_GENERATION_KEY: None,
                     }
                 )
-                workspace[_STATELESS_RUNTIME_CREATION_KEY] = marker
+                workspace[_STATELESS_RUNTIME_CREATION_KEY] = _persisted_creation_marker(
+                    marker
+                )
                 metadata["workspace_container"] = workspace
                 result = await conn.execute(
                     "UPDATE threads SET metadata = $2::jsonb, "
@@ -17177,7 +17338,9 @@ class PostgresDB:
                         _STATELESS_RUNTIME_INCARNATION_KEY: None,
                     }
                 )
-                workspace[_STATELESS_RUNTIME_CREATION_KEY] = marker
+                workspace[_STATELESS_RUNTIME_CREATION_KEY] = _persisted_creation_marker(
+                    marker
+                )
                 metadata["workspace_container"] = workspace
                 result = await conn.execute(
                     "UPDATE threads SET metadata = $2::jsonb, "
