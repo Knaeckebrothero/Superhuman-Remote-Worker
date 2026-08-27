@@ -381,9 +381,10 @@ _TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
 # actual provider boundary, including work queued before the failure.
 _runtime_authorization_admission_open: bool = False
 
-# One process incarnation inside one pod. Kubernetes may restart a container
-# without changing the pod UID; a new value lets that successor reclaim input
-# that existed only in the predecessor's RAM queue. Reset on every attach.
+# Durable input owner generation. Strict pinned runtimes use the orchestrator's
+# exact session generation because the database authority fence is keyed to
+# that value. Legacy/stateless compatibility retains a process-local UUID.
+# Reset on every attach.
 _input_runtime_generation: Optional[str] = None
 _queued_input_claims: set[tuple[str, int]] = set()
 # Serializes durable reclaim with local queue/priority publication. In
@@ -4892,7 +4893,12 @@ async def _attach_session_inner(
     _loop_interrupt_target_turn_id = None
     _hard_interrupt_event = asyncio.Event()
     _loop_last_user_content = [""]
-    _input_runtime_generation = str(uuid4())
+    _input_runtime_generation = (
+        _session_runtime_generation
+        if _pinned_runtime_generation_enabled
+        and _session_runtime_generation is not None
+        else str(uuid4())
+    )
     _input_delivery_reclaim_lock = asyncio.Lock()
     _queued_input_claims.clear()
 
@@ -6164,8 +6170,11 @@ def _pinned_input_runtime_identity() -> tuple[str, str, str, str]:
     agent_id = _registered_pinned_agent_id()
     pod_uid = str(os.environ.get("POD_UID") or "").strip()
     generation = str(_input_runtime_generation or "").strip()
+    session_generation = str(_session_runtime_generation or "").strip()
     attach_token = str(_session_runtime_attach_token or "").strip()
     if agent_id is None or not pod_uid or not generation or not attach_token:
+        raise DurableInputUnavailable
+    if _pinned_runtime_generation_enabled and generation != session_generation:
         raise DurableInputUnavailable
     return agent_id, pod_uid, generation, attach_token
 

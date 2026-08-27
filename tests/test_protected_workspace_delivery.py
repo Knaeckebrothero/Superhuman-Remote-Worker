@@ -619,11 +619,37 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     update_status.assert_awaited_once_with("active")
     assert persistent_app._session is session
+    assert persistent_app._input_runtime_generation == client.session_runtime_generation
 
     # This is a successful live attach, so invoking the delivered-attach abort
     # protocol here would now (correctly) require a real workspace process-zero
     # receipt and rotate its runtime generation.  The monkeypatch fixture owns
     # process-global restoration at test teardown instead.
+
+
+def test_strict_pinned_input_identity_rejects_non_session_generation(monkeypatch):
+    client = _runtime_client([])
+    monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
+    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(
+        persistent_app,
+        "_session_runtime_generation",
+        client.session_runtime_generation,
+    )
+    monkeypatch.setattr(
+        persistent_app,
+        "_session_runtime_attach_token",
+        client.session_runtime_attach_token,
+    )
+    monkeypatch.setattr(
+        persistent_app,
+        "_input_runtime_generation",
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    )
+    monkeypatch.setenv("POD_UID", "pod-uid")
+
+    with pytest.raises(persistent_app.DurableInputUnavailable):
+        persistent_app._pinned_input_runtime_identity()
 
 
 @pytest.mark.asyncio
