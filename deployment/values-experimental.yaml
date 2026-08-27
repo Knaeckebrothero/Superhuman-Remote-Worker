@@ -70,7 +70,7 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-6a74618
+    tag: sha-f17ef52
   agent:
     tag: sha-588a55c
   cockpit:
@@ -83,11 +83,11 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-6a7461815c9412118d68295cb625dc5f08fc1ec6"
+  releaseVersion: "0.0.0-dev.sha-f17ef5249290d8532959bd78b2eba76cc5ff9f93"
   components:
     orchestrator:
-      sourceRevision: 6a7461815c9412118d68295cb625dc5f08fc1ec6
-      releaseVersion: "0.0.0-dev.sha-6a7461815c9412118d68295cb625dc5f08fc1ec6"
+      sourceRevision: f17ef5249290d8532959bd78b2eba76cc5ff9f93
+      releaseVersion: "0.0.0-dev.sha-f17ef5249290d8532959bd78b2eba76cc5ff9f93"
     agent:
       sourceRevision: 588a55c22063955bbc1296b55a831ed29aba296e
       releaseVersion: "0.0.0-dev.sha-588a55c22063955bbc1296b55a831ed29aba296e"
