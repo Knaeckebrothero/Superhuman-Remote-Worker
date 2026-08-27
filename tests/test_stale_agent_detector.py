@@ -45,6 +45,90 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
 
 
 @pytest.mark.asyncio
+async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod():
+    """A deleted U1 is process-zero; recovery must not require SSH to U1."""
+
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+    generation = "11111111-1111-4111-8111-111111111111"
+    token = "22222222-2222-4222-8222-222222222222"
+    agent_id = "33333333-3333-4333-8333-333333333333"
+    attach_token = "44444444-4444-4444-8444-444444444444"
+    workspace_generation = "55555555-5555-4555-8555-555555555555"
+    workspace_runtime = "66666666-6666-4666-8666-666666666666"
+    context = {
+        "thread_id": thread_id,
+        "generation": generation,
+        "settle_status": "ended",
+        "runtime_authority_exposed": True,
+        "agent_id": agent_id,
+        "runtime_attach_token": attach_token,
+        "agent": {"hostname": "agent-retired", "pod_uid": "agent-pod-uid"},
+        "workspace_backend": "sandbox",
+        "workspace_container": {
+            "status": "ready",
+            "pod_ip": "10.42.0.8",
+            "port": 30022,
+            "_canvas_workspace_generation": workspace_generation,
+            "_runtime_incarnation": workspace_runtime,
+        },
+        "workspace_binding": {
+            "kind": "remote",
+            "generation": workspace_generation,
+            "ssh_host_key_fingerprint": "SHA256:test",
+        },
+    }
+    retirement = {
+        "generation": generation,
+        "token": token,
+        "permanent": True,
+        "context": context,
+    }
+    current = {
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_local_quiescence": None,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
+        return_value={"version": 1}
+    )
+
+    @asynccontextmanager
+    async def lifecycle_lock(_thread_id):
+        yield True
+
+    db.try_thread_advisory_lock = MagicMock(side_effect=lifecycle_lock)
+    agent_provisioner = MagicMock(is_available=True)
+    agent_provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    agent_provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
+    container_provisioner = MagicMock(is_available=True)
+    container_provisioner.workspace_pod_authority = AsyncMock(
+        return_value="exact_absent"
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", agent_provisioner),
+        patch.object(main, "container_provisioner", container_provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement) is True
+
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_agent_id=agent_id,
+        expected_attach_token=attach_token,
+        expected_settle_status="ended",
+        expected_quiescence_protocol="sandbox_actuator_zero_v1",
+        expected_workspace_generation=workspace_generation,
+        expected_workspace_runtime_incarnation=workspace_runtime,
+        quiescence_actor="orchestrator",
+    )
+
+
+@pytest.mark.asyncio
 async def test_detector_retries_durable_attach_abort_after_request_task_failure():
     """The leader/startup sweep owns G2 even if the request-local task dies."""
 

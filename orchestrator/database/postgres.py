@@ -24127,6 +24127,7 @@ class PostgresDB:
             not in {
                 "workspace_process_zero_v1",
                 "agent_runtime_zero_v1",
+                "sandbox_actuator_zero_v1",
                 "workspace_actuator_zero_v1",
             }
             or quiescence_actor not in {"agent", "orchestrator"}
@@ -24144,6 +24145,7 @@ class PostgresDB:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT runtime_retirement_token, "
+                    "runtime_retirement_permanent, "
                     "runtime_retirement_context, "
                     "runtime_retirement_local_quiescence "
                     "FROM threads WHERE id=$1::uuid "
@@ -24229,8 +24231,16 @@ class PostgresDB:
                 elif workspace_backend == "sandbox":
                     if bool(sandbox_generation) != bool(sandbox_runtime):
                         return None
+                    orchestrator_absence_proof = bool(
+                        row["runtime_retirement_permanent"] is True
+                        and expected_settle_status == "ended"
+                        and quiescence_actor == "orchestrator"
+                        and expected_quiescence_protocol == "sandbox_actuator_zero_v1"
+                    )
                     expected_protocol = (
-                        "workspace_process_zero_v1"
+                        "sandbox_actuator_zero_v1"
+                        if orchestrator_absence_proof
+                        else "workspace_process_zero_v1"
                         if sandbox_generation
                         else "agent_runtime_zero_v1"
                     )
