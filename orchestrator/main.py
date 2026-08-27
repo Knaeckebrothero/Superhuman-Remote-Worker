@@ -10431,8 +10431,7 @@ def _retirement_has_exact_local_quiescence(
             not pre_registration_pod_zero
             or (
                 str(receipt.get("quiescence_actor") or "") == "orchestrator"
-                and str(receipt.get("quiescence_protocol") or "")
-                == "agent_runtime_zero_v1"
+                and str(receipt.get("quiescence_protocol") or "") == expected_protocol
                 and str(receipt.get("agent_pod_name") or "")
                 == str(agent_pod.get("pod_name") or "")
                 and str(receipt.get("agent_pod_uid") or "")
@@ -10629,12 +10628,74 @@ async def _recover_pre_registration_agent_pod_zero(
         expected_pod_uid=pod[1],
     ):
         return False
+    workspace = context.get("workspace_container")
+    binding = context.get("workspace_binding")
+    workspace = {} if workspace is None else workspace
+    binding = {} if binding is None else binding
+    if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
+        return False
+    workspace_generation = str(binding.get("generation") or "")
+    workspace_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+    physical_workspace_evidence = bool(
+        binding
+        or str(workspace.get("status") or "") not in {"", "deleted"}
+        or any(
+            workspace.get(field) is not None
+            for field in (
+                WORKSPACE_RUNTIME_INCARNATION_KEY,
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    if physical_workspace_evidence and not (workspace_generation and workspace_runtime):
+        return False
+    if physical_workspace_evidence:
+        if not (
+            retirement.get("permanent")
+            and context.get("workspace_backend") == "sandbox"
+            and workspace.get("provisioner") == "k8s"
+            and workspace.get("status")
+            in {"ready", "suspending", "suspended", "deleted"}
+            and binding.get("kind") == "remote"
+            and str(binding.get("backing_id") or "").startswith(
+                ("k8s-pvc:", "k8s-pod:")
+            )
+            and str(workspace.get("_canvas_workspace_generation") or "")
+            == workspace_generation
+            and not context.get("workspace_provision_intent")
+            and container_provisioner.is_available
+        ):
+            return False
+        workspace_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=workspace_runtime,
+        )
+        if workspace_authority in {"exact_live", "exact_terminal"}:
+            deleted = await container_provisioner.delete_workspace(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=workspace_runtime,
+                wait_for_exact_absence=True,
+                exact_absence_timeout_seconds=120.0,
+                defer_context_clear=True,
+            )
+            if not deleted:
+                return False
+        elif workspace_authority != "exact_absent":
+            return False
     receipt = await postgres_db.acknowledge_pinned_thread_pre_registration_pod_zero(
         thread_id,
         expected_runtime_generation=str(retirement.get("generation") or ""),
         expected_retirement_token=str(retirement.get("token") or ""),
         expected_pod_name=pod[0],
         expected_pod_uid=pod[1],
+        expected_workspace_generation=workspace_generation or None,
+        expected_workspace_runtime_incarnation=workspace_runtime or None,
     )
     return receipt is not None
 

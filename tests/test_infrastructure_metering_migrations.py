@@ -253,7 +253,10 @@ APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY
+APP_PRE_REGISTRATION_SANDBOX_ZERO = (
+    ROOT / "orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_PRE_REGISTRATION_SANDBOX_ZERO
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -965,6 +968,22 @@ def test_0186_protected_cloud_instance_and_attempt_authority_contract() -> None:
     assert "cloud_ro_effect_intents_insert_authority" in sql
     assert "cloud_ro_effect_intents_horizon_authority" in sql
     assert "effect.safe_after > clock_timestamp()" in sql
+
+
+def test_0187_pre_registration_sandbox_zero_is_bounded_and_forward_only() -> None:
+    raw = APP_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0187_pre_registration_sandbox_zero.sql" in raw
+    assert "-- depends-on:    0186_protected_cloud_instance_authority.sql" in raw
+    assert "-- expected:      < 1s. Replace one trigger function" in raw
+    assert "-- locks:         Brief function-catalog lock" in raw
+    assert "-- transactional: yes" in raw
+    assert "pg_get_functiondef" in sql
+    assert "occurrence_count <> 1" in sql
+    assert "'sandbox_actuator_zero_v1'" in sql
+    assert "EXECUTE patched_definition" in sql
+    assert "0185_thread_runtime_generation_retirement.sql" not in sql
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
