@@ -1903,7 +1903,12 @@ class OrchestratorClient:
                 return False
             return bool(
                 isinstance(payload, dict)
-                and payload.get("status") in {"released", "already_detached"}
+                and payload.get("status")
+                in {
+                    "released",
+                    "already_detached",
+                    "retirement_acknowledged",
+                }
             )
         except Exception as e:
             logger.warning(f"Thread→agent release failed (non-fatal): {e}")

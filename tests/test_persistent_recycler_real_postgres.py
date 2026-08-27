@@ -3042,6 +3042,191 @@ async def test_failed_attach_abort_refuses_status_pod_and_protocol_mismatch(db):
 
 
 @pytest.mark.asyncio
+async def test_failed_attach_proof_joins_an_authorized_owner_retirement(db):
+    """End beating attach cleanup receipts G1 and never creates successor G2."""
+
+    import main as orch_main
+
+    ids = await _seed(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1",
+            UUID(ids["thread"]),
+        )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"],
+        permanent=True,
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=generation,
+        settle_status="ended",
+    )
+
+    with patch.object(orch_main, "postgres_db", db):
+        assert not await orch_main._acknowledge_retiring_failed_attach(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="replacement-pod",
+            local_quiescence_protocol="agent_runtime_zero_v1",
+            workspace_generation=None,
+            workspace_runtime_incarnation=None,
+        )
+        assert await orch_main._acknowledge_retiring_failed_attach(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="old-pod",
+            local_quiescence_protocol="agent_runtime_zero_v1",
+            workspace_generation=None,
+            workspace_runtime_incarnation=None,
+        )
+
+    current = await db.get_thread(ids["thread"])
+    receipt = _json(current["runtime_retirement_local_quiescence"])
+    assert receipt["retirement_token"] == retirement["token"]
+    assert receipt["runtime_generation"] == generation
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert str(current["runtime_generation"]) == generation
+    assert str(current["agent_id"]) == ids["agent"]
+    assert str(current["runtime_attach_token"]) == ids["attach_token"]
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM thread_runtime_attach_abort_outcomes "
+                "WHERE thread_id=$1",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_retiring_failed_attach_lost_ack_has_exact_outcome_readback(db):
+    import main as orch_main
+
+    ids = await _seed(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1",
+            UUID(ids["thread"]),
+        )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"],
+        permanent=False,
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=generation,
+        settle_status="ended",
+    )
+    with patch.object(orch_main, "postgres_db", db):
+        assert await orch_main._acknowledge_retiring_failed_attach(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="old-pod",
+            local_quiescence_protocol="agent_runtime_zero_v1",
+            workspace_generation=None,
+            workspace_runtime_incarnation=None,
+        )
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=generation,
+        final_status="ended",
+    )
+    assert await db.has_exact_pinned_runtime_retirement_outcome(
+        ids["thread"],
+        runtime_generation=generation,
+        agent_id=ids["agent"],
+        runtime_attach_token=ids["attach_token"],
+    )
+    assert not await db.has_exact_pinned_runtime_retirement_outcome(
+        ids["thread"],
+        runtime_generation=str(uuid4()),
+        agent_id=ids["agent"],
+        runtime_attach_token=ids["attach_token"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_retiring_failed_attach_refuses_committed_input_admission(db):
+    import main as orch_main
+
+    ids = await _seed(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1",
+            UUID(ids["thread"]),
+        )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    async with db.acquire() as conn:
+        message_id = await conn.fetchval(
+            "INSERT INTO thread_messages (thread_id,role,content,turn_number) "
+            "VALUES ($1,'user','admitted',1) RETURNING id",
+            UUID(ids["thread"]),
+        )
+        await conn.execute(
+            "INSERT INTO thread_input_deliveries ("
+            "delivery_id,thread_id,message_id,source,state,claim_generation,"
+            "owner_agent_id,owner_pod_uid,owner_runtime_generation,"
+            "admitted_turn_number,admitted_at) VALUES ("
+            "$1,$2,$3,'direct_human','admitted',1,$4,'old-pod',$5,1,now())",
+            uuid4(),
+            UUID(ids["thread"]),
+            message_id,
+            UUID(ids["agent"]),
+            UUID(generation),
+        )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"],
+        permanent=True,
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=generation,
+        settle_status="ended",
+    )
+
+    with patch.object(orch_main, "postgres_db", db):
+        assert not await orch_main._acknowledge_retiring_failed_attach(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="old-pod",
+            local_quiescence_protocol="agent_runtime_zero_v1",
+            workspace_generation=None,
+            workspace_runtime_incarnation=None,
+        )
+    assert (await db.get_thread(ids["thread"]))[
+        "runtime_retirement_local_quiescence"
+    ] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("admission_kind", ["input", "control"])
 async def test_failed_attach_abort_refuses_any_committed_admission(db, admission_kind):
     import main as orch_main
