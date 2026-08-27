@@ -753,31 +753,31 @@ class VMInstanceManager:
         ) and not await self._permit_external(permit):
             return False
         try:
-            if inst.metadata.get("scope") == "thread":
-                return bool(
-                    await self._provisioner.delete_thread_vm(
-                        bound, purge_disk=purge_disk
-                    )
-                )
+            owner_kind = "thread" if inst.metadata.get("scope") == "thread" else "job"
             identity = inst.metadata.get("_completion_lifecycle_vm_identity")
-            if isinstance(identity, VMTeardownIdentity):
+            if not isinstance(identity, VMTeardownIdentity):
                 async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                    outcome = await self._provisioner.delete_vm_captured(
-                        bound, identity, purge_disk=purge_disk
+                    identity = await self._provisioner.capture_vm_teardown_identity(
+                        bound,
+                        entity_type=owner_kind,
                     )
-                if isinstance(
-                    permit, LifecycleActionPermit
-                ) and not await self._permit_external(permit):
-                    return False
-                if outcome.disposition == "identity_superseded":
-                    if isinstance(permit, LifecycleActionPermit):
-                        permit.skip("vm_identity_superseded", settled=True)
-                    return True
-                return bool(outcome.deleted)
-            else:
-                return bool(
-                    await self._provisioner.delete_vm(bound, purge_disk=purge_disk)
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                outcome = await self._provisioner.release_vm_captured(
+                    bound,
+                    identity,
+                    purge_disk=purge_disk,
+                    entity_type=owner_kind,
+                    capture_snapshot=False,
                 )
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
+            if outcome.disposition == "identity_superseded":
+                if isinstance(permit, LifecycleActionPermit):
+                    permit.skip("vm_identity_superseded", settled=True)
+                return True
+            return bool(outcome.deleted)
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
             return False
@@ -810,13 +810,8 @@ class VMInstanceManager:
         # Rides the same tick rather than adding a second scheduler.
         await self.purge_kept_disks()
         try:
-            if self._completion_lifecycle is None:
-                vms = await self._provisioner.list_vms()
-            else:
-                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                    vms = await self._provisioner.list_vms(
-                        include_teardown_identity=True
-                    )
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                vms = await self._provisioner.list_vms(include_teardown_identity=True)
         except Exception:
             logger.exception("VM orphan sweep: list failed")
             return 0
@@ -850,22 +845,6 @@ class VMInstanceManager:
                 )
                 continue
             if row_exists:
-                continue
-            if self._completion_lifecycle is None:
-                # Dark-path invariant: preserve the pre-Gate-3 orphan action
-                # exactly.  Identity-bearing inventory and the captured delete
-                # contract are rollout-only because old controllers do not
-                # return those fields.
-                try:
-                    if await self._provisioner.delete_vm(entity_id):
-                        reaped += 1
-                        logger.warning(
-                            "Orphan VM reaped: %s (no jobs/threads row, age %.0fs)",
-                            vm.get("vm_name") or entity_id,
-                            age,
-                        )
-                except Exception:
-                    logger.exception("Orphan VM delete failed: %s", entity_id)
                 continue
             generation = vm.get("provision_generation")
             vm_uid = vm.get("vm_uid")
@@ -969,7 +948,18 @@ class VMInstanceManager:
                 try:
                     # Idempotent: a VM that is already gone 404s, which the
                     # provisioner treats as success, and the disk still goes.
-                    if not await self._provisioner.delete_vm(job_id, purge_disk=True):
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        identity = await self._provisioner.capture_vm_teardown_identity(
+                            str(job_id), entity_type="job"
+                        )
+                        outcome = await self._provisioner.release_vm_captured(
+                            str(job_id),
+                            identity,
+                            purge_disk=True,
+                            entity_type="job",
+                            capture_snapshot=False,
+                        )
+                    if not outcome.deleted:
                         continue
                     await self._db.merge_vm_context(job_id, {"rootdisk": None})
                     purged += 1
@@ -1001,7 +991,7 @@ class VMInstanceManager:
                     # Idempotent: a VM that is already gone 404s, which the
                     # provisioner treats as success, and the disk still goes.
                     async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        outcome = await self._provisioner.delete_vm_captured(
+                        outcome = await self._provisioner.release_vm_captured(
                             str(job_id), identity, purge_disk=True
                         )
                     if not await self._permit_external(permit):

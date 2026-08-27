@@ -107,8 +107,8 @@ data:
     runcmd:
       - mkdir -p /run/agent
       - chmod 755 /run/agent
-      - rm -f /etc/ssh/ssh_host_*
-      - ssh-keygen -A
+      # The controller injects ssh_keys into the per-VM Secret at render time.
+      # Regenerating here would replace the orchestrator-pinned identity.
       - systemctl restart ssh
       - systemctl daemon-reload
       - systemctl enable management-daemon.service

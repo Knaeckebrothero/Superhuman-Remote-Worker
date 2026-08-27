@@ -465,59 +465,61 @@ class TestAppSideAdmission:
             eg.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_notify_admins_fans_out_sse_and_email(self):
-        from services.notification_service import NotificationService
+    async def test_record_user_registered_fans_out_one_row_per_admin(self):
+        """App-side admission: every admin gets a `user_registered` feed row
+        about the new user (one dedup key, so approving resolves them all),
+        and the legacy `user_registered` SSE frame keeps flowing — it is the
+        admin Users page's refresh signal, not a notification."""
+        from services.notification_service import NotificationService, RecordResult
 
         svc = NotificationService()
         feed = MagicMock()  # broadcast is sync
-        email = MagicMock()
-        email.send_system_notification = AsyncMock(return_value=True)
         db = MagicMock()
         admin1, admin2 = str(uuid4()), str(uuid4())
         db.list_admin_user_ids = AsyncMock(return_value=[admin1, admin2])
-        db.get_user = AsyncMock(
-            side_effect=lambda uid: {
-                "id": uid,
-                "email": f"{uid}@x.com",
-                "display_name": "Admin",
-            }
+        svc.connect(db, MagicMock(), feed)
+        svc.record = AsyncMock(
+            side_effect=lambda **kw: RecordResult(
+                f"n-{kw['recipient_id'][:4]}", True, {"in_app": True}
+            )
         )
-        svc.connect(db, email, feed)
-        svc._get_user_channels = AsyncMock(return_value={"email": True})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=False)
 
-        res = await svc.notify_admins_user_registered(
-            "new-user-id", display_name="New", email="new@x.com"
+        res = await svc.record_user_registered(
+            new_user_id="new-user-id", display_name="New", email="new@x.com"
         )
-        assert res["notified"] == 2
+        assert res["notified"] == 2 and len(res["notification_ids"]) == 2
+        calls = [c.kwargs for c in svc.record.await_args_list]
+        assert {c["recipient_id"] for c in calls} == {admin1, admin2}
+        for c in calls:
+            assert c["category"] == "user_registered"
+            assert c["dedup_key"] == "user_registered:new-user-id"
+            assert (c["source_kind"], c["source_id"]) == ("user", "new-user-id")
+            assert c["action_params"] == {"user_id": "new-user-id"}
+            assert "new@x.com" in c["body"]
         assert feed.broadcast.call_count == 2
-        assert email.send_system_notification.call_count == 2
         assert feed.broadcast.call_args.kwargs["event_type"] == "user_registered"
 
     @pytest.mark.asyncio
-    async def test_notify_admins_skips_email_in_quiet_hours(self):
+    async def test_record_user_registered_skips_the_registrant_and_survives_a_bad_row(
+        self,
+    ):
         from services.notification_service import NotificationService
 
         svc = NotificationService()
         feed = MagicMock()
-        email = MagicMock()
-        email.send_system_notification = AsyncMock(return_value=True)
         db = MagicMock()
         admin1 = str(uuid4())
-        db.list_admin_user_ids = AsyncMock(return_value=[admin1])
-        db.get_user = AsyncMock(
-            return_value={"id": admin1, "email": "a@x.com", "display_name": "A"}
-        )
-        svc.connect(db, email, feed)
-        svc._get_user_channels = AsyncMock(return_value={"email": True})
-        svc._get_user_settings = AsyncMock(return_value={})
-        svc._is_in_quiet_hours = MagicMock(return_value=True)  # in quiet hours
+        db.list_admin_user_ids = AsyncMock(return_value=["new-user-id", admin1])
+        svc.connect(db, MagicMock(), feed)
+        svc.record = AsyncMock(side_effect=RuntimeError("feed down"))
 
-        await svc.notify_admins_user_registered("new-user-id", display_name="New")
-        # SSE still fires (in-app isn't quiet-houred); email is suppressed.
+        res = await svc.record_user_registered(new_user_id="new-user-id")
+        # A self-registered admin is not pending; the failed row is logged,
+        # not raised, and the refresh frame still goes to the real admin.
+        assert res["notified"] == 0
+        svc.record.assert_awaited_once()
         assert feed.broadcast.call_count == 1
-        email.send_system_notification.assert_not_called()
+        assert feed.broadcast.call_args.kwargs["user_id"] == admin1
 
 
 # ============================================================================

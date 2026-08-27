@@ -241,6 +241,70 @@ class EmailService:
             body_html=body_html,
         )
 
+    def reply_address(self, job_id: str, thread_id: str) -> str | None:
+        """The ``+job+thread`` sub-addressed Reply-To the IMAP poller routes
+        on, or ``None`` when reply routing is not configured."""
+        if not (self.reply_routing_configured and job_id and thread_id):
+            return None
+        agent_local = self.agent_email.split("@")[0]
+        return f"{agent_local}+{job_id[:8]}+{thread_id}@{self.mail_domain}"
+
+    async def send_notification_email(
+        self,
+        to: str,
+        to_name: str,
+        subject: str,
+        body_md: str,
+        *,
+        cockpit_path: str,
+        reply_to: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """One delivery of a feed notification (unified notification system).
+
+        Not job-shaped: the header is neutral and the single call to action is
+        the feed row's own deep link (``/inbox?n=<id>``), so the mail always
+        leads back to the notification center — never to a job that may not
+        exist. Returns ``(sent, message_id)``; the Message-ID is stored on the
+        delivery row for reply routing and read-state correlation. An agent
+        message passes ``reply_to`` so the mail can be answered directly.
+        """
+        full_subject = f"[SRW] {subject}"
+        domain = self.mail_domain or "srw.local"
+        email_msg_id = f"<{uuid_mod.uuid4().hex}@{domain}>"
+        cockpit_link = f"{self.cockpit_url}{cockpit_path}"
+
+        body_text = (
+            f"SRW Notification\n"
+            f"{'=' * 50}\n\n"
+            f"{body_md}\n\n"
+            f"{'=' * 50}\n"
+            f"Open in Cockpit: {cockpit_link}\n"
+        )
+        if reply_to:
+            body_text += "Or reply directly to this email.\n"
+        body_html = self.render_notification_html(body_md, cockpit_link)
+
+        success = await self._send(
+            to,
+            full_subject,
+            body_text,
+            body_html,
+            reply_to=reply_to,
+            message_id=email_msg_id,
+        )
+        return success, email_msg_id if success else None
+
+    def render_notification_html(self, body_md: str, cockpit_link: str) -> str:
+        """The HTML leg of a feed notification (also what the email preview
+        route renders): the brand layout with the body's markdown rendered,
+        so a digest's links and a permission mail's magic-link lines come out
+        as links, and one call to action — the feed row's own deep link."""
+        return render_email(
+            title="SRW Notification",
+            body_html=render_markdown(body_md),
+            actions=[Action(label="Open in Cockpit", url=cockpit_link)],
+        )
+
     async def send_agent_message(
         self,
         to: str,

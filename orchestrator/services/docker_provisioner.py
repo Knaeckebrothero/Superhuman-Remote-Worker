@@ -35,6 +35,10 @@ except ImportError:  # pragma: no cover - deployment dependency guard
     asyncssh = None  # type: ignore[assignment]
 
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from src.core.managed_repository import (
+    managed_repository_agent_retirement_command,
+    managed_repository_agent_zero_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -330,12 +334,47 @@ class DockerProvisioner:
         if not ctx or ctx.get("provisioner") != "docker":
             return False
 
+        current_status = str(ctx.get("status") or "")
+        if current_status == "released" or (
+            current_status == "quarantined"
+            and ctx.get("quarantine_reason")
+            == "container_recreation_required_process_zero"
+        ):
+            # The exact lease already carries the durable post-retirement
+            # result.  Replaying a supported terminal operation after its
+            # response (or a later teardown effect) was lost must not try to
+            # re-claim an absorbing quarantine or infer anything new from the
+            # static container.
+            return bool(
+                await self._db.docker_workspace_process_zero_is_current(
+                    job_id,
+                    owner_kind="job",
+                    lease_id=str(ctx.get("_docker_workspace_lease_id") or ""),
+                )
+            )
+        if current_status == "ready":
+            expected_statuses = {"ready"}
+        elif current_status == "quarantined" and ctx.get("quarantine_reason") in {
+            "container_recreation_required",
+            "managed_repository_agent_retirement_failed",
+        }:
+            # Upgrade/retry seam for leases quarantined by an older build or a
+            # prior exact-retirement failure.  The status CAS below changes it
+            # to releasing before SSH, so a concurrent retry cannot share the
+            # external side effect.
+            expected_statuses = {"quarantined"}
+        else:
+            return False
+
         releasing = await self._db.transition_docker_workspace_lease(
             owner_kind="job",
             owner_id=job_id,
             expected_lease_id=ctx.get("_docker_workspace_lease_id"),
-            expected_statuses={"ready"},
-            updates={"status": "releasing"},
+            expected_statuses=expected_statuses,
+            updates={
+                "status": "releasing",
+                "quarantine_reason": "managed_repository_agent_retirement_claimed",
+            },
         )
         if releasing is None:
             return False
@@ -369,23 +408,51 @@ class DockerProvisioner:
                 )
 
         if not self._trusted_dev_reuse:
-            await self._db.transition_docker_workspace_lease(
+            # A static container is not destroyed by quarantine.  Kill and
+            # prove absent every repo-scoped ssh-agent in its private managed
+            # namespace before reporting that the owner's runtime authority
+            # has been contained.  Merely unlinking sockets (or revoking the
+            # lease in PostgreSQL) leaves the live process and loaded private
+            # key behind in this long-lived process namespace.
+            retired = await self._retire_managed_repository_agents_via_ssh(host, port)
+            if retired:
+                retired = bool(
+                    await self._db.record_docker_workspace_process_zero(
+                        job_id,
+                        owner_kind="job",
+                        lease_id=lease_id,
+                    )
+                )
+            finalized = await self._db.transition_docker_workspace_lease(
                 owner_kind="job",
                 owner_id=job_id,
                 expected_lease_id=lease_id,
                 expected_statuses={"releasing"},
                 updates={
                     "status": "quarantined",
-                    "quarantine_reason": "container_recreation_required",
+                    "quarantine_reason": (
+                        "container_recreation_required_process_zero"
+                        if retired
+                        else "managed_repository_agent_retirement_failed"
+                    ),
                 },
             )
+            if finalized is None or not retired:
+                logger.error(
+                    "Docker provisioner: workspace %s:%d remains quarantined; "
+                    "managed repository process-zero was not established",
+                    host,
+                    port,
+                )
+                return False
             logger.warning(
-                "Docker provisioner: quarantined %s:%d; safe reuse requires "
-                "controller-attested container recreation",
+                "Docker provisioner: retired repository agents and quarantined "
+                "%s:%d; safe reuse requires controller-attested container "
+                "recreation",
                 host,
                 port,
             )
-            return False
+            return True
 
         try:
             cleaned = await self._reset_workspace_via_ssh(host, port)
@@ -394,6 +461,15 @@ class DockerProvisioner:
                 "Docker provisioner: dev cleanup raised on %s:%d", host, port
             )
             cleaned = False
+
+        if cleaned:
+            cleaned = bool(
+                await self._db.record_docker_workspace_process_zero(
+                    job_id,
+                    owner_kind="job",
+                    lease_id=lease_id,
+                )
+            )
 
         final_status = "released" if cleaned else "quarantined"
         finalized = await self._db.transition_docker_workspace_lease(
@@ -610,11 +686,20 @@ class DockerProvisioner:
         ) != str(expected_lease_id):
             return False
         current_status = str(ctx.get("status") or "")
-        if current_status in {"released", "quarantined"}:
-            if force_quarantine and current_status == "released":
-                # A released endpoint may already have been allocated under a
-                # new lease. Never relabel it quarantined by stale owner JSON.
-                return False
+        quarantine_reason = str(ctx.get("quarantine_reason") or "")
+        retryable_quarantine = bool(
+            current_status == "quarantined"
+            and quarantine_reason
+            in {
+                "container_recreation_required",
+                "managed_repository_agent_retirement_failed",
+            }
+        )
+        if current_status == "released" and force_quarantine:
+            # A released endpoint may already have been allocated under a new
+            # lease. Never relabel it quarantined by stale owner JSON.
+            return False
+        if current_status in {"released", "quarantined"} and not (retryable_quarantine):
             terminal = await self._db.transition_docker_workspace_lease(
                 owner_kind="thread",
                 owner_id=thread_id,
@@ -622,22 +707,40 @@ class DockerProvisioner:
                 expected_statuses={current_status},
                 updates={"status": current_status},
             )
-            return terminal is not None and str(terminal.get("status") or "") == (
-                current_status
+            if terminal is None:
+                return False
+            if current_status != "released" and (
+                quarantine_reason != "container_recreation_required_process_zero"
+            ):
+                return False
+            return (
+                await self._db.docker_workspace_process_zero_is_current(
+                    thread_id,
+                    owner_kind="thread",
+                    lease_id=str(ctx.get("_docker_workspace_lease_id") or ""),
+                )
+                is True
             )
+        if current_status == "ready":
+            expected_statuses = {"ready"}
+        elif current_status == "releasing":
+            expected_statuses = {"releasing"}
+        elif retryable_quarantine:
+            expected_statuses = {"quarantined"}
+        else:
+            return False
 
         # Claim the release before snapshot/reset. Only one replica can move a
         # concrete lease from ready to releasing, and Canvas is revoked in the
         # same DB update before the static host is touched.
-        if current_status not in {"ready", "releasing"}:
-            return False
         releasing = await self._db.transition_docker_workspace_lease(
             owner_kind="thread",
             owner_id=thread_id,
             expected_lease_id=ctx.get("_docker_workspace_lease_id"),
-            expected_statuses={current_status},
+            expected_statuses=expected_statuses,
             updates={
                 "status": "releasing",
+                "quarantine_reason": "managed_repository_agent_retirement_claimed",
                 CANVAS_WORKSPACE_GENERATION_KEY: None,
             },
         )
@@ -670,28 +773,54 @@ class DockerProvisioner:
                 )
 
         if force_quarantine or not self._trusted_dev_reuse:
-            quarantined = await self._db.transition_docker_workspace_lease(
+            retired = (
+                await self._db.docker_workspace_process_zero_is_current(
+                    thread_id,
+                    owner_kind="thread",
+                    lease_id=lease_id,
+                )
+                is True
+            )
+            if not retired:
+                retired = await self._retire_managed_repository_agents_via_ssh(
+                    host, port
+                )
+            if retired:
+                retired = bool(
+                    await self._db.record_docker_workspace_process_zero(
+                        thread_id,
+                        owner_kind="thread",
+                        lease_id=lease_id,
+                    )
+                )
+            finalized = await self._db.transition_docker_workspace_lease(
                 owner_kind="thread",
                 owner_id=thread_id,
                 expected_lease_id=lease_id,
                 expected_statuses={"releasing"},
                 updates={
                     "status": "quarantined",
-                    "quarantine_reason": "container_recreation_required",
+                    "quarantine_reason": (
+                        "container_recreation_required_process_zero"
+                        if retired
+                        else "managed_repository_agent_retirement_failed"
+                    ),
                     CANVAS_WORKSPACE_GENERATION_KEY: None,
                 },
             )
-            if quarantined is None or str(quarantined.get("status") or "") != (
-                "quarantined"
-            ):
+            if finalized is None or not retired:
                 logger.error(
-                    "Docker provisioner: exact quarantine did not commit for %s",
-                    thread_id,
+                    "Docker provisioner: thread workspace %s:%d remains "
+                    "quarantined; managed repository process-zero was not "
+                    "established",
+                    host,
+                    port,
                 )
                 return False
             logger.warning(
-                "Docker provisioner: quarantined %s:%d; safe reuse requires "
-                "controller-attested container recreation",
+                "Docker provisioner: retired repository agents and quarantined "
+                "%s:%d; safe reuse requires controller-attested container "
+                "recreation",
                 host,
                 port,
             )
@@ -708,6 +837,14 @@ class DockerProvisioner:
                 "Docker provisioner: dev cleanup raised on %s:%d", host, port
             )
             cleaned = False
+        if cleaned:
+            cleaned = bool(
+                await self._db.record_docker_workspace_process_zero(
+                    thread_id,
+                    owner_kind="thread",
+                    lease_id=lease_id,
+                )
+            )
         final_status = "released" if cleaned else "quarantined"
         finalized = await self._db.transition_docker_workspace_lease(
             owner_kind="thread",
@@ -858,12 +995,12 @@ class DockerProvisioner:
         # safely recovers if an untrusted workspace replaced the root with a
         # symlink. The final assertions make a partial cleanup fail closed.
         command = (
-            "set -eu; "
-            "if test -d /home/agent-host/.ssh/srw-managed/sockets; then "
-            "for socket in /home/agent-host/.ssh/srw-managed/sockets/*.sock; do "
-            'if test -S "$socket"; then '
-            'SSH_AUTH_SOCK="$socket" ssh-add -D >/dev/null 2>&1 || true; '
-            "fi; done; fi; "
+            managed_repository_agent_retirement_command(
+                home_path="/home/agent-host",
+                authority_ids=None,
+                remove_configs=True,
+            )
+            + "; "
             "rm -rf -- /home/agent-host/.ssh/srw-managed; "
             "rm -rf -- /home/agent-host/workspace; "
             "install -d -m 700 /home/agent-host/workspace; "
@@ -913,6 +1050,180 @@ class DockerProvisioner:
         except Exception:
             logger.exception(
                 "Docker provisioner: dev workspace cleanup error on %s:%d", host, port
+            )
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
+                with suppress(Exception):
+                    await connection.wait_closed()
+
+    async def _retire_managed_repository_agents_via_ssh(
+        self, host: str, port: int
+    ) -> bool:
+        """Retire the exact managed ssh-agent namespace on a static host.
+
+        Production Docker release cannot prove process-zero by quarantining a
+        database lease: the underlying container remains alive.  Use the same
+        pinned host identity as the trusted reset path, but mutate only the
+        server-owned managed-repository namespace.  The first command performs
+        exact PID/start/socket classification, retirement, receipt/config
+        cleanup and a post-kill scan; the second is an independent read-only
+        zero proof before the lease may be reported contained.
+        """
+
+        command = (
+            managed_repository_agent_retirement_command(
+                home_path="/home/agent-host",
+                authority_ids=None,
+                remove_configs=True,
+            )
+            + "; "
+            + managed_repository_agent_zero_command(home_path="/home/agent-host")
+        )
+        return await self._run_pinned_workspace_command(
+            host,
+            port,
+            command,
+            operation="managed repository agent retirement",
+        )
+
+    async def settle_claimed_terminal_workspace_retirement(
+        self,
+        claim: dict[str, Any],
+    ) -> bool:
+        """Settle one DB-claimed terminal static-workspace retirement.
+
+        ``claim_terminal_docker_workspace_retirements`` has already moved the
+        exact owner/inventory lease to ``releasing``.  This method performs the
+        bounded external process retirement and records either the durable
+        retry reason or the terminal process-zero reason.  No endpoint is
+        selected from caller/job JSON after the claim.
+        """
+
+        if not self._db:
+            return False
+        try:
+            owner_kind = str(claim["owner_kind"])
+            owner_id = str(UUID(str(claim["owner_id"])))
+            lease_id = str(UUID(str(claim["lease_id"])))
+            host = str(claim["host"])
+            port = int(claim["port"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if owner_kind not in {"job", "thread"} or not host or not 1 <= port <= 65535:
+            return False
+
+        retired = await self._retire_managed_repository_agents_via_ssh(host, port)
+        if retired:
+            retired = bool(
+                await self._db.record_docker_workspace_process_zero(
+                    owner_id,
+                    owner_kind=owner_kind,
+                    lease_id=lease_id,
+                )
+            )
+        updates: dict[str, Any] = {
+            "status": "quarantined",
+            "quarantine_reason": (
+                "container_recreation_required_process_zero"
+                if retired
+                else "managed_repository_agent_retirement_failed"
+            ),
+        }
+        if owner_kind == "thread":
+            updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
+        finalized = await self._db.transition_docker_workspace_lease(
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            expected_lease_id=lease_id,
+            expected_statuses={"releasing"},
+            updates=updates,
+        )
+        if finalized is None or not retired:
+            logger.error(
+                "Docker provisioner: durable terminal retirement remains "
+                "pending for %s %s",
+                owner_kind,
+                owner_id,
+            )
+            return False
+        return True
+
+    async def _run_pinned_workspace_command(
+        self,
+        host: str,
+        port: int,
+        command: str,
+        *,
+        operation: str,
+    ) -> bool:
+        """Run one credential-free command against an attested static host."""
+
+        key = self._host_key(host, port)
+        fingerprint = self._workspace_fingerprints.get(key)
+        ssh_key = os.environ.get("SSH_KEY_PATH", "").strip()
+        if asyncssh is None:
+            logger.error("Docker provisioner: pinned SSH transport is unavailable")
+            return False
+        if not ssh_key:
+            logger.warning(
+                "Docker provisioner: SSH_KEY_PATH not set — cannot run %s on %s:%d",
+                operation,
+                host,
+                port,
+            )
+            return False
+        if not fingerprint:
+            logger.error(
+                "Docker provisioner: no pinned host identity for %s target %s",
+                operation,
+                key,
+            )
+            return False
+
+        connection = None
+        try:
+            async with asyncio.timeout(30):
+                connection = await asyncssh.connect(
+                    host,
+                    port=port,
+                    username="agent-host",
+                    client_keys=[ssh_key],
+                    known_hosts=EMPTY_KNOWN_HOSTS,
+                    client_factory=lambda: _PinnedResetSSHClient(fingerprint),
+                    server_host_key_algs=["ssh-ed25519"],
+                    connect_timeout=10,
+                    login_timeout=15,
+                )
+                result = await connection.run(command, check=False, timeout=20)
+            if result.exit_status == 0:
+                logger.info(
+                    "Docker provisioner: %s completed on %s:%d",
+                    operation,
+                    host,
+                    port,
+                )
+                return True
+            logger.warning(
+                "Docker provisioner: %s failed on %s:%d (rc=%d)",
+                operation,
+                host,
+                port,
+                result.exit_status,
+            )
+            return False
+        except TimeoutError:
+            logger.warning(
+                "Docker provisioner: %s timed out on %s:%d",
+                operation,
+                host,
+                port,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Docker provisioner: %s error on %s:%d", operation, host, port
             )
             return False
         finally:

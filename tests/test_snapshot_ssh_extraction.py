@@ -178,6 +178,64 @@ class TestWaitForAgentSsh:
         assert attempts == 1
         assert error == "ssh readiness probe could not start: FileNotFoundError"
 
+    @pytest.mark.asyncio
+    async def test_pinned_probe_enforces_selected_host_key(self):
+        fake = _fake_proc(returncode=0)
+        scan = AsyncMock(return_value=("host ssh-ed25519 AAAAtest", b""))
+        with (
+            patch(
+                "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+                new=scan,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake),
+            ) as execute,
+        ):
+            ready, attempts, error = await wait_for_agent_ssh(
+                "10.0.0.9",
+                22,
+                deadline_s=1,
+                connect_timeout_s=1,
+                interval_s=0,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+            )
+
+        assert (ready, attempts, error) == (True, 1, "")
+        scan.assert_awaited_once_with(
+            "10.0.0.9", 22, VALID_TEST_FINGERPRINT, timeout_s=1
+        )
+        argv = execute.await_args.args
+        assert "StrictHostKeyChecking=yes" in argv
+        assert "UserKnownHostsFile=/dev/null" not in argv
+
+    @pytest.mark.asyncio
+    async def test_pinned_probe_rejects_mismatch_before_authentication(self):
+        mismatch = b"SSH host-key fingerprint mismatch"
+        execute = AsyncMock()
+        with (
+            patch(
+                "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+                new=AsyncMock(return_value=(None, mismatch)),
+            ),
+            patch("asyncio.create_subprocess_exec", new=execute),
+        ):
+            ready, attempts, error = await wait_for_agent_ssh(
+                "10.0.0.9",
+                22,
+                deadline_s=0,
+                connect_timeout_s=1,
+                interval_s=0,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+            )
+
+        assert ready is False
+        assert attempts == 1
+        assert error == mismatch.decode()
+        execute.assert_not_awaited()
+
 
 class TestStreamExtractSnapshot:
     @pytest.mark.asyncio

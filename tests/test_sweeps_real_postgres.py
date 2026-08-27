@@ -21,6 +21,7 @@ is unset so plain unit-test runs stay hermetic.
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -101,6 +102,29 @@ SWEEPS = [
     (
         "fail_llm_outage_job",
         lambda db: db.fail_llm_outage_job(str(uuid4()), "sweep bind test"),
+    ),
+    # Unified notification feed — the escalate-on-timeout sweeper (slice 2).
+    (
+        "claim_due_notification_steps",
+        lambda db: db.claim_due_notification_steps(
+            worker_id="sweep-bind-test", limit=50, lease_minutes=10
+        ),
+    ),
+    (
+        "defer_notification_steps",
+        lambda db: db.defer_notification_steps(
+            [1], due_at=datetime.now(timezone.utc), detail="quiet_hours"
+        ),
+    ),
+    (
+        "retry_notification_steps",
+        lambda db: db.retry_notification_steps(
+            [1], due_at=datetime.now(timezone.utc), detail="retry"
+        ),
+    ),
+    (
+        "settle_notification_steps",
+        lambda db: db.settle_notification_steps([1], state="skipped", detail="x"),
     ),
 ]
 

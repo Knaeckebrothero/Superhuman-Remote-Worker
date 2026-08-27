@@ -55,6 +55,9 @@ def _make_manager(
     provisioner.delete_vm_captured = AsyncMock(
         return_value=VMTeardownResult("completed", True)
     )
+    provisioner.release_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
     provisioner.delete_orphan_vm_captured = AsyncMock(
         return_value=VMTeardownResult("completed", True)
     )
@@ -478,6 +481,7 @@ class TestStatelessVMLifecycleRefusal:
         snapshot.capture_vm_snapshot.assert_not_called()
         provisioner.delete_vm.assert_not_called()
         provisioner.delete_thread_vm.assert_not_called()
+        provisioner.release_vm_captured.assert_not_called()
         db.merge_vm_context.assert_not_called()
         db.merge_thread_vm_context.assert_not_called()
 
@@ -591,8 +595,12 @@ class TestStatelessVMLifecycleRefusal:
 
         assert report["vm"]["reaped"] == 1
         snapshot.capture_vm_snapshot.assert_awaited_once()
-        provisioner.delete_thread_vm.assert_awaited_once_with(
-            "thread-stateless", purge_disk=True
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "thread-stateless",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=True,
+            entity_type="thread",
+            capture_snapshot=False,
         )
 
     @pytest.mark.asyncio
@@ -607,7 +615,13 @@ class TestStatelessVMLifecycleRefusal:
 
         assert report["vm"]["reaped"] == 1
         snapshot.capture_vm_snapshot.assert_awaited_once()
-        provisioner.delete_vm.assert_awaited_once_with("job-stateless", purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "job-stateless",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=True,
+            entity_type="job",
+            capture_snapshot=False,
+        )
 
 
 # =============================================================================
@@ -933,15 +947,23 @@ class TestSignalDrainPending:
 
 class TestDelete:
     @pytest.mark.asyncio
-    async def test_job_vm_calls_delete_vm(self):
+    async def test_job_vm_uses_exact_retirement_release(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
-        provisioner.delete_thread_vm.assert_not_called()
+        provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
+            "job-1", entity_type="job"
+        )
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "job-1",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=True,
+            entity_type="job",
+            capture_snapshot=False,
+        )
 
     @pytest.mark.asyncio
-    async def test_thread_vm_calls_thread_delete(self):
+    async def test_thread_vm_uses_exact_retirement_release(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(
             kind="vm",
@@ -950,32 +972,37 @@ class TestDelete:
             metadata={"scope": "thread"},
         )
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_thread_vm.assert_awaited_once_with(
-            "thread-1", purge_disk=True
+        provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
+            "thread-1", entity_type="thread"
         )
-        provisioner.delete_vm.assert_not_called()
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "thread-1",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=True,
+            entity_type="thread",
+            capture_snapshot=False,
+        )
 
     @pytest.mark.asyncio
     async def test_drain_dispatches_through_delete(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.drain(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_noop_when_provisioner_unavailable(self):
         mgr, provisioner, *_ = _make_manager(is_available=False)
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_vm.assert_not_called()
+        provisioner.release_vm_captured.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skipped_without_bound(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to=None, metadata={})
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_vm.assert_not_called()
-        provisioner.delete_thread_vm.assert_not_called()
+        provisioner.release_vm_captured.assert_not_called()
 
 
 class TestCompletionControlLifecycleOwnership:
@@ -1010,7 +1037,7 @@ class TestCompletionControlLifecycleOwnership:
         await mgr.give_up(inst, grace_s=0)
 
         snapshot.capture_vm_snapshot.assert_not_awaited()
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
         db.merge_vm_context.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
         marker_queries = [
@@ -1055,7 +1082,7 @@ class TestCompletionControlLifecycleOwnership:
 
         await mgr.delete(inst, grace_s=0)
 
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_replacement_after_claim_blocks_vm_snapshot_and_context_write(self):
@@ -1088,7 +1115,7 @@ class TestCompletionControlLifecycleOwnership:
         assert await mgr.snapshot(inst) is None
 
         snapshot.capture_vm_snapshot.assert_not_awaited()
-        provisioner.delete_vm_captured.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
         db.merge_vm_context.assert_not_awaited()
 
 
@@ -1401,14 +1428,26 @@ class TestGiveUp:
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
         await mgr.give_up(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("j1", purge_disk=False)
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "j1",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=False,
+            entity_type="job",
+            capture_snapshot=False,
+        )
 
     @pytest.mark.asyncio
     async def test_give_up_keeps_the_thread_rootdisk(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="t1", metadata={"scope": "thread"})
         await mgr.give_up(inst, grace_s=0)
-        provisioner.delete_thread_vm.assert_awaited_once_with("t1", purge_disk=False)
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "t1",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=False,
+            entity_type="thread",
+            capture_snapshot=False,
+        )
 
     @pytest.mark.asyncio
     async def test_give_up_records_the_kept_disk(self):
@@ -1427,7 +1466,7 @@ class TestGiveUp:
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
         await mgr.drain(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("j1", purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once()
 
 
 class TestSnapshotResetsAttempts:
@@ -1479,7 +1518,7 @@ class TestChurnRegression:
         mgr, provisioner, *_ = _make_manager(job_rows=[job])
         rec = InstanceLifecycleReconciler([mgr])
         report = await rec.tick()
-        provisioner.delete_vm.assert_not_called()
+        provisioner.release_vm_captured.assert_not_called()
         assert report["vm"]["reaped"] == 0
         assert report["vm"]["reap_forced"] == 0
 
@@ -1510,7 +1549,13 @@ class TestChurnRegression:
         # Reached via give_up (dirty + unreachable + attempts exhausted), which
         # keeps the rootdisk — it is the only surviving copy of the state the
         # snapshot could not capture.
-        provisioner.delete_vm.assert_awaited_once_with("j-idle", purge_disk=False)
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "j-idle",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=False,
+            entity_type="job",
+            capture_snapshot=False,
+        )
         assert report["vm"]["reap_forced"] == 1
 
 
@@ -1529,17 +1574,33 @@ class TestReapOrphans:
     ORPHAN_ID = "deadbeef-dead-4bad-8bad-feedfacef00d"
 
     @classmethod
-    def _vm(cls, entity_id=None, age_hours: float = 2.0, created_at="unset"):
+    def _vm(
+        cls,
+        entity_id=None,
+        age_hours: float = 2.0,
+        created_at="unset",
+        *,
+        with_identity: bool = True,
+    ):
         if created_at == "unset":
             created_at = (
                 datetime.now(timezone.utc) - timedelta(hours=age_hours)
             ).isoformat()
-        return {
+        vm = {
             "vm_name": f"agent-vm-{entity_id or cls.ORPHAN_ID}",
             "entity_id": entity_id or cls.ORPHAN_ID,
             "created_at": created_at,
             "phase": "Running",
         }
+        if with_identity:
+            vm.update(
+                {
+                    "provision_generation": ("00000000-0000-4000-8000-000000000001"),
+                    "vm_uid": "vm-uid-1",
+                    "rootdisk_pvc_uid": "rootdisk-uid-1",
+                }
+            )
+        return vm
 
     @staticmethod
     def _conn(db):
@@ -1552,20 +1613,28 @@ class TestReapOrphans:
         provisioner.list_vms = AsyncMock(return_value=[self._vm()])
         self._conn(db).fetchval = AsyncMock(return_value=False)  # no row anywhere
         assert await mgr.reap_orphans() == 1
-        provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)
+        provisioner.delete_orphan_vm_captured.assert_awaited_once()
+        args = provisioner.delete_orphan_vm_captured.await_args
+        assert args.args[0] == self.ORPHAN_ID
+        assert args.args[1].provision_generation == (
+            "00000000-0000-4000-8000-000000000001"
+        )
+        assert args.args[1].vm_uid == "vm-uid-1"
+        assert args.args[1].rootdisk_pvc_uid == "rootdisk-uid-1"
+        assert args.kwargs == {"purge_disk": True}
 
     @pytest.mark.asyncio
-    async def test_control_marker_blocks_orphan_destructive_recheck(self, monkeypatch):
+    async def test_orphan_without_authenticated_inventory_is_preserved(
+        self, monkeypatch
+    ):
         monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
-        mgr, provisioner, _, _, _ = _make_manager(
-            completion_commands_enabled=True,
-            completion_control_active=True,
-        )
-        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm(with_identity=False)])
+        self._conn(db).fetchval = AsyncMock(return_value=False)
 
         assert await mgr.reap_orphans() == 0
 
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.delete_orphan_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_spares_young_orphan(self, monkeypatch):
@@ -1652,7 +1721,7 @@ class TestReapOrphans:
         rec = InstanceLifecycleReconciler([mgr])
         report = await rec.tick()
         assert report["vm"]["orphans_reaped"] == 1
-        provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)
+        provisioner.delete_orphan_vm_captured.assert_awaited_once()
 
 
 class TestKeptDiskSweep:
@@ -1683,7 +1752,13 @@ class TestKeptDiskSweep:
         purged = await mgr.purge_kept_disks()
 
         assert purged == 1
-        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once_with(
+            "job-1",
+            provisioner.capture_vm_teardown_identity.return_value,
+            purge_disk=True,
+            entity_type="job",
+            capture_snapshot=False,
+        )
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):
@@ -1697,7 +1772,7 @@ class TestKeptDiskSweep:
 
         assert await mgr.purge_kept_disks() == 0
 
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_purge_clears_the_marker(self):
@@ -1712,7 +1787,9 @@ class TestKeptDiskSweep:
     async def test_marker_survives_a_failed_delete(self):
         """A delete that did not happen must stay on the worklist."""
         mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
-        provisioner.delete_vm = AsyncMock(return_value=False)
+        provisioner.release_vm_captured = AsyncMock(
+            return_value=VMTeardownResult("retry_pending", False)
+        )
 
         purged = await mgr.purge_kept_disks()
 
@@ -1723,7 +1800,7 @@ class TestKeptDiskSweep:
     async def test_nothing_to_do_is_silent(self):
         mgr, provisioner, _ = self._mgr_with_kept([])
         assert await mgr.purge_kept_disks() == 0
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_exact_stateless_job_is_refused_even_if_reader_returns_it(self):
@@ -1734,7 +1811,7 @@ class TestKeptDiskSweep:
         )
 
         assert await mgr.purge_kept_disks() == 0
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
         db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1744,7 +1821,7 @@ class TestKeptDiskSweep:
         db.acquire = MagicMock(side_effect=RuntimeError("db down"))
 
         assert await mgr.purge_kept_disks() == 0
-        provisioner.delete_vm.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_orphan_sweep_runs_it(self):
@@ -1753,4 +1830,4 @@ class TestKeptDiskSweep:
 
         await mgr.reap_orphans()
 
-        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once()

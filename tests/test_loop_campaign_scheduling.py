@@ -1356,40 +1356,41 @@ class TestPlannerKickoffBlocks:
 
 
 class TestLoopNotifications:
-    @pytest.mark.asyncio
-    async def test_notify_persists_and_broadcasts(self):
-        from main import _notify_loop_event
+    """A loop event is a `loop_event` feed row for the loop's owner (in-app
+    only — loop_campaign_scheduling Q3: no email, no push)."""
 
-        db = AsyncMock()
-        feed = MagicMock()
+    @pytest.mark.asyncio
+    async def test_notify_records_a_loop_event_row(self):
+        from main import _notify_loop_event
+        from services.notification_service import RecordResult
+
+        record = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
         loop = _loop(owner_id="cccccccc-0000-0000-0000-000000000001")
-        with patch("main.postgres_db", db):
-            with patch("services.notification_feed.notification_feed", feed):
-                await _notify_loop_event(
-                    loop,
-                    job_id=CRITIC_JOB_ID,
-                    event_type="loop_campaign_disposition",
-                    subject="Loop campaign ship: F5",
-                    message="done",
-                )
-        db.log_message.assert_awaited_once()
-        kw = db.log_message.call_args.kwargs
-        assert kw["direction"] == "outbound"
-        assert kw["user_id"] == "cccccccc-0000-0000-0000-000000000001"
-        # message_log.thread_id is varchar(12) NOT NULL — found live when the
-        # first disposition event failed the constraint with thread_id=None.
-        assert kw["thread_id"] and len(kw["thread_id"]) <= 12
-        feed.broadcast.assert_called_once()
-        assert (
-            feed.broadcast.call_args.kwargs["event_type"] == "loop_campaign_disposition"
-        )
+        with patch("main.notification_service.record", record):
+            await _notify_loop_event(
+                loop,
+                job_id=CRITIC_JOB_ID,
+                event_type="loop_campaign_disposition",
+                subject="Loop campaign ship: F5",
+                message="done",
+            )
+        record.assert_awaited_once()
+        kw = record.await_args.kwargs
+        assert kw["recipient_id"] == "cccccccc-0000-0000-0000-000000000001"
+        assert kw["category"] == "loop_event"
+        assert kw["subject"] == "Loop campaign ship: F5" and kw["body"] == "done"
+        assert kw["source_kind"] == "loop" and kw["source_id"] == str(loop["id"])
+        assert kw["payload"]["event_type"] == "loop_campaign_disposition"
+        assert kw["payload"]["job_id"] == CRITIC_JOB_ID
+        # A legacy (non-durable) caller gets a random key: two calls, two rows.
+        assert kw["dedup_key"].startswith(f"loop:{loop['id']}:{CRITIC_JOB_ID}:")
 
     @pytest.mark.asyncio
     async def test_notify_skips_ownerless_loops(self):
         from main import _notify_loop_event
 
-        db = AsyncMock()
-        with patch("main.postgres_db", db):
+        record = AsyncMock()
+        with patch("main.notification_service.record", record):
             await _notify_loop_event(
                 _loop(owner_id=None),
                 job_id=CRITIC_JOB_ID,
@@ -1397,96 +1398,21 @@ class TestLoopNotifications:
                 subject="s",
                 message="m",
             )
-        db.log_message.assert_not_awaited()
+        record.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_user_question_scan_emits_per_note(self):
-        from main import _notify_loop_user_questions
+    async def test_feed_failure_never_breaks_an_advance(self):
+        from main import _notify_loop_event
 
-        rows = [
-            {"note_id": "q-1", "title": "Need lawyer budget?"},
-            {"note_id": "q-2", "title": "Which domain name?"},
-        ]
-        vector = _FakeAcquire(AsyncMock(), fetch=AsyncMock(return_value=rows))
-        notify = AsyncMock()
-        loop = _loop(project_id=str(uuid.uuid4()))
-        job = {"id": CRITIC_JOB_ID}
-        with patch("main.vector_db", vector):
-            with patch("main._notify_loop_event", notify):
-                await _notify_loop_user_questions(loop, job)
-        assert notify.await_count == 2
-        first = notify.call_args_list[0].kwargs
-        assert first["event_type"] == "loop_user_question"
-        assert "Need lawyer budget?" in first["subject"]
-
-    @pytest.mark.asyncio
-    async def test_user_question_scan_silent_without_project_or_store(self):
-        from main import _notify_loop_user_questions
-
-        notify = AsyncMock()
-        with patch("main.vector_db", None):
-            with patch("main._notify_loop_event", notify):
-                await _notify_loop_user_questions(
-                    _loop(project_id=None), {"id": CRITIC_JOB_ID}
-                )
-        notify.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_abort_emits_disposition_event(self):
-        from main import _rotate_loop_to_next_stage
-
-        db = AsyncMock()
-        spawn = _spawn_mock()
-        notify = AsyncMock()
-        camp = _campaign(member_failures=1)
-        member = _member_job(camp["id"], 1, status="failed")
-        with _patched_main(db, spawn):
-            with patch("main._notify_loop_event", notify):
-                await _rotate_loop_to_next_stage(
-                    _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
-                    seq_index_completed=2,
-                    base_total=12,
-                    next_remaining=17,
-                    consecutive=2,
-                    last_error="job failed",
-                    actions=[],
-                    completed_job=member,
-                    completed_ctx=member["context"],
-                    completed_failed=True,
-                )
-        notify.assert_awaited_once()
-        kw = notify.call_args.kwargs
-        assert kw["event_type"] == "loop_campaign_disposition"
-        assert "aborted" in kw["subject"]
-
-    @pytest.mark.asyncio
-    async def test_disposition_emits_event_with_outcome(self):
-        from main import _rotate_loop_to_next_stage
-
-        db = AsyncMock()
-        spawn = _spawn_mock()
-        notify = AsyncMock()
-        prior = "aaaaaaaa-0000-0000-0000-00000000dead"
-        reviewed = _campaign(status="review", id=prior, plan_job_id=prior)
-        plan = _plan(disposition={"outcome": "ship", "notes": "evidence green"})
-        with _patched_main(db, spawn):
-            with patch("main._notify_loop_event", notify):
-                await _rotate_loop_to_next_stage(
-                    _loop(campaign=reviewed),
-                    seq_index_completed=1,
-                    base_total=13,
-                    next_remaining=16,
-                    consecutive=0,
-                    last_error=None,
-                    actions=[],
-                    completed_job=_critic_job(plan),
-                    completed_ctx=_critic_job(plan)["context"],
-                    completed_failed=False,
-                )
-        notify.assert_awaited_once()
-        kw = notify.call_args.kwargs
-        assert "ship" in kw["subject"]
-        assert "evidence green" in kw["message"]
+        record = AsyncMock(side_effect=RuntimeError("feed down"))
+        with patch("main.notification_service.record", record):
+            await _notify_loop_event(
+                _loop(owner_id="cccccccc-0000-0000-0000-000000000001"),
+                job_id=CRITIC_JOB_ID,
+                event_type="x",
+                subject="s",
+                message="m",
+            )  # no raise
 
 
 class TestDispositionClosesBacklogTicket:

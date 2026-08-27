@@ -596,18 +596,21 @@ async def test_durable_branch_notifies_the_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_owner_notification_resolves_the_recipient_address(monkeypatch):
-    """dispatch() takes user_id for PREFERENCES only — its email leg sends to
-    ``recipient_email or ""``, so omitting it does not fall back to the user's
-    address, it hands the empty string to the email service, which refuses to
-    send and merely logs. Nothing raises, so the notification is silently
-    dropped while the wake still reports success. (Live-gate regression,
-    2026-07-27.)"""
-    sent = {}
+async def test_owner_notification_records_a_session_wake_row(monkeypatch):
+    """The owner's half of the durable branch is a ``session_wake`` feed row
+    (unified notification system): addressed to the thread owner, deduped per
+    (thread, job) so a re-claimed wake never files twice, with the session
+    thread as its source so the cockpit can deep-link back. Which channel
+    reaches the owner — and at what address — is the notification system's
+    business; nothing here resolves an email. (The old dispatch() path handed
+    the email leg an empty address and silently dropped the notice — live-gate
+    regression, 2026-07-27; a feed row cannot be dropped that way.)"""
+    recorded = {}
 
     class _Svc:
-        async def dispatch(self, **kw):
-            sent.update(kw)
+        async def record(self, **kw):
+            recorded.update(kw)
+            return SimpleNamespace(notification_id="n-1", inserted=True)
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -615,25 +618,34 @@ async def test_owner_notification_resolves_the_recipient_address(monkeypatch):
         type("M", (), {"notification_service": _Svc()}),
     )
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
-    db.get_user = AsyncMock(
-        return_value={"id": "u", "email": "owner@example.test", "display_name": "Owner"}
-    )
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
     assert await session_wake.drain_pending_wakes(db) == 0
 
-    assert sent.get("recipient_email") == "owner@example.test"
-    assert sent.get("recipient_name") == "Owner"
-    assert sent.get("thread_id") == THREAD_ID
+    assert recorded["recipient_id"] == "u"
+    assert recorded["category"] == "session_wake"
+    assert recorded["dedup_key"] == f"session_wake:{THREAD_ID}:{JOB_ID}"
+    assert recorded["source_kind"] == "thread"
+    assert recorded["source_id"] == THREAD_ID
+    assert recorded["action_params"] == {"thread_id": THREAD_ID, "job_id": JOB_ID}
+    assert recorded["payload"]["job_id"] == JOB_ID
+    assert recorded["payload"]["status"] == "completed"
+    assert recorded["payload"]["title"] == "Theme work"
+    assert JOB_ID[:8] in recorded["subject"]
 
 
 @pytest.mark.asyncio
-async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
+async def test_owner_without_an_email_still_gets_the_row(monkeypatch):
+    """An owner with no address on file is NOT skipped at this layer: the feed
+    row is the durable half and lands in-app regardless. Suppressing the email
+    leg for an addressless recipient is the notification system's job — the
+    wake never looks the user up."""
     calls = []
 
     class _Svc:
-        async def dispatch(self, **kw):
+        async def record(self, **kw):
             calls.append(kw)
+            return SimpleNamespace(notification_id="n-1", inserted=True)
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -645,7 +657,9 @@ async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
     monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
 
     assert await session_wake.drain_pending_wakes(db) == 0
-    assert calls == [], "dispatching with no address just logs a refusal"
+    assert len(calls) == 1
+    assert calls[0]["recipient_id"] == "u"
+    db.get_user.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -667,6 +681,22 @@ async def test_failed_notification_does_not_undeliver_the_notice(monkeypatch):
     assert await session_wake.drain_pending_wakes(db) == 0
     db.finish_job_wake.assert_not_awaited()
     db.defer_job_wake_for_input.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_durable_retry_finishes_only_after_provider_admission():
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.persist_thread_input_delivery = AsyncMock(
+        return_value={
+            "transcript_inserted": False,
+            "state": "admitted",
+        }
+    )
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.defer_job_wake_for_input.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------

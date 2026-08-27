@@ -7,6 +7,8 @@ import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 
 import { environment } from '../../core/environment';
 import { ApiService } from '../../core/services/api.service';
+import { NotificationService } from '../../core/services/notification.service';
+import type { Notification } from '../../core/models/notification.model';
 import { ModelService } from '../../core/services/model.service';
 import type {
   OfficerBrainSpec,
@@ -24,6 +26,7 @@ import { AppInputComponent } from '../../ui/input';
 import { AppSelectComponent } from '../../ui/select';
 import { AppFormFieldComponent } from '../../ui/form-field';
 import { AppSpinnerComponent } from '../../ui/spinner';
+import { AppCheckboxComponent } from '../../ui/checkbox';
 
 /** Editable roster row in the kit editor. */
 export interface SlotDraft {
@@ -54,12 +57,13 @@ export type OfficerTranslate = (key: string, params?: Record<string, unknown>) =
 /** The whole kit editor as plain strings ('' = unset / server default). */
 export interface OfficerEditorDraft {
   slots: SlotDraft[];
+  autoPull: boolean;
+  workerSpendCeilingDaily: string;
   brainModel: string;
   reasoning: string;
   sleepMin: string;
   sleepMax: string;
   tokenCeiling: string;
-  maxPages: string;
   maxActions: string;
   maxWorkers: string;
 }
@@ -105,9 +109,10 @@ export function holdBadgeLabel(
 /** Editor fields grouped by when a live edit actually lands (§7's table). */
 export type OfficerEditField =
   | 'slots'
+  | 'auto_pull'
+  | 'worker_spend_ceiling_daily'
   | 'max_concurrent_workers'
   | 'daily_token_ceiling'
-  | 'max_pages_per_day'
   | 'sleep'
   | 'max_actions_per_wake'
   | 'brain';
@@ -116,10 +121,11 @@ export type OfficerEditField =
 export function immediacyLabel(field: OfficerEditField, translate: OfficerTranslate): string {
   switch (field) {
     case 'slots':
+    case 'auto_pull':
+    case 'worker_spend_ceiling_daily':
     case 'max_concurrent_workers':
       return translate('officerCard.immediacy.nextDispatch');
     case 'daily_token_ceiling':
-    case 'max_pages_per_day':
       return translate('officerCard.immediacy.nextDelivery');
     case 'sleep':
       return translate('officerCard.immediacy.nextSleep');
@@ -168,6 +174,13 @@ export function kitChips(
     if (s.category) parts.push(s.category);
     if (s.model) parts.push(s.model);
     if (s.backend) parts.push(s.backend);
+    if (s.spend_ceiling_daily != null) {
+      parts.push(
+        translate('officerCard.kit.spendCeiling', {
+          amount: s.spend_ceiling_daily,
+        }),
+      );
+    }
     if (s.ready_depth != null) {
       parts.push(
         translate(s.below_floor ? 'officerCard.kit.readyBelowFloor' : 'officerCard.kit.ready', {
@@ -207,12 +220,13 @@ export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
   const num = (v: number | null | undefined): string => (v == null ? '' : String(v));
   return {
     slots,
+    autoPull: post?.backlog?.auto_pull === true,
+    workerSpendCeilingDaily: num(post?.backlog?.worker_spend_ceiling_daily),
     brainModel: o?.model ?? '',
     reasoning: o?.reasoning_level ?? '',
     sleepMin: num(o?.sleep_minutes?.min),
     sleepMax: num(o?.sleep_minutes?.max),
     tokenCeiling: num(o?.token_ceiling?.daily),
-    maxPages: num(o?.pages_today?.budget),
     maxActions: num(o?.max_actions_per_wake),
     maxWorkers: num(o?.max_concurrent_workers),
   };
@@ -265,7 +279,10 @@ export function rosterValidationIssue(
  * fields are omitted so commission cannot clear row state the editor never saw.
  */
 export function buildOfficerConfig(draft: OfficerEditorDraft): OfficerPostPatch {
-  const body: OfficerPostPatch = { slots: buildSlotsSpec(draft.slots) };
+  const body: OfficerPostPatch = {
+    slots: buildSlotsSpec(draft.slots),
+    auto_pull: draft.autoPull,
+  };
   const brain: OfficerBrainSpec = {};
   if (draft.brainModel.trim()) brain.model = draft.brainModel.trim();
   if (draft.reasoning) brain.reasoning_level = draft.reasoning;
@@ -280,22 +297,25 @@ export function buildOfficerConfig(draft: OfficerEditorDraft): OfficerPostPatch 
   if (sleepMax !== undefined) body.sleep_max_minutes = sleepMax;
   const ceiling = num(draft.tokenCeiling);
   if (ceiling !== undefined) body.daily_token_ceiling = ceiling;
-  const pages = num(draft.maxPages);
-  if (pages !== undefined) body.max_pages_per_day = pages;
   const actions = num(draft.maxActions);
   if (actions !== undefined) body.max_actions_per_wake = actions;
   const workers = num(draft.maxWorkers);
   if (workers !== undefined) body.max_concurrent_workers = workers;
+  const workerSpendCeiling = Number(draft.workerSpendCeilingDaily);
+  if (draft.workerSpendCeilingDaily.trim() && Number.isFinite(workerSpendCeiling)) {
+    body.worker_spend_ceiling_daily = workerSpendCeiling;
+  }
   return body;
 }
 
 const PATCH_FIELDS: (keyof OfficerPostPatch)[] = [
   'slots',
+  'auto_pull',
+  'worker_spend_ceiling_daily',
   'brain',
   'sleep_min_minutes',
   'sleep_max_minutes',
   'daily_token_ceiling',
-  'max_pages_per_day',
   'max_actions_per_wake',
   'max_concurrent_workers',
 ];
@@ -399,6 +419,7 @@ export function nextWakeLabel(
     AppSelectComponent,
     AppFormFieldComponent,
     AppSpinnerComponent,
+    AppCheckboxComponent,
   ],
   template: `
     <div class="officer-tab">
@@ -486,20 +507,36 @@ export function nextWakeLabel(
                 <div class="officer-slots" data-testid="officer-runtime-lifecycle">
                   <span class="k">{{ 'officerCard.runtimeLifecycle.label' | transloco }}</span>
                   <span class="v" [class.officer-warn]="lifecycle.drift_state !== 'current'">
-                    {{ 'officerCard.runtimeLifecycle.drift.' + (lifecycle.drift_state || 'unknown') | transloco }}
-                    · {{
+                    {{
+                      'officerCard.runtimeLifecycle.drift.' + (lifecycle.drift_state || 'unknown')
+                        | transloco
+                    }}
+                    ·
+                    {{
                       'officerCard.runtimeLifecycle.phase.' +
-                        ((lifecycle.recycle_phase || 'unknown').replaceAll('_', '-')) | transloco
+                        (lifecycle.recycle_phase || 'unknown').replaceAll('_', '-') | transloco
                     }}
                     @if (lifecycle.observed_build_sha || lifecycle.expected_build_sha) {
-                      · {{ lifecycle.observed_build_sha || ('officerCard.runtimeLifecycle.missing' | transloco) }}
-                      → {{ lifecycle.expected_build_sha || ('officerCard.runtimeLifecycle.unpinned' | transloco) }}
+                      ·
+                      {{
+                        lifecycle.observed_build_sha ||
+                          ('officerCard.runtimeLifecycle.missing' | transloco)
+                      }}
+                      →
+                      {{
+                        lifecycle.expected_build_sha ||
+                          ('officerCard.runtimeLifecycle.unpinned' | transloco)
+                      }}
                     }
-                    @if (lifecycle.last_failure) { · {{ lifecycle.last_failure }} }
-                    · {{
+                    @if (lifecycle.last_failure) {
+                      · {{ lifecycle.last_failure }}
+                    }
+                    ·
+                    {{
                       (lifecycle.automatic_reconciliation_enabled
                         ? 'officerCard.runtimeLifecycle.automatic.enabled'
-                        : 'officerCard.runtimeLifecycle.automatic.disabled') | transloco
+                        : 'officerCard.runtimeLifecycle.automatic.disabled'
+                      ) | transloco
                     }}
                   </span>
                 </div>
@@ -513,12 +550,6 @@ export function nextWakeLabel(
                 <div>
                   <span class="k">{{ 'officerCard.summary.queuedEvents' | transloco }}</span>
                   <span class="v">{{ o.pending_events ?? 0 }}</span>
-                </div>
-                <div>
-                  <span class="k">{{ 'officerCard.summary.pagesToday' | transloco }}</span>
-                  <span class="v"
-                    >{{ o.pages_today?.used ?? 0 }}/{{ o.pages_today?.budget ?? 3 }}</span
-                  >
                 </div>
                 @if (post()?.spend_today; as spend) {
                   <div>
@@ -567,6 +598,19 @@ export function nextWakeLabel(
                       {{ 'officerCard.backlog.on' | transloco }}
                     } @else {
                       <span class="officer-warn">{{ 'officerCard.backlog.off' | transloco }}</span>
+                    }
+                    @if (bl.worker_spend_ceiling_daily != null) {
+                      ·
+                      {{
+                        'officerCard.backlog.centurySpendCeiling'
+                          | transloco: { amount: bl.worker_spend_ceiling_daily }
+                      }}
+                    }
+                    @if (bl.auto_pull_control?.enable_available === false) {
+                      ·
+                      <span class="officer-warn" data-testid="officer-auto-pull-release-closed">{{
+                        'officerCard.backlog.releaseClosed' | transloco
+                      }}</span>
                     }
                   </span>
                 </div>
@@ -776,6 +820,21 @@ export function nextWakeLabel(
                       }
                     </app-select>
                   </app-form-field>
+                  <app-form-field
+                    [label]="'officerCard.roster.spendCeiling' | transloco"
+                    [hint]="'officerCard.roster.spendCeilingHint' | transloco"
+                  >
+                    <app-input
+                      type="number"
+                      inputmode="decimal"
+                      [ariaLabel]="
+                        'officerCard.a11y.slotSpendCeiling' | transloco: { index: i + 1 }
+                      "
+                      [value]="row.spendCeilingDaily == null ? '' : '' + row.spendCeilingDaily"
+                      (changed)="patchSlot(i, { spendCeilingDaily: toOptionalCeiling($event) })"
+                      [placeholder]="'officerCard.defaults.unlimited' | transloco"
+                    />
+                  </app-form-field>
                   <app-button
                     variant="secondary"
                     size="sm"
@@ -815,6 +874,64 @@ export function nextWakeLabel(
 
               <div class="officer-editor-head">
                 <span class="officer-section-title">{{
+                  'officerCard.sections.autoPull' | transloco
+                }}</span>
+                @if (showImmediacy()) {
+                  <span class="officer-immediacy" data-testid="immediacy-auto-pull">{{
+                    immediacy('auto_pull')
+                  }}</span>
+                }
+              </div>
+              <div class="officer-slot-row" data-testid="officer-auto-pull-control">
+                <app-checkbox
+                  [checked]="fAutoPull()"
+                  [disabled]="busy() || (!autoPullEnableAvailable() && !fAutoPull())"
+                  [ariaLabel]="'officerCard.a11y.autoPull' | transloco"
+                  (changed)="requestAutoPullChange($event)"
+                >
+                  {{ 'officerCard.autoPull.label' | transloco }}
+                </app-checkbox>
+                <app-form-field
+                  [label]="'officerCard.budgets.workerSpendCeiling' | transloco"
+                  [hint]="'officerCard.budgets.workerSpendCeilingHint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    inputmode="decimal"
+                    [ariaLabel]="'officerCard.a11y.workerSpendCeiling' | transloco"
+                    [value]="fWorkerSpendCeiling()"
+                    (changed)="fWorkerSpendCeiling.set($event)"
+                    [placeholder]="'officerCard.defaults.unlimited' | transloco"
+                  />
+                </app-form-field>
+              </div>
+              @if (!autoPullEnableAvailable() && !fAutoPull()) {
+                <p class="officer-hint officer-warn" data-testid="officer-auto-pull-gate-hint">
+                  {{ 'officerCard.autoPull.releaseClosed' | transloco }}
+                </p>
+              }
+              @if (autoPullArmed()) {
+                <div class="officer-confirm" data-testid="officer-auto-pull-confirm" role="alert">
+                  <p class="officer-hint">{{ 'officerCard.autoPull.confirmation' | transloco }}</p>
+                  <div class="officer-actions">
+                    <app-button
+                      variant="danger"
+                      size="sm"
+                      [disabled]="busy()"
+                      (clicked)="confirmAutoPull()"
+                      data-testid="officer-auto-pull-confirm-enable"
+                    >
+                      {{ 'officerCard.autoPull.confirmEnable' | transloco }}
+                    </app-button>
+                    <app-button variant="secondary" size="sm" (clicked)="cancelAutoPull()">{{
+                      'officerCard.actions.cancel' | transloco
+                    }}</app-button>
+                  </div>
+                </div>
+              }
+
+              <div class="officer-editor-head">
+                <span class="officer-section-title">{{
                   'officerCard.sections.budgets' | transloco
                 }}</span>
                 @if (showImmediacy()) {
@@ -834,18 +951,6 @@ export function nextWakeLabel(
                     [value]="fTokenCeiling()"
                     (changed)="fTokenCeiling.set($event)"
                     [placeholder]="'officerCard.defaults.unlimited' | transloco"
-                  />
-                </app-form-field>
-                <app-form-field
-                  [label]="'officerCard.budgets.pages' | transloco"
-                  [hint]="'officerCard.budgets.pagesHint' | transloco"
-                >
-                  <app-input
-                    type="number"
-                    [ariaLabel]="'officerCard.a11y.pagesPerDay' | transloco"
-                    [value]="fMaxPages()"
-                    (changed)="fMaxPages.set($event)"
-                    placeholder="3"
                   />
                 </app-form-field>
               </div>
@@ -1113,15 +1218,26 @@ export function nextWakeLabel(
             </div>
           }
 
-          @if (postState() !== 'vacant' && digest().length) {
-            <div class="officer-digest" data-testid="officer-digest">
-              <div class="officer-digest-title">{{ 'officerCard.digest.title' | transloco }}</div>
-              @for (d of digest(); track $index) {
-                <div class="officer-digest-item">
-                  <span class="dim">{{ d.at | date: 'short' }}</span>
-                  <strong>{{ d.subject }}</strong>
-                  <span>{{ d.message }}</span>
-                </div>
+          @if (postState() !== 'vacant' && recentNotifications().length) {
+            <!-- The feed rows recorded about this officer's session (pages,
+                 runtime alerts) — the unified feed replaced his digest ring. -->
+            <div class="officer-recent" data-testid="officer-recent-notifications">
+              <div class="officer-recent-title">
+                {{ 'officerCard.recentNotifications.title' | transloco }}
+              </div>
+              @for (n of recentNotifications(); track n.id) {
+                <a
+                  class="officer-recent-item"
+                  [routerLink]="['/inbox']"
+                  [queryParams]="{ n: n.id }"
+                  data-testid="officer-recent-item"
+                >
+                  <span class="dim">{{ n.created_at | date: 'short' }}</span>
+                  <span class="officer-recent-severity" [attr.data-severity]="n.severity">
+                    {{ 'notifications.severity.' + n.severity | transloco }}
+                  </span>
+                  <span class="officer-recent-subject" [class.dim]="!!n.resolved_at">{{ n.subject }}</span>
+                </a>
               }
             </div>
           }
@@ -1320,22 +1436,40 @@ export function nextWakeLabel(
         font-family: var(--font-mono, monospace);
         font-size: 12px;
       }
-      .officer-digest {
+      .officer-recent {
         display: flex;
         flex-direction: column;
         gap: 6px;
       }
-      .officer-digest-title {
+      .officer-recent-title {
         font-size: 12px;
         color: var(--text-tertiary);
         text-transform: uppercase;
         letter-spacing: 0.4px;
       }
-      .officer-digest-item {
+      .officer-recent-item {
         display: flex;
         gap: 8px;
+        align-items: baseline;
         font-size: 13px;
         flex-wrap: wrap;
+        color: var(--text-primary);
+        text-decoration: none;
+      }
+      .officer-recent-item:hover .officer-recent-subject {
+        text-decoration: underline;
+      }
+      .officer-recent-severity {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+        color: var(--text-secondary);
+      }
+      .officer-recent-severity[data-severity='high'] {
+        color: var(--warning);
+      }
+      .officer-recent-severity[data-severity='critical'] {
+        color: var(--danger);
       }
       .officer-slot-row {
         display: flex;
@@ -1368,6 +1502,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   private readonly http = inject(HttpClient);
   private readonly api = inject(ApiService);
+  private readonly notificationFeed = inject(NotificationService);
   private readonly router = inject(Router);
   private readonly modelService = inject(ModelService);
   private readonly transloco = inject(TranslocoService);
@@ -1389,6 +1524,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly decommissionWarning = signal<OfficerDecommissionResult | null>(null);
   readonly holdArmed = signal(false);
   readonly holdNote = signal('');
+  readonly autoPullArmed = signal(false);
 
   // The kit editor — one set of drafts, every state. Seeded from the post on
   // state transitions only (editorSeedKey), so the 15s poll never clobbers
@@ -1399,11 +1535,12 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   // his workers run on — the classic mistake is arming the troops and leaving
   // the commander on the account default).
   readonly fBrainModel = signal('');
+  readonly fAutoPull = signal(false);
+  readonly fWorkerSpendCeiling = signal('');
   readonly fReasoning = signal('');
   readonly fSleepMin = signal('');
   readonly fSleepMax = signal('');
   readonly fTokenCeiling = signal('');
-  readonly fMaxPages = signal('');
   readonly fMaxActions = signal('');
   readonly fMaxWorkers = signal('');
 
@@ -1416,6 +1553,9 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly modelOptions = computed(() => this.modelService.models().flatMap((g) => g.models));
   readonly postState = computed<OfficerPostState>(() => postStateOf(this.post()));
   readonly canManage = computed(() => this.post()?.can_manage === true);
+  readonly autoPullEnableAvailable = computed(
+    () => this.post()?.backlog?.auto_pull_control?.enable_available === true,
+  );
   readonly recycleActive = computed(() => {
     const phase = this.post()?.runtime_lifecycle?.recycle_phase;
     return !!phase && !['idle', 'complete', 'cancelled'].includes(phase);
@@ -1425,7 +1565,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly wakeLabel = computed(() =>
     nextWakeLabel(this.post()?.officer?.next_wake_at ?? null, this.tr),
   );
-  readonly digest = computed(() => [...(this.post()?.officer?.digest ?? [])].reverse());
+  /** Feed rows about the officer's session, newest first (`source_kind=thread`). */
+  readonly recentNotifications = signal<Notification[]>([]);
   readonly kitRows = computed(() =>
     kitChips(this.post()?.kit, this.tr, this.post()?.backlog?.breakers, new Date()),
   );
@@ -1487,12 +1628,13 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   private readonly currentDraft = computed<OfficerEditorDraft>(() => ({
     slots: this.slotDrafts(),
+    autoPull: this.fAutoPull(),
+    workerSpendCeilingDaily: this.fWorkerSpendCeiling(),
     brainModel: this.fBrainModel(),
     reasoning: this.fReasoning(),
     sleepMin: this.fSleepMin(),
     sleepMax: this.fSleepMax(),
     tokenCeiling: this.fTokenCeiling(),
-    maxPages: this.fMaxPages(),
     maxActions: this.fMaxActions(),
     maxWorkers: this.fMaxWorkers(),
   }));
@@ -1560,8 +1702,12 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   private applyPost(p: OfficerPost | null): void {
     if (p) {
       const authorityChanged = this.post() !== null && this.post()?.can_manage !== p.can_manage;
-      if (authorityChanged) this.editorSeedKey = null;
+      if (authorityChanged) {
+        this.editorSeedKey = null;
+        this.autoPullArmed.set(false);
+      }
       this.post.set(p);
+      this.loadRecentNotifications(p.commissioned ? (p.officer?.thread_id ?? null) : null);
       const key = p.commissioned ? `c:${p.officer?.thread_id ?? ''}` : 'vacant';
       if (this.editorSeedKey !== key) {
         this.seedEditor(draftFromPost(p));
@@ -1574,14 +1720,28 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     this.loading.set(false);
   }
 
+  /** The last ten feed rows recorded about this officer's session. A
+   *  transport failure keeps the previous list (same rule as the post). */
+  private loadRecentNotifications(threadId: string | null): void {
+    if (!threadId) {
+      this.recentNotifications.set([]);
+      return;
+    }
+    this.notificationFeed.listBySource('thread', threadId, 10).subscribe((page) => {
+      if (page) this.recentNotifications.set(page.items ?? []);
+    });
+  }
+
   private seedEditor(draft: OfficerEditorDraft): void {
     this.slotDrafts.set(draft.slots);
+    this.fAutoPull.set(draft.autoPull);
+    this.fWorkerSpendCeiling.set(draft.workerSpendCeilingDaily);
+    this.autoPullArmed.set(false);
     this.fBrainModel.set(draft.brainModel);
     this.fReasoning.set(draft.reasoning);
     this.fSleepMin.set(draft.sleepMin);
     this.fSleepMax.set(draft.sleepMax);
     this.fTokenCeiling.set(draft.tokenCeiling);
-    this.fMaxPages.set(draft.maxPages);
     this.fMaxActions.set(draft.maxActions);
     this.fMaxWorkers.set(draft.maxWorkers);
   }
@@ -1594,6 +1754,35 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   toCount(value: string | null | undefined): number {
     const n = parseInt(value ?? '1', 10);
     return Number.isNaN(n) ? 1 : Math.min(20, Math.max(0, n));
+  }
+
+  toOptionalCeiling(value: string | null | undefined): number | null {
+    const trimmed = (value ?? '').trim();
+    if (!trimmed) return null;
+    const amount = Number(trimmed);
+    return Number.isFinite(amount) ? amount : null;
+  }
+
+  /** Enabling is a two-step money-spend acknowledgement; disabling is direct. */
+  requestAutoPullChange(enabled: boolean): void {
+    if (!this.canManage()) return;
+    if (!enabled) {
+      this.autoPullArmed.set(false);
+      this.fAutoPull.set(false);
+      return;
+    }
+    if (this.fAutoPull() || !this.autoPullEnableAvailable()) return;
+    this.autoPullArmed.set(true);
+  }
+
+  confirmAutoPull(): void {
+    if (!this.canManage() || !this.autoPullEnableAvailable()) return;
+    this.fAutoPull.set(true);
+    this.autoPullArmed.set(false);
+  }
+
+  cancelAutoPull(): void {
+    this.autoPullArmed.set(false);
   }
 
   addSlot(): void {

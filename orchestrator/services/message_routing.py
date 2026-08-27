@@ -659,18 +659,49 @@ async def deliver_route_to_user(
             # Another replica owns the bounded delivery attempt. Its failure
             # or timeout leaves the route unstamped for the reconciler.
             return False
+        # Thread continuity: the escalation is an outbound row on the SAME
+        # thread, so the cockpit shows it and an emailed reply (In-Reply-To
+        # of this message id) routes back to the same thread → same resume.
+        # Logged BEFORE the notification so the (possibly deferred) mail can
+        # stamp its Message-ID onto this row.
+        log_row = None
         try:
-            dispatch = await notifier.dispatch(
-                user_id=str(job["user_id"]),
+            # notification-ledger: the thread's outbound record, not a feed write
+            log_row = await db.log_message(
                 job_id=str(route["job_id"]),
+                user_id=str(job["user_id"]),
+                thread_id=str(route["thread_id"]),
+                direction="outbound",
+                recipient_email=user.get("email"),
+                subject=subject,
+                message=body,
+                mode="async",
+                status="pending",
+                routing_generation=generation,
+                effective_audience="officer_and_user",
+            )
+        except Exception:
+            logger.warning(
+                "message routing: escalation log_message failed (non-fatal)",
+                exc_info=True,
+            )
+        try:
+            # An escalation means the automated tier already failed the
+            # user: `high`, so the mail goes now.
+            recorded = await notifier.record_agent_message(
+                user_id=str(job["user_id"]),
+                job=job,
+                job_id=str(route["job_id"]),
+                thread_id=str(route["thread_id"]),
+                sequence=None,
                 subject=subject,
                 message_md=body,
-                job_description=(job.get("description") or "")[:100],
-                config_name=str(job.get("config_name") or "worker_base"),
-                thread_id=str(route["thread_id"]),
-                recipient_email=user.get("email"),
-                recipient_name=user.get("display_name") or "User",
+                severity="high",
+                dedup_key=f"route_escalation:{route.get('route_id')}:{reason}",
+                message_log_id=(str(log_row["id"]) if log_row else None),
+                reason_line=reason,
             )
+            dispatch = recorded.as_dispatch()
         except Exception:
             await settle_delivery_attempt(
                 db,
@@ -681,29 +712,19 @@ async def deliver_route_to_user(
             )
             raise
         outcome = classify_dispatch(dispatch)
-        # Thread continuity: the escalation is an outbound row on the SAME
-        # thread, so the cockpit shows it and an emailed reply (In-Reply-To
-        # of this message id) routes back to the same thread → same resume.
-        try:
-            await db.log_message(
-                job_id=str(route["job_id"]),
-                user_id=str(job["user_id"]),
-                thread_id=str(route["thread_id"]),
-                direction="outbound",
-                recipient_email=user.get("email"),
-                subject=subject,
-                message=body,
-                mode="async",
-                status=outcome.log_status,
-                email_message_id=dispatch.get("email_message_id"),
-                routing_generation=generation,
-                effective_audience="officer_and_user",
-            )
-        except Exception:
-            logger.warning(
-                "message routing: escalation log_message failed (non-fatal)",
-                exc_info=True,
-            )
+        if log_row:
+            try:
+                await db.settle_outbound_message_log(
+                    str(log_row["id"]),
+                    accepted=outcome.accepted,
+                    error_message=outcome.detail,
+                    email_message_id=dispatch.get("email_message_id"),
+                )
+            except Exception:
+                logger.warning(
+                    "message routing: escalation ledger settle failed (non-fatal)",
+                    exc_info=True,
+                )
         # OC-06: only an ACCEPTED dispatch may stamp delivery. The
         # reconciler retries exactly while this stamp is null, so stamping a
         # failure is what stops the retry loop and strands the user's thread.

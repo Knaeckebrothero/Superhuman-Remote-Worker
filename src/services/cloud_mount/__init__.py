@@ -132,6 +132,17 @@ class RcloneMountError(RuntimeError):
     """Raised when a lazy cloud mount cannot be started."""
 
 
+class RcloneMountCleanFailure(RcloneMountError):
+    """Mount startup failed after exact stateless resident rollback.
+
+    This is deliberately narrower than :class:`RcloneMountError`.  It may be
+    used to degrade an *optional* stateless cloud mount because every mount
+    candidate was newly owned by this claimant and strict cleanup proved its
+    process and mount-table state absent.  Probe ambiguity, an adopted
+    predecessor resident, or a failed rollback never produces this type.
+    """
+
+
 @dataclass(frozen=True)
 class RcloneMountState:
     mount_id: str
@@ -581,6 +592,7 @@ echo "{_OK}"
 
         states: list[RcloneMountState] = []
         attempted_states: list[RcloneMountState] = []
+        adopted_states: list[RcloneMountState] = []
         mounts_by_id: dict[str, dict[str, Any]] = {}
         mount_index_by_id: dict[str, int] = {}
         try:
@@ -594,6 +606,8 @@ echo "{_OK}"
                     record_owned=attempted_states.append,
                 )
                 states.append(state)
+                if disposition == "adopted":
+                    adopted_states.append(state)
                 mounts_by_id[state.mount_id] = mount
                 mount_index_by_id[state.mount_id] = index
                 logger.info(
@@ -608,11 +622,33 @@ echo "{_OK}"
 
             if not self.cloud_cfg.get("skip_workspace_links"):
                 self._install_workspace_links(states)
-        except Exception:
-            self._rollback_start_sync(attempted_states)
+        except Exception as exc:
+            strict_stateless = bool(
+                getattr(self.workspace_backend, "claim_resource_fenced", False)
+            )
+            rollback_clean = self._rollback_start_sync(
+                attempted_states,
+                strict=strict_stateless,
+            )
             self._states = []
             self._mounts_by_id = {}
             self._mount_index_by_id = {}
+            # A typed degraded result is legal only when every requested mount
+            # crossed the new-generation ownership boundary and every one was
+            # then proven absent.  A failure before that point may hide an
+            # unknown predecessor resident; an adopted resident must remain
+            # available to the successor and therefore cannot be discarded as
+            # a clean optional-mount failure.
+            if (
+                strict_stateless
+                and rollback_clean
+                and not adopted_states
+                and len(attempted_states)
+                == len(list(self.cloud_cfg.get("mounts") or []))
+            ):
+                raise RcloneMountCleanFailure(
+                    "optional cloud mount is unavailable after exact resident cleanup"
+                ) from exc
             raise
 
         self._states = states
@@ -819,7 +855,7 @@ if [ "$_srw_spec" != {shlex.quote(state.resident_spec_digest)} ]; then
   exit 0
 fi
 {basic_check}
-if ! rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/refresh recursive=false >/dev/null 2>&1; then
+if ! timeout 10 rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/refresh recursive=false >/dev/null 2>&1; then
   printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
   exit 0
 fi
@@ -883,17 +919,30 @@ fi
             rc_pass=rc_pass,
         )
 
-    def _rollback_start_sync(self, states: list[RcloneMountState]) -> None:
-        """Best-effort reverse rollback after a partial mount startup."""
+    def _rollback_start_sync(
+        self,
+        states: list[RcloneMountState],
+        *,
+        strict: bool = False,
+    ) -> bool:
+        """Reverse partial startup and report whether exact cleanup succeeded.
+
+        Pinned sessions retain best-effort cleanup.  Stateless callers request
+        strict output validation because only that positive zero proof can
+        authorize optional-cloud degradation.
+        """
+
+        clean = True
         for state in reversed(states):
             try:
                 self._run_remote_script(
                     f"unmount_{state.remote_name}.sh",
                     self._unmount_script(state),
                     timeout=45,
-                    require_ok=False,
+                    require_ok=strict,
                 )
             except Exception:
+                clean = False
                 logger.warning(
                     "rclone partial-start rollback failed: thread=%s "
                     "mount_id=%s target=%s",
@@ -902,6 +951,7 @@ fi
                     state.target_path,
                     exc_info=True,
                 )
+        return clean
 
     def restart_mount(self, mount_id: str) -> None:
         """Unmount then remount ONE mount in place (ENOTCONN heal path).
@@ -1216,7 +1266,7 @@ chmod 600 {shlex.quote(state.config_path)}
 if [ -s {shlex.quote(default_ignore_file)} ]; then
   compile_cloudignore {shlex.quote(default_ignore_file)} {shlex.quote(state.filter_path)}
 fi
-if rclone --config {shlex.quote(state.config_path)} cat {shlex.quote(cloudignore_ref)} > {shlex.quote(state.state_dir + "/cloudignore.raw")} 2>/dev/null; then
+if timeout 15 rclone --config {shlex.quote(state.config_path)} cat {shlex.quote(cloudignore_ref)} > {shlex.quote(state.state_dir + "/cloudignore.raw")} 2>/dev/null; then
   compile_cloudignore {shlex.quote(state.state_dir + "/cloudignore.raw")} {shlex.quote(state.filter_path)}
 fi
 sort -u {shlex.quote(state.filter_path)} -o {shlex.quote(state.filter_path)}
@@ -1366,8 +1416,28 @@ _srw_mount_present() {{
     mountpoint -q "$target"
   fi
 }}
+_srw_any_exact_process() {{
+  for _srw_cmdline in /proc/[0-9]*/cmdline; do
+    if [ ! -r "$_srw_cmdline" ]; then
+      _srw_proc=${{_srw_cmdline%/cmdline}}
+      [ ! -e "$_srw_proc" ] && continue
+      _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+      [ "$_srw_uid" = "$(id -u)" ] && exit 86
+      continue
+    fi
+    _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+    [ "$(basename "$(printf '%s\n' "$_srw_args" | head -n1)")" = rclone ] || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- mount || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- {shlex.quote(state.config_path)} || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$target" || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- {shlex.quote(state.rc_addr)} || continue
+    return 0
+  done
+  return 1
+}}
 if [ ! -f "$identity" ]; then
   _srw_mount_present && exit 87
+  ! _srw_any_exact_process || exit 85
   rm -f -- {shlex.quote(state.pid_file)} {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
   echo "{_OK}"
   exit 0
@@ -1384,7 +1454,8 @@ if [ "$_srw_pid" = 0 ] && [ -s {shlex.quote(state.pid_file)} ]; then
   _srw_pid=$(cat {shlex.quote(state.pid_file)})
 fi
 printf %s "$_srw_pid" | grep -Eq '^[1-9][0-9]*$' || {{
-  mountpoint -q "$target" && exit 85
+  _srw_mount_present && exit 85
+  ! _srw_any_exact_process || exit 85
   rm -f -- "$identity" {shlex.quote(state.pid_file)}
   echo "{_OK}"
   exit 0
@@ -1434,6 +1505,7 @@ for _srw_i in $(seq 1 20); do
   sleep 0.1
 done
 [ "$_srw_target_ready" = yes ] || exit 88
+! _srw_any_exact_process || exit 85
 rm -f -- "$identity" {shlex.quote(state.pid_file)} {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
 echo "{_OK}"
 """
@@ -1721,14 +1793,13 @@ echo "{_OK}"
         )
         self.workspace_backend.write_home_file(rel_path, script)
         script_path = self.workspace_backend.resolve_home_path(rel_path)
-        command = (
-            f"chmod 700 {shlex.quote(script_path)} && "
-            f"bash {shlex.quote(script_path)}; "
-            f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
+        command, outer_timeout = self._bounded_remote_script_command(
+            script_path,
+            timeout=timeout,
         )
         output = self._exec_resource(
             command,
-            timeout=timeout,
+            timeout=outer_timeout,
             operation=f"run rclone script {name}",
         )
         if require_ok and _OK not in output:
@@ -1751,10 +1822,9 @@ echo "{_OK}"
         )
         self.workspace_backend.write_home_file(rel_path, script)
         script_path = self.workspace_backend.resolve_home_path(rel_path)
-        command = (
-            f"chmod 700 {shlex.quote(script_path)} && "
-            f"bash {shlex.quote(script_path)}; "
-            f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
+        command, outer_timeout = self._bounded_remote_script_command(
+            script_path,
+            timeout=timeout,
         )
         execute = getattr(self.workspace_backend, "exec_terminal_claim_resource", None)
         if not callable(execute):
@@ -1763,12 +1833,38 @@ echo "{_OK}"
             )
         output = execute(
             command,
-            timeout=timeout,
+            timeout=outer_timeout,
             operation=f"terminal rclone cleanup {name}",
         )
         if _OK not in output or _FAILED in output:
             raise RcloneMountError(output.strip() or "terminal rclone cleanup failed")
         return output
+
+    @staticmethod
+    def _bounded_remote_script_command(
+        script_path: str,
+        *,
+        timeout: int,
+    ) -> tuple[str, int]:
+        """Build a remote kill boundary that expires before SSH does.
+
+        Paramiko's channel timeout only closes the client-side channel; it
+        does not prove that the remote shell (or a child holding the durable
+        claim-resource flock) stopped. GNU ``timeout`` owns a remote process
+        group, sends TERM and then KILL. The extra 40 seconds cover
+        RemoteBackend's bounded 30-second flock acquisition plus cleanup and
+        transport margin.
+        """
+
+        script_timeout = max(1, int(timeout))
+        outer_timeout = script_timeout + 40
+        command = (
+            f"chmod 700 {shlex.quote(script_path)} && "
+            "timeout --signal=TERM --kill-after=5s "
+            f"{script_timeout}s bash {shlex.quote(script_path)}; "
+            f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
+        )
+        return command, outer_timeout
 
     def _exec_resource(
         self,
@@ -1913,6 +2009,7 @@ def _coerce_ignore_lines(value: Any) -> list[str]:
 __all__ = [
     "RcloneCacheUsage",
     "RcloneMountError",
+    "RcloneMountCleanFailure",
     "RcloneMountManager",
     "RcloneMountState",
 ]

@@ -318,7 +318,7 @@ class PersistentSession:
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
     # Raw datasource payloads (orchestrator-shaped dicts) currently attached —
-    # the diff baseline + datasources.md input for live datasource changes
+    # the diff baseline + README.md facts-block input for live datasource changes
     # (live_session_settings.md Slice B). Set at attach; replaced by
     # resetup_datasources().
     datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
@@ -755,6 +755,10 @@ class PersistentSession:
                         "retry_timeouts_as_booting", False
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
+                    # Current pinned attaches also carry the provisioner-owned
+                    # backing/runtime pair.  Shell fencing remains stateless-
+                    # only, but managed-repository receipts use this pair to
+                    # distinguish a remounted PVC from same-runtime PID reuse.
                     workspace_generation=(
                         workspace_generation if physical_identity_required else None
                     ),
@@ -975,9 +979,11 @@ class PersistentSession:
         prior agent may have left workspace-side rclone/overlay processes for
         this thread, and using the workspace before the new claimant has
         adopted or healed them would expose stale credentials or a dead FUSE
-        mount.  ``RcloneMountManager.start_all`` therefore includes the first
-        real directory probe and this method propagates failures for stateless
-        claims so :meth:`setup` stops before shell/tool construction.
+        mount. ``RcloneMountManager.start_all`` therefore includes the first
+        real directory probe and this method propagates ambiguous failures for
+        stateless claims so :meth:`setup` stops before shell/tool construction.
+        An ordinary non-protected mount may degrade only after the manager
+        proves exact rollback of every newly-owned resident.
         """
         self._protected_cloud_health_ready = False
         if self.protected_cloud_required and not self._protected_cloud_config_valid(
@@ -1011,9 +1017,12 @@ class PersistentSession:
                     "cloud mount requires an attached workspace"
                 )
             return
-        try:
-            from src.services.cloud_mount import RcloneMountManager
+        from src.services.cloud_mount import (
+            RcloneMountCleanFailure,
+            RcloneMountManager,
+        )
 
+        try:
             self.cloud_mount_manager = RcloneMountManager(
                 thread_id=self.thread_id,
                 cloud_cfg=cloud_mount_cfg,
@@ -1029,7 +1038,26 @@ class PersistentSession:
             self.cloud_mount_error = str(e)
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
-            if self.shell_owner_token is not None or self.protected_cloud_required:
+            if self.shell_owner_token is not None:
+                # A stateless workspace normally fails closed because an
+                # attach error may conceal an old resident/FUSE mount.  The
+                # manager emits this subtype only after strict, exact cleanup
+                # of every newly-owned resident. Optional ordinary cloud can
+                # then degrade without blocking unrelated repository/shell
+                # work. Protected cloud never degrades.
+                if (
+                    isinstance(e, RcloneMountCleanFailure)
+                    and cloud_mount_cfg.get("required") is False
+                    and not bool(cloud_mount_cfg.get("protected"))
+                ):
+                    logger.warning(
+                        "Stateless optional cloud mount degraded after exact "
+                        "resident cleanup: %s",
+                        e,
+                    )
+                    return
+                raise
+            if self.protected_cloud_required:
                 raise
             return
 
@@ -2549,7 +2577,7 @@ class PersistentSession:
         tool categories directly to ``config.tools`` (the validated session
         tools override's closed vocabulary silently drops sql/graph/mongodb/
         webdav, so they must never ride ``config.update``), clones added
-        repositories, rewrites the datasources.md index, and re-derives +
+        repositories, rewrites the README.md workspace-facts block, and re-derives +
         rebinds the toolset — which also rebuilds the system prompt for the
         per-turn ``messages[0]`` refresh (P0.1).
 
@@ -2585,7 +2613,7 @@ class PersistentSession:
         from ..core.datasource_setup import (
             clone_repository_datasources,
             datasource_tool_categories,
-            inject_datasource_index,
+            inject_workspace_facts,
             process_datasources,
             resolve_repo_clone_names,
         )
@@ -2674,13 +2702,17 @@ class PersistentSession:
         self._refresh_runtime_facts()
 
         if self.workspace_manager:
-            # inject_datasource_index rewrites (cuts the previous section), so
+            # inject_workspace_facts replaces the marked README.md block, so
             # connection names stay truthful for the next turn — including the
-            # explicit "no datasources" state after a remove-all.
+            # explicit "no connectors" state after a remove-all.
             try:
-                inject_datasource_index(new_configs, self.workspace_manager)
+                inject_workspace_facts(
+                    new_configs,
+                    self.workspace_manager,
+                    expert=getattr(self.config, "display_name", None),
+                )
             except Exception as e:
-                logger.warning("Failed to rewrite datasource index: %s", e)
+                logger.warning("Failed to rewrite workspace facts: %s", e)
 
         self.resetup_tools_for_backend()
 

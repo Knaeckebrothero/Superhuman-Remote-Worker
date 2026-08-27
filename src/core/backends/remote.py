@@ -616,6 +616,20 @@ class RemoteBackend(WorkspaceBackend):
     def supports_shell(self) -> bool:
         return True
 
+    @property
+    def managed_repository_runtime_authority(self) -> tuple[str, str] | None:
+        """Return the server-attested backing/runtime tuple when available.
+
+        The managed-repository receipt also records a local PID-namespace
+        incarnation, so legacy pinned lanes remain safe.  Supplying this tuple
+        strengthens stateless and current persistent attaches by making an
+        authority-generation mismatch an explicit replacement boundary.
+        """
+
+        if self._workspace_generation is None or self._runtime_incarnation is None:
+            return None
+        return self._workspace_generation, self._runtime_incarnation
+
     def set_shell_owner_token(self, lease_token: Optional[int]) -> None:
         """Bind future tmux mutations to a monotonic queue lease token.
 
@@ -648,12 +662,16 @@ class RemoteBackend(WorkspaceBackend):
             self._shell_protocol_current = False
 
     def retire_shell_owner(self) -> None:
-        """Stop all further shell I/O from this backend instance."""
+        """Stop shell I/O while retaining the claim-resource generation.
+
+        Resident cleanup deliberately runs after shell admission closes.  Its
+        independent token/generation fence still needs the exact established
+        shell generation until :meth:`retire` closes the whole backend.
+        """
         with self._shell_io_lock:
             self._shell_retired = True
             self._shell_initialized = False
             self._tabs.clear()
-            self._shell_generation = None
             self._shell_protocol_current = False
 
     def make_terminal_shell_cleanup_capability(self) -> Callable[[], None]:
@@ -1134,6 +1152,47 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     f"Claim-fenced {operation} failed with exit code {exit_code}"
                 )
             return output
+
+    def execute_claim_resource_with_secret_stdin(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int = 30,
+        operation: str = "workspace secret resource mutation",
+    ) -> bool:
+        """Run trusted secret stdin under the exact stateless claim fence.
+
+        Managed repository setup cannot use tmux because private key bytes may
+        never enter scrollback or argv. This is the secret-stdin counterpart to
+        :meth:`exec_claim_resource`: it holds the same local admission lock and
+        wraps the remote command in the same token/generation flock before the
+        private channel receives any bytes.
+        """
+
+        del operation  # retained for call-site audit symmetry
+        if self._shell_owner_token is None:
+            return self.execute_with_secret_stdin(command, secret, timeout=timeout)
+        with self._claim_resource_io_lock:
+            if self._claim_resource_retired:
+                raise WorkspaceUnavailableError(
+                    "Workspace claim-resource owner has been retired from this backend"
+                )
+            process_tag = (
+                self._stateless_process_env_export()
+                if self.workspace_incarnation_fenced
+                else ""
+            )
+            inner = (
+                self._stateless_tmux_fence_shell()
+                + (process_tag + "\n" if process_tag else "")
+                + command
+            )
+            return self.execute_with_secret_stdin(
+                self._tmux_lock_command(inner, shell="bash"),
+                secret,
+                timeout=timeout,
+            )
 
     def exec_terminal_claim_resource(
         self,

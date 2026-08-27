@@ -1144,12 +1144,14 @@ async def test_stateless_virtual_workspace_exact_backing_exposes_generation():
 async def test_none_agent_cloud_suppression_is_stateless_only(
     monkeypatch, stateless: bool, expects_sync: bool
 ):
-    """Pinned ScratchBackend keeps the pre-S2 legacy sync construction path."""
+    """Pinned ScratchBackend keeps its sync and pinned-inbox attach paths."""
 
     if stateless:
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
     else:
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+
+    postgres = MagicMock(name="non_null_pool_connection")
 
     class FakeSession:
         def __init__(self, *args, **kwargs):
@@ -1162,10 +1164,13 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             )
             self.workspace_sync = None
             self.cloud_sync_workspace_generation = ""
-            self.postgres_conn = None
+            self.postgres_conn = postgres
             self.tool_context = None
 
         async def setup(self, **kwargs):
+            return None
+
+        async def cleanup(self, **kwargs):
             return None
 
     cloud_sync = {"backend": "nextcloud", "webdav_url": "http://historical"}
@@ -1178,14 +1183,15 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         "datasources": None,
     }
     client = SimpleNamespace(
-        get_thread_workspace=AsyncMock(return_value=workspace_payload)
+        get_thread_workspace=AsyncMock(return_value=workspace_payload),
+        agent_id=None,
     )
     agent = SimpleNamespace(
         config=SimpleNamespace(workspace=SimpleNamespace(backend="none")),
         _tactical_llm=None,
         _llm=object(),
         _auxiliary_llm=None,
-        postgres_conn=None,
+        postgres_conn=postgres,
         vector_conn=None,
     )
     workspace_sync = MagicMock()
@@ -1204,14 +1210,28 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             papp, "_build_sync_coordinator", return_value=workspace_sync
         ) as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
+        patch.object(
+            papp,
+            "_reclaim_pending_pinned_inputs",
+            AsyncMock(return_value=set()),
+        ) as reclaim_pinned,
+        patch.object(
+            papp, "_resolve_event_journal_epoch", AsyncMock(return_value=(1, 0))
+        ),
+        patch.object(papp, "_OrderedPersistentEventWriter") as writer_cls,
         patch.object(papp, "_update_thread_status", AsyncMock()),
         patch.object(papp, "_start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
         patch.object(papp, "_apply_session_embedding_env"),
     ):
+        lease_reset = None
         try:
+            if stateless:
+                _, lease_reset = _install_lease()
             await papp._attach_session(THREAD_ID, config_override={})
         finally:
+            if lease_reset is not None:
+                current_lease.reset(lease_reset)
             papp._session = None
             papp._thread_id = None
 
@@ -1222,6 +1242,11 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
     else:
         build_sync.assert_not_called()
         workspace_sync.pull_all.assert_not_awaited()
+    if stateless:
+        reclaim_pinned.assert_not_awaited()
+    else:
+        reclaim_pinned.assert_awaited_once_with()
+    writer_cls.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -241,226 +241,107 @@ class TestConsumeMagicLink:
 # IN-set that absorbed the probe's responsibilities.
 
 
-class TestThreadRateLimited:
-    @pytest.mark.asyncio
-    async def test_under_both_limits_returns_false(self):
-        db = _make_db()
-        # Two fetchvals: 5-min count, 60-min count. Sequence via side_effect.
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
-        assert await hn.thread_rate_limited(db, "t") is False
-
-    @pytest.mark.asyncio
-    async def test_over_5min_limit_returns_true(self):
-        db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[5, 5])
-        assert await hn.thread_rate_limited(db, "t") is True
-
-    @pytest.mark.asyncio
-    async def test_over_hour_limit_returns_true(self):
-        db = _make_db()
-        # Under 5min limit, but at hour limit.
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 10])
-        assert await hn.thread_rate_limited(db, "t") is True
-
-
 # ---------------------------------------------------------------------------
-# Section 3 — send_permission_pending_email orchestration
+# Section 3 — record_permission_pending (the feed row with the magic links)
 # ---------------------------------------------------------------------------
 
 
-def _email_service_mock(*, is_configured=True, send_returns=True):
-    es = MagicMock()
-    es.is_configured = is_configured
-    es.cockpit_url = "http://cockpit"
-    es._send = AsyncMock(return_value=send_returns)
-    return es
+class _Recorded:
+    def __init__(self, inserted=True):
+        self.notification_id = "n-1"
+        self.inserted = inserted
+        self.deliveries = {"in_app": True}
 
 
-class TestSendPermissionPendingEmail:
+class TestRecordPermissionPending:
+    def _row(self, **overrides):
+        row = {
+            "id": "a",
+            "thread_id": "t",
+            "tool_name": "run_command",
+            "tool_args": {"cmd": "ls"},
+            "requested_at": datetime.now(timezone.utc) - timedelta(minutes=3),
+            "user_id": "u",
+            "title": "Nightly build",
+        }
+        row.update(overrides)
+        return row
+
     @pytest.mark.asyncio
-    async def test_skips_when_rate_limited(self):
+    async def test_records_a_high_row_with_both_magic_links(self, monkeypatch):
+        db = _make_db(execute="INSERT 0 1")
+        tokens = iter(["approve-tok", "deny-tok"])
+
+        async def _gen(db_, **kw):
+            return next(tokens), "hashed"
+
+        monkeypatch.setattr(hn, "generate_magic_link_token", _gen)
+        notifier = MagicMock()
+        notifier.record = AsyncMock(return_value=_Recorded())
+
+        result = await hn.record_permission_pending(
+            db, notifier, row=self._row(), cockpit_external_url="http://x/"
+        )
+        assert result == {"status": "recorded", "notification_id": "n-1"}
+        kw = notifier.record.await_args.kwargs
+        assert kw["recipient_id"] == "u"
+        assert kw["category"] == "session_permission"
+        assert kw["dedup_key"] == "session_permission:a"
+        assert (kw["source_kind"], kw["source_id"]) == ("permission_request", "a")
+        assert kw["action_params"] == {"thread_id": "t", "request_id": "a"}
+        assert kw["subject"] == "Approval needed: run_command"
+        body = kw["body"]
+        assert "Approve: http://x/magic/approve/approve-tok" in body
+        assert "Deny: http://x/magic/approve/deny-tok" in body
+        assert "http://x/sessions/t" in body
+        assert "Nightly build" in body and "3 min ago" in body
+        assert '"cmd": "ls"' in body
+        assert kw["payload"]["tool_name"] == "run_command"
+        assert kw["payload"]["request_id"] == "a"
+
+    @pytest.mark.asyncio
+    async def test_replay_reports_replayed(self, monkeypatch):
         db = _make_db()
-        # Sequence: 5min-count → 10 (over), 60min-count → 10 (over).
-        db._fake_conn.fetchval = AsyncMock(side_effect=[10, 10])
-        es = _email_service_mock()
-        result = await hn.send_permission_pending_email(
+
+        async def _gen(db_, **kw):
+            return "tok", "hashed"
+
+        monkeypatch.setattr(hn, "generate_magic_link_token", _gen)
+        notifier = MagicMock()
+        notifier.record = AsyncMock(return_value=_Recorded(inserted=False))
+        result = await hn.record_permission_pending(
+            db, notifier, row=self._row(), cockpit_external_url="http://x"
+        )
+        assert result["status"] == "replayed"
+
+    @pytest.mark.asyncio
+    async def test_no_owner_means_nobody_to_notify(self):
+        db = _make_db()
+        notifier = MagicMock()
+        notifier.record = AsyncMock()
+        result = await hn.record_permission_pending(
+            db, notifier, row=self._row(user_id=None), cockpit_external_url="http://x"
+        )
+        assert result == {"status": "skipped_no_owner"}
+        notifier.record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_string_tool_args_are_parsed_for_the_preview(self, monkeypatch):
+        db = _make_db()
+
+        async def _gen(db_, **kw):
+            return "tok", "hashed"
+
+        monkeypatch.setattr(hn, "generate_magic_link_token", _gen)
+        notifier = MagicMock()
+        notifier.record = AsyncMock(return_value=_Recorded())
+        await hn.record_permission_pending(
             db,
-            es,
-            thread_id="t",
-            approval_id="a",
+            notifier,
+            row=self._row(tool_args='{"path": "/etc"}'),
             cockpit_external_url="http://x",
         )
-        assert result == {"status": "skipped_rate_limit"}
-        es._send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_full_send_path(self):
-        """Happy path: dedup ok, rate ok, user has email, SMTP works."""
-        thread_row = {
-            "id": "t",
-            "user_id": "user-uuid",
-            "title": "My session",
-        }
-        permission_row = {
-            "id": "a",
-            "tool_name": "run_command",
-            "tool_args": '{"cmd": "ls"}',
-            "requested_at": datetime.now(timezone.utc) - timedelta(minutes=2),
-            "status": "pending",
-        }
-        user_row = {
-            "id": "user-uuid",
-            "email": "user@example.com",
-            "display_name": "Alice",
-        }
-
-        # Sequencing — order matters:
-        #   thread_rate_limited (fetchval x2)    → 0, 0
-        #   thread row (fetchrow)                → thread_row
-        #   permission row (fetchrow)            → permission_row
-        #   user row (fetchrow)                  → user_row
-        #   generate_magic_link_token x2 (fetchval) → "tok-row-1", "tok-row-2"
-        #   claim_sent_notification (fetchrow)   → {"id": 1}  (wins the slot)
-        db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(
-            side_effect=[
-                0,  # rate_limited 5min
-                0,  # rate_limited 60min
-                "tok-row-1",  # generate_magic_link_token approve
-                "tok-row-2",  # generate_magic_link_token deny
-            ]
-        )
-        db._fake_conn.fetchrow = AsyncMock(
-            side_effect=[thread_row, permission_row, user_row, {"id": 1}]
-        )
-        db._fake_conn.execute = AsyncMock()
-
-        es = _email_service_mock(send_returns=True)
-        result = await hn.send_permission_pending_email(
-            db,
-            es,
-            thread_id="t",
-            approval_id="a",
-            cockpit_external_url="http://cockpit",
-        )
-        assert result["status"] == "sent"
-        assert result["email_to"] == "user@example.com"
-        # _send was called with the user's address.
-        send_kwargs = es._send.await_args.kwargs
-        assert send_kwargs["to"] == "user@example.com"
-        assert "run_command" in send_kwargs["subject"]
-        assert "approve" in send_kwargs["body_html"].lower()
-        # The 'sent' slot was claimed BEFORE sending (claim_sent_notification,
-        # INSERT ... RETURNING id via fetchrow — not execute). The claim is the
-        # 4th and final fetchrow on the happy path.
-        assert db._fake_conn.fetchrow.await_count == 4
-        claim_sql = db._fake_conn.fetchrow.await_args.args[0]
-        assert "INSERT INTO thread_notifications" in claim_sql
-        assert "delivery_status = 'sent'" in claim_sql
-        # Claim won → send succeeded → we never downgrade, so execute (only used
-        # by downgrade_sent_claim) stays untouched on the happy path.
-        db._fake_conn.execute.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skips_when_user_has_no_email(self):
-        thread_row = {"id": "t", "user_id": "user-uuid", "title": "x"}
-        permission_row = {
-            "id": "a",
-            "tool_name": "run_command",
-            "tool_args": "{}",
-            "requested_at": datetime.now(timezone.utc),
-            "status": "pending",
-        }
-        user_row = {"id": "user-uuid", "email": None, "display_name": "Alice"}
-
-        db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
-        db._fake_conn.fetchrow = AsyncMock(
-            side_effect=[thread_row, permission_row, user_row]
-        )
-        db._fake_conn.execute = AsyncMock()
-
-        es = _email_service_mock()
-        result = await hn.send_permission_pending_email(
-            db,
-            es,
-            thread_id="t",
-            approval_id="a",
-            cockpit_external_url="http://cockpit",
-        )
-        assert result == {"status": "skipped_no_email"}
-        es._send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skips_when_smtp_unconfigured(self):
-        thread_row = {"id": "t", "user_id": "user-uuid", "title": "x"}
-        permission_row = {
-            "id": "a",
-            "tool_name": "run_command",
-            "tool_args": "{}",
-            "requested_at": datetime.now(timezone.utc),
-            "status": "pending",
-        }
-        user_row = {
-            "id": "user-uuid",
-            "email": "user@example.com",
-            "display_name": "Alice",
-        }
-
-        db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
-        db._fake_conn.fetchrow = AsyncMock(
-            side_effect=[thread_row, permission_row, user_row]
-        )
-        db._fake_conn.execute = AsyncMock()
-
-        es = _email_service_mock(is_configured=False)
-        result = await hn.send_permission_pending_email(
-            db,
-            es,
-            thread_id="t",
-            approval_id="a",
-            cockpit_external_url="http://cockpit",
-        )
-        assert result == {"status": "skipped_smtp"}
-        es._send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skips_when_request_already_resolved(self):
-        thread_row = {"id": "t", "user_id": "user-uuid", "title": "x"}
-        permission_row = {
-            "id": "a",
-            "tool_name": "run_command",
-            "tool_args": "{}",
-            "requested_at": datetime.now(timezone.utc),
-            "status": "approved",  # already resolved
-        }
-        db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
-        db._fake_conn.fetchrow = AsyncMock(side_effect=[thread_row, permission_row])
-        db._fake_conn.execute = AsyncMock()
-        es = _email_service_mock()
-        result = await hn.send_permission_pending_email(
-            db,
-            es,
-            thread_id="t",
-            approval_id="a",
-            cockpit_external_url="http://cockpit",
-        )
-        assert result["status"] == "skipped_already_resolved"
-        es._send.assert_not_called()
-        # The race must be recorded in thread_notifications so the
-        # sweeper's widened IN-set can suppress re-dispatch.
-        assert db._fake_conn.execute.await_count >= 1
-        recorded_sql = db._fake_conn.execute.await_args.args[0]
-        assert "INSERT INTO thread_notifications" in recorded_sql
-        bound = db._fake_conn.execute.await_args.args
-        assert "skipped_already_resolved" in bound
-
-
-# ---------------------------------------------------------------------------
-# Section 4 — Magic-link URL composition
-# ---------------------------------------------------------------------------
+        assert '"path": "/etc"' in notifier.record.await_args.kwargs["body"]
 
 
 class TestBuildMagicLinkUrl:
@@ -478,32 +359,6 @@ class TestBuildMagicLinkUrl:
         url = hn._build_magic_link_url("http://x///", "tok")
         assert url.startswith("http://x/magic/approve/")
         assert "////" not in url
-
-
-class TestBuildPermissionEmailBodies:
-    def test_returns_text_and_html(self):
-        text, html = hn._build_permission_email_bodies(
-            tool_name="run_command",
-            tool_args_preview='{"cmd": "ls"}',
-            approve_url="http://x/magic/approve/T1",
-            deny_url="http://x/magic/approve/T2",
-            cockpit_link="http://x/sessions/abc",
-            request_age_minutes=3,
-        )
-        # Both bodies mention the tool and the links.
-        assert "run_command" in text
-        assert "run_command" in html
-        assert "http://x/magic/approve/T1" in text
-        assert "http://x/magic/approve/T1" in html
-        assert "http://x/magic/approve/T2" in text
-        assert "http://x/magic/approve/T2" in html
-        # HTML escapes the args content.
-        assert "&quot;" in html or "{&quot;cmd" in html or '"cmd"' in html
-
-
-# ---------------------------------------------------------------------------
-# Section 5 — _truncate_args_for_email
-# ---------------------------------------------------------------------------
 
 
 class TestTruncateArgsForEmail:
@@ -540,7 +395,7 @@ class TestTruncateArgsForEmail:
 
 class TestPermissionNotifySweeperSQL:
     @pytest.mark.asyncio
-    async def test_dedup_filter_includes_permanent_skips_and_floor(self, monkeypatch):
+    async def test_selects_aged_pending_gates_without_a_feed_row(self, monkeypatch):
         import asyncio
 
         import orchestrator.main as orch_main
@@ -576,38 +431,14 @@ class TestPermissionNotifySweeperSQL:
         await orch_main.thread_permission_notify_sweeper(evt)
 
         q = captured.get("query", "")
-        # Permanent skips suppress forever.
-        assert "'skipped_no_email'" in q
-        assert "'skipped_already_resolved'" in q
-        # Transient skips have a recency floor.
-        assert "'skipped_rate_limit'" in q
-        assert "'skipped_smtp'" in q
-        assert "make_interval(secs => $2)" in q
-        # The recency-floor parameter is the second bind, expressed as
-        # int seconds = 2 × sweeper interval (default 30s → 60s).
+        # Only gates still pending and older than the age threshold …
+        assert "r.status = 'pending'" in q
+        assert "$1::int * interval '1 second'" in q
+        # … that have no feed row yet (the row is the dedup; tokens are
+        # minted once). The thread join supplies the recipient.
+        assert "n.source_kind = 'permission_request'" in q
+        assert "n.source_id = r.id::text" in q
+        assert "JOIN threads t ON t.id = r.thread_id" in q
+        assert "thread_notifications" not in q
         args = captured.get("args", ())
-        assert len(args) == 2
-        # Args is (age_threshold_str, recency_floor_secs).
-        assert isinstance(args[1], int)
-        assert args[1] >= 60
-
-
-def test_permission_email_uses_brand_palette_and_ghost_deny() -> None:
-    import re
-    from services import brand
-    from services import headless_notifications as hn
-
-    _text, html = hn._build_permission_email_bodies(
-        tool_name="run_command",
-        tool_args_preview='{"cmd": "ls"}',
-        approve_url="http://x/magic/approve/T1",
-        deny_url="http://x/magic/deny/T1",
-        cockpit_link="http://x/cockpit",
-        request_age_minutes=3,
-    )
-    assert "#1e1e2e" not in html and "#a6e3a1" not in html  # Catppuccin gone
-    assert brand.TRAVERTINE["panel-bg"] in html
-
-    deny_cell = re.search(r"<td[^>]*>\s*<a[^>]*>Deny</a>", html, re.S).group(0)
-    assert f"background-color:{brand.TRAVERTINE['panel-bg']}" in deny_cell
-    assert f"border:2px solid {brand.TRAVERTINE['danger']}" in deny_cell
+        assert args == (30,)  # HEADLESS_NOTIFY_AGE_S default

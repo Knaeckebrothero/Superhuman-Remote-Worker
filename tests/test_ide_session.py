@@ -1,7 +1,7 @@
 """Unit tests for IDE session restore routing and container clone behavior."""
 
 import logging
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -320,6 +320,87 @@ async def test_gitea_clone_chain_is_idempotent(service_factory):
     assert "IdentitiesOnly" not in clone_cmd
     assert bytes(secret) == b"private-material"
     assert "private_key" not in payload
+    assert clone_cmd.index("flock -x 9") < clone_cmd.index(
+        "Host srw-repo-2fd83ae5f72c41dbae1802e69d598aef"
+    )
+    assert clone_cmd.index("present") < clone_cmd.index(
+        "Host srw-repo-2fd83ae5f72c41dbae1802e69d598aef"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_ide_delivers_repository_key_to_immutable_container_id(
+    service_factory,
+):
+    """A mutable container name is only an assertion, never a key target."""
+
+    svc = service_factory
+    container_id = "a" * 64
+    process = MagicMock(returncode=0)
+    process.communicate = AsyncMock(return_value=(container_id.encode(), b""))
+    svc._find_free_port = AsyncMock(return_value=38080)
+    svc._detect_container_runtime = AsyncMock(return_value="podman")
+    svc._inspect_container_id = AsyncMock(return_value=container_id)
+    svc._managed_repository_payload = AsyncMock(return_value={"private_key": "x"})
+    private_key = bytearray(b"private-key")
+    svc._managed_git_command = MagicMock(return_value=("git-command", private_key))
+    svc._run_secret_stdin_process = AsyncMock(return_value=True)
+    svc._wait_for_code_server = AsyncMock(return_value=True)
+
+    with patch(
+        "orchestrator.services.ide_session.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
+    ):
+        assert await svc._restore_local_ide_container(
+            "job-immutable-id", "demo/repo", "main"
+        )
+
+    container_name = "srw-ide-job-immutabl"
+    svc._inspect_container_id.assert_awaited_once_with("podman", container_name)
+    command, delivered_key = svc._run_secret_stdin_process.await_args.args
+    assert command[:4] == ["podman", "exec", "-i", container_id]
+    assert container_name not in command
+    assert delivered_key is private_key
+    assert any(
+        call.args[1] == {"container_id": container_id}
+        for call in svc._db.merge_ide_session_context.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_ide_refuses_name_replacement_before_loading_repository_key(
+    service_factory,
+):
+    """A same-name replacement cannot receive the predecessor's private key."""
+
+    svc = service_factory
+    container_id = "a" * 64
+    replacement_id = "b" * 64
+    process = MagicMock(returncode=0)
+    process.communicate = AsyncMock(return_value=(container_id.encode(), b""))
+    svc._find_free_port = AsyncMock(return_value=38080)
+    svc._detect_container_runtime = AsyncMock(return_value="podman")
+    svc._inspect_container_id = AsyncMock(return_value=replacement_id)
+    svc._managed_repository_payload = AsyncMock()
+    svc._run_secret_stdin_process = AsyncMock()
+    svc._delete_ide_container = AsyncMock(return_value=False)
+
+    with patch(
+        "orchestrator.services.ide_session.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
+    ):
+        assert not await svc._restore_local_ide_container(
+            "job-replaced-id", "demo/repo", "main"
+        )
+
+    svc._managed_repository_payload.assert_not_awaited()
+    svc._run_secret_stdin_process.assert_not_awaited()
+    svc._delete_ide_container.assert_awaited_once_with(
+        "job-replaced-id",
+        "srw-ide-job-replaced",
+        "container",
+        expected_container_id=container_id,
+    )
 
 
 @pytest.mark.asyncio

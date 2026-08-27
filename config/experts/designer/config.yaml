@@ -28,7 +28,6 @@ workspace:
     - design_spec/
     - reference/
     - output/
-    - repo/
   git_versioning: true
 
 instruction_files:

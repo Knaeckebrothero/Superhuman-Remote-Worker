@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from .kb_git_source import GiteaKnowledgeGitSource
+from src.shared.backlog_tags import READY_TAG, category_tag
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,55 @@ async def fetch_backlog(
         [dict(r) for r in rows],
         {int(r["priority"]): int(r["n"]) for r in count_rows},
     )
+
+
+async def fetch_ready_backlog_candidates(
+    vector_db: Any,
+    project_id: str,
+    categories: list[str],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Return one bounded, ordered candidate set for several Officer pools.
+
+    Ready-depth is an exact cross-store calculation: the vector database owns
+    ticket tags and ``ready_at``, while the app database owns claim and
+    materialization state.  Running :func:`fetch_backlog` once per roster slot
+    multiplies that whole calculation by the number of pools.  This query is
+    the vector half of the batched path.  It keeps the same active/note-type
+    predicates and complete deterministic order as ``fetch_backlog``, but uses
+    tag overlap so one statement covers every requested category.
+
+    ``limit`` is deliberately supplied by the control-plane caller as
+    ``truthful ceiling + 1``.  Seeing the extra row means the result is
+    incomplete and must be surfaced as unavailable; it must never be truncated
+    into a false depth.
+    """
+    category_tags = sorted(
+        {category_tag(category) for category in categories if category}
+    )
+    if not category_tags or limit <= 0:
+        return []
+    async with vector_db.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT note_id, note_type, title, priority, tags, ready_at,
+                   created_at
+              FROM knowledge_index
+             WHERE project_id = $1::uuid
+               AND status = 'active'
+               AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
+               AND tags @> $2::text[]
+               AND tags && $3::text[]
+             ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC
+             LIMIT $4
+            """,
+            project_id,
+            [READY_TAG],
+            category_tags,
+            int(limit),
+        )
+    return [dict(row) for row in rows]
 
 
 async def fetch_ticket_state(

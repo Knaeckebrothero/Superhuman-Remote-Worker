@@ -495,6 +495,7 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
     assert payload is not None
     assert payload["driver"] == "rclone"
     assert payload["fallback"] is True
+    assert payload["required"] is False
     assert len(payload["mounts"]) == 1
     mount = payload["mounts"][0]
     assert mount["mount_kind"] == "session_folder"
@@ -549,6 +550,7 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
 
     assert payload is not None
     assert payload["fallback"] is False
+    assert payload["required"] is False
     assert payload["mounts"][0]["mount_kind"] == "project_default"
     assert payload["mounts"][0]["target_path"] == "/cloud/home"
 
@@ -947,6 +949,7 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
     payload = _build_protected_cloud_mount(row, thread_id="thread-1")
     assert payload["driver"] == "rclone"
     assert payload["protected"] is True
+    assert payload["required"] is True
     # overlay layout obeys the snapshot placement rule (design §11.3)
     ov = payload["overlay"]
     assert ov["upper"].startswith("/home/agent-host/.overlay")
@@ -1096,6 +1099,7 @@ async def test_build_agent_cloud_mount_protected_marker_active_row_returns_paylo
         )
     assert payload is not None
     assert payload["protected"] is True
+    assert payload["required"] is True
     assert payload["mounts"][0]["access"] == "read_only"
     assert payload["mounts"][0]["source"]["config"]["user"] == "srw-reader-abc"
 

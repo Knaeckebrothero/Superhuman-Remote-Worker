@@ -24,6 +24,7 @@ def test_automatic_persistent_reconciliation_defaults_false() -> None:
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
     assert values["orchestrator"]["persistentAgentReconciliationEnabled"] is False
     assert values["orchestrator"]["officerRuntimeVerificationEnabled"] is False
+    assert values["orchestrator"]["officerAutoPullReleaseEnabled"] is False
     assert values["orchestrator"]["runtimeAuthorityMigrationMaintenanceAck"] is False
     assert values["agent"]["persistentInputCancellationEnabled"] is False
     assert values["agent"]["requirePinnedStatusIdentity"] == "true"
@@ -346,3 +347,71 @@ def test_runtime_verification_flag_renders_dark_and_can_be_enabled_explicitly() 
     )
     enabled, _ = _render("--set", "orchestrator.officerRuntimeVerificationEnabled=true")
     assert enabled["data"]["OFFICER_RUNTIME_VERIFICATION_ENABLED"] == "true"
+
+
+def test_auto_pull_release_flag_renders_dark_and_can_be_enabled_explicitly() -> None:
+    if shutil.which("helm") is None:
+        pytest.skip("helm is not installed")
+
+    def _render(*extra: str):
+        output = subprocess.run(
+            [
+                "helm",
+                "template",
+                "auto-pull-release-proof",
+                str(CHART),
+                "-f",
+                str(CHART / "ci" / "test-values.yaml"),
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        documents = [doc for doc in yaml.safe_load_all(output) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and "OFFICER_AUTO_PULL_RELEASE_ENABLED" in (doc.get("data") or {})
+        )
+        deployment = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "Deployment"
+            and any(
+                container.get("name") == "orchestrator"
+                for container in doc["spec"]["template"]["spec"]["containers"]
+            )
+        )
+        orchestrator = next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container.get("name") == "orchestrator"
+        )
+        return (
+            configmap,
+            {entry["name"]: entry for entry in orchestrator.get("env") or []},
+            deployment["spec"]["template"]["metadata"]["annotations"],
+        )
+
+    dark, dark_env, dark_annotations = _render()
+    assert dark["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "false"
+    assert (
+        dark_env["OFFICER_AUTO_PULL_RELEASE_ENABLED"]["valueFrom"]["configMapKeyRef"][
+            "key"
+        ]
+        == "OFFICER_AUTO_PULL_RELEASE_ENABLED"
+    )
+    enabled, _, enabled_annotations = _render(
+        "--set", "orchestrator.officerAutoPullReleaseEnabled=true"
+    )
+    assert enabled["data"]["OFFICER_AUTO_PULL_RELEASE_ENABLED"] == "true"
+    checksum_key = "checksum/officer-auto-pull-release"
+    assert dark_annotations[checksum_key]
+    assert enabled_annotations[checksum_key]
+    assert dark_annotations[checksum_key] != enabled_annotations[checksum_key]
+    # The checksum lives on the Pod template itself, independent of the
+    # optional Reloader deployment annotation.
+    _, _, dark_without_reloader = _render("--set", "reloader.enabled=false")
+    assert dark_without_reloader[checksum_key] == dark_annotations[checksum_key]

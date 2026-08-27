@@ -77,13 +77,13 @@ Each todo must:
 Phase-typed examples:
 
 `tdd_phase: red`
-Good: "Write failing test for AC-1 in repo/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user, magic_link_clicked arrives, awaiting_user_deadline = now + ttl_default. Follow style from repo/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm it fails with AssertionError, not ImportError."
+Good: "Write failing test for AC-1 in repos/<name>/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user, magic_link_clicked arrives, awaiting_user_deadline = now + ttl_default. Follow style from repos/<name>/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm it fails with AssertionError, not ImportError."
 
 `tdd_phase: green`
-Good: "Make AC-1 test pass: in repo/src/persistent/lifecycle.py, handle MagicLinkClicked event by setting thread.awaiting_user_deadline = now + ttl_default. Reference pattern: repo/src/persistent/lifecycle.py:handle_idle (line 88). Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go from red to green; full suite `pytest tests/ -x` must stay green."
+Good: "Make AC-1 test pass: in repos/<name>/src/persistent/lifecycle.py, handle MagicLinkClicked event by setting thread.awaiting_user_deadline = now + ttl_default. Reference pattern: repos/<name>/src/persistent/lifecycle.py:handle_idle (line 88). Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go from red to green; full suite `pytest tests/ -x` must stay green."
 
 `tdd_phase: refactor`
-Good: "Extract MagicLinkClicked handler from repo/src/persistent/lifecycle.py into repo/src/persistent/handlers/magic_link.py. Keep behavior identical. Run `pytest tests/ -x` — every previously-green test must remain green."
+Good: "Extract MagicLinkClicked handler from repos/<name>/src/persistent/lifecycle.py into repos/<name>/src/persistent/handlers/magic_link.py. Keep behavior identical. Run `pytest tests/ -x` — every previously-green test must remain green."
 
 Bad (vague, no AC trace, no phase awareness): "Fix the auth bug", "Add tests".
 

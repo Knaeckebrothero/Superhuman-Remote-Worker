@@ -38,7 +38,6 @@ workspace:
     - archive/
     - documents/
     - output/
-    - repo/
   git_versioning: true
 
 tools:

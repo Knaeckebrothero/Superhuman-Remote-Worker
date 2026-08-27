@@ -1933,6 +1933,39 @@ class TestRemoteBackendTmuxFences:
         assert "touch /cloud/state" in command
         assert execute.call_args.kwargs == {"timeout": 19, "retain_tail": True}
 
+    def test_secret_resource_materialization_is_claim_fenced_and_stale_owner_refused(
+        self,
+    ):
+        predecessor = self._incarnation_backend(token=21)
+        predecessor._shell_generation = "a" * 32
+        predecessor.retire_shell_owner()
+        with patch.object(
+            predecessor, "execute_with_secret_stdin", return_value=True
+        ) as execute:
+            assert predecessor.execute_claim_resource_with_secret_stdin(
+                "printf new-config", b"private", timeout=23
+            )
+            guarded = execute.call_args.args[0]
+            assert '"$_srw_token" = 21 ] || exit 75' in guarded
+            assert "printf new-config" in guarded
+
+            predecessor.retire_claim_resource_owner()
+            with pytest.raises(WorkspaceUnavailableError, match="retired"):
+                predecessor.execute_claim_resource_with_secret_stdin(
+                    "printf stale-config", b"private", timeout=23
+                )
+            assert execute.call_count == 1
+
+        successor = self._incarnation_backend(token=22)
+        successor._shell_generation = "b" * 32
+        with patch.object(
+            successor, "execute_with_secret_stdin", return_value=True
+        ) as execute_successor:
+            assert successor.execute_claim_resource_with_secret_stdin(
+                "printf successor-config", b"private", timeout=23
+            )
+        assert '"$_srw_token" = 22 ] || exit 75' in execute_successor.call_args.args[0]
+
     def test_claim_resource_lock_uses_bash_for_pipefail_scripts(self, tmp_path):
         backend = self._incarnation_backend()
         command = backend._tmux_lock_command(

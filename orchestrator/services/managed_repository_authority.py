@@ -260,6 +260,25 @@ async def ensure_managed_repository_authority(
             return current
         raise ManagedRepositoryAuthorityError("repository_key_unavailable")
 
+    # The forge mutation may have committed even if the later proof request or
+    # this process is lost. Persist its exact ID against the immutable authority
+    # generation before probing, so cleanup can recover and revoke that key
+    # without repository-name inference or minting an untracked replacement.
+    recorded = await postgres_db.record_managed_repository_authority_forge_key(
+        str(authority["id"]),
+        repository_owner=repository_owner,
+        repo_name=repo_name,
+        authority_kind=authority_kind,
+        authority_scope_id=str(authority_id),
+        project_id=str(project_id) if project_id else None,
+        generation=int(authority["generation"]),
+        access_mode=access_mode,
+        public_key_fingerprint=str(authority["public_key_fingerprint"]),
+        forge_key_id=int(key_id),
+    )
+    if recorded is None:
+        raise ManagedRepositoryAuthorityError("repository_authority_raced")
+
     proven = await gitea_client.probe_repo_deploy_key(
         repo_name,
         private_key=authority["private_key"],

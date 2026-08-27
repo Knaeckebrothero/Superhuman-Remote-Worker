@@ -1121,6 +1121,15 @@ FROM resource_inventory_snapshot_items
 WHERE snapshot_id = $1
 """
 
+
+def _reconciliation_item_health(summary: Mapping[str, Any]) -> str:
+    return (
+        "partial"
+        if int(summary["invalid_items"]) or int(summary["pending_valid_items"])
+        else "healthy"
+    )
+
+
 _OBSERVE_PRESENT_SQL = """
 WITH updated AS (
     UPDATE resource_intervals AS interval
@@ -3026,11 +3035,7 @@ class InventoryStore:
                             "interval set changed during snapshot reconciliation"
                         )
 
-                item_health = (
-                    "partial"
-                    if summary["invalid_items"] or summary["pending_valid_items"]
-                    else "healthy"
-                )
+                item_health = _reconciliation_item_health(summary)
                 continuity_gap_code = next(
                     (
                         error.code

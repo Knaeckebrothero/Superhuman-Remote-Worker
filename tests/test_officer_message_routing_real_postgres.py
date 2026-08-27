@@ -27,6 +27,7 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
 from services import message_routing
+from services.notification_service import RecordResult
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -414,7 +415,11 @@ async def test_concurrent_escalation_delivers_and_charges_once(db):
     assert await db.create_message_route(route)
     stored = await db.get_message_route(route["route_id"])
     notifier = SimpleNamespace(
-        dispatch=AsyncMock(return_value={"email": True, "email_message_id": "<x>"})
+        record_agent_message=AsyncMock(
+            return_value=RecordResult(
+                "n-1", True, {"in_app": True, "email": True, "email_message_id": "<x>"}
+            )
+        )
     )
     results = await asyncio.gather(
         *(
@@ -425,7 +430,7 @@ async def test_concurrent_escalation_delivers_and_charges_once(db):
         )
     )
     assert sum(bool(result) for result in results) == 1
-    assert notifier.dispatch.await_count == 1
+    assert notifier.record_agent_message.await_count == 1
     async with db.acquire() as conn:
         assert (
             await conn.fetchval(

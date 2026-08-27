@@ -284,6 +284,7 @@ async def _scan_pinned_host_key(
             proc.kill()
             await proc.wait()
 
+    saw_candidate = False
     for raw_line in stdout.splitlines():
         line = raw_line.decode("ascii", errors="ignore").strip()
         if not line or line.startswith("#"):
@@ -295,10 +296,20 @@ async def _scan_pinned_host_key(
             actual = _fingerprint_host_key(fields[2])
         except (ValueError, UnicodeError):
             continue
+        saw_candidate = True
         if secrets.compare_digest(actual, expected_fingerprint):
             return line, b""
 
-    return None, b"SSH server host key did not match the pinned fingerprint"
+    if saw_candidate:
+        # The server PRESENTED an ed25519 key and it is not ours. This exact
+        # wording is an identity verdict: vm_readiness demotes a ready VM on
+        # it, and test_thread_uploads_stateless asserts it. Keep it stable.
+        return None, b"SSH server host key did not match the pinned fingerprint"
+    # No ed25519 key was presented at all: unreachable host, closed port, or
+    # sshd not yet up. That is an AVAILABILITY outcome, not an identity one —
+    # the wording must not contain "fingerprint" or vm_readiness would demote
+    # a ready VM on every blip (the k3d gate proved it did).
+    return None, b"SSH host-key scan found no ed25519 host key"
 
 
 async def stream_extract_snapshot(
@@ -447,11 +458,15 @@ async def wait_for_agent_ssh(
     connect_timeout_s: int,
     interval_s: float,
     key_path: Optional[str] = None,
+    expected_host_key_fingerprint: Optional[str] = None,
 ) -> tuple[bool, int, str]:
     """Poll until ``agent-host@ssh_host`` accepts an authenticated SSH command.
 
     Returns ``(ready, attempts, last_error)``. The probe proves route + sshd +
-    key authorization by running ``true`` with ``BatchMode=yes``.
+    key authorization by running ``true`` with ``BatchMode=yes``. When an
+    expected fingerprint is supplied, every attempt first selects that exact
+    public key and the SSH process enforces it through a one-use known_hosts
+    file. There is no trust-on-first-use fallback in that mode.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.0, float(deadline_s))
@@ -460,39 +475,64 @@ async def wait_for_agent_ssh(
 
     while True:
         attempts += 1
-        ssh_cmd = build_agent_ssh_cmd(
-            ssh_host,
-            ssh_port,
-            "true",
-            key_path=key_path,
-            connect_timeout_s=connect_timeout_s,
-            batch_mode=True,
-        )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *ssh_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        known_hosts_line: Optional[str] = None
+        if expected_host_key_fingerprint is not None:
+            known_hosts_line, scan_error = await _scan_pinned_host_key(
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint,
+                timeout_s=connect_timeout_s,
             )
-        except OSError as exc:
-            return (
-                False,
-                attempts,
-                f"ssh readiness probe could not start: {type(exc).__name__}",
-            )
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=max(1, int(connect_timeout_s)) + 5
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            stderr = b"ssh readiness probe process timed out"
+            if known_hosts_line is None:
+                last_error = scan_error.decode("utf-8", errors="replace").strip()
+                if loop.time() >= deadline:
+                    return False, attempts, last_error
+                remaining = max(0.0, deadline - loop.time())
+                await asyncio.sleep(min(max(0.0, float(interval_s)), remaining))
+                continue
 
-        if proc.returncode == 0:
-            return True, attempts, ""
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="ascii", prefix="srw-ready-known-host-", delete=True
+        ) as known_hosts:
+            known_hosts_path: Optional[str] = None
+            if known_hosts_line is not None:
+                known_hosts.write(known_hosts_line + "\n")
+                known_hosts.flush()
+                known_hosts_path = known_hosts.name
+            ssh_cmd = build_agent_ssh_cmd(
+                ssh_host,
+                ssh_port,
+                "true",
+                key_path=key_path,
+                connect_timeout_s=connect_timeout_s,
+                batch_mode=True,
+                known_hosts_path=known_hosts_path,
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *ssh_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                return (
+                    False,
+                    attempts,
+                    f"ssh readiness probe could not start: {type(exc).__name__}",
+                )
+            try:
+                _stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=max(1, int(connect_timeout_s)) + 5
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                stderr = b"ssh readiness probe process timed out"
 
-        last_error = stderr.decode("utf-8", errors="replace").strip()
+            if proc.returncode == 0:
+                return True, attempts, ""
+
+            last_error = stderr.decode("utf-8", errors="replace").strip()
         if len(last_error) > 500:
             last_error = last_error[-500:]
         if loop.time() >= deadline:

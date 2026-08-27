@@ -1,6 +1,6 @@
-"""MCP routing through datasource setup and index rendering."""
+"""MCP routing through datasource setup and README.md facts rendering."""
 
-from src.core.datasource_setup import inject_datasource_index, process_datasources
+from src.core.datasource_setup import inject_workspace_facts, process_datasources
 from src.tools.mcp.manager import MCPManager
 
 
@@ -41,7 +41,7 @@ def test_process_datasources_groups_all_mcp_into_one_manager():
 
 def test_index_renders_connected_server():
     workspace = FakeWorkspace()
-    inject_datasource_index(
+    inject_workspace_facts(
         [
             _mcp_ds(
                 status="connected",
@@ -54,8 +54,9 @@ def test_index_renders_connected_server():
         workspace,
     )
 
-    text = workspace.files["datasources.md"]
-    assert "## Available Connectors" in text
+    text = workspace.files["README.md"]
+    assert "<!-- srw:workspace-facts:start -->" in text
+    assert "## Connectors" in text
     assert "Available Datasources" not in text
     assert "### MCP Servers" in text
     assert "**GitHub** (mcp, 2 tools)" in text
@@ -65,12 +66,12 @@ def test_index_renders_connected_server():
 
 def test_index_marks_unavailable_server():
     workspace = FakeWorkspace()
-    inject_datasource_index(
+    inject_workspace_facts(
         [_mcp_ds(status="unavailable: connect timed out")],
         workspace,
     )
 
-    text = workspace.files["datasources.md"]
+    text = workspace.files["README.md"]
     assert "unavailable: connect timed out" in text
     assert "tools)" not in text
 
@@ -78,12 +79,12 @@ def test_index_marks_unavailable_server():
 def test_index_caps_long_tool_lists_at_40():
     tools = [f"mcp__big__tool_{index}" for index in range(50)]
     workspace = FakeWorkspace()
-    inject_datasource_index(
+    inject_workspace_facts(
         [_mcp_ds(status="connected", tools=tools)],
         workspace,
     )
 
-    text = workspace.files["datasources.md"]
+    text = workspace.files["README.md"]
     assert "mcp__big__tool_39" in text
     assert "mcp__big__tool_40" not in text
     assert "+10 more" in text

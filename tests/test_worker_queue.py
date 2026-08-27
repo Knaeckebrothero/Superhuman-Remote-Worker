@@ -569,3 +569,51 @@ async def test_worker_error_release_has_explicit_terminal_report_exception(
     assert token == 12
     assert park is park_on_exhaustion
     assert backoff == 5.0
+
+
+class TestStatelessWorkerBackendAdmissible:
+    """One predicate for both admission twins (claim CAS + agent guard)."""
+
+    def test_sandbox_always_admissible(self, monkeypatch):
+        from src.shared.workspace_contract import stateless_worker_backend_admissible
+
+        for mode in ("off", "same-cluster", "external"):
+            assert stateless_worker_backend_admissible("sandbox", vm_mode=mode)
+        assert stateless_worker_backend_admissible("container", vm_mode="off")
+
+    def test_vm_admissible_only_on_pod_network(self):
+        from src.shared.workspace_contract import stateless_worker_backend_admissible
+
+        assert stateless_worker_backend_admissible("vm", vm_mode="same-cluster")
+        assert stateless_worker_backend_admissible("remote", vm_mode="same-cluster")
+        assert not stateless_worker_backend_admissible("vm", vm_mode="external")
+        assert not stateless_worker_backend_admissible("vm", vm_mode="off")
+
+    def test_lite_and_junk_never_admissible(self):
+        from src.shared.workspace_contract import stateless_worker_backend_admissible
+
+        for backend in ("virtual", "none", "", None, 7, "desktop"):
+            assert not stateless_worker_backend_admissible(
+                backend, vm_mode="same-cluster"
+            )
+
+    def test_job_requests_vm_follows_topology(self, monkeypatch):
+        from src.shared.worker_queue import _job_requests_vm
+
+        vm_job = {
+            "config_override": {"workspace": {"backend": "vm"}},
+            "context": {
+                "_workspace_contract": {
+                    "version": 1,
+                    "assigned_backend": "vm",
+                    "requested_backend": "vm",
+                    "assignment_source": "test",
+                }
+            },
+        }
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        assert _job_requests_vm(vm_job) is False
+        monkeypatch.setenv("VM_MODE", "external")
+        assert _job_requests_vm(vm_job) is True
+        monkeypatch.delenv("VM_MODE")
+        assert _job_requests_vm(vm_job) is True

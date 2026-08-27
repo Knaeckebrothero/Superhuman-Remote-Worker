@@ -14,7 +14,6 @@ from uuid import UUID, uuid4
 
 from services import resolve_ssh_key_path
 
-from .completion import probe_workspace_ssh
 from .ide_settings import seed_ide_config_for_user
 from .ssh_helpers import wait_for_agent_ssh
 
@@ -235,12 +234,6 @@ class VMReadinessService:
         pod_ip = status.get("pod_ip")
         active_pod_uid = status.get("active_pod_uid")
         if (
-            reprobe
-            and pod_ip == vm.get("pod_ip")
-            and active_pod_uid == vm.get("active_pod_uid")
-        ):
-            return
-        if (
             not isinstance(pod_ip, str)
             or not pod_ip
             or not isinstance(active_pod_uid, str)
@@ -249,24 +242,24 @@ class VMReadinessService:
         ):
             return
 
-        if not await probe_workspace_ssh(pod_ip, 22):
-            if reprobe:
-                logger.debug(
-                    "Ready VM %s %s failed changed-pod TCP probe; preserving readiness",
-                    entity_type,
-                    entity_id,
-                )
-                return
+        host_key_fingerprint = vm.get("ssh_host_key_fingerprint")
+        if not isinstance(host_key_fingerprint, str) or not host_key_fingerprint:
             await self._transient_failure(
                 key,
                 entity_type,
                 entity_id,
                 generation,
                 vm,
-                "TCP probe failed",
+                "SSH host-key fingerprint pin is absent",
                 reprobe=reprobe,
             )
             return
+
+        unchanged_ready_identity = (
+            reprobe
+            and pod_ip == vm.get("pod_ip")
+            and active_pod_uid == vm.get("active_pod_uid")
+        )
         ready, _attempts, error = await wait_for_agent_ssh(
             pod_ip,
             22,
@@ -274,11 +267,23 @@ class VMReadinessService:
             deadline_s=10.0,
             connect_timeout_s=10,
             interval_s=0.5,
+            expected_host_key_fingerprint=host_key_fingerprint,
         )
         if not ready:
-            if reprobe:
+            # Availability blips on an already-ready VM preserve the existing
+            # endpoint, but identity failures never do: a missing/invalid pin
+            # or mismatched presented key must demote the VM fail-closed.
+            # Two identity sources: the scan's fingerprint verdicts, and the
+            # ssh process itself refusing the one-use known_hosts line (the
+            # scan->connect race). The scan's no-key-seen availability error
+            # deliberately avoids both wordings.
+            lowered = (error or "").lower()
+            identity_failure = (
+                "fingerprint" in lowered or "host key verification failed" in lowered
+            )
+            if reprobe and not identity_failure:
                 logger.debug(
-                    "Ready VM %s %s failed changed-pod SSH auth; preserving readiness",
+                    "Ready VM %s %s failed SSH auth; preserving readiness",
                     entity_type,
                     entity_id,
                 )
@@ -292,6 +297,8 @@ class VMReadinessService:
                 error or "SSH authentication failed",
                 reprobe=reprobe,
             )
+            return
+        if unchanged_ready_identity:
             return
 
         verified_at = datetime.now(timezone.utc).isoformat()

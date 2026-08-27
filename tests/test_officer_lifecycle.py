@@ -113,14 +113,43 @@ class TestPatchValidator:
 
     def test_int_fields_coerce_and_clamp(self):
         fragment, _, _ = _validated_officer_post_patch(
-            {"max_pages_per_day": "4", "daily_token_ceiling": -5}
+            {"max_actions_per_wake": "4", "daily_token_ceiling": -5}
         )
-        assert fragment["officer"]["max_pages_per_day"] == 4
+        assert fragment["officer"]["max_actions_per_wake"] == 4
         assert fragment["officer"]["daily_token_ceiling"] == 0
 
     def test_int_garbage_400s(self):
         with pytest.raises(HTTPException) as exc:
             _validated_officer_post_patch({"max_concurrent_workers": "lots"})
+        assert exc.value.status_code == 400
+
+    def test_auto_pull_is_strict_boolean_and_null_clears_off(self):
+        fragment, _, effects = _validated_officer_post_patch({"auto_pull": True})
+        assert fragment == {"officer": {"auto_pull": True}}
+        assert effects == {"auto_pull": "next dispatch"}
+        fragment, _, _ = _validated_officer_post_patch({"auto_pull": None})
+        assert fragment == {"officer": {"auto_pull": False}}
+        for bad in (1, "true", [], {}):
+            with pytest.raises(HTTPException) as exc:
+                _validated_officer_post_patch({"auto_pull": bad})
+            assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize("value", [12.5, "12.5"])
+    def test_worker_spend_ceiling_is_optional_positive_usd(self, value):
+        fragment, _, effects = _validated_officer_post_patch(
+            {"worker_spend_ceiling_daily": value}
+        )
+        assert fragment == {"officer": {"worker_spend_ceiling_daily": 12.5}}
+        assert effects == {"worker_spend_ceiling_daily": "next dispatch"}
+        fragment, _, _ = _validated_officer_post_patch(
+            {"worker_spend_ceiling_daily": None}
+        )
+        assert fragment == {"officer": {"worker_spend_ceiling_daily": None}}
+
+    @pytest.mark.parametrize("value", [0, -1, True, "nan", "inf", "nope"])
+    def test_worker_spend_ceiling_rejects_invalid_values(self, value):
+        with pytest.raises(HTTPException) as exc:
+            _validated_officer_post_patch({"worker_spend_ceiling_daily": value})
         assert exc.value.status_code == 400
 
     def test_brain_maps_to_llm_fragment(self):
@@ -195,9 +224,10 @@ class TestPatchValidator:
     def test_effect_labels_cover_the_whole_table(self):
         body = {
             "slots": {"line": {"count": 1}},
+            "auto_pull": False,
+            "worker_spend_ceiling_daily": 12.5,
             "max_concurrent_workers": 2,
             "daily_token_ceiling": 1,
-            "max_pages_per_day": 1,
             "sleep_min_minutes": 5,
             "sleep_max_minutes": 60,
             "max_actions_per_wake": 3,
@@ -206,9 +236,10 @@ class TestPatchValidator:
         _, _, effects = _validated_officer_post_patch(body)
         assert effects == {
             "slots": "next dispatch",
+            "auto_pull": "next dispatch",
+            "worker_spend_ceiling_daily": "next dispatch",
             "max_concurrent_workers": "next dispatch",
             "daily_token_ceiling": "next delivery",
-            "max_pages_per_day": "next delivery",
             "sleep_min_minutes": "next sleep filing + watchdog immediately",
             "sleep_max_minutes": "next sleep filing + watchdog immediately",
             "max_actions_per_wake": "next respawn",
@@ -301,7 +332,6 @@ class TestEditorBlock:
                 "sleep_min_minutes": 10,
                 "sleep_max_minutes": 45,
                 "daily_token_ceiling": 500000,
-                "max_pages_per_day": 4,
                 "max_actions_per_wake": 6,
                 "max_concurrent_workers": 3,
             },
@@ -314,7 +344,6 @@ class TestEditorBlock:
         assert block["sleep_min_minutes"] == 10
         assert block["sleep_max_minutes"] == 45
         assert block["daily_token_ceiling"] == 500000
-        assert block["max_pages_per_day"] == 4
         assert block["max_actions_per_wake"] == 6
         assert block["max_concurrent_workers"] == 3
 
@@ -469,7 +498,7 @@ class TestAdminGate:
             lambda req: release_project_officer(req, PROJECT_ID),
             lambda req: recycle_project_officer(req, PROJECT_ID),
             lambda req: patch_project_officer(
-                req, PROJECT_ID, {"max_pages_per_day": 1}
+                req, PROJECT_ID, {"max_actions_per_wake": 1}
             ),
         ],
     )
@@ -646,21 +675,113 @@ class TestOfficerRecycle:
 
 class TestPatchEndpoint:
     @pytest.mark.asyncio
+    async def test_release_gate_refuses_true_before_any_post_write(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        with pytest.raises(HTTPException) as exc:
+            await patch_project_officer(MagicMock(), PROJECT_ID, {"auto_pull": True})
+        assert exc.value.status_code == 409
+        assert "not released" in str(exc.value.detail)
+        db.update_project_officer_post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_release_gate_always_permits_disable_and_spend_edits(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        await patch_project_officer(
+            MagicMock(),
+            PROJECT_ID,
+            {"auto_pull": False, "worker_spend_ceiling_daily": 19.5},
+        )
+        db.update_project_officer_post.assert_awaited_once_with(
+            PROJECT_ID,
+            config_updates={
+                "officer": {
+                    "auto_pull": False,
+                    "worker_spend_ceiling_daily": 19.5,
+                }
+            },
+            communication_policy_patch=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_released_enable_mirrors_all_three_control_layers(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        db.update_project_officer_post = AsyncMock(
+            return_value={
+                "post": _post_row(
+                    thread_id=THREAD_ID,
+                    config_override={
+                        "officer": {
+                            "auto_pull": True,
+                            "worker_spend_ceiling_daily": 19.5,
+                            "slots": {
+                                "research": {
+                                    "count": 1,
+                                    "category": "researcher",
+                                    "spend_ceiling_daily": 7.25,
+                                }
+                            },
+                        }
+                    },
+                ),
+                "thread": _officer_thread(),
+                "applied_to_thread": True,
+            }
+        )
+        out = await patch_project_officer(
+            MagicMock(),
+            PROJECT_ID,
+            {
+                "auto_pull": True,
+                "worker_spend_ceiling_daily": 19.5,
+                "slots": {
+                    "research": {
+                        "count": 1,
+                        "category": "researcher",
+                        "spend_ceiling_daily": 7.25,
+                    }
+                },
+            },
+        )
+        fragment = db.update_project_officer_post.await_args.kwargs["config_updates"]
+        assert fragment["officer"] == {
+            "auto_pull": True,
+            "worker_spend_ceiling_daily": 19.5,
+            "slots": {
+                "research": {
+                    "count": 1,
+                    "category": "researcher",
+                    "spend_ceiling_daily": 7.25,
+                }
+            },
+        }
+        assert out["effects"] == {
+            "auto_pull": "next dispatch",
+            "worker_spend_ceiling_daily": "next dispatch",
+            "slots": "next dispatch",
+        }
+
+    @pytest.mark.asyncio
     async def test_vacant_post_writes_the_row_only(
         self, db, as_project_admin, quiet_side_channels
     ):
         out = await patch_project_officer(
-            MagicMock(), PROJECT_ID, {"max_pages_per_day": 5}
+            MagicMock(), PROJECT_ID, {"daily_token_ceiling": 5}
         )
         db.update_project_officer_post.assert_awaited_once_with(
             PROJECT_ID,
-            config_updates={"officer": {"max_pages_per_day": 5}},
+            config_updates={"officer": {"daily_token_ceiling": 5}},
             communication_policy_patch=None,
         )
         db.merge_thread_config_override.assert_not_awaited()
         assert out["commissioned"] is False
         assert out["applied_to_thread"] is False
-        assert out["effects"] == {"max_pages_per_day": "next delivery"}
+        assert out["effects"] == {"daily_token_ceiling": "next delivery"}
 
     @pytest.mark.asyncio
     async def test_commissioned_post_mirrors_to_thread_and_notices_not_wakes(
@@ -792,6 +913,61 @@ class TestCommissionCapabilityGate:
 
 class TestCommissionEndpoint:
     @pytest.mark.asyncio
+    async def test_dark_release_gate_refuses_commission_true_without_mutation(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        create = AsyncMock()
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        with pytest.raises(HTTPException) as exc:
+            await commission_project_officer(
+                MagicMock(), PROJECT_ID, {"auto_pull": True}
+            )
+        assert exc.value.status_code == 409
+        create.assert_not_awaited()
+        db.get_or_create_project_officer.assert_not_awaited()
+        db.update_project_officer_post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dark_release_gate_refuses_recommission_of_standing_true(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        create = AsyncMock()
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        db.get_or_create_project_officer = AsyncMock(
+            return_value=_post_row(config_override={"officer": {"auto_pull": True}})
+        )
+        with pytest.raises(HTTPException) as exc:
+            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+        assert exc.value.status_code == 409
+        create.assert_not_awaited()
+        db.update_project_officer_post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy_true", ["true", "True", 1])
+    async def test_dark_release_gate_refuses_legacy_truthy_recommission(
+        self,
+        db,
+        as_project_admin,
+        quiet_side_channels,
+        monkeypatch,
+        legacy_true,
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        create = AsyncMock()
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        db.get_or_create_project_officer = AsyncMock(
+            return_value=_post_row(
+                config_override={"officer": {"auto_pull": legacy_true}}
+            )
+        )
+        with pytest.raises(HTTPException) as exc:
+            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+        assert exc.value.status_code == 409
+        create.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_standing_officer_409s_before_any_create(
         self, db, as_project_admin, quiet_side_channels, monkeypatch
     ):
@@ -802,6 +978,77 @@ class TestCommissionEndpoint:
             await commission_project_officer(MagicMock(), PROJECT_ID, None)
         assert exc.value.status_code == 409
         create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_released_commission_carries_auto_pull_and_spend_layers(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        new_tid = str(uuid4())
+
+        async def create_with_continuity(req, _request):
+            req._officer_commission_result = {
+                "brief_enqueued": True,
+                "while_vacant": [],
+                "while_vacant_dropped": 0,
+                "state_restored": False,
+            }
+            return {"thread_id": new_tid, "status": "created"}
+
+        create = AsyncMock(side_effect=create_with_continuity)
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        original = _post_row(config_override={"officer": {}})
+        commissioned_config = {
+            "officer": {
+                "auto_pull": True,
+                "worker_spend_ceiling_daily": 20.0,
+                "slots": {
+                    "research": {
+                        "count": 1,
+                        "category": "researcher",
+                        "spend_ceiling_daily": 8.5,
+                    }
+                },
+            }
+        }
+        updated = _post_row(config_override=commissioned_config)
+        db.get_or_create_project_officer = AsyncMock(return_value=original)
+        db.update_project_officer_post = AsyncMock(
+            return_value={
+                "post": updated,
+                "thread": None,
+                "applied_to_thread": False,
+            }
+        )
+
+        await commission_project_officer(
+            MagicMock(),
+            PROJECT_ID,
+            {
+                "auto_pull": True,
+                "worker_spend_ceiling_daily": 20,
+                "slots": {
+                    "research": {
+                        "count": 1,
+                        "category": "researcher",
+                        "spend_ceiling_daily": 8.5,
+                    }
+                },
+            },
+        )
+
+        db.update_project_officer_post.assert_awaited_once_with(
+            PROJECT_ID,
+            config_updates=commissioned_config,
+            communication_policy_patch=None,
+            expected_vacant_updated_at=original["updated_at"],
+        )
+        create_request = create.await_args.args[0]
+        officer = create_request.config_override["officer"]
+        assert "auto_pull" not in officer
+        assert "worker_spend_ceiling_daily" not in officer
+        assert "slots" not in officer
+        assert create_request._officer_post_config_snapshot == commissioned_config
 
     @pytest.mark.asyncio
     async def test_bad_kit_400s_before_any_create(
@@ -868,13 +1115,13 @@ class TestCommissionEndpoint:
             }
         )
 
-        body = {"max_pages_per_day": 4}
+        body = {"max_actions_per_wake": 4}
         out = await commission_project_officer(MagicMock(), PROJECT_ID, body)
 
         # Body validated + merged into the row under the post lock FIRST.
         db.update_project_officer_post.assert_awaited_once_with(
             PROJECT_ID,
-            config_updates={"officer": {"max_pages_per_day": 4}},
+            config_updates={"officer": {"max_actions_per_wake": 4}},
             communication_policy_patch=None,
             expected_vacant_updated_at=row["updated_at"],
         )
@@ -899,7 +1146,10 @@ class TestCommissionEndpoint:
         officer_frag = req.config_override["officer"]
         assert officer_frag["enabled"] is True
         assert "conference" not in officer_frag
-        assert officer_frag["slots"]["line"]["count"] == 2
+        assert "slots" not in officer_frag
+        assert req._officer_post_config_snapshot["officer"]["slots"]["line"] == {
+            "count": 2
+        }
         assert req.config_override["workspace"] == {"backend": "sandbox"}
 
         # Continuity was already restored/drained/enqueued inside registration's
@@ -1025,7 +1275,7 @@ class TestCommissionEndpoint:
                     "enabled": True,
                     "slots": None,
                     "daily_token_ceiling": None,
-                    "max_pages_per_day": 2,
+                    "max_actions_per_wake": 2,
                 },
                 "llm": {"model": None, "reasoning_level": None},
             }
@@ -1042,7 +1292,7 @@ class TestCommissionEndpoint:
         officer_frag = req.config_override["officer"]
         assert "slots" not in officer_frag
         assert "daily_token_ceiling" not in officer_frag
-        assert officer_frag["max_pages_per_day"] == 2
+        assert officer_frag["max_actions_per_wake"] == 2
         assert officer_frag["enabled"] is True
         assert req.model is None
         assert req.reasoning_level is None

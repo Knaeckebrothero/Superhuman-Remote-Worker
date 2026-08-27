@@ -37,6 +37,7 @@ import {
   type SlotDraft,
 } from './project-officer.component';
 import { ApiService } from '../../core/services/api.service';
+import { NotificationService } from '../../core/services/notification.service';
 import { ModelService } from '../../core/services/model.service';
 import type { OfficerPost } from '../../core/models/api.model';
 
@@ -102,9 +103,7 @@ function commissionedPost(over: Partial<OfficerPost> = {}): OfficerPost {
       sleep_minutes: { min: 5, max: 60 },
       next_wake_at: null,
       pending_events: 2,
-      pages_today: { used: 1, budget: 3 },
       token_ceiling: { daily: 5000000, deferred_today: false },
-      digest: [],
       conference: null,
     },
     kit: { line: { count: 2, model: 'MiniMax-M3', backend: 'vm', in_flight: 1 } },
@@ -124,12 +123,13 @@ function heldPost(): OfficerPost {
 function emptyDraft(over: Partial<OfficerEditorDraft> = {}): OfficerEditorDraft {
   return {
     slots: [],
+    autoPull: false,
+    workerSpendCeilingDaily: '',
     brainModel: '',
     reasoning: '',
     sleepMin: '',
     sleepMax: '',
     tokenCeiling: '',
-    maxPages: '',
     maxActions: '',
     maxWorkers: '',
     ...over,
@@ -143,11 +143,14 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
     decommissionOfficer: vi.fn().mockReturnValue(of({ status: 'decommissioned' })),
     holdOfficer: vi.fn().mockReturnValue(of({ status: 'held' })),
     releaseOfficer: vi.fn().mockReturnValue(of({ status: 'released' })),
-    recycleOfficer: vi.fn().mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
+    recycleOfficer: vi
+      .fn()
+      .mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
     updateOfficerPost: vi.fn().mockReturnValue(of({ status: 'updated' })),
   };
   const router = { navigate: vi.fn().mockResolvedValue(true) };
   const http = { post: vi.fn().mockReturnValue(of({ thread_id: 'conf-1' })) };
+  const feed = { listBySource: vi.fn().mockReturnValue(of(null)) };
   const translate = lang === 'de-DE' ? trDe : trEn;
   const transloco = {
     translate,
@@ -160,6 +163,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
       { provide: Router, useValue: router },
       { provide: ModelService, useValue: { load: vi.fn(), models: () => [] } },
       { provide: HttpClient, useValue: http },
+      { provide: NotificationService, useValue: feed },
       { provide: TranslocoService, useValue: transloco },
     ],
   });
@@ -168,7 +172,7 @@ function createComponent(lang: 'en' | 'de-DE' = 'en') {
   // off-DOM (this repo's no-TestBed convention) the field is swapped for a
   // plain accessor — the class only ever CALLS this.projectId().
   (component as unknown as { projectId: () => string }).projectId = () => 'p-1';
-  return { component, api, router, http };
+  return { component, api, router, http, feed };
 }
 
 @Component({
@@ -202,10 +206,32 @@ class RenderButtonStub {
 })
 class RenderInputStub {
   @Input() type = 'text';
+  @Input() inputmode = '';
   @Input() ariaLabel = '';
   @Input() value = '';
   @Input() placeholder = '';
   @Output() changed = new EventEmitter<string>();
+}
+
+@Component({
+  selector: 'app-checkbox',
+  standalone: true,
+  template: `<label>
+    <input
+      type="checkbox"
+      [checked]="checked"
+      [disabled]="disabled"
+      [attr.aria-label]="ariaLabel"
+      (change)="changed.emit($any($event.target).checked)"
+    />
+    <ng-content />
+  </label>`,
+})
+class RenderCheckboxStub {
+  @Input() checked = false;
+  @Input() disabled = false;
+  @Input() ariaLabel = '';
+  @Output() changed = new EventEmitter<boolean>();
 }
 
 @Component({
@@ -245,7 +271,9 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
     decommissionOfficer: vi.fn().mockReturnValue(of({ status: 'decommissioned' })),
     holdOfficer: vi.fn().mockReturnValue(of({ status: 'held' })),
     releaseOfficer: vi.fn().mockReturnValue(of({ status: 'released' })),
-    recycleOfficer: vi.fn().mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
+    recycleOfficer: vi
+      .fn()
+      .mockReturnValue(of({ state: 'recycling', phase: 'awaiting_old_pod_exit' })),
     updateOfficerPost: vi.fn().mockReturnValue(of({ status: 'updated' })),
   };
   TestBed.overrideComponent(ProjectOfficerComponent, {
@@ -257,6 +285,7 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
         RouterLink,
         RenderButtonStub,
         RenderInputStub,
+        RenderCheckboxStub,
         RenderSelectStub,
         RenderFormFieldStub,
         RenderSpinnerStub,
@@ -285,6 +314,10 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
         provide: HttpClient,
         useValue: { post: vi.fn().mockReturnValue(of({ thread_id: 'conf-1' })) },
       },
+      {
+        provide: NotificationService,
+        useValue: { listBySource: vi.fn().mockReturnValue(of(null)) },
+      },
     ],
   }).compileComponents();
   TestBed.inject(TranslocoService).setActiveLang(lang);
@@ -300,6 +333,49 @@ async function renderComponent(post: OfficerPost, lang: 'en' | 'de-DE') {
   fixture.detectChanges();
   return { fixture, api };
 }
+
+// ---------------------------------------------------------------------------
+// Recent notifications from this officer (the unified feed replaced the
+// digest ring and the pages-per-day budget).
+
+describe('recent notifications from this officer', () => {
+  const page = (items: unknown[]) => ({ items, next_before: null, counts: { unseen: 0, unread: 0, pending: 0, by_category: {} } });
+
+  it('a commissioned post lists the last ten feed rows about his session', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    feed.listBySource.mockReturnValue(
+      of(page([{ id: 'ntf-1', subject: 'Your centurion needs you', severity: 'high', created_at: '2026-08-26T09:00:00Z', resolved_at: null }])),
+    );
+
+    component.refresh();
+
+    expect(feed.listBySource).toHaveBeenCalledWith('thread', 't-1', 10);
+    expect(component.recentNotifications().map((n) => n.id)).toEqual(['ntf-1']);
+  });
+
+  it('a vacant post asks for nothing and clears the list', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(vacantPost()));
+
+    component.refresh();
+
+    expect(feed.listBySource).not.toHaveBeenCalled();
+    expect(component.recentNotifications()).toEqual([]);
+  });
+
+  it('a transport failure keeps the previous list (stale beats wrong)', () => {
+    const { component, api, feed } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    feed.listBySource.mockReturnValueOnce(of(page([{ id: 'ntf-1', subject: 's', severity: 'normal', created_at: null, resolved_at: null }])));
+    component.refresh();
+    feed.listBySource.mockReturnValueOnce(of(null));
+
+    component.refresh();
+
+    expect(component.recentNotifications().map((n) => n.id)).toEqual(['ntf-1']);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // The state machine and per-state labels.
@@ -329,14 +405,15 @@ describe('holdBadgeLabel', () => {
 });
 
 describe('immediacyLabel (§7 per-field honesty, verbatim)', () => {
-  it('slots and the flat cap land at next dispatch', () => {
+  it('slots, auto-pull, worker spend, and the flat cap land at next dispatch', () => {
     expect(immediacyLabel('slots', trEn)).toBe('applies at next dispatch');
+    expect(immediacyLabel('auto_pull', trEn)).toBe('applies at next dispatch');
+    expect(immediacyLabel('worker_spend_ceiling_daily', trEn)).toBe('applies at next dispatch');
     expect(immediacyLabel('max_concurrent_workers', trEn)).toBe('applies at next dispatch');
   });
 
   it('budget fields land at next delivery', () => {
     expect(immediacyLabel('daily_token_ceiling', trEn)).toBe('applies at next delivery');
-    expect(immediacyLabel('max_pages_per_day', trEn)).toBe('applies at next delivery');
   });
 
   it('sleep bounds land at the next sleep filing', () => {
@@ -382,6 +459,15 @@ describe('kitChips (utilization, not just allocation)', () => {
       { name: 'line', label: 'line ×2', alert: false },
     ]);
     expect(kitChips(null, trEn)).toEqual([]);
+  });
+
+  it('surfaces the per-slot daily spend ceiling', () => {
+    expect(kitChips({ line: { count: 2, spend_ceiling_daily: 7.5 } }, trEn)).toEqual([
+      { name: 'line', label: 'line ×2 · $7.5/day', alert: false },
+    ]);
+    expect(kitChips({ line: { count: 2, spend_ceiling_daily: 7.5 } }, trDe)).toEqual([
+      { name: 'line', label: 'line ×2 · $7.5/Tag', alert: false },
+    ]);
   });
 });
 
@@ -634,14 +720,49 @@ describe('draftFromPost', () => {
           spendCeilingDaily: null,
         },
       ],
+      autoPull: false,
+      workerSpendCeilingDaily: '',
       brainModel: 'MiniMax-M3',
       reasoning: 'high',
       sleepMin: '5',
       sleepMax: '60',
       tokenCeiling: '5000000',
-      maxPages: '3',
       maxActions: '',
       maxWorkers: '',
+    });
+  });
+
+  it('round-trips auto-pull and both spend-ceiling scopes from the post', () => {
+    expect(
+      draftFromPost(
+        commissionedPost({
+          kit: {
+            researchers: {
+              count: 2,
+              category: 'researcher',
+              spend_ceiling_daily: 7.5,
+            },
+          },
+          backlog: {
+            auto_pull: true,
+            auto_pull_control: { enable_available: true, source: 'deployment_policy' },
+            worker_spend_ceiling_daily: 42.25,
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+      ),
+    ).toMatchObject({
+      autoPull: true,
+      workerSpendCeilingDaily: '42.25',
+      slots: [
+        {
+          name: 'researchers',
+          count: 2,
+          category: 'researcher',
+          spendCeilingDaily: 7.5,
+        },
+      ],
     });
   });
 });
@@ -657,21 +778,52 @@ describe('buildOfficerConfig (commission body)', () => {
           sleepMin: '5',
           sleepMax: '60',
           tokenCeiling: '5000000',
-          maxPages: '3',
         }),
       ),
     ).toEqual({
       slots: { line: { count: 2, backend: 'sandbox' } },
+      auto_pull: false,
       brain: { model: 'MiniMax-M3', reasoning_level: 'high' },
       sleep_min_minutes: 5,
       sleep_max_minutes: 60,
       daily_token_ceiling: 5000000,
-      max_pages_per_day: 3,
     });
   });
 
   it('an empty roster is explicit in a commission body', () => {
-    expect(buildOfficerConfig(emptyDraft())).toEqual({ slots: null });
+    expect(buildOfficerConfig(emptyDraft())).toEqual({ slots: null, auto_pull: false });
+  });
+
+  it('carries an acknowledged auto-pull choice and both spend ceilings', () => {
+    expect(
+      buildOfficerConfig(
+        emptyDraft({
+          autoPull: true,
+          workerSpendCeilingDaily: '42.25',
+          slots: [
+            {
+              name: 'researchers',
+              count: 2,
+              model: '',
+              backend: 'sandbox',
+              category: 'researcher',
+              spendCeilingDaily: 7.5,
+            },
+          ],
+        }),
+      ),
+    ).toEqual({
+      slots: {
+        researchers: {
+          count: 2,
+          backend: 'sandbox',
+          category: 'researcher',
+          spend_ceiling_daily: 7.5,
+        },
+      },
+      auto_pull: true,
+      worker_spend_ceiling_daily: 42.25,
+    });
   });
 });
 
@@ -737,6 +889,29 @@ describe('buildOfficerPatch (per-field diff against the post)', () => {
     });
     expect(buildOfficerPatch(baseline, { ...baseline, brainModel: '', reasoning: '' })).toEqual({
       brain: null,
+    });
+  });
+
+  it('patches auto-pull and clears the century spend ceiling explicitly', () => {
+    const enabled = draftFromPost(
+      commissionedPost({
+        backlog: {
+          auto_pull: true,
+          worker_spend_ceiling_daily: 42.25,
+          breakers: {},
+          stale_claims: [],
+        },
+      }),
+    );
+    expect(
+      buildOfficerPatch(enabled, {
+        ...enabled,
+        autoPull: false,
+        workerSpendCeilingDaily: '',
+      }),
+    ).toEqual({
+      auto_pull: false,
+      worker_spend_ceiling_daily: null,
     });
   });
 
@@ -882,6 +1057,7 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       expect(root.textContent).toContain(tr('officerCard.readOnly'));
       expect(root.querySelector('[data-testid="officer-editor"]')).toBeNull();
       expect(root.querySelector('[data-testid="officer-commission"]')).toBeNull();
+      expect(root.querySelector('[data-testid="officer-auto-pull-control"]')).toBeNull();
       expect(root.querySelector('[data-testid="officer-policy-read-only"]')?.textContent).toContain(
         tr('officerCard.policy.userDirect'),
       );
@@ -961,13 +1137,132 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       expect(root.querySelector('[data-testid="officer-recycle"]')).not.toBeNull();
       expect(root.textContent).toContain(tr('officerCard.actions.rejoinConference'));
       expect(root.querySelector('[data-testid="officer-policy"] app-select')).not.toBeNull();
-      expect(root.querySelector('input')?.getAttribute('aria-label')).toBe(
-        tr('officerCard.a11y.actionsPerWake'),
-      );
+      expect(
+        root.querySelector(`input[aria-label="${tr('officerCard.a11y.actionsPerWake')}"]`),
+      ).not.toBeNull();
       expect(root.querySelector('button[aria-label]')?.getAttribute('aria-label')).toContain(
         tr('officerCard.a11y.removeSlot', { name: 'line' }),
       );
       manager.fixture.destroy();
+    });
+
+    it(`renders the ${lang} dark auto-pull gate while leaving disable and spend controls truthful`, async () => {
+      const dark = commissionedPost({
+        kit: {
+          researchers: {
+            count: 2,
+            category: 'researcher',
+            spend_ceiling_daily: 7.5,
+          },
+        },
+        backlog: {
+          auto_pull: false,
+          auto_pull_control: {
+            enable_available: false,
+            source: 'deployment_policy',
+            reason: 'release_gate_closed',
+          },
+          worker_spend_ceiling_daily: 42.25,
+          breakers: {},
+          stale_claims: [],
+        },
+      });
+      const { fixture } = await renderComponent(dark, lang);
+      const root = fixture.nativeElement as HTMLElement;
+      const checkbox = root.querySelector(
+        `[data-testid="officer-auto-pull-control"] input[type="checkbox"]`,
+      ) as HTMLInputElement | null;
+      expect(checkbox?.disabled).toBe(true);
+      expect(checkbox?.checked).toBe(false);
+      expect(checkbox?.getAttribute('aria-label')).toBe(tr('officerCard.a11y.autoPull'));
+      expect(
+        root.querySelector('[data-testid="officer-auto-pull-gate-hint"]')?.textContent,
+      ).toContain(tr('officerCard.autoPull.releaseClosed'));
+      expect(
+        (
+          root.querySelector(
+            `input[aria-label="${tr('officerCard.a11y.workerSpendCeiling')}"]`,
+          ) as HTMLInputElement | null
+        )?.value,
+      ).toBe('42.25');
+      expect(
+        (
+          root.querySelector(
+            `input[aria-label="${tr('officerCard.a11y.slotSpendCeiling', { index: 1 })}"]`,
+          ) as HTMLInputElement | null
+        )?.value,
+      ).toBe('7.5');
+      expect(root.textContent).toContain(
+        tr('officerCard.backlog.centurySpendCeiling', { amount: 42.25 }),
+      );
+      expect(root.textContent).toContain(tr('officerCard.kit.spendCeiling', { amount: 7.5 }));
+      fixture.destroy();
+      TestBed.resetTestingModule();
+
+      const existing = await renderComponent(
+        commissionedPost({
+          backlog: {
+            auto_pull: true,
+            auto_pull_control: {
+              enable_available: false,
+              source: 'deployment_policy',
+              reason: 'release_gate_closed',
+            },
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+        lang,
+      );
+      const existingRoot = existing.fixture.nativeElement as HTMLElement;
+      const existingCheckbox = existingRoot.querySelector(
+        `[data-testid="officer-auto-pull-control"] input[type="checkbox"]`,
+      ) as HTMLInputElement | null;
+      expect(existingCheckbox?.checked).toBe(true);
+      expect(existingCheckbox?.disabled).toBe(false);
+      expect(existingRoot.querySelector('[data-testid="officer-auto-pull-gate-hint"]')).toBeNull();
+      existing.fixture.destroy();
+    });
+
+    it(`renders the ${lang} explicit auto-pull acknowledgement before changing the draft`, async () => {
+      const { fixture } = await renderComponent(
+        commissionedPost({
+          backlog: {
+            auto_pull: false,
+            auto_pull_control: { enable_available: true, source: 'deployment_policy' },
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+        lang,
+      );
+      let root = fixture.nativeElement as HTMLElement;
+      const checkbox = root.querySelector(
+        `[data-testid="officer-auto-pull-control"] input[type="checkbox"]`,
+      ) as HTMLInputElement | null;
+      expect(checkbox?.disabled).toBe(false);
+
+      fixture.componentInstance.requestAutoPullChange(true);
+      fixture.detectChanges();
+      root = fixture.nativeElement as HTMLElement;
+      expect(fixture.componentInstance.fAutoPull()).toBe(false);
+      expect(
+        root.querySelector('[data-testid="officer-auto-pull-confirm"]')?.textContent,
+      ).toContain(tr('officerCard.autoPull.confirmation'));
+      expect(
+        root.querySelector('[data-testid="officer-auto-pull-confirm"]')?.getAttribute('role'),
+      ).toBe('alert');
+
+      fixture.componentInstance.confirmAutoPull();
+      fixture.detectChanges();
+      expect(fixture.componentInstance.fAutoPull()).toBe(true);
+      expect(fixture.componentInstance.pendingPatch()).toEqual({ auto_pull: true });
+      expect(
+        (fixture.nativeElement as HTMLElement).querySelector(
+          '[data-testid="officer-auto-pull-confirm"]',
+        ),
+      ).toBeNull();
+      fixture.destroy();
     });
 
     it(`renders the ${lang} runtime-authorization incident without credential detail`, async () => {
@@ -988,9 +1283,7 @@ describe('ProjectOfficerComponent rendered authority and localization', () => {
       );
 
       expect(alert?.getAttribute('role')).toBe('alert');
-      expect(alert?.getAttribute('aria-label')).toBe(
-        tr('officerCard.runtimeAuthorization.a11y'),
-      );
+      expect(alert?.getAttribute('aria-label')).toBe(tr('officerCard.runtimeAuthorization.a11y'));
       expect(alert?.textContent).toContain(tr('officerCard.runtimeAuthorization.unavailable'));
       expect(alert?.textContent).not.toContain('refresh_expired');
       fixture.destroy();
@@ -1094,6 +1387,137 @@ describe('ProjectOfficerComponent editor seeding', () => {
     component.patchSlot(0, { count: 1 });
     expect(component.drainHints()).toEqual(['2 in flight — drains to 1']);
   });
+
+  it('defaults auto-pull off and fails closed when the release capability is absent', () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    component.refresh();
+
+    expect(component.fAutoPull()).toBe(false);
+    expect(component.autoPullEnableAvailable()).toBe(false);
+    component.requestAutoPullChange(true);
+    expect(component.autoPullArmed()).toBe(false);
+    expect(component.fAutoPull()).toBe(false);
+    expect(component.pendingPatch()).toEqual({});
+  });
+
+  it('permits disabling an existing true value while the release gate is closed', () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          backlog: {
+            auto_pull: true,
+            auto_pull_control: {
+              enable_available: false,
+              source: 'deployment_policy',
+              reason: 'release_gate_closed',
+            },
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+
+    expect(component.fAutoPull()).toBe(true);
+    expect(component.autoPullEnableAvailable()).toBe(false);
+    component.requestAutoPullChange(false);
+    expect(component.autoPullArmed()).toBe(false);
+    expect(component.fAutoPull()).toBe(false);
+    expect(component.pendingPatch()).toEqual({ auto_pull: false });
+  });
+
+  it('requires an explicit second action before arming released auto-pull', () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          backlog: {
+            auto_pull: false,
+            auto_pull_control: { enable_available: true, source: 'deployment_policy' },
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+
+    component.requestAutoPullChange(true);
+    expect(component.autoPullArmed()).toBe(true);
+    expect(component.fAutoPull()).toBe(false);
+    expect(component.pendingPatch()).toEqual({});
+
+    component.confirmAutoPull();
+    expect(component.autoPullArmed()).toBe(false);
+    expect(component.fAutoPull()).toBe(true);
+    expect(component.pendingPatch()).toEqual({ auto_pull: true });
+  });
+
+  it('round-trips century and per-slot spend ceilings into one narrow patch', () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          kit: {
+            researchers: {
+              count: 2,
+              category: 'researcher',
+              spend_ceiling_daily: 7.5,
+            },
+          },
+          backlog: {
+            auto_pull: false,
+            auto_pull_control: { enable_available: true, source: 'deployment_policy' },
+            worker_spend_ceiling_daily: 42.25,
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+    expect(component.fWorkerSpendCeiling()).toBe('42.25');
+    expect(component.slotDrafts()[0].spendCeilingDaily).toBe(7.5);
+
+    component.fWorkerSpendCeiling.set('55.5');
+    component.patchSlot(0, { spendCeilingDaily: 8.25 });
+    expect(component.pendingPatch()).toEqual({
+      slots: {
+        researchers: {
+          count: 2,
+          category: 'researcher',
+          spend_ceiling_daily: 8.25,
+        },
+      },
+      worker_spend_ceiling_daily: 55.5,
+    });
+  });
+
+  it('keeps every unattended-operation control inert for a viewer', () => {
+    const { component, api } = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          can_manage: false,
+          backlog: {
+            auto_pull: false,
+            auto_pull_control: { enable_available: true, source: 'deployment_policy' },
+            breakers: {},
+            stale_claims: [],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+    component.requestAutoPullChange(true);
+    component.confirmAutoPull();
+    expect(component.autoPullArmed()).toBe(false);
+    expect(component.fAutoPull()).toBe(false);
+    expect(component.pendingPatch()).toEqual({});
+  });
 });
 
 describe('ProjectOfficerComponent lifecycle actions', () => {
@@ -1103,6 +1527,7 @@ describe('ProjectOfficerComponent lifecycle actions', () => {
     await component.commission();
     expect(api.commissionOfficer).toHaveBeenCalledWith('p-1', {
       slots: { line: { count: 2, backend: 'sandbox' } },
+      auto_pull: false,
     });
     expect(router.navigate).not.toHaveBeenCalled();
     expect(component.message()).toContain('continuity brief');
@@ -1124,7 +1549,10 @@ describe('ProjectOfficerComponent lifecycle actions', () => {
 
     await component.commission();
 
-    expect(api.commissionOfficer).toHaveBeenCalledWith('p-1', { slots: null });
+    expect(api.commissionOfficer).toHaveBeenCalledWith('p-1', {
+      slots: null,
+      auto_pull: false,
+    });
   });
 
   it('recommissions an established flat-cap post without inventing a starter', async () => {
@@ -1142,7 +1570,10 @@ describe('ProjectOfficerComponent lifecycle actions', () => {
 
     await component.commission();
 
-    expect(api.commissionOfficer).toHaveBeenCalledWith('p-1', { slots: null });
+    expect(api.commissionOfficer).toHaveBeenCalledWith('p-1', {
+      slots: null,
+      auto_pull: false,
+    });
   });
 
   it('PATCHes only the fields that changed, and nothing when clean', async () => {
@@ -1350,7 +1781,7 @@ describe('buildSlotsSpec', () => {
     });
   });
 
-  it('preserves an existing per-slot spend ceiling without exposing a new control', () => {
+  it('preserves a per-slot spend ceiling in the complete roster', () => {
     expect(buildSlotsSpec([row({ spendCeilingDaily: 7.5 })])).toEqual({
       line: {
         count: 2,

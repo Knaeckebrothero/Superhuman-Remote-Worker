@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -51,6 +52,7 @@ from orchestrator.services.infrastructure_metering.sealer import (
     InfrastructureUsageDaySealer,
 )
 from orchestrator.services.usage_ledger import StrictUsagePublishResult
+from src.shared.persistent_input_delivery import message_row_id, persist_input_delivery
 
 
 ROOT = Path(__file__).parents[1]
@@ -253,7 +255,38 @@ APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY
+APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0187_compute_initial_recovery_epoch_authority.sql"
+)
+APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0188_managed_repository_legacy_reconciliation.sql"
+)
+APP_STATELESS_INPUT_DELIVERIES = (
+    ROOT / "orchestrator/database/migrations/app/0189_stateless_input_deliveries.sql"
+)
+APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0190_stateless_input_delivery_validate.sql"
+)
+APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0191_managed_repository_process_zero_authority.sql"
+)
+APP_NOTIFICATIONS_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0192_notifications.sql"
+)
+APP_NOTIFICATION_STEPS_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0193_notification_steps.sql"
+)
+APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0194_notifications_cutover.sql"
+)
+# Unified notification feed (slice 3: the cutover backfill) — the head after
+# the 0184-0190 managed-repository / stateless-input lane and the slice-1/2
+# feed tables; bump when the next lands.
+APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATIONS_CUTOVER_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -315,8 +348,8 @@ def test_migration_discovery_rejects_duplicate_interstitial_version(
 @pytest.fixture(scope="module")
 def app_pg_dsn() -> str:
     testcontainers = pytest.importorskip("testcontainers.postgres")
-    container = testcontainers.PostgresContainer("postgres:16")
     try:
+        container = testcontainers.PostgresContainer("postgres:16")
         container.start()
     except Exception as exc:
         pytest.skip(f"no container runtime for app migration test: {exc}")
@@ -797,6 +830,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current" not in APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION.read_text()
     )
     assert "schema_current" not in APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
     assert (
         "schema_current"
         not in APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
@@ -965,6 +999,456 @@ def test_0186_protected_cloud_instance_and_attempt_authority_contract() -> None:
     assert "cloud_ro_effect_intents_insert_authority" in sql
     assert "cloud_ro_effect_intents_horizon_authority" in sql
     assert "effect.safe_after > clock_timestamp()" in sql
+
+
+def test_managed_repository_legacy_reconciliation_migration_is_additive() -> None:
+    raw = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0187_compute_initial_recovery_epoch_authority.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    assert "CREATE TABLE public.managed_repository_legacy_reconciliations" in sql
+    assert "CREATE SEQUENCE public.managed_repository_legacy_reconcile_claim_seq" in sql
+    assert "managed_repository_legacy_source_unique" in sql
+    assert "managed_repository_legacy_claim_shape_check" in sql
+    assert "managed_repository_legacy_completion_shape_check" in sql
+    assert "UPDATE jobs" not in sql
+    assert "UPDATE threads" not in sql
+    assert "UPDATE project_repositories" not in sql
+
+
+def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None:
+    raw = APP_STATELESS_INPUT_DELIVERIES.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0188_managed_repository_legacy_reconciliation.sql" in raw
+    assert "transactional: yes" in raw
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    thread_lock = "LOCK TABLE public.threads IN SHARE ROW EXCLUSIVE MODE"
+    queue_lock = "LOCK TABLE public.run_queue IN SHARE ROW EXCLUSIVE MODE"
+    delivery_lock = (
+        "LOCK TABLE public.thread_input_deliveries IN SHARE ROW EXCLUSIVE MODE"
+    )
+    assert thread_lock in sql
+    assert queue_lock in sql
+    assert delivery_lock in sql
+    assert sql.index(thread_lock) < sql.index(queue_lock) < sql.index(delivery_lock)
+    assert "ADD COLUMN execution_lane TEXT NOT NULL DEFAULT 'pinned'" in sql
+    assert "stateless_input_delivery_history_ambiguous" in sql
+    assert "SET execution_lane = thread.execution_lane" not in sql
+    assert "SET execution_lane = 'stateless'" in sql
+    assert "delivery.state = 'persisted'" in sql
+    assert "delivery.claim_generation = 0" in sql
+    assert sql.count("message.turn_number IS NULL") == 3
+    assert (
+        "SET turn_number = (eligible.base_turn + eligible.turn_offset)::integer" in sql
+    )
+    assert sql.count("NOT VALID") == 3
+    assert "ADD COLUMN input_delivery_capable_lease_token BIGINT" in sql
+    assert "trg_input_delivery_lane_authority" in sql
+    assert "trg_stateless_input_delivery_claim" in sql
+    assert "stateless_input_delivery_requires_capable_claim" in sql
+    assert "stateless_input_delivery_requires_admission" in sql
+
+    validation = _compact(APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text())
+    assert "depends-on:    0189_stateless_input_deliveries.sql" in (
+        APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text()
+    )
+    assert validation.count("VALIDATE CONSTRAINT thread_input_deliveries_") == 3
+
+
+@pytest.mark.asyncio
+async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Genuine 0184 pending and terminal history keep distinct authority."""
+
+    dbname = f"stateless_delivery_0185_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    through_0184 = tmp_path / "through-0184"
+    through_0184.mkdir()
+    blocker = updater = observer = None
+    migration_task = update_task = None
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        delivery_id = uuid4()
+        message_id = message_row_id(delivery_id)
+        terminal_thread_id = uuid4()
+        terminal_message_id = uuid4()
+        terminal_delivery_id = uuid4()
+        terminal_agent_id = uuid4()
+        terminal_runtime_generation = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','genuine pre-0185 wake',NULL)",
+                message_id,
+                thread_id,
+            )
+            # This is the exact shape the preceding release produced: 0174's
+            # pinned-only ledger had no lane column, while orchestrator-side
+            # wake persistence could still target a stateless thread.
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted')",
+                delivery_id,
+                thread_id,
+                message_id,
+            )
+            # This is the other genuine predecessor shape: a pinned runtime
+            # admitted and settled its delivery, after which the detached
+            # thread moved to stateless. The current thread lane must never
+            # rewrite that immutable pinned execution receipt.
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','pinned','default',2)",
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','settled pinned wake',2)",
+                terminal_message_id,
+                terminal_thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation,"
+                " admitted_turn_number,admitted_at,settled_at) "
+                "VALUES ($1,$2,$3,'officer_wake','settled',1,$4,'old-pod',$5,"
+                " 2,now(),now())",
+                terminal_delivery_id,
+                terminal_thread_id,
+                terminal_message_id,
+                terminal_agent_id,
+                terminal_runtime_generation,
+            )
+            await conn.execute(
+                "UPDATE threads SET execution_lane='stateless' WHERE id=$1",
+                terminal_thread_id,
+            )
+
+        blocker = await asyncpg.connect(dsn)
+        updater = await asyncpg.connect(dsn)
+        observer = await asyncpg.connect(dsn)
+        await blocker.execute("BEGIN")
+        # Hold the migration after it takes the thread/run_queue prefix but
+        # before it can alter/backfill the delivery table.
+        await blocker.execute(
+            "LOCK TABLE thread_input_deliveries IN ACCESS EXCLUSIVE MODE"
+        )
+        migration_task = asyncio.create_task(
+            run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        )
+
+        for _ in range(100):
+            migration_holds_thread = await observer.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_locks "
+                "WHERE database=(SELECT oid FROM pg_database "
+                "WHERE datname=current_database()) "
+                "AND relation='public.threads'::regclass "
+                "AND mode='ShareRowExclusiveLock' AND granted)"
+            )
+            if migration_holds_thread:
+                break
+            await asyncio.sleep(0.005)
+        assert migration_holds_thread
+
+        update_task = asyncio.create_task(
+            updater.execute(
+                "UPDATE threads SET execution_lane='pinned' WHERE id=$1",
+                thread_id,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not update_task.done()
+
+        await blocker.execute("COMMIT")
+        await asyncio.wait_for(migration_task, timeout=15)
+        with pytest.raises(asyncpg.CheckViolationError, match="durable input"):
+            await asyncio.wait_for(update_task, timeout=5)
+
+        row = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "message.turn_number, thread.total_turns "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
+            "WHERE delivery.delivery_id=$1",
+            delivery_id,
+        )
+        assert dict(row) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "stateless",
+            "state": "persisted",
+            "turn_number": 1,
+            "total_turns": 1,
+        }
+        async with observer.transaction():
+            replay = await persist_input_delivery(
+                observer,
+                thread_id=thread_id,
+                delivery_id=delivery_id,
+                role="event",
+                content="genuine pre-0185 wake",
+                source="officer_wake",
+                turn_number=None,
+            )
+        assert replay["transcript_inserted"] is False
+        assert replay["execution_lane"] == "stateless"
+        assert replay["state"] == "queued"
+        assert replay["turn_number"] == 1
+        assert (
+            await observer.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1", thread_id
+            )
+            == "queued"
+        )
+        terminal = await observer.fetchrow(
+            "SELECT thread.execution_lane AS thread_lane, "
+            "delivery.execution_lane AS delivery_lane, delivery.state, "
+            "delivery.claim_generation, delivery.owner_agent_id, "
+            "message.turn_number, thread.total_turns "
+            "FROM threads AS thread "
+            "JOIN thread_input_deliveries AS delivery "
+            "ON delivery.thread_id=thread.id "
+            "JOIN thread_messages AS message ON message.id=delivery.message_id "
+            "WHERE delivery.delivery_id=$1",
+            terminal_delivery_id,
+        )
+        assert dict(terminal) == {
+            "thread_lane": "stateless",
+            "delivery_lane": "pinned",
+            "state": "settled",
+            "claim_generation": 1,
+            "owner_agent_id": terminal_agent_id,
+            "turn_number": 2,
+            "total_turns": 2,
+        }
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERIES.name,
+        )
+        assert await observer.fetchval(
+            "SELECT success FROM schema_migrations WHERE filename=$1",
+            APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+        )
+        assert (
+            await observer.fetchval(
+                "SELECT count(*) FROM pg_constraint "
+                "WHERE conname = ANY($1::text[]) AND convalidated",
+                [
+                    "thread_input_deliveries_lane_check",
+                    "thread_input_deliveries_owner_shape",
+                    "thread_input_deliveries_claim_shape",
+                ],
+            )
+            == 3
+        )
+    finally:
+        if migration_task is not None and not migration_task.done():
+            migration_task.cancel()
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
+        if blocker is not None:
+            await blocker.close()
+        if updater is not None:
+            await updater.close()
+        if observer is not None:
+            await observer.close()
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Do not guess that a pinned predecessor claim became stateless work."""
+
+    dbname = f"stateless_delivery_0185_ambiguous_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "ambiguous-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id,status,execution_lane,config_name) "
+                "VALUES ($1,'active','stateless','default')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','claimed predecessor wake',NULL)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation,"
+                " owner_agent_id,owner_pod_uid,owner_runtime_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','owned',1,$4,'old-pod',$5)",
+                uuid4(),
+                thread_id,
+                message_id,
+                uuid4(),
+                uuid4(),
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0189 stateless input history is ambiguous",
+        ):
+            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+
+        async with pool.acquire() as conn:
+            # Transactional failure rolls every 0185 catalog mutation back.
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+            failure = await conn.fetchrow(
+                "SELECT success, error FROM schema_migrations WHERE filename=$1",
+                APP_STATELESS_INPUT_DELIVERIES.name,
+            )
+            assert failure is not None
+            assert failure["success"] is False
+            assert (
+                "stateless input history is ambiguous" in str(failure["error"]).lower()
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename=$1)",
+                APP_STATELESS_INPUT_DELIVERY_VALIDATION.name,
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """A numbered predecessor input is not the known durable-wake shape."""
+
+    dbname = f"stateless_delivery_0185_numbered_{uuid4().hex[:8]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    through_0184 = tmp_path / "numbered-through-0184"
+    through_0184.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name >= APP_STATELESS_INPUT_DELIVERIES.name:
+                break
+            (through_0184 / path.name).write_bytes(path.read_bytes())
+        await run_migrations(pool, through_0184)
+
+        thread_id = uuid4()
+        message_id = uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads "
+                "(id,status,execution_lane,config_name,total_turns) "
+                "VALUES ($1,'active','stateless','default',7)",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id,thread_id,role,content,turn_number) "
+                "VALUES ($1,$2,'event','numbered predecessor wake',7)",
+                message_id,
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_input_deliveries "
+                "(delivery_id,thread_id,message_id,source,state,claim_generation) "
+                "VALUES ($1,$2,$3,'officer_wake','persisted',0)",
+                uuid4(),
+                thread_id,
+                message_id,
+            )
+
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Pre-0189 stateless input history is ambiguous",
+        ):
+            await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='execution_lane')"
+            )
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
@@ -1331,6 +1815,27 @@ def test_compute_epoch_rollover_is_audited_append_only_and_directly_bound() -> N
     assert (
         "DROP TRIGGER resource_intervals_compute_exact_epoch_lifecycle_guard" in compact
     )
+
+
+def test_initial_compute_authority_accepts_only_proven_recovery_coverage() -> None:
+    raw = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
+    sql = _compact(raw)
+
+    assert "depends-on:    0186_protected_cloud_instance_authority.sql" in raw
+    assert (
+        "CREATE OR REPLACE FUNCTION public."
+        "protect_compute_metering_epoch_authority()" in sql
+    )
+    assert "epoch_continuity_health IS DISTINCT FROM 'healthy'" in sql
+    assert "epoch_reliable_from IS NULL" in sql
+    assert "epoch_reliable_from > NEW.effective_from" in sql
+    assert "epoch_continuous_since IS NULL" in sql
+    assert "epoch_continuous_since > NEW.effective_from" in sql
+    assert "FROM public.resource_inventory_coverage_gaps AS gap" in sql
+    assert "gap.resolution = 'unresolved'" in sql
+    assert "epoch_recovery_from IS NOT NULL" in sql
+    assert "DROP TRIGGER" not in raw
+    assert "CREATE TABLE" not in raw
 
 
 def test_compute_authority_confirmation_gap_supersedes_deployed_rollover() -> None:

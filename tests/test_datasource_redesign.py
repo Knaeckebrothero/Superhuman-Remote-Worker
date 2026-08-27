@@ -10,7 +10,6 @@ Functions under test are replicated here to avoid importing orchestrator.main
 import json
 import os
 import re
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -645,107 +644,6 @@ class TestInjectTypedEnvVars:
             os.environ["MONGOSH_URI"]
             == "mongodb+srv://user:pass@cluster.mongodb.net/mydb"
         )
-
-
-# =============================================================================
-# Agent-side: Datasource Index for workspace.md
-# =============================================================================
-
-
-class TestDatasourceIndex:
-    """Tests for Agent._inject_datasource_index (workspace.md injection)."""
-
-    def _make_agent(self):
-        from src.agent import UniversalAgent
-
-        agent = UniversalAgent.__new__(UniversalAgent)
-        ws = MagicMock()
-        ws.read_file.return_value = "# Workspace\n\nExisting content."
-        agent._workspace_manager = ws
-        return agent, ws
-
-    def test_index_contains_all_types(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "generic", "name": "API Gateway", "cli_hint": "curl $API_URL"},
-            {"type": "repository", "name": "Frontend App"},
-            {"type": "postgresql", "name": "Analytics", "project_read_only": False},
-            {"type": "neo4j", "name": "Graph DB", "project_read_only": True},
-            {"type": "webdav", "name": "Files", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "## Available Connectors" in written
-        assert "Available Datasources" not in written
-        assert "**API Gateway** (generic)" in written
-        assert "**Frontend App** (repository)" in written
-        assert "./repos/frontend-app/" in written
-        assert "**Analytics** (postgresql, read-write)" in written
-        assert "`psql`" in written
-        assert "**Graph DB** (neo4j, read-only)" in written
-        assert "**Files** (webdav, read-write tools)" in written
-
-    def test_preserves_existing_content(self):
-        agent, ws = self._make_agent()
-        agent._inject_datasource_index([{"type": "generic", "name": "X"}])
-        written = ws.write_file.call_args[0][1]
-        assert "Existing content." in written
-
-    def test_workspace_read_failure_handled(self):
-        agent, ws = self._make_agent()
-        ws.read_file.side_effect = FileNotFoundError("no workspace.md")
-        # Should not raise
-        agent._inject_datasource_index([{"type": "generic", "name": "X"}])
-
-    def test_rw_postgresql_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "postgresql", "name": "Main DB", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "**Main DB** (postgresql, read-write)" in written
-        assert "run_command" in written
-        assert "psql -c" in written
-        assert "Credentials are pre-configured" in written
-        assert "do NOT pass connection flags" in written
-
-    def test_rw_neo4j_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "neo4j", "name": "Graph", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "cypher-shell --format plain" in written
-        assert "run_command" in written
-        assert "Credentials are pre-configured" in written
-
-    def test_rw_mongodb_expanded_block(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "mongodb", "name": "Docs", "project_read_only": False},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "mongosh --quiet --eval" in written
-        assert "run_command" in written
-        assert "Credentials are pre-configured" in written
-
-    def test_readonly_not_expanded(self):
-        agent, ws = self._make_agent()
-        configs = [
-            {"type": "postgresql", "name": "ReadOnly DB", "project_read_only": True},
-        ]
-        agent._inject_datasource_index(configs)
-        written = ws.write_file.call_args[0][1]
-
-        assert "query tools" in written
-        assert "run_command" not in written
 
 
 class TestRenderInstructionContentCLI:

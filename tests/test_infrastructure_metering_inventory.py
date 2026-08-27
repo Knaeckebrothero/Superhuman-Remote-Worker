@@ -9,6 +9,7 @@ import pytest
 
 from orchestrator.services.infrastructure_metering.inventory import (
     _RECONCILIATION_COUNTS_SQL,
+    _reconciliation_item_health,
     InventoryConflictError,
     InventoryContractError,
     InventoryItem,
@@ -36,6 +37,17 @@ def test_pending_items_only_exclude_explicit_not_applicable_comparisons() -> Non
     assert "LEFT JOIN resource_inventory_shadow_comparisons" in compact
     assert "comparison.status IS NULL" in compact
     assert "comparison.status <> 'not-applicable'" in compact
+
+
+def test_resolved_valid_snapshot_items_are_healthy() -> None:
+    assert (
+        _reconciliation_item_health({"invalid_items": 0, "pending_valid_items": 0})
+        == "healthy"
+    )
+    assert (
+        _reconciliation_item_health({"invalid_items": 0, "pending_valid_items": 1})
+        == "partial"
+    )
 
 
 def _valid(uid: str, revision: str = "a" * 64) -> InventoryItem:

@@ -28,6 +28,10 @@ from services.workspace_binding import (
     remote_canvas_presentation_available,
 )
 from src.core.backends.remote import RemoteBackend
+from src.core.managed_repository import (
+    managed_repository_agent_retirement_command,
+    managed_repository_agent_zero_command,
+)
 
 
 SHELL_RETIREMENT_ACK_KEY = "_stateless_shell_retirement_ack"
@@ -349,6 +353,16 @@ async def retire_stateless_workspace_residents(
     try:
         await asyncio.to_thread(
             backend.exec_terminal_claim_resource,
+            managed_repository_agent_retirement_command(
+                home_path="/home/agent-host",
+                authority_ids=None,
+                remove_configs=True,
+            ),
+            30,
+            operation="managed repository credential-agent cleanup",
+        )
+        await asyncio.to_thread(
+            backend.exec_terminal_claim_resource,
             _resident_cleanup_command(authority.thread_id),
             90,
             operation="browser and IDE resident cleanup",
@@ -371,7 +385,9 @@ async def retire_stateless_workspace_residents(
             counters.update(await mount_manager.retire_existing(drain=True))
         await asyncio.to_thread(
             backend.exec_terminal_claim_resource,
-            _resident_zero_command(authority.thread_id),
+            _resident_zero_command(authority.thread_id)
+            + "\n"
+            + managed_repository_agent_zero_command(home_path="/home/agent-host"),
             30,
             operation="terminal resident zero proof",
         )
@@ -405,7 +421,9 @@ async def verify_stateless_workspace_residents_retired(
     try:
         await asyncio.to_thread(
             backend.verify_terminal_claim_resources_retired,
-            _resident_zero_command(authority.thread_id),
+            _resident_zero_command(authority.thread_id)
+            + "\n"
+            + managed_repository_agent_zero_command(home_path="/home/agent-host"),
             30,
         )
         if cloud_mount_cfg:

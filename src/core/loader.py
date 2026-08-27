@@ -2061,7 +2061,6 @@ class OfficerConfig:
     sleep_min_minutes: int = 5
     sleep_max_minutes: int = 60
     max_concurrent_workers: int = 3
-    max_pages_per_day: int = 3
     max_actions_per_wake: int = 10
     daily_token_ceiling: int = 0  # 0 = disabled (v1 leans on per-job caps)
     # Conference embodiment (centurion.md §2/S9): an ordinary interactive
@@ -2100,7 +2099,6 @@ def _parse_officer_config(data: Dict[str, Any]) -> OfficerConfig:
         sleep_min_minutes=sleep_min,
         sleep_max_minutes=sleep_max,
         max_concurrent_workers=int(officer_data.get("max_concurrent_workers") or 3),
-        max_pages_per_day=int(officer_data.get("max_pages_per_day") or 3),
         max_actions_per_wake=int(officer_data.get("max_actions_per_wake") or 10),
         daily_token_ceiling=int(officer_data.get("daily_token_ceiling") or 0),
         conference=bool(officer_data.get("conference", False)),

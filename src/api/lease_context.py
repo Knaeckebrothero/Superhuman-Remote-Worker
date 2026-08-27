@@ -52,17 +52,28 @@ class LeaseHandle:
     :meth:`mark_lost`; the executor reacts by aborting the in-flight turn.
     """
 
-    __slots__ = ("unit_id", "lease_token", "lost")
+    __slots__ = ("unit_id", "lease_token", "executor_id", "pod_uid", "lost")
 
     def __init__(self) -> None:
         self.unit_id: Optional[str] = None
         self.lease_token: int = 0
+        self.executor_id: Optional[str] = None
+        self.pod_uid: Optional[str] = None
         self.lost: asyncio.Event = asyncio.Event()
 
-    def update(self, unit_id, lease_token: int) -> None:
+    def update(
+        self,
+        unit_id,
+        lease_token: int,
+        *,
+        executor_id: str | None = None,
+        pod_uid: str | None = None,
+    ) -> None:
         """Point the handle at a freshly claimed lease (one call per claim)."""
         self.unit_id = str(unit_id)
         self.lease_token = int(lease_token)
+        self.executor_id = str(executor_id).strip() if executor_id else None
+        self.pod_uid = str(pod_uid).strip() if pod_uid else None
         # Fresh event per claim: waiters bind to the claim they serve.
         self.lost = asyncio.Event()
 

@@ -720,6 +720,16 @@ async def test_queued_remote_read_aborts_after_release_and_reassignment(
             self.thread["metadata"]["workspace_container"].update(updates)
             return True
 
+        async def record_docker_workspace_process_zero(
+            self, owner_id, *, owner_kind, lease_id
+        ):
+            assert (owner_kind, owner_id, lease_id) == (
+                "thread",
+                THREAD_ID,
+                "lease-old",
+            )
+            return True
+
     db = DB()
 
     async def current_thread():
@@ -2167,6 +2177,7 @@ class _DockerLeaseConnection:
         self.jobs: dict[str, dict[str, Any]] = {}
         self.threads: dict[str, dict[str, Any]] = {}
         self.inventory: dict[tuple[str, int], dict[str, Any]] = {}
+        self.process_zero_receipts: set[tuple[str, str, str]] = set()
         self.lock = asyncio.Lock()
         self.advisory_calls = 0
 
@@ -2223,6 +2234,13 @@ class _DockerLeaseConnection:
         if key not in table:
             return None
         return {"workspace": table[key]}
+
+    async def fetchval(self, query: str, *args):
+        assert "managed_repository_process_zero_receipts" in query
+        owner_kind, owner_id, lease_id = args
+        return (str(owner_kind), str(owner_id), str(lease_id)) in (
+            self.process_zero_receipts
+        )
 
     async def fetch(self, query: str):
         assert "UNION ALL" in query
@@ -2409,6 +2427,7 @@ async def test_legacy_lease_id_none_is_cas_not_wildcard_after_reassignment() -> 
     )
     assert claimed is not None
     old_lease_id = claimed["_docker_workspace_lease_id"]
+    connection.process_zero_receipts.add(("job", job_id, str(old_lease_id)))
     released = await db.transition_docker_workspace_lease(
         owner_kind="job",
         owner_id=job_id,
@@ -2920,7 +2939,7 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
     }
 
 
-def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None:
+def test_vm_host_key_ownership_modes_leave_canvas_fail_closed() -> None:
     cleanup = Path("docker/agent-vm-base/scripts/cleanup.sh").read_text()
     primary_template = Path("helm/templates/vm-controller/configmap.yaml").read_text()
     remote_template = Path(
@@ -2928,12 +2947,15 @@ def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None
     ).read_text()
     nats_source = Path("orchestrator/services/nats_bridge.py").read_text()
     assert "rm -f /etc/ssh/ssh_host_*" in cleanup
-    for template in (primary_template, remote_template):
-        assert "rm -f /etc/ssh/ssh_host_*" in template
-        assert "ssh-keygen -A" in template
-        assert template.index("ssh-keygen -A") < template.index(
-            "systemctl start management-daemon.service"
-        )
+    # Same-cluster host identity is injected into the per-VM Secret by the
+    # controller. The external/tailnet template keeps guest-side generation.
+    assert "rm -f /etc/ssh/ssh_host_*" not in primary_template
+    assert "ssh-keygen -A" not in primary_template
+    assert "rm -f /etc/ssh/ssh_host_*" in remote_template
+    assert "ssh-keygen -A" in remote_template
+    assert remote_template.index("ssh-keygen -A") < remote_template.index(
+        "systemctl start management-daemon.service"
+    )
     assert "bind_thread_workspace_backing(" not in nats_source
 
 
@@ -3006,7 +3028,7 @@ async def test_unattested_docker_thread_still_assigns_but_disables_canvas(
 
 
 @pytest.mark.asyncio
-async def test_default_docker_job_release_quarantines_without_ssh_cleanup() -> None:
+async def test_default_docker_job_release_retires_agents_then_quarantines() -> None:
     from unittest.mock import AsyncMock
 
     from services.docker_provisioner import DockerProvisioner
@@ -3030,22 +3052,30 @@ async def test_default_docker_job_release_quarantines_without_ssh_cleanup() -> N
     db.transition_docker_workspace_lease.side_effect = transition
     provisioner._db = db
     provisioner._reset_workspace_via_ssh = AsyncMock(return_value=True)
+    provisioner._retire_managed_repository_agents_via_ssh = AsyncMock(return_value=True)
 
-    assert await provisioner.release_workspace("job") is False
+    assert await provisioner.release_workspace("job") is True
     provisioner._reset_workspace_via_ssh.assert_not_awaited()
+    provisioner._retire_managed_repository_agents_via_ssh.assert_awaited_once_with(
+        "workspace-1", 30022
+    )
+    db.record_docker_workspace_process_zero.assert_awaited_once_with(
+        "job", owner_kind="job", lease_id="lease-job"
+    )
     assert transitions == [
-        {"status": "releasing"},
+        {
+            "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
+        },
         {
             "status": "quarantined",
-            "quarantine_reason": "container_recreation_required",
+            "quarantine_reason": "container_recreation_required_process_zero",
         },
     ]
 
 
 @pytest.mark.asyncio
-async def test_default_docker_thread_release_revokes_then_quarantines_without_cleanup() -> (
-    None
-):
+async def test_default_docker_thread_release_retires_then_quarantines() -> None:
     from unittest.mock import AsyncMock
 
     from services.docker_provisioner import DockerProvisioner
@@ -3070,19 +3100,190 @@ async def test_default_docker_thread_release_revokes_then_quarantines_without_cl
     db.transition_docker_workspace_lease.side_effect = transition
     provisioner._db = db
     provisioner._reset_workspace_via_ssh = AsyncMock(return_value=True)
+    provisioner._retire_managed_repository_agents_via_ssh = AsyncMock(return_value=True)
 
     # Exact quarantine is a successful terminal release: the host is fenced
     # from allocation until controller-attested container recreation.
     assert await provisioner.release_thread_workspace(THREAD_ID) is True
     provisioner._reset_workspace_via_ssh.assert_not_awaited()
+    provisioner._retire_managed_repository_agents_via_ssh.assert_awaited_once_with(
+        "workspace-1", 30022
+    )
+    db.record_docker_workspace_process_zero.assert_awaited_once_with(
+        THREAD_ID, owner_kind="thread", lease_id="lease-thread"
+    )
     assert transitions == [
-        {"status": "releasing", "_canvas_workspace_generation": None},
+        {
+            "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
+            "_canvas_workspace_generation": None,
+        },
         {
             "status": "quarantined",
-            "quarantine_reason": "container_recreation_required",
+            "quarantine_reason": "container_recreation_required_process_zero",
             "_canvas_workspace_generation": None,
         },
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+async def test_default_docker_release_fails_closed_when_process_zero_is_unknown(
+    owner_kind: str,
+) -> None:
+    """Quarantine is not evidence that a live static process namespace is clean."""
+
+    from unittest.mock import AsyncMock
+
+    from services.docker_provisioner import DockerProvisioner
+
+    provisioner = DockerProvisioner()
+    lease = {
+        "status": "ready",
+        "host": "workspace-1",
+        "port": 30022,
+        "provisioner": "docker",
+        "_docker_workspace_lease_id": f"lease-{owner_kind}",
+    }
+    db = AsyncMock()
+    if owner_kind == "job":
+        db.get_job.return_value = {"context": {"workspace_container": lease}}
+    else:
+        db.get_thread.return_value = {"metadata": {"workspace_container": lease}}
+    transitions: list[dict[str, Any]] = []
+
+    async def transition(**kwargs):
+        transitions.append(kwargs)
+        return {**lease, **kwargs["updates"]}
+
+    db.transition_docker_workspace_lease.side_effect = transition
+    provisioner._db = db
+    provisioner._retire_managed_repository_agents_via_ssh = AsyncMock(
+        return_value=False
+    )
+
+    released = (
+        await provisioner.release_workspace("job")
+        if owner_kind == "job"
+        else await provisioner.release_thread_workspace(THREAD_ID)
+    )
+    assert released is False
+    assert transitions[-1]["updates"]["status"] == "quarantined"
+    assert (
+        transitions[-1]["updates"]["quarantine_reason"]
+        == "managed_repository_agent_retirement_failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_docker_release_reclaims_exact_failed_quarantine_once() -> None:
+    """A supported retry can settle an old/failed exact lease without a race."""
+
+    from unittest.mock import AsyncMock
+
+    from services.docker_provisioner import DockerProvisioner
+
+    provisioner = DockerProvisioner()
+    lease = {
+        "status": "quarantined",
+        "quarantine_reason": "managed_repository_agent_retirement_failed",
+        "host": "workspace-1",
+        "port": 30022,
+        "provisioner": "docker",
+        "_docker_workspace_lease_id": "lease-job",
+    }
+    db = AsyncMock()
+    db.get_job.return_value = {"context": {"workspace_container": lease}}
+    transitions: list[dict[str, Any]] = []
+
+    async def transition(**kwargs):
+        transitions.append(kwargs)
+        return {**lease, **kwargs["updates"]}
+
+    db.transition_docker_workspace_lease.side_effect = transition
+    provisioner._db = db
+    provisioner._retire_managed_repository_agents_via_ssh = AsyncMock(return_value=True)
+
+    assert await provisioner.release_workspace("job") is True
+    assert transitions[0]["expected_statuses"] == {"quarantined"}
+    assert transitions[0]["updates"] == {
+        "status": "releasing",
+        "quarantine_reason": "managed_repository_agent_retirement_claimed",
+    }
+    assert transitions[-1]["updates"] == {
+        "status": "quarantined",
+        "quarantine_reason": "container_recreation_required_process_zero",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+async def test_default_docker_release_replays_proven_process_zero(
+    owner_kind: str,
+) -> None:
+    """A lost response or later teardown failure does not wedge retry."""
+
+    from unittest.mock import AsyncMock
+
+    from services.docker_provisioner import DockerProvisioner
+
+    provisioner = DockerProvisioner()
+    lease = {
+        "status": "quarantined",
+        "quarantine_reason": "container_recreation_required_process_zero",
+        "host": "workspace-1",
+        "port": 30022,
+        "provisioner": "docker",
+        "_docker_workspace_lease_id": f"lease-{owner_kind}",
+    }
+    db = AsyncMock()
+    db.get_job.return_value = {"context": {"workspace_container": lease}}
+    db.get_thread.return_value = {"metadata": {"workspace_container": lease}}
+    db.docker_workspace_process_zero_is_current.return_value = True
+    db.transition_docker_workspace_lease.return_value = lease
+    provisioner._db = db
+    provisioner._retire_managed_repository_agents_via_ssh = AsyncMock()
+
+    released = (
+        await provisioner.release_workspace("job")
+        if owner_kind == "job"
+        else await provisioner.release_thread_workspace(THREAD_ID)
+    )
+
+    assert released is True
+    if owner_kind == "job":
+        db.transition_docker_workspace_lease.assert_not_awaited()
+    else:
+        db.transition_docker_workspace_lease.assert_awaited_once_with(
+            owner_kind="thread",
+            owner_id=THREAD_ID,
+            expected_lease_id="lease-thread",
+            expected_statuses={"quarantined"},
+            updates={"status": "quarantined"},
+        )
+    provisioner._retire_managed_repository_agents_via_ssh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_default_docker_retirement_uses_all_then_independent_zero_proof() -> None:
+    from unittest.mock import AsyncMock
+
+    from services.docker_provisioner import DockerProvisioner
+
+    provisioner = DockerProvisioner()
+    provisioner._run_pinned_workspace_command = AsyncMock(return_value=True)
+
+    assert (
+        await provisioner._retire_managed_repository_agents_via_ssh(
+            "workspace-1", 30022
+        )
+        is True
+    )
+    command = provisioner._run_pinned_workspace_command.await_args.args[2]
+    assert " all " in command
+    assert " zero " in command
+    assert command.index(" all ") < command.index(" zero ")
+    assert "/home/agent-host/.ssh/srw-managed/sockets" in command
 
 
 @pytest.mark.asyncio
@@ -3187,7 +3388,10 @@ async def test_trusted_dev_cleanup_requires_and_pins_inventory_identity(
         validator.validate_host_public_key("workspace-1", "127.0.0.1", 30022, wrong_key)
         is False
     )
-    assert "ssh-add -D" in connection.command
+    assert "stateless-process-zero" not in connection.command
+    assert "starttime" in connection.command
+    assert "ssh-agent" in connection.command
+    assert "ssh-add -D" not in connection.command
     assert "rm -rf -- /home/agent-host/.ssh/srw-managed" in connection.command
     assert "test ! -e /home/agent-host/.ssh/srw-managed" in connection.command
     assert "rm -rf -- /home/agent-host/workspace" in connection.command
@@ -3393,7 +3597,12 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
         events.append(("reset", (host, port)))
         return True
 
+    async def record(owner_id, **kwargs):
+        events.append(("receipt", (owner_id, kwargs)))
+        return True
+
     db.transition_docker_workspace_lease.side_effect = transition
+    db.record_docker_workspace_process_zero.side_effect = record
     provisioner._db = db
     provisioner._snapshot_service = None
     provisioner._trusted_dev_reuse = True
@@ -3404,15 +3613,23 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
         "db",
         {
             "status": "releasing",
+            "quarantine_reason": "managed_repository_agent_retirement_claimed",
             "_canvas_workspace_generation": None,
         },
     )
     assert events[1] == ("reset", ("workspace-1", 30022))
-    assert events[2][0] == "db"
-    assert events[2][1]["status"] == "released"
-    assert events[2][1]["_canvas_workspace_generation"] is None
-    assert events[2][1]["_docker_workspace_trust_mode"] == "trusted_dev"
-    assert events[2][1]["_docker_workspace_attested"] is False
+    assert events[2] == (
+        "receipt",
+        (
+            THREAD_ID,
+            {"owner_kind": "thread", "lease_id": "lease-release"},
+        ),
+    )
+    assert events[3][0] == "db"
+    assert events[3][1]["status"] == "released"
+    assert events[3][1]["_canvas_workspace_generation"] is None
+    assert events[3][1]["_docker_workspace_trust_mode"] == "trusted_dev"
+    assert events[3][1]["_docker_workspace_attested"] is False
 
 
 def test_canvas_session_create_override_is_closed() -> None:

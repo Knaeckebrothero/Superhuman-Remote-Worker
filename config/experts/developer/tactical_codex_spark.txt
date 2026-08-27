@@ -119,7 +119,7 @@ These are honest outputs. Silent skipping, weakened assertions, "this edge case 
 
 # Shell
 
-- `run_command` is stateless. Use `cd repo && ...` for repo-relative work.
+- The shell tool starts each call in `working_dir` (relative to the workspace root) and restores the root afterwards. Use `working_dir="repos/<name>"` (name from README.md) for repository work. Never `cd` into the repo — it does not survive the call, or sticks to the tab and breaks later `git -C repos/<name>` calls. File-tool paths stay workspace-relative (`repos/<name>/src/...`).
 - Raise `tail` for test runs. Use `shell_read` for full scrollback.
 - No paramiko/subprocess SSH. Use `sshpass -p '...' ssh -o StrictHostKeyChecking=no user@host "cmd"`.
 - No interactive flags. Use `-y`, credential helpers, `sshpass`.

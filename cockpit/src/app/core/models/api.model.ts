@@ -958,22 +958,6 @@ export interface CommunicationSettings {
 }
 
 /**
- * A notification entry from the orchestrator.
- */
-export interface AppNotification {
-  id: string;
-  job_id: string | null;
-  thread_id: string | null;
-  subject: string;
-  message: string;
-  job_description: string | null;
-  config_name: string | null;
-  status: string;
-  read_at: string | null;
-  created_at: string;
-}
-
-/**
  * An external contact linked to a project.
  */
 export interface ExternalContact {
@@ -1336,6 +1320,12 @@ export interface OfficerFloorWakeOutcome {
 /** Backlog-pool policy state: what the tick enforces, made visible (§6). */
 export interface OfficerBacklogState {
   auto_pull: boolean;
+  /** Deployment-owned release fence for the unattended enable transition. */
+  auto_pull_control?: {
+    enable_available: boolean;
+    source: 'deployment_policy';
+    reason?: 'release_gate_closed' | null;
+  };
   breakers: Record<string, OfficerPoolBreaker>;
   stale_claims: OfficerStaleClaim[];
   stale_claim_policy?: {
@@ -1366,9 +1356,7 @@ export interface OfficerLive {
   sleep_minutes?: {min: number; max: number} | null;
   next_wake_at?: string | null;
   pending_events?: number;
-  pages_today?: {used: number; budget: number} | null;
   token_ceiling?: {daily: number; deferred_today?: boolean} | null;
-  digest?: {at: string; subject: string; message: string}[] | null;
   conference?: {thread_id: string; status?: string | null} | null;
   /** Not yet in the O1–O4 contract; optional so the editor seeds them when the backend adds them. */
   max_actions_per_wake?: number | null;
@@ -1461,7 +1449,6 @@ export interface OfficerPostPatch {
   /** Optional century-wide daily USD ceiling on worker spend. */
   worker_spend_ceiling_daily?: number | null;
   max_concurrent_workers?: number | null;
-  max_pages_per_day?: number | null;
   max_actions_per_wake?: number | null;
   daily_token_ceiling?: number | null;
   sleep_min_minutes?: number | null;

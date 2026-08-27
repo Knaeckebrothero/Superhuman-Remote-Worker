@@ -14,7 +14,7 @@ import pytest
 
 from src.core.datasource_setup import (
     clone_repository_datasources,
-    inject_datasource_index,
+    inject_workspace_facts,
     process_datasources,
     resolve_repo_clone_names,
 )
@@ -594,7 +594,8 @@ class TestResolveRepoCloneNames:
 
 
 class TestDatasourceIndexRepoPaths:
-    """datasources.md must point at the directories clones actually land in."""
+    """The README.md connector list must point at the directories clones
+    actually land in."""
 
     def test_index_uses_clone_directory_names(self):
         ws = MagicMock()
@@ -604,13 +605,60 @@ class TestDatasourceIndexRepoPaths:
             {path: content}
         )
 
-        inject_datasource_index([token_ds(name="Read-only mirror of upstream")], ws)
+        inject_workspace_facts([token_ds(name="Read-only mirror of upstream")], ws)
 
-        content = written["datasources.md"]
+        content = written["README.md"]
         assert "`./repos/repo/`" in content
         # The old behavior used the datasource-label slug, which never
         # matched the clone directory (upstream repo name).
         assert "read-only-mirror-of-upstream" not in content
+
+
+class TestWorkspaceFactsRepositoryLine:
+    """The repository line tells the agent the clone dir, the repo= handle,
+    the base branch (when known), and which repo_* tools apply."""
+
+    def _render(self, ds, meta=None):
+        ws = make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        if meta is not None:
+            ws.source_repo_meta["repo"] = meta
+        inject_workspace_facts([ds], ws)
+        return written["README.md"]
+
+    def test_writable_repo_with_known_base_branch(self):
+        content = self._render(
+            token_ds(name="Mine"), meta={"read_only": False, "default_branch": "main"}
+        )
+        assert (
+            "- **Mine** — repository cloned at `./repos/repo/` "
+            '(use `repo="repo"` with the repo_* tools); base branch `main`; '
+            "writable — pull requests opened with repo_open_pr are recorded "
+            "for this job"
+        ) in content
+
+    def test_unknown_base_branch_omits_the_clause(self):
+        content = self._render(token_ds(name="Mine"))
+        assert "`./repos/repo/`" in content
+        assert "base branch" not in content
+        assert "writable — pull requests opened with repo_open_pr" in content
+
+    def test_read_only_repo_lists_only_the_read_tools(self):
+        content = self._render(
+            token_ds(name="Mirror", project_read_only=True),
+            meta={"read_only": True, "default_branch": "develop"},
+        )
+        assert "base branch `develop`" in content
+        assert "read-only — only repo_pull/repo_pr_status" in content
+        assert "repo_open_pr" not in content
+
+    def test_read_only_falls_back_to_the_payload_flag_without_meta(self):
+        content = self._render(token_ds(name="Mirror", project_read_only=True))
+        assert "read-only — only repo_pull/repo_pr_status" in content
 
 
 class TestProcessDatasourcesRepoGuard:
@@ -642,9 +690,9 @@ class TestDeclaredReadOnlyIndexNote:
         ds = token_ds(name="Org Wiki")
         ds["read_only"] = True
 
-        inject_datasource_index([ds], ws)
+        inject_workspace_facts([ds], ws)
 
-        assert "declared read-only" in written["datasources.md"]
+        assert "declared read-only" in written["README.md"]
 
     def test_private_repo_has_no_ro_note(self):
         ws = make_workspace_manager()
@@ -654,6 +702,6 @@ class TestDeclaredReadOnlyIndexNote:
             {path: content}
         )
 
-        inject_datasource_index([token_ds(name="Mine")], ws)
+        inject_workspace_facts([token_ds(name="Mine")], ws)
 
-        assert "declared read-only" not in written["datasources.md"]
+        assert "declared read-only" not in written["README.md"]

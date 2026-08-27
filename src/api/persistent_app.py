@@ -4234,7 +4234,6 @@ async def _attach_session_inner(
     if datasources:
         from ..core.datasource_setup import (
             datasource_tool_categories,
-            inject_datasource_index as _inject_ds_index,
             process_datasources,
         )
 
@@ -4671,12 +4670,20 @@ async def _attach_session_inner(
 
         clone_repository_datasources(repo_datasources, _session.workspace_manager)
 
-    # Inject datasource index into datasources.md (after workspace is initialized)
-    if datasources and _session.workspace_manager:
+    # README.md workspace-facts block (connectors, materials, layout) — after
+    # the workspace is initialized and repositories are cloned. Written even
+    # without connectors so the file states the explicit "none" case.
+    if _session.workspace_manager:
+        from ..core.datasource_setup import inject_workspace_facts
+
         try:
-            _inject_ds_index(datasources, _session.workspace_manager)
+            inject_workspace_facts(
+                datasources or [],
+                _session.workspace_manager,
+                expert=getattr(_session.config, "display_name", None),
+            )
         except Exception as e:
-            logger.warning(f"Failed to inject datasource index: {e}")
+            logger.warning(f"Failed to write workspace facts: {e}")
 
     # Initialize cloud workspace sync if the orchestrator gave us a config.
     # F-C1: a protected thread NEVER adopts cloud_sync or nc_session_folder
@@ -4923,7 +4930,14 @@ async def _attach_session_inner(
     # Restore deliberately excludes persisted-but-unadmitted delivery rows:
     # they are executable inbox work, not passive conversation context. Claim
     # and queue them after the exact reciprocal binding is active.
-    await _reclaim_pending_pinned_inputs()
+    # Pinned input deliveries are owned by the reciprocal thread/agent/pod
+    # binding.  A stateless turn is instead owned by its run_queue lease and
+    # deliberately has no registered agent row; trying to enter the pinned
+    # reclaimer here makes every pooled attach fail after all of its durable
+    # setup has already completed.  The turn executor reads the stateless
+    # inbox through input_seq/consumed_seq after this attach returns.
+    if not _stateless_mode():
+        await _reclaim_pending_pinned_inputs()
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
@@ -6229,6 +6243,27 @@ async def _transition_claimed_input(
     if _session is None or _session.postgres_conn is None or _thread_id is None:
         return False
     try:
+        live_lease = _current_lease_var.get()
+        if live_lease is not None and live_lease.active:
+            executor_id = str(live_lease.executor_id or "").strip()
+            pod_uid = str(live_lease.pod_uid or "").strip()
+            if (
+                str(live_lease.unit_id or "") != str(_thread_id)
+                or not executor_id
+                or not pod_uid
+            ):
+                return False
+            return await _session.postgres_conn.transition_stateless_input_delivery(
+                thread_id=_thread_id,
+                delivery_id=delivery_id,
+                lease_token=int(live_lease.lease_token),
+                executor_id=executor_id,
+                pod_uid=pod_uid,
+                claim_generation=claim_generation,
+                transition=transition,
+                turn_number=turn_number,
+                reason=reason,
+            )
         agent_id, pod_uid, runtime_generation, runtime_attach_token = (
             _pinned_input_runtime_identity()
         )
@@ -6246,7 +6281,7 @@ async def _transition_claimed_input(
         )
     except Exception as exc:
         logger.warning(
-            "Pinned input %s transition failed (%s)",
+            "Durable input %s transition failed (%s)",
             transition,
             type(exc).__name__,
         )
@@ -16280,10 +16315,14 @@ async def _handle_workspace_upgrade(
             retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
             workspace_generation=(
-                workspace_generation if shell_owner_token is not None else None
+                workspace_generation
+                if workspace_generation and workspace_runtime_incarnation
+                else None
             ),
             runtime_incarnation=(
-                workspace_runtime_incarnation if shell_owner_token is not None else None
+                workspace_runtime_incarnation
+                if workspace_generation and workspace_runtime_incarnation
+                else None
             ),
             expected_host_key_fingerprint=(
                 workspace_ssh_host_key_fingerprint

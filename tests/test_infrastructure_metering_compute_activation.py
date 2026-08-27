@@ -14,6 +14,9 @@ import asyncpg
 import pytest
 
 from orchestrator.database.migrate import run_migrations
+from orchestrator.services.infrastructure_metering.collectors.vmi_normalization import (
+    normalize_virtual_machine_instance,
+)
 from orchestrator.services.infrastructure_metering.compute_activation import (
     ComputeActivationStore,
     ComputeActivationConflict,
@@ -35,6 +38,9 @@ from orchestrator.services.infrastructure_metering.inventory import (
     SnapshotObservationContext,
     TransportNonceClaim,
     inventory_manifest_digest,
+)
+from orchestrator.services.infrastructure_metering.vmi_intervals import (
+    VMIIntervalReconciler,
 )
 from src.shared.workspace_contract import (
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -75,8 +81,8 @@ def _transport(collector_id: str, request_kind: str) -> TransportNonceClaim:
 @pytest.fixture(scope="module")
 def compute_pg_dsn() -> str:
     testcontainers = pytest.importorskip("testcontainers.postgres")
-    container = testcontainers.PostgresContainer("postgres:16")
     try:
+        container = testcontainers.PostgresContainer("postgres:16")
         container.start()
     except Exception as exc:
         pytest.skip(f"no container runtime for compute migration test: {exc}")
@@ -266,6 +272,53 @@ def _healthy_scope_row(
         "missing_shadow_count": 0,
         "orphan_shadow_count": 0,
     }
+
+
+def _workspace_vm_item() -> InventoryItem:
+    normalized = normalize_virtual_machine_instance(
+        {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachineInstance",
+            "metadata": {
+                "uid": "recovery-vmi-uid",
+                "namespace": "agent-vms",
+                "name": "recovery-vm",
+                "resourceVersion": "rv-vmi-recovery",
+                "creationTimestamp": "2026-08-25T08:00:00Z",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "kubevirt.io/v1",
+                        "kind": "VirtualMachine",
+                        "name": "recovery-vm",
+                        "uid": "recovery-vm-uid",
+                    }
+                ],
+            },
+            "spec": {
+                "domain": {
+                    "cpu": {"cores": 2, "sockets": 1, "threads": 1},
+                    "memory": {"guest": "8Gi"},
+                }
+            },
+            "status": {
+                "phase": "Running",
+                "nodeName": "worker-a",
+                "phaseTransitionTimestamps": [
+                    {
+                        "phase": "Scheduled",
+                        "phaseTransitionTimestamp": "2026-08-25T08:00:02Z",
+                    }
+                ],
+            },
+        }
+    )
+    return InventoryItem(
+        source_kind="vmi",
+        source_uid=normalized.uid,
+        revision_hash=normalized.revision_hash,
+        normalized_item=normalized.to_db_item(),
+        valid_for_metering=normalized.valid_for_metering,
+    )
 
 
 def _scope_proof_connection(
@@ -501,6 +554,277 @@ async def test_compute_authority_confirmation_requires_exact_live_list_proof() -
         scope_id,
         received_at,
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_vm_initial_authority_uses_healthy_recovery_epoch(
+    compute_pg_dsn: str,
+) -> None:
+    dbname = f"compute_vm_recovery_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(compute_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    pool = await asyncpg.create_pool(
+        _swap_db(compute_pg_dsn, dbname),
+        min_size=1,
+        max_size=3,
+    )
+    assert pool is not None
+    try:
+        await run_migrations(pool, APP_MIGRATIONS)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE infra_metering_control SET leader_generation=7 "
+                "WHERE singleton=TRUE"
+            )
+            await advance_compute_activation_to_shadow(conn, "workspace_vm")
+            database_time = await conn.fetchval("SELECT statement_timestamp()")
+            assert isinstance(database_time, datetime)
+
+            scope_id, predecessor_epoch_id, recovery_epoch_id = (
+                uuid4(),
+                uuid4(),
+                uuid4(),
+            )
+            await conn.execute(
+                "INSERT INTO resource_inventory_scopes ("
+                "id,collector_id,source_cluster,api_resource,namespace) VALUES ("
+                "$1,'kubevirt-vmis','cluster-a',"
+                "'kubevirt.io/v1/virtualmachineinstances','agent-vms')",
+                scope_id,
+            )
+            await conn.execute(
+                "INSERT INTO resource_inventory_scope_epochs ("
+                "id,scope_id,epoch_number,coverage_mode,leader_generation) "
+                "VALUES ($1,$2,1,'list-watch',7)",
+                predecessor_epoch_id,
+                scope_id,
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_scope_epochs SET retired_at=$2 WHERE id=$1",
+                predecessor_epoch_id,
+                database_time,
+            )
+            await conn.execute(
+                "INSERT INTO resource_inventory_scope_epochs ("
+                "id,scope_id,epoch_number,coverage_mode,leader_generation,"
+                "recovery_from_epoch_id,require_after_recovery) VALUES ("
+                "$1,$2,2,'list-watch',7,$3,TRUE)",
+                recovery_epoch_id,
+                scope_id,
+                predecessor_epoch_id,
+            )
+
+        store = InventoryStore(pool)
+        await store.activate_generation(expected_generation=7)
+        scope = InventoryScopeIdentity(
+            collector_id="kubevirt-vmis",
+            source_cluster="cluster-a",
+            api_resource="kubevirt.io/v1/virtualmachineinstances",
+            namespace="agent-vms",
+        )
+        item = _workspace_vm_item()
+        assert item.valid_for_metering
+        ticket = await store.issue_ingest_ticket(
+            recovery_epoch_id,
+            "a" * 64,
+            scope=scope,
+            transport=_transport(scope.collector_id, "snapshot-ticket"),
+            max_snapshot_items=10,
+            max_snapshot_bytes=100_000,
+        )
+        snapshot_id = uuid4()
+        await store.begin_snapshot(
+            ticket.token,
+            ticket.id,
+            snapshot_id,
+            database_time - timedelta(minutes=2),
+            scope=scope,
+            transport=_transport(scope.collector_id, "snapshot-begin"),
+        )
+        await store.stage_items(
+            ticket.token,
+            ticket.id,
+            snapshot_id,
+            (item,),
+            scope=scope,
+            transport=_transport(scope.collector_id, "snapshot-items"),
+        )
+        final = SnapshotFinalization(
+            collection_completed_at=database_time - timedelta(minutes=1),
+            complete=True,
+            item_count=1,
+            item_digest=inventory_manifest_digest((item,)),
+            resource_version="rv-vmi-recovery",
+        )
+        reconciler = VMIIntervalReconciler(shadow_enabled=True)
+        finalized = await store.finalize_snapshot(
+            ticket.token,
+            ticket.id,
+            snapshot_id,
+            final,
+            scope=scope,
+            transport=_transport(scope.collector_id, "snapshot-finalize"),
+            interval_mutator=reconciler.apply_snapshot,
+            observation_hook=reconciler.observe_snapshot,
+            require_shadow_comparison=True,
+        )
+        assert finalized.pending_valid_items == 0
+        assert finalized.shadow_comparisons == 1
+
+        replayed = await store.finalize_snapshot(
+            ticket.token,
+            ticket.id,
+            snapshot_id,
+            final,
+            scope=scope,
+            transport=_transport(scope.collector_id, "snapshot-finalize"),
+        )
+        assert replayed.replayed
+
+        async with pool.acquire() as conn:
+            comparison = await conn.fetchrow(
+                "SELECT status,reason_code,explained,owner_kind,owner_id,"
+                "owner_trusted,observed_cpu_millicores,observed_memory_bytes,"
+                "observed_started_at,observed_start_time_source,"
+                "observed_start_uncertainty_us,comparison_at "
+                "FROM resource_inventory_shadow_comparisons "
+                "WHERE snapshot_id=$1 AND source_uid=$2",
+                snapshot_id,
+                item.source_uid,
+            )
+            assert comparison is not None
+            assert (
+                comparison["status"],
+                comparison["reason_code"],
+                comparison["explained"],
+            ) == ("not-applicable", "vmi-no-legacy-interval", True)
+            assert (
+                comparison["owner_kind"],
+                comparison["owner_id"],
+                comparison["owner_trusted"],
+            ) == (None, None, False)
+            assert (
+                comparison["observed_cpu_millicores"],
+                comparison["observed_memory_bytes"],
+            ) == (2000, 8 * 1024**3)
+            assert comparison["observed_started_at"] == datetime(
+                2026, 8, 25, 8, 0, 2, tzinfo=timezone.utc
+            )
+            assert (
+                comparison["observed_start_time_source"],
+                comparison["observed_start_uncertainty_us"],
+            ) == ("vmi-scheduled-transition", 0)
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM resource_inventory_shadow_comparisons "
+                    "WHERE snapshot_id=$1 AND source_uid=$2",
+                    snapshot_id,
+                    item.source_uid,
+                )
+                == 1
+            )
+            epoch_health = await conn.fetchrow(
+                "SELECT item_health,continuity_health,reliable_from,"
+                "continuous_since,required_from "
+                "FROM resource_inventory_scope_epochs "
+                "WHERE id=$1",
+                recovery_epoch_id,
+            )
+            assert epoch_health is not None
+            assert (
+                epoch_health["item_health"],
+                epoch_health["continuity_health"],
+            ) == ("healthy", "healthy")
+            boundary = epoch_health["required_from"]
+            assert isinstance(boundary, datetime)
+            assert epoch_health["reliable_from"] <= boundary
+            assert epoch_health["continuous_since"] <= boundary
+
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="initial compute epoch authority is invalid",
+            ):
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO resource_inventory_coverage_gaps ("
+                        "scope_epoch_id,gap_start,reason) VALUES ("
+                        "$1,$2,'test-unresolved-recovery-gap')",
+                        recovery_epoch_id,
+                        database_time,
+                    )
+                    await conn.execute(
+                        "INSERT INTO compute_metering_scope_requirements ("
+                        "activation_key,collector_id,source_cluster,"
+                        "inventory_scope_id,inventory_scope_epoch_id,"
+                        "required_from) VALUES ("
+                        "'workspace_vm','kubevirt-vmis','cluster-a',$1,$2,$3)",
+                        scope_id,
+                        recovery_epoch_id,
+                        boundary,
+                    )
+                    rejected_request_id = uuid4()
+                    await conn.execute(
+                        "INSERT INTO compute_metering_epoch_promotion_requests ("
+                        "id,activation_key,request_kind,collector_id,"
+                        "source_cluster,request_digest,actor_id,audit_reason,"
+                        "promoted_at) VALUES ("
+                        "$1,'workspace_vm','initial-activation',"
+                        "'kubevirt-vmis','cluster-a',$2,$3,$4,"
+                        "statement_timestamp())",
+                        rejected_request_id,
+                        "b" * 64,
+                        uuid4(),
+                        "reject unresolved recovery gap",
+                    )
+                    await conn.execute(
+                        "INSERT INTO compute_metering_epoch_authorities ("
+                        "activation_key,collector_id,source_cluster,"
+                        "inventory_scope_id,inventory_scope_epoch_id,"
+                        "previous_authority_id,predecessor_epoch_id,"
+                        "authority_sequence,effective_from,proof_snapshot_id,"
+                        "proof_generation,promotion_request_id) VALUES ("
+                        "'workspace_vm','kubevirt-vmis','cluster-a',$1,$2,"
+                        "NULL,NULL,1,$3,$4,7,$5)",
+                        scope_id,
+                        recovery_epoch_id,
+                        boundary,
+                        snapshot_id,
+                        rejected_request_id,
+                    )
+
+            request_id = uuid4()
+            async with conn.transaction():
+                promotion = await promote_compute_scope_epochs(
+                    conn,
+                    activation_key="workspace_vm",
+                    activated_at=boundary,
+                    source_cluster="cluster-a",
+                    namespaces=("agent-vms",),
+                    max_scope_age=timedelta(minutes=15),
+                    expected_generation=7,
+                    request_id=request_id,
+                    actor_id=uuid4(),
+                    audit_reason="healthy recovered VMI epoch proof",
+                )
+                activation = await schedule_compute_activation(
+                    conn,
+                    activation_key="workspace_vm",
+                    activated_at=boundary,
+                )
+            assert not promotion.replayed
+            assert len(promotion.authorities) == 1
+            assert (
+                promotion.authorities[0].inventory_scope_epoch_id == recovery_epoch_id
+            )
+            assert promotion.authorities[0].authority_sequence == 1
+            assert activation.state == "active"
+            assert activation.activated_at == boundary
+    finally:
+        await pool.close()
 
 
 async def _insert_interval(

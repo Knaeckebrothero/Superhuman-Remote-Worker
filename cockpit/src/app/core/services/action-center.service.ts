@@ -1,30 +1,14 @@
-import {computed, DestroyRef, inject, Injectable, signal} from '@angular/core';
-import {SudoRequest, SudoService} from './sudo.service';
-import {NotificationService, SessionEvent} from './notification.service';
-import {ApiService} from './api.service';
-import {AppNotification, Job} from '../models/api.model';
-import {ActionItem, ActionItemStatus, MessageActionData, ReviewActionData,} from '../models/action.model';
-
-/**
- * Full UUID — the shape of a persistent-session thread id. Job-message
- * thread ids are short hex tokens and loop keys are "loop-" + 6 chars, so
- * this cleanly separates session-keyed rows (officer pages) from job-keyed
- * ones.
- */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * An officer page: keyed to a persistent session, no job behind it. REST rows
- * persist job_id NULL; live SSE frames carry job_id === thread_id (the
- * dispatch keys its queue row with the thread UUID).
- */
-function isSessionPage(n: AppNotification): boolean {
-  return (
-    !!n.thread_id &&
-    UUID_RE.test(n.thread_id) &&
-    (!n.job_id || n.job_id === n.thread_id)
-  );
-}
+import {computed, DestroyRef, inject, Injectable} from '@angular/core';
+import {Observable, tap} from 'rxjs';
+import {NotificationService} from './notification.service';
+import {ActionItem} from '../models/action.model';
+import {
+  Notification,
+  NotificationActResponse,
+  SEVERITY_URGENCY,
+  SourceRef,
+  sourceKey,
+} from '../models/notification.model';
 
 /** Sort: pending before resolved, then urgency desc, then timestamp desc. */
 function actionItemComparator(a: ActionItem, b: ActionItem): number {
@@ -38,11 +22,19 @@ function actionItemComparator(a: ActionItem, b: ActionItem): number {
   return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
 }
 
+/** Debounce for the batched seen-stamp POST. */
+const SEEN_FLUSH_MS = 750;
+
+/**
+ * The action center's item list: the durable feed (`NotificationService.feed`)
+ * and nothing else. Every producer records through the server's `record()`,
+ * so a sudo request, an agent message, a review, a headless permission gate
+ * all arrive as rows with server-declared actions (D7). Counts are the
+ * server's.
+ */
 @Injectable({ providedIn: 'root' })
 export class ActionCenterService {
-  private readonly sudo = inject(SudoService);
   private readonly notifications = inject(NotificationService);
-  private readonly api = inject(ApiService);
   private readonly destroyRef = inject(DestroyRef);
 
   // --- SSE lifecycle (owned here, not by individual components) ---
@@ -51,229 +43,153 @@ export class ActionCenterService {
   initSSE(): void {
     if (this.sseInitialized) return;
     this.sseInitialized = true;
-    this.sudo.connectSSE();
     this.notifications.connectSSE();
     this.destroyRef.onDestroy(() => {
-      this.sudo.disconnectSSE();
       this.notifications.disconnectSSE();
     });
   }
 
-  // --- Review jobs (event-driven, not polled) ---
-  readonly reviewJobs = signal<Job[]>([]);
-  private reviewLoading = false;
+  // --- Items ---
+  readonly items = computed<ActionItem[]>(() =>
+    this.notifications.feed().map((n) => this.mapNotification(n)).sort(actionItemComparator),
+  );
 
-  loadReviewJobs(): void {
-    if (this.reviewLoading) return;
-    this.reviewLoading = true;
-    this.api.getJobs('pending_review').subscribe({
-      next: (jobs) => {
-        this.reviewJobs.set(jobs as unknown as Job[]);
-        this.reviewLoading = false;
-      },
-      error: () => {
-        this.reviewLoading = false;
-      },
-    });
-  }
-
-  // --- Merged action items ---
-  readonly items = computed<ActionItem[]>(() => {
-    const sudoItems = this.sudo.requests().map((r) => this.mapSudo(r));
-    const messageItems = this.deduplicateThreads(this.notifications.notifications());
-    const reviewItems = this.reviewJobs().map((j) => this.mapReview(j));
-      const sessionItems = this.notifications.sessionEvents().map((e) => this.mapSession(e));
-      return [...sudoItems, ...messageItems, ...reviewItems, ...sessionItems].sort(actionItemComparator);
-  });
-
+  /**
+   * Server-driven counts. `pending` is what still needs someone; `unseen`
+   * is the bell's signal (D4: a row the user has had in front of them stops
+   * nagging); `byCategory` feeds the inbox chips.
+   */
   readonly counts = computed(() => {
-    const pending = this.items().filter((i) => i.status === 'pending');
+    const c = this.notifications.feedCounts();
     return {
-      sudo: pending.filter((i) => i.type === 'sudo').length,
-      messages: pending.filter((i) => i.type === 'message').length,
-      reviews: pending.filter((i) => i.type === 'review').length,
-        sessions: pending.filter((i) => i.type === 'session').length,
-      total: pending.length,
+      notifications: c.pending,
+      unseen: c.unseen,
+      total: c.pending,
+      byCategory: c.by_category,
     };
   });
 
-  // --- Actions ---
+  /** Bell badge: unseen feed rows, straight from the server. */
+  readonly badgeCount = computed(() => this.counts().unseen);
 
-  loadThread(jobId: string, threadId: string) {
-    return this.api.getThreadMessages(jobId, threadId);
+  // --- Feed engagement ---
+  private pendingSeen = new Set<string>();
+  private seenTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** A feed row rendered in the list. Batched + debounced into one POST;
+   *  stamped optimistically so the badge drops immediately. */
+  noteSeen(notificationId: string): void {
+    const row = this.notifications.feed().find((n) => n.id === notificationId);
+    if (!row || row.seen_at || this.pendingSeen.has(notificationId)) return;
+    this.pendingSeen.add(notificationId);
+    if (this.seenTimer) clearTimeout(this.seenTimer);
+    this.seenTimer = setTimeout(() => this.flushSeen(), SEEN_FLUSH_MS);
   }
 
-  reply(jobId: string, threadId: string, message: string, urgent: boolean) {
-    return this.api.replyToThread(jobId, threadId, message, urgent);
-  }
-
-  approveJob(jobId: string, notes?: string) {
-    return this.api.approveJob(jobId, notes);
-  }
-
-  resumeJob(jobId: string, feedback: string) {
-    return this.api.resumeJob(jobId, feedback);
-  }
-
-  upgradeJobToVm(jobId: string) {
-    return this.api.upgradeJobToVm(jobId);
-  }
-
-  // --- Refresh all data ---
-  refreshAll(): void {
-    this.sudo.loadRequests();
-    this.notifications.loadNotifications();
-    this.loadReviewJobs();
-  }
-
-  // --- Mapping helpers ---
-
-  private deduplicateThreads(notifications: AppNotification[]): ActionItem[] {
-    const threadMap = new Map<string, AppNotification>();
-
-    for (const n of notifications) {
-      if (!n.thread_id) continue;
-      // Session pages have no job; every other row still requires one.
-      if (!n.job_id && !isSessionPage(n)) continue;
-      // Session pages key on the thread UUID alone so the REST row
-      // (job_id NULL), the live SSE frame (job_id === thread_id), and the
-      // email deep link (?job={thread}&thread={thread}) all converge.
-      const key = `${n.job_id || n.thread_id}:${n.thread_id}`;
-      const existing = threadMap.get(key);
-      if (!existing || new Date(n.created_at) > new Date(existing.created_at)) {
-        threadMap.set(key, n);
-      }
-    }
-
-    return Array.from(threadMap.values()).map((n) => {
-      const sessionPage = isSessionPage(n);
-      const isUnread = !n.read_at;
-      // Determine blocking status from notification subject/status
-      const isBlocking = n.status === 'waiting_for_reply';
-      const status: ActionItemStatus = isUnread || isBlocking ? 'pending' : 'resolved';
-
-      let urgency: number;
-      if (isBlocking) urgency = 80;
-      else if (isUnread) urgency = 40;
-      else urgency = 20;
-
-      return {
-        id: `msg:${n.job_id || n.thread_id}:${n.thread_id}`,
-        type: 'message' as const,
-        status,
-        urgency,
-        timestamp: n.created_at,
-        title: n.subject || 'Message',
-        subtitle: sessionPage
-          ? [n.config_name, `session ${n.thread_id!.slice(0, 8)}`].filter(Boolean).join(' \u00B7 ')
-          : [n.config_name || 'agent', n.job_description].filter(Boolean).join(' \u00B7 '),
-        // No resolvable job behind a session page: a null jobId keeps the
-        // detail pane from firing the thread lookup that 404s (today's
-        // dead-end bug) and disables the job-scoped reply path.
-        jobId: sessionPage ? null : n.job_id,
-        message: {
-          threadId: n.thread_id!,
-          subject: n.subject,
-          mode: isBlocking ? 'blocking' : 'async',
-          lastMessage: n.message?.slice(0, 200) || '',
-          configName: n.config_name,
-          jobDescription: n.job_description,
-          unread: isUnread,
-          sessionThreadId: sessionPage ? n.thread_id : null,
-        } as MessageActionData,
-      };
+  /** Exposed for specs (fake timers) and for `ngOnDestroy` paths. */
+  flushSeen(): void {
+    this.seenTimer = null;
+    const ids = Array.from(this.pendingSeen);
+    this.pendingSeen.clear();
+    if (!ids.length) return;
+    const now = new Date().toISOString();
+    for (const id of ids) this.notifications.patchFeedRow({ id, seen_at: now });
+    this.notifications.markSeen(ids).subscribe({
+      error: () => {
+        /* the next load corrects the optimistic stamp */
+      },
     });
   }
 
-  private mapSudo(req: SudoRequest): ActionItem {
-    const isPending = req.status === 'pending';
-    const isVmUpgrade = req.request_type === 'vm_upgrade';
-
-    let urgency: number;
-    if (!isPending) {
-      urgency = 0;
-    } else if (isVmUpgrade) {
-      urgency = 60; // Important but not TTL-critical
-    } else {
-      const secondsLeft = req.expires_at
-        ? Math.max(0, Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000))
-        : 0;
-      if (secondsLeft < 30) urgency = 90;
-      else if (secondsLeft < 120) urgency = 70;
-      else urgency = 50;
-    }
-
-    const command = req.arguments?.join(' ') || req.command;
-    const title = isVmUpgrade ? `VM Upgrade: ${command}` : command;
-    const subtitle = isVmUpgrade
-      ? [req.vm_name, 'sudo in container'].filter(Boolean).join(' \u00B7 ')
-      : [req.vm_name, `${req.requesting_user} \u2192 ${req.target_user}`]
-          .filter(Boolean)
-          .join(' \u00B7 ');
-
-    return {
-      id: `sudo:${req.id}`,
-      type: 'sudo',
-      status: isPending ? 'pending' : 'resolved',
-      urgency,
-      timestamp: req.requested_at,
-      title,
-      subtitle,
-      jobId: req.job_id,
-      sudo: req,
-    };
+  /** Selecting a row is reading it; the server stamps read (and seen). */
+  markRead(notificationId: string): void {
+    const row = this.notifications.feed().find((n) => n.id === notificationId);
+    if (!row || row.read_at) return;
+    this.notifications.markReadV2(notificationId).subscribe({
+      next: (res) => this.notifications.upsertFeedRow(res.notification),
+      error: () => {
+        /* stays unread; nothing to undo */
+      },
+    });
   }
 
-  private mapReview(job: Job): ActionItem {
-    const isPending = job.status === 'pending_review';
-
-    return {
-      id: `rev:${job.id}`,
-      type: 'review',
-      status: isPending ? 'pending' : 'resolved',
-      urgency: 30, // Default; will be refined when frozen data loads
-      timestamp: job.updated_at || job.created_at,
-      title: job.description,
-      subtitle: [job.config_name, `job ${job.id.slice(0, 8)}`].filter(Boolean).join(' \u00B7 '),
-      jobId: job.id,
-      review: {
-        jobId: job.id,
-        jobDescription: job.description,
-        configName: job.config_name,
-        freezeType: 'job_complete',
-        phaseType: null,
-        phaseNumber: null,
-        summary: null,
-        confidence: null,
-        deliverables: [],
-        frozenAt: null,
-        command: null,
-      } as ReviewActionData,
-    };
+  /** Run a declared action; the response row replaces the local one. */
+  act(
+    notificationId: string,
+    actionType: string,
+    params: Record<string, unknown>,
+  ): Observable<NotificationActResponse> {
+    return this.notifications
+      .act(notificationId, actionType, params)
+      .pipe(tap((res) => this.notifications.upsertFeedRow(res.notification)));
   }
 
-    private mapSession(e: SessionEvent): ActionItem {
-        const isPermission = e.type === 'session.permission_request';
-        const isVmUpgrade = e.type === 'session.vm_upgrade';
-        const isWorkspaceUpgrade = e.type === 'session.workspace_upgrade';
-        const isUpgrade = isVmUpgrade || isWorkspaceUpgrade;
+  /** Deep link `?n=<id>` for a row not in the loaded page: fetch + upsert. */
+  fetchNotification(notificationId: string): Observable<Notification | null> {
+    return new Observable((subscriber) => {
+      this.notifications.getNotification(notificationId).subscribe((detail) => {
+        if (detail?.notification) this.notifications.upsertFeedRow(detail.notification);
+        subscriber.next(detail?.notification ?? null);
+        subscriber.complete();
+      });
+    });
+  }
 
-        return {
-            id: `sess:${e.event_id}`,
-            type: 'session',
-            status: 'pending',
-            urgency: isPermission ? 90 : isUpgrade ? 70 : 30,
-            timestamp: e.created_at,
-            title: isPermission
-                ? `Approve: ${e.tool}`
-                : isVmUpgrade
-                    ? 'VM Upgrade Needed'
-                    : isWorkspaceUpgrade
-                        ? 'Workspace Upgrade Needed'
-                        : 'Waiting for Input',
-            subtitle: [e.title, e.config_name].filter(Boolean).join(' \u00B7 '),
-            jobId: null,
-            session: {threadId: e.thread_id, event: e},
-        };
-    }
+  /**
+   * The legacy email deep links (`?sudo=<id>`, `?job=<id>&thread=<tid>`,
+   * `?job=<id>&review=1`) name a *source*, not a row. Find the newest feed
+   * row about it — in the loaded page first, else from the server — and
+   * upsert it so the caller can select it.
+   */
+  fetchBySource(ref: SourceRef): Observable<Notification | null> {
+    const key = sourceKey(ref);
+    return new Observable((subscriber) => {
+      const local = this.notifications.feed().find((n) => sourceKey(n.source_ref) === key);
+      if (local) {
+        subscriber.next(local);
+        subscriber.complete();
+        return;
+      }
+      this.notifications.listBySource(ref.kind, ref.id, 1).subscribe((page) => {
+        const row = page?.items?.[0] ?? null;
+        if (row) this.notifications.upsertFeedRow(row);
+        subscriber.next(row);
+        subscriber.complete();
+      });
+    });
+  }
+
+  loadMore(): void {
+    this.notifications.loadMoreFeed();
+  }
+
+  // --- Refresh ---
+  refreshAll(): void {
+    this.notifications.loadNotifications();
+  }
+
+  // --- Mapping ---
+
+  private mapNotification(n: Notification): ActionItem {
+    const pending = !n.resolved_at;
+    const payload = n.payload || {};
+    const configName = typeof payload['config_name'] === 'string' ? payload['config_name'] : null;
+    const jobDescription =
+      typeof payload['job_description'] === 'string' ? payload['job_description'] : null;
+    const title = typeof payload['title'] === 'string' ? payload['title'] : null;
+    const jobId = typeof payload['job_id'] === 'string' ? payload['job_id'] : null;
+    return {
+      id: `ntf:${n.id}`,
+      status: pending ? 'pending' : 'resolved',
+      urgency: pending ? (SEVERITY_URGENCY[n.severity] ?? 40) : 0,
+      timestamp: n.created_at || new Date(0).toISOString(),
+      title: n.subject || n.category,
+      // Empty when the payload carries nothing to say; the row then shows the
+      // translated category label rather than the raw key.
+      subtitle: [configName, jobDescription || title].filter(Boolean).join(' · '),
+      jobId,
+      notification: n,
+      category: n.category,
+    };
+  }
 }

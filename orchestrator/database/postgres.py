@@ -52,6 +52,7 @@ from utils.db_url import build_postgres_url
 from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
 from src.shared.pinned_session_identity import PinnedSessionBinding
+from src.shared.session_retirement import stateless_settled_retirement_authority
 from src.shared.deliverable_contract import (
     parse_required_deliverables,
     pr_repositories,
@@ -116,9 +117,15 @@ _DOCKER_WORKSPACE_TRUST_KEY = "_docker_workspace_trust_mode"
 _DOCKER_WORKSPACE_ATTESTED_KEY = "_docker_workspace_attested"
 _STATELESS_RUNTIME_CREATION_KEY = "_stateless_runtime_creation"
 _STATELESS_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
+_STATELESS_PROCESS_ZERO_OBSERVATION_KEY = (
+    "_stateless_workspace_process_zero_observation"
+)
 _STATELESS_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
 _STATELESS_RUNTIME_CREATION_FIELDS = frozenset(
     {"generation", "mode", "attempted", "replaces_uid"}
+)
+_STATELESS_PROCESS_ZERO_OBSERVATION_FIELDS = frozenset(
+    {"runtime_incarnation", "observed_at"}
 )
 _DOCKER_INVENTORY_COLUMNS = (
     "host, port, status, lease_id, owner_kind, owner_id, trust_mode, "
@@ -155,6 +162,8 @@ _SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS = frozenset(
         "repository_auth",
         "repository_credentials",
         "_managed_repository_authority_pending",
+        "_managed_repository_process_zero",
+        "_stateless_workspace_process_zero_observation",
     }
 )
 
@@ -528,6 +537,40 @@ def _stateless_runtime_creation_marker(
         "mode": mode,
         "attempted": attempted,
         "replaces_uid": replaces_uid,
+    }
+
+
+def _stateless_process_zero_observation(
+    metadata: dict[str, Any],
+) -> dict[str, str] | None:
+    """Strictly parse one server-owned exact-Pod terminal observation."""
+
+    if _STATELESS_PROCESS_ZERO_OBSERVATION_KEY not in metadata:
+        return None
+    raw = metadata[_STATELESS_PROCESS_ZERO_OBSERVATION_KEY]
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != _STATELESS_PROCESS_ZERO_OBSERVATION_FIELDS
+    ):
+        raise RuntimeError("stateless process-zero observation is malformed")
+    runtime_incarnation = _canonical_uuid_text(
+        raw.get("runtime_incarnation"),
+        label="stateless process-zero runtime incarnation",
+    )
+    observed_at = raw.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at:
+        raise RuntimeError("stateless process-zero observation time is malformed")
+    try:
+        parsed_at = datetime.fromisoformat(observed_at)
+    except ValueError as exc:
+        raise RuntimeError(
+            "stateless process-zero observation time is malformed"
+        ) from exc
+    if parsed_at.tzinfo is None:
+        raise RuntimeError("stateless process-zero observation time is malformed")
+    return {
+        "runtime_incarnation": runtime_incarnation,
+        "observed_at": observed_at,
     }
 
 
@@ -9109,11 +9152,27 @@ class PostgresDB:
                     # lease and endpoint before remote process cleanup.
                     "releasing": {"releasing", "released", "quarantined"},
                     "released": {"released"},
-                    "quarantined": {"quarantined"},
+                    # A terminal owner can retry only the two exact
+                    # repository-process retirement reasons accepted below.
+                    # This transition claims the retry before external SSH;
+                    # arbitrary trust/inventory quarantines remain absorbing.
+                    "quarantined": {"quarantined", "releasing"},
                 }
                 inventory_status = str(inventory["status"])
                 if status not in allowed_targets[inventory_status]:
                     raise ValueError("Docker workspace lifecycle transition is invalid")
+                if (
+                    inventory_status == "quarantined"
+                    and status == "releasing"
+                    and inventory.get("quarantine_reason")
+                    not in {
+                        "container_recreation_required",
+                        "managed_repository_agent_retirement_failed",
+                    }
+                ):
+                    raise ValueError(
+                        "Docker workspace quarantine is not retirement-retryable"
+                    )
 
                 owner_matches = False
                 if current is not None:
@@ -9228,8 +9287,40 @@ class PostgresDB:
                     quarantine_reason = str(
                         updates.get("quarantine_reason") or "lease_quarantined"
                     )
+                elif status == "releasing":
+                    raw_reason = updates.get("quarantine_reason")
+                    if raw_reason is not None and raw_reason != (
+                        "managed_repository_agent_retirement_claimed"
+                    ):
+                        raise ValueError("Docker workspace releasing reason is invalid")
+                    quarantine_reason = raw_reason
                 else:
                     quarantine_reason = None
+
+                if current is not None and (
+                    status == "released"
+                    or (
+                        status == "quarantined"
+                        and quarantine_reason
+                        == "container_recreation_required_process_zero"
+                    )
+                ):
+                    receipt_exists = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = 'docker_workspace' "
+                        "AND provisioner = 'docker' "
+                        "AND runtime_incarnation = $3)",
+                        owner_kind,
+                        owner_uuid,
+                        str(inventory["lease_id"]),
+                    )
+                    if not receipt_exists:
+                        raise ValueError(
+                            "Docker workspace release requires prior exact "
+                            "process-zero authority"
+                        )
 
                 inventory_result = await conn.execute(
                     """
@@ -9293,6 +9384,368 @@ class PostgresDB:
                             "Docker workspace owner mirror disappeared during transition"
                         )
                 return replacement
+
+    async def record_docker_workspace_process_zero(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        lease_id: str,
+    ) -> bool:
+        """Record process-zero only for one exact claimed Docker lease.
+
+        The caller performs the external, host-key-pinned retirement first.
+        This transaction does not infer success from a requested status or
+        quarantine reason: it requires both the locked inventory row and its
+        locked owner mirror to still name the same ``releasing`` lease with the
+        server-owned retirement claim marker.  Generic lease transitions can
+        consume this receipt, but can never create it.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            lease_uuid = UUID(str(lease_id))
+        except (TypeError, ValueError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        column = "context" if owner_kind == "job" else "metadata"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                owner_row = await conn.fetchrow(
+                    f"SELECT {column}->'workspace_container' AS workspace "
+                    f"FROM {table} WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                inventory = await conn.fetchrow(
+                    "SELECT host, port, owner_kind, owner_id, lease_id, "
+                    "status::text AS status, quarantine_reason "
+                    "FROM docker_workspace_leases "
+                    "WHERE owner_kind = $1 AND owner_id = $2 AND lease_id = $3 "
+                    "FOR UPDATE",
+                    owner_kind,
+                    owner_uuid,
+                    lease_uuid,
+                )
+                if owner_row is None or inventory is None:
+                    return False
+                workspace = owner_row.get("workspace") or {}
+                if isinstance(workspace, str):
+                    try:
+                        workspace = json.loads(workspace)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(workspace, dict):
+                    return False
+                claimed = (
+                    workspace.get("provisioner") == "docker"
+                    and workspace.get("status") == "releasing"
+                    and workspace.get("quarantine_reason")
+                    == "managed_repository_agent_retirement_claimed"
+                    and str(workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                    == str(lease_uuid)
+                    and str(workspace.get("host") or "")
+                    == str(inventory.get("host") or "")
+                    and not isinstance(workspace.get("port"), bool)
+                    and str(workspace.get("port") or "")
+                    == str(inventory.get("port") or "")
+                    and inventory.get("status") == "releasing"
+                    and inventory.get("quarantine_reason")
+                    == "managed_repository_agent_retirement_claimed"
+                )
+                if not claimed:
+                    return False
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ($1, $2, "
+                    "'docker_workspace', 'docker', $3) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    owner_kind,
+                    owner_uuid,
+                    str(lease_uuid),
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def docker_workspace_process_zero_is_current(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        lease_id: str,
+    ) -> bool:
+        """Verify Docker process-zero against the exact locked inventory lease."""
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            lease_uuid = UUID(str(lease_id))
+        except (TypeError, ValueError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        column = "context" if owner_kind == "job" else "metadata"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                row = await conn.fetchrow(
+                    f"SELECT {column}->'workspace_container' AS workspace "
+                    f"FROM {table} WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                workspace = row.get("workspace") or {}
+                if isinstance(workspace, str):
+                    try:
+                        workspace = json.loads(workspace)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(workspace, dict):
+                    return False
+                workspace_status = str(workspace.get("status") or "")
+                if workspace.get("provisioner") != "docker" or str(
+                    workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or ""
+                ) != str(lease_uuid):
+                    return False
+                if workspace_status == "quarantined":
+                    if (
+                        workspace.get("quarantine_reason")
+                        != "container_recreation_required_process_zero"
+                    ):
+                        return False
+                elif workspace_status != "released":
+                    return False
+                receipt_exists = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = 'docker_workspace' "
+                        "AND provisioner = 'docker' "
+                        "AND runtime_incarnation = $3)",
+                        owner_kind,
+                        owner_uuid,
+                        str(lease_uuid),
+                    )
+                )
+                if not receipt_exists:
+                    return False
+                try:
+                    inventory = await conn.fetchrow(
+                        "SELECT owner_kind, owner_id, lease_id, "
+                        "status::text AS status, quarantine_reason "
+                        "FROM docker_workspace_leases "
+                        "WHERE host = $1 AND port = $2 FOR UPDATE",
+                        str(workspace.get("host") or ""),
+                        int(workspace.get("port", 22)),
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if inventory is None:
+                    return False
+                if str(inventory.get("lease_id") or "") == str(lease_uuid):
+                    return bool(
+                        inventory.get("owner_kind") == owner_kind
+                        and inventory.get("owner_id") == owner_uuid
+                        and inventory.get("status") == workspace_status
+                        and (
+                            workspace_status != "quarantined"
+                            or inventory.get("quarantine_reason")
+                            == "container_recreation_required_process_zero"
+                        )
+                    )
+                # Only a released lease may have been safely reallocated.  Its
+                # exact owner/lease receipt remains authoritative for replay;
+                # an absorbing quarantine can never lose inventory ownership.
+                return workspace_status == "released"
+
+    async def claim_terminal_docker_workspace_retirements(
+        self,
+        *,
+        limit: int = 20,
+        stale_releasing_seconds: int = 120,
+    ) -> list[Dict[str, Any]]:
+        """Claim static workspaces whose repo agents need process-zero.
+
+        A lifecycle transition and the external SSH retirement cannot be one
+        transaction. The exact inventory lease, still-present owner, and typed
+        ``managed_repository_agent_retirement_claimed`` marker are therefore
+        the durable retry owner even when the server died before it could make
+        the job/thread terminal. This claim runs
+        under the same pool advisory lock as allocation/transition, mirrors
+        ``releasing`` to the owner row atomically, and reclaims a crashed claim
+        only after the bounded SSH operation's deadline has elapsed.
+
+        Successful new releases use the distinct
+        ``container_recreation_required_process_zero`` quarantine reason and
+        are intentionally absent from this query.  Arbitrary inventory/trust
+        quarantines are also excluded.
+        """
+
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_stale = max(60, min(int(stale_releasing_seconds), 1800))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                rows = await conn.fetch(
+                    """
+                    SELECT d.host,
+                           d.port,
+                           d.owner_kind,
+                           d.owner_id,
+                           d.lease_id,
+                           d.status::text AS status,
+                           d.trust_mode,
+                           d.host_key_fingerprint,
+                           d.quarantine_reason,
+                           CASE
+                             WHEN d.owner_kind = 'job' THEN j.status::text
+                             ELSE t.status::text
+                           END AS owner_status,
+                           CASE
+                             WHEN d.owner_kind = 'job'
+                               THEN j.context->'workspace_container'
+                             ELSE t.metadata->'workspace_container'
+                           END AS owner_workspace
+                    FROM docker_workspace_leases d
+                    LEFT JOIN jobs j
+                      ON d.owner_kind = 'job' AND j.id = d.owner_id
+                    LEFT JOIN threads t
+                      ON d.owner_kind = 'thread' AND t.id = d.owner_id
+                    WHERE d.lease_id IS NOT NULL
+                      AND (
+                        (
+                          (
+                            (d.owner_kind = 'job'
+                             AND j.status IN ('completed', 'failed', 'cancelled'))
+                            OR
+                            (d.owner_kind = 'thread' AND t.status = 'ended')
+                          )
+                          AND (
+                            d.status = 'ready'
+                            OR (
+                              d.status = 'quarantined'
+                              AND d.quarantine_reason IN (
+                                'container_recreation_required',
+                                'managed_repository_agent_retirement_failed'
+                              )
+                            )
+                          )
+                        )
+                        OR (
+                          d.status = 'releasing'
+                          AND d.quarantine_reason =
+                              'managed_repository_agent_retirement_claimed'
+                          AND d.updated_at < CURRENT_TIMESTAMP
+                              - ($1::int * INTERVAL '1 second')
+                        )
+                      )
+                    ORDER BY d.updated_at, d.host, d.port
+                    LIMIT $2
+                    FOR UPDATE OF d SKIP LOCKED
+                    """,
+                    bounded_stale,
+                    bounded_limit,
+                )
+                claimed: list[Dict[str, Any]] = []
+                for row in rows:
+                    candidate = dict(row)
+                    raw_workspace = candidate.pop("owner_workspace", None) or {}
+                    if isinstance(raw_workspace, str):
+                        try:
+                            raw_workspace = json.loads(raw_workspace)
+                        except (TypeError, ValueError):
+                            continue
+                    if not isinstance(raw_workspace, dict):
+                        continue
+                    workspace = dict(raw_workspace)
+                    try:
+                        exact_owner = (
+                            workspace.get("provisioner") == "docker"
+                            and str(workspace.get("host") or "")
+                            == str(candidate["host"])
+                            and int(workspace.get("port", 22)) == int(candidate["port"])
+                            and str(workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                            == str(candidate["lease_id"])
+                            and str(workspace.get("status") or "")
+                            == str(candidate["status"])
+                        )
+                    except (TypeError, ValueError):
+                        exact_owner = False
+                    if not exact_owner:
+                        continue
+
+                    inventory_result = await conn.execute(
+                        """
+                        UPDATE docker_workspace_leases
+                        SET status = 'releasing',
+                            quarantine_reason =
+                                'managed_repository_agent_retirement_claimed',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE host = $1 AND port = $2 AND lease_id = $3
+                        """,
+                        candidate["host"],
+                        candidate["port"],
+                        candidate["lease_id"],
+                    )
+                    if inventory_result != "UPDATE 1":
+                        raise RuntimeError("Docker terminal retirement claim was lost")
+                    replacement = {
+                        **workspace,
+                        "status": "releasing",
+                        "quarantine_reason": (
+                            "managed_repository_agent_retirement_claimed"
+                        ),
+                    }
+                    if candidate["owner_kind"] == "thread":
+                        replacement[_DOCKER_WORKSPACE_GENERATION_KEY] = None
+                        owner_result = await conn.execute(
+                            "UPDATE threads SET metadata = jsonb_set("
+                            "COALESCE(metadata, '{}'::jsonb), "
+                            "'{workspace_container}', $2::jsonb), "
+                            "last_activity = CURRENT_TIMESTAMP "
+                            "WHERE id = $1 AND status::text = $3",
+                            candidate["owner_id"],
+                            json.dumps(replacement),
+                            candidate["owner_status"],
+                        )
+                    else:
+                        owner_result = await conn.execute(
+                            "UPDATE jobs SET context = jsonb_set("
+                            "COALESCE(context, '{}'::jsonb), "
+                            "'{workspace_container}', $2::jsonb), "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = $1 "
+                            "AND status::text = $3",
+                            candidate["owner_id"],
+                            json.dumps(replacement),
+                            candidate["owner_status"],
+                        )
+                    if owner_result != "UPDATE 1":
+                        raise RuntimeError(
+                            "Docker terminal retirement owner disappeared"
+                        )
+                    claimed.append(
+                        {
+                            **candidate,
+                            "owner_id": str(candidate["owner_id"]),
+                            "lease_id": str(candidate["lease_id"]),
+                            "status": "releasing",
+                        }
+                    )
+                return claimed
 
     async def merge_thread_workspace_context(
         self, thread_id: str, container_updates: Dict[str, Any]
@@ -10440,6 +10893,473 @@ class PostgresDB:
                 retirement_token=token_uuid,
             )
         )
+    async def record_stateless_thread_workspace_process_zero(
+        self,
+        thread_id: str,
+        *,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Durably bind exact Kubernetes terminal proof to the current UID.
+
+        The caller observes all containers terminated on the exact Pod object
+        before entering this transaction. Persisting that observation before
+        finalizer removal closes the committed-patch/lost-response window: a
+        retry may combine this receipt with a later 404, while a bare 404 can
+        never manufacture process-zero authority.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            expected_runtime = _canonical_uuid_text(
+                runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT execution_lane, metadata FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if row is None or str(row.get("execution_lane") or "") != "stateless":
+                    return False
+                try:
+                    metadata = _strict_json_object(
+                        row.get("metadata"), label="thread metadata"
+                    )
+                except RuntimeError:
+                    return False
+                raw_workspace = metadata.get("workspace_container")
+                if not isinstance(raw_workspace, dict):
+                    return False
+                workspace = dict(raw_workspace)
+                if workspace.get("provisioner") != "k8s":
+                    return False
+                try:
+                    current_runtime = _canonical_uuid_text(
+                        workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY),
+                        label="stateless workspace runtime incarnation",
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                workspace["status"] = "retiring_process_zero"
+                metadata["workspace_container"] = workspace
+                updated = await conn.execute(
+                    "UPDATE threads SET metadata = $2::jsonb, "
+                    "last_activity = CURRENT_TIMESTAMP WHERE id = $1",
+                    thread_uuid,
+                    json.dumps(metadata),
+                )
+                if updated != "UPDATE 1":
+                    raise RuntimeError(
+                        "Stateless workspace retirement state update was lost"
+                    )
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ('thread', $1, "
+                    "'stateless_workspace', 'k8s', $2) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    thread_uuid,
+                    expected_runtime,
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def get_stateless_thread_workspace_process_zero(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_incarnation: str | None = None,
+    ) -> str | None:
+        """Return the current UID only when its terminal receipt is exact."""
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            expected_runtime = (
+                _canonical_uuid_text(
+                    expected_runtime_incarnation,
+                    label="stateless workspace runtime incarnation",
+                )
+                if expected_runtime_incarnation is not None
+                else None
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT execution_lane, metadata FROM threads "
+                    "WHERE id = $1 FOR SHARE",
+                    thread_uuid,
+                )
+                if row is None or str(row.get("execution_lane") or "") != "stateless":
+                    return None
+                try:
+                    metadata = _strict_json_object(
+                        row.get("metadata"), label="thread metadata"
+                    )
+                except RuntimeError:
+                    return None
+                raw_workspace = metadata.get("workspace_container")
+                if (
+                    not isinstance(raw_workspace, dict)
+                    or raw_workspace.get("provisioner") != "k8s"
+                ):
+                    return None
+                try:
+                    current_runtime = _canonical_uuid_text(
+                        raw_workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY),
+                        label="stateless workspace runtime incarnation",
+                    )
+                except RuntimeError:
+                    return None
+                if expected_runtime is not None and current_runtime != expected_runtime:
+                    return None
+                has_receipt = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 "
+                    "FROM managed_repository_process_zero_receipts "
+                    "WHERE owner_kind = 'thread' AND owner_id = $1 "
+                    "AND scope = 'stateless_workspace' "
+                    "AND provisioner = 'k8s' AND runtime_incarnation = $2)",
+                    thread_uuid,
+                    current_runtime,
+                )
+                return current_runtime if has_receipt is True else None
+
+    async def claim_managed_repository_workspace_retirement(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Fence one exact runtime before remote credential-process retirement.
+
+        The owner row is the serialization point.  A claimed runtime becomes
+        ``retiring_process_zero`` before any SSH side effect, so dispatch,
+        attach, and credential materialization cannot reopen the same runtime
+        while a later process-zero receipt is being established.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        valid_scopes = {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }
+        if (scope, provisioner) not in valid_scopes:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {json_column} AS state FROM {table} "
+                    "WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                try:
+                    state = _strict_json_object(row.get("state"), label=json_column)
+                except RuntimeError:
+                    return False
+                raw_runtime = state.get(state_key)
+                if not isinstance(raw_runtime, dict):
+                    return False
+                if (
+                    scope == "workspace_container"
+                    and raw_runtime.get("provisioner") != "k8s"
+                ):
+                    return False
+                current_runtime = raw_runtime.get(runtime_key)
+                try:
+                    current_runtime = (
+                        str(current_runtime)
+                        if scope == "ide_local"
+                        else _canonical_uuid_text(
+                            current_runtime,
+                            label="managed repository workspace runtime",
+                        )
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                has_receipt = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = $3 AND provisioner = $4 "
+                        "AND runtime_incarnation = $5)",
+                        owner_kind,
+                        owner_uuid,
+                        scope,
+                        provisioner,
+                        expected_runtime,
+                    )
+                )
+                if has_receipt:
+                    return True
+                if str(raw_runtime.get("status") or "") in {
+                    "aborted",
+                    "deleted",
+                    "expired",
+                    "released",
+                }:
+                    return False
+                raw_runtime = dict(raw_runtime)
+                raw_runtime["status"] = "retiring_process_zero"
+                state[state_key] = raw_runtime
+                result = await conn.execute(
+                    f"UPDATE {table} SET {json_column} = $2::jsonb, "
+                    + (
+                        "updated_at = CURRENT_TIMESTAMP "
+                        if owner_kind == "job"
+                        else "last_activity = CURRENT_TIMESTAMP "
+                    )
+                    + "WHERE id = $1",
+                    owner_uuid,
+                    json.dumps(state),
+                )
+                return result == "UPDATE 1"
+
+    async def record_managed_repository_workspace_process_zero(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Persist exact remote repository-agent process-zero authority.
+
+        Kubernetes/VM deletion acknowledgements are control-plane facts, not
+        proof that a partitioned node or guest stopped using a delivered
+        deploy key. The provisioner records this receipt only after an exact
+        endpoint retirement plus an independent zero scan. A later ambiguous
+        delete response may replay only when the receipt still matches the
+        server-owned runtime generation in the same owner row.
+        """
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        if (scope, provisioner) not in {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        if not await self.claim_managed_repository_workspace_retirement(
+            owner_id,
+            owner_kind=owner_kind,
+            scope=scope,
+            provisioner=provisioner,
+            runtime_incarnation=expected_runtime,
+        ):
+            return False
+
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {json_column} AS state FROM {table} "
+                    "WHERE id = $1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if row is None:
+                    return False
+                try:
+                    state = _strict_json_object(row.get("state"), label=json_column)
+                except RuntimeError:
+                    return False
+                raw_runtime = state.get(state_key)
+                if not isinstance(raw_runtime, dict):
+                    return False
+                if scope == "workspace_container" and raw_runtime.get(
+                    "provisioner"
+                ) not in {"k8s", None}:
+                    return False
+                try:
+                    current_runtime = (
+                        str(raw_runtime.get(runtime_key))
+                        if scope == "ide_local"
+                        else _canonical_uuid_text(
+                            raw_runtime.get(runtime_key),
+                            label="managed repository workspace runtime",
+                        )
+                    )
+                except RuntimeError:
+                    return False
+                if current_runtime != expected_runtime:
+                    return False
+                if str(raw_runtime.get("status") or "") != ("retiring_process_zero"):
+                    # An existing receipt may be observed after the supported
+                    # delete already published its terminal state.  New
+                    # receipts, however, are admitted only from the absorbing
+                    # retirement claim.
+                    existing = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM managed_repository_process_zero_receipts "
+                        "WHERE owner_kind = $1 AND owner_id = $2 "
+                        "AND scope = $3 AND provisioner = $4 "
+                        "AND runtime_incarnation = $5)",
+                        owner_kind,
+                        owner_uuid,
+                        scope,
+                        provisioner,
+                        expected_runtime,
+                    )
+                    return bool(existing)
+
+                result = await conn.execute(
+                    "INSERT INTO managed_repository_process_zero_receipts ("
+                    "owner_kind, owner_id, scope, provisioner, "
+                    "runtime_incarnation) VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (owner_kind, owner_id, scope, "
+                    "runtime_incarnation) DO NOTHING",
+                    owner_kind,
+                    owner_uuid,
+                    scope,
+                    provisioner,
+                    expected_runtime,
+                )
+                return result in {"INSERT 0 1", "INSERT 0 0"}
+
+    async def managed_repository_workspace_process_zero_is_current(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        provisioner: str,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Verify a receipt against the current server-owned runtime row."""
+
+        if owner_kind not in {"job", "thread"}:
+            return False
+        if (scope, provisioner) not in {
+            ("workspace_container", "k8s"),
+            ("vm", "vm"),
+            ("ide", "k8s"),
+            ("ide_local", "docker"),
+        }:
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+            if scope == "ide_local":
+                expected_runtime = str(runtime_incarnation)
+                if re.fullmatch(r"[0-9a-f]{64}", expected_runtime) is None:
+                    return False
+            else:
+                expected_runtime = _canonical_uuid_text(
+                    runtime_incarnation,
+                    label="managed repository workspace runtime",
+                )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        table = "jobs" if owner_kind == "job" else "threads"
+        json_column = "context" if owner_kind == "job" else "metadata"
+        state_key = "ide_session" if scope in {"ide", "ide_local"} else scope
+        runtime_key = (
+            "provision_generation"
+            if scope == "vm"
+            else "container_id"
+            if scope == "ide_local"
+            else _STATELESS_RUNTIME_INCARNATION_KEY
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {json_column} AS state, EXISTS ("
+                "SELECT 1 FROM managed_repository_process_zero_receipts r "
+                "WHERE r.owner_kind = $2 AND r.owner_id = $1 "
+                "AND r.scope = $3 AND r.provisioner = $4 "
+                "AND r.runtime_incarnation = $5) AS has_receipt "
+                f"FROM {table} WHERE id = $1",
+                owner_uuid,
+                owner_kind,
+                scope,
+                provisioner,
+                expected_runtime,
+            )
+        if row is None or row.get("has_receipt") is not True:
+            return False
+        try:
+            state = _strict_json_object(row.get("state"), label=json_column)
+            raw_runtime = state.get(state_key)
+            return bool(
+                isinstance(raw_runtime, dict)
+                and (
+                    str(raw_runtime.get(runtime_key))
+                    if scope == "ide_local"
+                    else _canonical_uuid_text(
+                        raw_runtime.get(runtime_key),
+                        label="managed repository workspace runtime",
+                    )
+                )
+                == expected_runtime
+            )
+        except RuntimeError:
+            return False
 
     async def stateless_thread_workspace_creation_requires_authority(
         self, thread_id: str
@@ -16819,6 +17739,8 @@ class PostgresDB:
                 SELECT po.project_id,
                        p.name AS project_name,
                        po.thread_id,
+                       po.config_override AS post_config_override,
+                       t.project_id AS thread_project_id,
                        t.status AS thread_status,
                        t.metadata,
                        (SELECT MIN(w.fire_at)
@@ -17099,11 +18021,12 @@ class PostgresDB:
         the same durable row.
 
         ``expected_post_config_override`` is used by the explicit commission
-        flow after external thread provisioning.  A concurrent post edit makes
-        registration lose cleanly instead of overwriting the newer kit with
-        the provisioning snapshot. Direct legacy creates omit it and retain
-        the established behavior of stamping their validated kit onto a vacant
-        post.
+        flow after external thread provisioning. A concurrent post edit makes
+        registration lose cleanly. The durable Post is never overwritten from
+        ``config_override``: generic registration is a link operation, not an
+        alternate configuration authority. New production commissions must
+        provide the exact snapshot; the optional argument remains only for
+        legacy/test callers whose candidate cannot acquire Post-owned values.
 
         Explicit commission sets ``commission_continuity``. Registration,
         durable state restore, while-vacant drain, and commission-wake INSERT
@@ -17193,15 +18116,63 @@ class PostgresDB:
                     and current_config != expected_post_config_override
                 ):
                     return None
-                durable_config = (
-                    current_config
-                    if expected_post_config_override is not None
-                    else (
-                        config_override
-                        if config_override is not None
-                        else current_config
-                    )
-                )
+                if expected_post_config_override is not None:
+                    candidate_metadata = candidate["metadata"]
+                    if isinstance(candidate_metadata, str):
+                        try:
+                            candidate_metadata = json.loads(candidate_metadata)
+                        except (TypeError, ValueError):
+                            candidate_metadata = {}
+                    if not isinstance(candidate_metadata, dict):
+                        return None
+                    candidate_config = candidate_metadata.get("config_override") or {}
+                    if not isinstance(candidate_config, dict):
+                        return None
+
+                    def _post_owned_projection(
+                        config: Dict[str, Any],
+                    ) -> Optional[Dict[str, Any]]:
+                        officer = config.get("officer") or {}
+                        if not isinstance(officer, dict):
+                            return None
+                        auto_pull = officer.get("auto_pull", False)
+                        if type(auto_pull) is not bool:
+                            return None
+                        worker_ceiling = officer.get("worker_spend_ceiling_daily")
+                        if worker_ceiling is not None and (
+                            isinstance(worker_ceiling, bool)
+                            or not isinstance(worker_ceiling, (int, float))
+                            or not math.isfinite(float(worker_ceiling))
+                            or float(worker_ceiling) <= 0
+                        ):
+                            return None
+                        slots = officer.get("slots")
+                        if slots is not None:
+                            from services.officer_slots import validate_slots_spec
+
+                            try:
+                                slots = validate_slots_spec(slots)
+                            except ValueError:
+                                return None
+                        return {
+                            "auto_pull": auto_pull,
+                            "worker_spend_ceiling_daily": worker_ceiling,
+                            "slots": slots,
+                        }
+
+                    # The private snapshot is not merely compared with the
+                    # Post: the candidate runtime must contain the same
+                    # canonical unattended/spend projection before the link is
+                    # committed under Post -> thread locks.
+                    candidate_projection = _post_owned_projection(candidate_config)
+                    current_projection = _post_owned_projection(current_config)
+                    if (
+                        candidate_projection is None
+                        or current_projection is None
+                        or candidate_projection != current_projection
+                    ):
+                        return None
+                durable_config = current_config
                 row = await conn.fetchrow(
                     """
                     UPDATE project_officers
@@ -21326,9 +22297,10 @@ class PostgresDB:
         *,
         fair_key: str | None,
         priority: int,
+        allow_vm_workspace: bool = False,
         completion_commands_enabled: bool = False,
     ) -> tuple[bool, str | None]:
-        """Atomically expose a verified k8s-ready stateless job to workers.
+        """Atomically expose a verified pod-network stateless job to workers.
 
         The queue row is locked/created first, matching worker claim and all
         control verbs. The jobs-row predicate is then checked under lock in the
@@ -21417,10 +22389,33 @@ class PostgresDB:
                                        context->'vm'->>'requested', 'false'
                                    ) <> 'true'
                                )
+                               OR (
+                                   $2::boolean
+                                   AND jsonb_typeof(
+                                       context->'_workspace_contract'
+                                   ) = 'object'
+                                   AND context->'_workspace_contract'
+                                           ->>'version' = '1'
+                                   AND context->'_workspace_contract'
+                                           ->>'assigned_backend' = 'vm'
+                                   AND CASE lower(COALESCE(
+                                       config_override->'workspace'->>'backend',
+                                       'sandbox'
+                                   ))
+                                       WHEN 'container' THEN 'sandbox'
+                                       WHEN 'remote' THEN 'vm'
+                                       ELSE lower(COALESCE(
+                                           config_override->'workspace'->>'backend',
+                                           'sandbox'
+                                       ))
+                                   END = 'vm'
+                               )
                            )
                            {completion_exclusion}
                            {control_guard}
-                           AND CASE
+                           AND (
+                           (
+                           CASE
                                WHEN COALESCE(
                                    context->>'inherits_parent_workspace',
                                    'false'
@@ -21458,9 +22453,96 @@ class PostgresDB:
                                    ) IS NOT NULL
                                )
                            END
+                           AND CASE lower(COALESCE(
+                               config_override->'workspace'->>'backend',
+                               'sandbox'
+                           ))
+                               WHEN 'container' THEN 'sandbox'
+                               WHEN 'remote' THEN 'vm'
+                               ELSE lower(COALESCE(
+                                   config_override->'workspace'->>'backend',
+                                   'sandbox'
+                               ))
+                           END = 'sandbox'
+                           )
+                           OR (
+                               $2::boolean
+                               AND CASE
+                                   WHEN COALESCE(
+                                       context->>'inherits_parent_workspace',
+                                       'false'
+                                   ) = 'true'
+                                   THEN EXISTS (
+                                       SELECT 1
+                                         FROM jobs parent
+                                        WHERE parent.id = jobs.parent_job_id
+                                          AND parent.execution_lane = 'stateless'
+                                          AND parent.context->'vm'
+                                                ->>'status' = 'ready'
+                                          AND parent.context->'vm'
+                                                ->>'ssh_ready_source'
+                                                = 'provisioner_probe'
+                                          AND parent.context->'vm'
+                                                ->>'identity_authenticated'
+                                                = 'true'
+                                          AND parent.context->'vm'
+                                                ->>'identity_provision_generation'
+                                                = parent.context->'vm'
+                                                    ->>'provision_generation'
+                                          AND NULLIF(
+                                              parent.context->'vm'
+                                                  ->>'active_pod_uid',
+                                              ''
+                                          ) IS NOT NULL
+                                          AND NULLIF(
+                                              parent.context->'vm'
+                                                  ->>'ssh_host_key_fingerprint',
+                                              ''
+                                          ) IS NOT NULL
+                                          AND NULLIF(
+                                              COALESCE(
+                                                  parent.context->'vm'
+                                                      ->>'ssh_host',
+                                                  parent.context->'vm'
+                                                      ->>'pod_ip'
+                                              ),
+                                              ''
+                                          ) IS NOT NULL
+                                   )
+                                   ELSE (
+                                       context->'vm'->>'status' = 'ready'
+                                       AND context->'vm'
+                                            ->>'ssh_ready_source'
+                                            = 'provisioner_probe'
+                                       AND context->'vm'
+                                            ->>'identity_authenticated' = 'true'
+                                       AND context->'vm'
+                                            ->>'identity_provision_generation'
+                                            = context->'vm'
+                                                ->>'provision_generation'
+                                       AND NULLIF(
+                                           context->'vm'->>'active_pod_uid', ''
+                                       ) IS NOT NULL
+                                       AND NULLIF(
+                                           context->'vm'
+                                               ->>'ssh_host_key_fingerprint',
+                                           ''
+                                       ) IS NOT NULL
+                                       AND NULLIF(
+                                           COALESCE(
+                                               context->'vm'->>'ssh_host',
+                                               context->'vm'->>'pod_ip'
+                                           ),
+                                           ''
+                                       ) IS NOT NULL
+                                   )
+                               END
+                           )
+                           )
                          FOR UPDATE
                         """,
                         job_uuid,
+                        bool(allow_vm_workspace),
                     )
                     if row is None:
                         raise _AdmissionCASLostError
@@ -21566,7 +22648,11 @@ class PostgresDB:
             initial_workspace = dict(initial_workspace)
             initial_workspace.pop("repo_name", None)
             metadata["workspace_container"] = initial_workspace
-        if "datasource_ids" in metadata or "datasource_selection" in metadata:
+        if (
+            "datasource_ids" in metadata
+            or "datasource_selection" in metadata
+            or _STATELESS_PROCESS_ZERO_OBSERVATION_KEY in metadata
+        ):
             raise ValueError("initial thread metadata contains reserved fields")
         metadata["datasource_ids"] = selected_ids
         if execution_lane == "stateless":
@@ -26261,8 +27347,20 @@ class PostgresDB:
                             "_stateless_workspace_retirement_settled", None
                         )
                     queue = await conn.fetchrow(
-                        "SELECT unit_kind FROM run_queue "
+                        "SELECT unit_kind, state, input_seq, consumed_seq FROM run_queue "
                         "WHERE unit_id = $1::uuid FOR UPDATE",
+                        thread_id,
+                    )
+                    pending_delivery_seq = await conn.fetchval(
+                        "SELECT max(message.seq) "
+                        "FROM thread_input_deliveries AS delivery "
+                        "JOIN thread_messages AS message "
+                        "  ON message.id = delivery.message_id "
+                        "WHERE delivery.thread_id = $1::uuid "
+                        "AND delivery.execution_lane = 'stateless' "
+                        "AND delivery.state IN "
+                        "('persisted', 'owned', 'queued', 'deferred') "
+                        "AND message.rewound_at IS NULL",
                         thread_id,
                     )
                     if queue is not None:
@@ -26270,7 +27368,10 @@ class PostgresDB:
                             return False
                         revived = await conn.fetchval(
                             "UPDATE run_queue SET "
-                            "state = CASE WHEN (input_seq IS NOT NULL "
+                            "input_seq = CASE WHEN $2::bigint IS NULL "
+                            "THEN input_seq ELSE GREATEST(input_seq, $2::bigint) END, "
+                            "state = CASE WHEN $2::bigint IS NOT NULL "
+                            "OR (input_seq IS NOT NULL "
                             "AND input_seq > COALESCE(consumed_seq, -1)) "
                             "OR control_input_seq > control_consumed_seq "
                             "THEN 'queued' ELSE 'done' END, "
@@ -26282,8 +27383,21 @@ class PostgresDB:
                             "AND unit_kind = 'session_turn' AND state = 'done' "
                             "RETURNING unit_id",
                             thread_id,
+                            pending_delivery_seq,
                         )
                         if revived is None:
+                            return False
+                    elif pending_delivery_seq is not None:
+                        created_queue = await conn.fetchval(
+                            "INSERT INTO run_queue "
+                            "(unit_id, unit_kind, state, input_seq, consumed_seq) "
+                            "VALUES ($1::uuid, 'session_turn', 'queued', "
+                            "$2::bigint, $2::bigint - 1) "
+                            "ON CONFLICT (unit_id) DO NOTHING RETURNING unit_id",
+                            thread_id,
+                            pending_delivery_seq,
+                        )
+                        if created_queue is None:
                             return False
                 if stateless:
                     row = await conn.fetchval(
@@ -27916,7 +29030,7 @@ class PostgresDB:
         source: str,
         turn_number: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Persist an unclaimed pinned input for a future/current runtime."""
+        """Persist one unclaimed durable input for its authoritative lane."""
 
         from src.shared.persistent_input_delivery import persist_input_delivery
 
@@ -34751,6 +35865,1409 @@ class PostgresDB:
             )
         return False
 
+    async def list_managed_repository_legacy_candidates(
+        self,
+        *,
+        after_kind: str | None = None,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Keyset-page credential-bearing managed repository source rows.
+
+        Raw URLs are returned only to the in-process reconciler for exact CAS.
+        Callers must never log, serialize, or persist them.  The stable order is
+        project repository -> job -> thread, then UUID; no correctness decision
+        applies ``LIMIT`` before the credential predicate.
+        """
+
+        ranks = {None: 0, "project_repository": 1, "job": 2, "thread": 3}
+        if after_kind not in ranks:
+            raise ValueError("Unsupported managed repository source kind")
+        after_rank = ranks[after_kind]
+        try:
+            after_uuid = UUID(str(after_id)) if after_id else UUID(int=0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid managed repository keyset cursor") from exc
+        safe_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT 1::integer AS source_rank,
+                           'project_repository'::text AS source_kind,
+                           repository.id AS source_id,
+                           repository.project_id,
+                           repository.repo_url AS observed_url,
+                           repository.name AS repo_name,
+                           repository.role,
+                           repository.read_only,
+                           repository.is_managed,
+                           project.status::text AS project_status,
+                           NULL::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           NULL::text AS execution_lane,
+                           NULL::jsonb AS source_metadata,
+                           FALSE AS current_officer
+                      FROM project_repositories AS repository
+                      JOIN projects AS project ON project.id = repository.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               repository.repo_url
+                           )
+                    UNION ALL
+                    SELECT 2, 'job', job.id, job.project_id,
+                           job.context->>'git_remote_url', job.repo_name,
+                           NULL::text, NULL::boolean, NULL::boolean,
+                           project.status::text, job.status::text,
+                           job.completion_outcome_kind,
+                           job.parent_job_id, job.branch_name,
+                           job.execution_lane, job.context, FALSE
+                      FROM jobs AS job
+                      LEFT JOIN projects AS project ON project.id = job.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               job.context->>'git_remote_url'
+                           )
+                    UNION ALL
+                    SELECT 3, 'thread', thread.id, thread.project_id,
+                           thread.metadata->'workspace_container'
+                               ->>'git_remote_url',
+                           thread.metadata->'workspace_container'->>'repo_name',
+                           NULL::text, NULL::boolean, NULL::boolean,
+                           project.status::text, thread.status::text,
+                           NULL::text,
+                           NULL::uuid, NULL::text, thread.execution_lane,
+                           thread.metadata,
+                           EXISTS (
+                               SELECT 1
+                                 FROM project_officers AS officer
+                                WHERE officer.project_id = thread.project_id
+                                  AND officer.thread_id = thread.id
+                           )
+                      FROM threads AS thread
+                      LEFT JOIN projects AS project ON project.id = thread.project_id
+                     WHERE public.managed_repository_url_has_userinfo(
+                               thread.metadata->'workspace_container'
+                                   ->>'git_remote_url'
+                           )
+                )
+                SELECT *
+                  FROM candidates
+                 WHERE source_rank > $1
+                    OR (source_rank = $1 AND source_id > $2)
+                 ORDER BY source_rank, source_id
+                 LIMIT $3
+                """,
+                after_rank,
+                after_uuid,
+                safe_limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_managed_repository_legacy_candidate(
+        self, source_kind: str, source_id: str
+    ) -> Dict[str, Any] | None:
+        """Re-read one still-credentialed legacy source without exposing it."""
+
+        try:
+            source_uuid = UUID(str(source_id))
+        except (TypeError, ValueError):
+            return None
+        if source_kind not in {"project_repository", "job", "thread"}:
+            return None
+        async with self.acquire() as conn:
+            if source_kind == "project_repository":
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1::integer AS source_rank,
+                           'project_repository'::text AS source_kind,
+                           repository.id AS source_id,
+                           repository.project_id, repository.repo_url AS observed_url,
+                           repository.name AS repo_name, repository.role,
+                           repository.read_only, repository.is_managed,
+                           project.status::text AS project_status,
+                           NULL::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           NULL::text AS execution_lane,
+                           NULL::jsonb AS source_metadata,
+                           FALSE AS current_officer
+                      FROM project_repositories AS repository
+                      JOIN projects AS project ON project.id=repository.project_id
+                     WHERE repository.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               repository.repo_url
+                           )
+                    """,
+                    source_uuid,
+                )
+            elif source_kind == "job":
+                row = await conn.fetchrow(
+                    """
+                    SELECT 2::integer AS source_rank, 'job'::text AS source_kind,
+                           job.id AS source_id, job.project_id,
+                           job.context->>'git_remote_url' AS observed_url,
+                           job.repo_name, NULL::text AS role,
+                           NULL::boolean AS read_only,
+                           NULL::boolean AS is_managed,
+                           project.status::text AS project_status,
+                           job.status::text AS source_status,
+                           job.completion_outcome_kind,
+                           job.parent_job_id, job.branch_name,
+                           job.execution_lane, job.context AS source_metadata,
+                           FALSE AS current_officer
+                      FROM jobs AS job
+                      LEFT JOIN projects AS project ON project.id=job.project_id
+                     WHERE job.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               job.context->>'git_remote_url'
+                           )
+                    """,
+                    source_uuid,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 3::integer AS source_rank,
+                           'thread'::text AS source_kind,
+                           thread.id AS source_id, thread.project_id,
+                           thread.metadata->'workspace_container'
+                               ->>'git_remote_url' AS observed_url,
+                           thread.metadata->'workspace_container'
+                               ->>'repo_name' AS repo_name,
+                           NULL::text AS role, NULL::boolean AS read_only,
+                           NULL::boolean AS is_managed,
+                           project.status::text AS project_status,
+                           thread.status::text AS source_status,
+                           NULL::text AS completion_outcome_kind,
+                           NULL::uuid AS parent_job_id,
+                           NULL::text AS branch_name,
+                           thread.execution_lane,
+                           thread.metadata AS source_metadata,
+                           EXISTS (
+                               SELECT 1 FROM project_officers AS officer
+                                WHERE officer.project_id=thread.project_id
+                                  AND officer.thread_id=thread.id
+                           ) AS current_officer
+                      FROM threads AS thread
+                      LEFT JOIN projects AS project ON project.id=thread.project_id
+                     WHERE thread.id=$1
+                       AND public.managed_repository_url_has_userinfo(
+                               thread.metadata->'workspace_container'
+                                   ->>'git_remote_url'
+                           )
+                    """,
+                    source_uuid,
+                )
+        return dict(row) if row else None
+
+    async def list_managed_repository_legacy_active_authority_candidates(
+        self,
+        *,
+        after_kind: str | None = None,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Keyset-page live exact authorities for lifecycle convergence.
+
+        The cursor UUID is the immutable authority-record id, not the mutable
+        source id. The public key is returned only so a lost registration
+        response can recover its exact forge identifier. Rows contain no URL,
+        private key, ciphertext, credential, or transport coordinate.
+        """
+
+        ranks = {None: 0, "project_repository": 1, "job": 2, "thread": 3}
+        if after_kind not in ranks:
+            raise ValueError("Unsupported managed repository authority cursor")
+        after_rank = ranks[after_kind]
+        try:
+            after_uuid = UUID(str(after_id)) if after_id else UUID(int=0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid managed repository authority cursor") from exc
+        safe_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT CASE authority_kind
+                               WHEN 'project_repository' THEN 1
+                               WHEN 'job' THEN 2
+                               WHEN 'thread' THEN 3
+                           END AS source_rank,
+                           authority_kind AS source_kind,
+                           authority_id AS source_id,
+                           id AS authority_record_id,
+                           project_id, repository_owner, repo_name, access_mode,
+                           generation AS authority_generation,
+                           public_key, public_key_fingerprint, forge_key_id,
+                           status
+                      FROM managed_repository_authorities
+                     WHERE status IN ('provisioning', 'active', 'revoking')
+                )
+                SELECT source_kind, source_id, authority_record_id, project_id,
+                       repository_owner, repo_name, access_mode,
+                       authority_generation, public_key, public_key_fingerprint,
+                       forge_key_id, status
+                  FROM candidates
+                 WHERE source_rank > $1
+                    OR (source_rank = $1 AND authority_record_id > $2)
+                 ORDER BY source_rank, authority_record_id
+                 LIMIT $3
+                """,
+                after_rank,
+                after_uuid,
+                safe_limit,
+            )
+            result: list[dict[str, Any]] = []
+            for raw in rows:
+                row = dict(raw)
+                source_kind = str(row["source_kind"])
+                source_id = row["source_id"]
+                containable = False
+                containment_reason = None
+                if source_kind == "job":
+                    lineage = await conn.fetch(
+                        """
+                        WITH RECURSIVE lineage AS (
+                            SELECT id, parent_job_id, project_id, repo_name,
+                                   status::text AS status,
+                                   completion_outcome_kind
+                              FROM jobs WHERE id=$1
+                            UNION
+                            SELECT child.id, child.parent_job_id,
+                                   child.project_id, child.repo_name,
+                                   child.status::text,
+                                   child.completion_outcome_kind
+                              FROM jobs AS child
+                              JOIN lineage AS parent
+                                ON child.parent_job_id=parent.id
+                        )
+                        SELECT * FROM lineage
+                        """,
+                        source_id,
+                    )
+                    root = next(
+                        (item for item in lineage if item["id"] == source_id), None
+                    )
+                    containable = not lineage or bool(
+                        root is not None
+                        and root["parent_job_id"] is None
+                        and all(
+                            item["project_id"] == row["project_id"]
+                            and item["repo_name"] == row["repo_name"]
+                            and (
+                                (
+                                    item["status"] == "completed"
+                                    and item["completion_outcome_kind"]
+                                    != "blocked_undelivered"
+                                )
+                                or (
+                                    item["status"] == "cancelled"
+                                    and item["completion_outcome_kind"]
+                                    == "blocked_undelivered"
+                                )
+                            )
+                            for item in lineage
+                        )
+                    )
+                    if containable:
+                        containment_reason = (
+                            "source_absent" if not lineage else "job_lineage_terminal"
+                        )
+                elif source_kind == "thread":
+                    source = await conn.fetchrow(
+                        "SELECT project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads WHERE id=$1",
+                        source_id,
+                    )
+                    if source is None:
+                        commissioned = bool(
+                            await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE thread_id=$1)",
+                                source_id,
+                            )
+                        )
+                        containable = not commissioned
+                        containment_reason = "source_absent" if containable else None
+                    else:
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            settled = None
+                            workspace = {}
+                        commissioned = bool(
+                            await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE project_id=$1 AND thread_id=$2)",
+                                source["project_id"],
+                                source_id,
+                            )
+                        )
+                        containable = bool(
+                            source["project_id"] == row["project_id"]
+                            and workspace.get("repo_name") == row["repo_name"]
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and not commissioned
+                        )
+                        if containable:
+                            containment_reason = "thread_permanently_retired"
+                else:
+                    source = await conn.fetchrow(
+                        "SELECT project_id, name, role, read_only, is_managed "
+                        "FROM project_repositories WHERE id=$1",
+                        source_id,
+                    )
+                    if source is None:
+                        containable = True
+                        containment_reason = "source_absent"
+                    else:
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        containable = bool(
+                            source["project_id"] != row["project_id"]
+                            or source["name"] != row["repo_name"]
+                            or current_mode != row["access_mode"]
+                        )
+                        if containable:
+                            containment_reason = "project_repository_authority_changed"
+                row["containment_candidate"] = containable
+                row["containment_reason"] = containment_reason
+                result.append(row)
+        return result
+
+    async def upsert_managed_repository_legacy_reconciliation(
+        self,
+        *,
+        source_kind: str,
+        source_id: str,
+        project_id: str | None,
+        classification: str,
+        authority_kind: str | None,
+        authority_id: str | None,
+        repository_owner: str | None,
+        repo_name: str | None,
+        access_mode: str | None,
+        reason_code: str | None,
+        authority_record_id: str | None = None,
+        authority_generation: int | None = None,
+    ) -> Dict[str, Any]:
+        """Persist one exact, secret-free reconciliation intent.
+
+        Re-scanning an unchanged retry/failed/ambiguous intent never resets its
+        attempt budget. A genuine authoritative reclassification (including an
+        operator resolving ambiguity in durable source rows) reopens it.
+        """
+
+        source_uuid = UUID(str(source_id))
+        project_uuid = UUID(str(project_id)) if project_id else None
+        authority_uuid = UUID(str(authority_id)) if authority_id else None
+        authority_record_uuid = (
+            UUID(str(authority_record_id)) if authority_record_id else None
+        )
+        if (authority_record_uuid is None) != (authority_generation is None):
+            raise ValueError(
+                "Managed repository authority record and generation must be paired"
+            )
+        authority_generation_value = (
+            int(authority_generation) if authority_generation is not None else None
+        )
+        if authority_generation_value is not None and authority_generation_value <= 0:
+            raise ValueError("Managed repository authority generation must be positive")
+        initial_state = "ambiguous" if classification == "ambiguous" else "pending"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO managed_repository_legacy_reconciliations (
+                        source_kind, source_id, project_id, classification,
+                        authority_kind, authority_id, authority_record_id,
+                        authority_generation, repository_owner, repo_name,
+                        access_mode, state, reason_code
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                    )
+                    ON CONFLICT (source_kind, source_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    source_kind,
+                    source_uuid,
+                    project_uuid,
+                    classification,
+                    authority_kind,
+                    authority_uuid,
+                    authority_record_uuid,
+                    authority_generation_value,
+                    repository_owner,
+                    repo_name,
+                    access_mode,
+                    initial_state,
+                    reason_code,
+                )
+                if row is None:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT *,
+                               state = 'claimed'
+                               AND claim_expires_at IS NOT NULL
+                               AND claim_expires_at > clock_timestamp()
+                                   AS claim_is_active
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE source_kind=$1 AND source_id=$2
+                         FOR UPDATE
+                        """,
+                        source_kind,
+                        source_uuid,
+                    )
+                    assert existing is not None
+                    active_claim = bool(existing["claim_is_active"])
+                    same_plan = (
+                        existing["project_id"] == project_uuid
+                        and existing["classification"] == classification
+                        and existing["authority_kind"] == authority_kind
+                        and existing["authority_id"] == authority_uuid
+                        and existing["authority_record_id"] == authority_record_uuid
+                        and existing["authority_generation"]
+                        == authority_generation_value
+                        and existing["repository_owner"] == repository_owner
+                        and existing["repo_name"] == repo_name
+                        and existing["access_mode"] == access_mode
+                        and (
+                            classification != "ambiguous"
+                            or existing["reason_code"] == reason_code
+                        )
+                    )
+                    if active_claim or (same_plan and existing["state"] != "completed"):
+                        row = await conn.fetchrow(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET last_scanned_at=now(), updated_at=now()
+                             WHERE id=$1
+                            RETURNING *
+                            """,
+                            existing["id"],
+                        )
+                    else:
+                        # A changed authoritative scope, resolved ambiguity, or
+                        # reappearance after completion is a new bounded attempt
+                        # series. Never rewrite an unexpired worker's plan.
+                        row = await conn.fetchrow(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET project_id=$2, classification=$3,
+                                   authority_kind=$4, authority_id=$5,
+                                   authority_record_id=$6,
+                                   authority_generation=$7,
+                                   repository_owner=$8, repo_name=$9,
+                                   access_mode=$10, state=$11, reason_code=$12,
+                                   attempts=0, claimed_by=NULL,
+                                   claim_expires_at=NULL, next_attempt_at=now(),
+                                   result_kind=NULL, completed_at=NULL,
+                                   last_scanned_at=now(), updated_at=now()
+                             WHERE id=$1
+                            RETURNING *
+                            """,
+                            existing["id"],
+                            project_uuid,
+                            classification,
+                            authority_kind,
+                            authority_uuid,
+                            authority_record_uuid,
+                            authority_generation_value,
+                            repository_owner,
+                            repo_name,
+                            access_mode,
+                            initial_state,
+                            reason_code,
+                        )
+        return dict(row)
+
+    async def claim_managed_repository_legacy_reconciliations(
+        self,
+        *,
+        claimant_id: str,
+        limit: int = 10,
+        lease_seconds: int = 300,
+        max_attempts: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Claim due exact intents with a never-reused settlement token."""
+
+        claimant_uuid = UUID(str(claimant_id))
+        safe_limit = max(1, min(int(limit), 100))
+        safe_lease = max(30, min(int(lease_seconds), 1800))
+        safe_attempts = max(1, min(int(max_attempts), 50))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE managed_repository_legacy_reconciliations
+                       SET state = 'failed', reason_code = 'attempt_limit_exhausted',
+                           claimed_by = NULL, claim_expires_at = NULL,
+                           result_kind = NULL, completed_at = NULL,
+                           updated_at = now()
+                     WHERE state IN ('pending', 'retry', 'claimed')
+                       AND attempts >= $1
+                       AND (state <> 'claimed' OR claim_expires_at <= now())
+                    """,
+                    safe_attempts,
+                )
+                rows = await conn.fetch(
+                    """
+                    WITH due AS (
+                        SELECT id
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE classification <> 'ambiguous'
+                           AND attempts < $3
+                           AND next_attempt_at <= now()
+                           AND (
+                               state IN ('pending', 'retry')
+                               OR (state = 'claimed' AND claim_expires_at <= now())
+                           )
+                         ORDER BY next_attempt_at, updated_at, id
+                         FOR UPDATE SKIP LOCKED
+                         LIMIT $1
+                    )
+                    UPDATE managed_repository_legacy_reconciliations AS intent
+                       SET state = 'claimed', attempts = intent.attempts + 1,
+                           lifetime_attempts = intent.lifetime_attempts + 1,
+                           claim_token = nextval(
+                               'managed_repository_legacy_reconcile_claim_seq'
+                           ),
+                           claimed_by = $4,
+                           claim_expires_at = now() + make_interval(secs => $2),
+                           reason_code = NULL, updated_at = now()
+                      FROM due
+                     WHERE intent.id = due.id
+                    RETURNING intent.*
+                    """,
+                    safe_limit,
+                    safe_lease,
+                    safe_attempts,
+                    claimant_uuid,
+                )
+        return [dict(row) for row in rows]
+
+    async def settle_inactive_managed_repository_legacy_reconciliations(
+        self,
+    ) -> int:
+        """Close intents whose exact source vanished or is credential-free.
+
+        A concurrent normal adoption with an exact active authority is left for
+        the leased worker, which records ``adopted`` after locked validation.
+        This sweep exists primarily for an operator-supported ambiguity
+        resolution (for example, deleting a proven duplicate attachment) and
+        retains a durable audit row instead of silently deleting the intent.
+        """
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations AS intent
+                   SET state='completed',
+                       result_kind=CASE WHEN EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS settled_authority
+                            WHERE settled_authority.id=intent.authority_record_id
+                              AND settled_authority.generation=
+                                  intent.authority_generation
+                              AND settled_authority.status='revoked'
+                       ) THEN 'authority_revoked' ELSE 'source_absent' END,
+                       reason_code=CASE WHEN EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS settled_authority
+                            WHERE settled_authority.id=intent.authority_record_id
+                              AND settled_authority.generation=
+                                  intent.authority_generation
+                              AND settled_authority.status='revoked'
+                       ) THEN 'authority_revoked' ELSE 'source_absent_or_clean' END,
+                       completed_at=COALESCE(completed_at, now()),
+                       claimed_by=NULL, claim_expires_at=NULL,
+                       updated_at=now()
+                 WHERE state NOT IN ('claimed', 'completed')
+                   AND (
+                       intent.authority_kind IS DISTINCT FROM intent.source_kind
+                       OR intent.authority_id IS DISTINCT FROM intent.source_id
+                       OR NOT EXISTS (
+                           SELECT 1
+                             FROM managed_repository_authorities AS authority
+                            WHERE authority.status IN (
+                                      'provisioning', 'active', 'revoking'
+                                  )
+                              AND authority.authority_kind=intent.authority_kind
+                              AND authority.authority_id=intent.authority_id
+                              AND authority.project_id IS NOT DISTINCT FROM
+                                  intent.project_id
+                              AND authority.repository_owner=
+                                  intent.repository_owner
+                              AND authority.repo_name=intent.repo_name
+                              AND authority.access_mode=intent.access_mode
+                       )
+                   )
+                   AND CASE intent.source_kind
+                       WHEN 'job' THEN NOT EXISTS (
+                           SELECT 1 FROM jobs AS job
+                            WHERE job.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  job.context->>'git_remote_url'
+                              )
+                       )
+                       WHEN 'thread' THEN NOT EXISTS (
+                           SELECT 1 FROM threads AS thread
+                            WHERE thread.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  thread.metadata->'workspace_container'
+                                      ->>'git_remote_url'
+                              )
+                       )
+                       WHEN 'project_repository' THEN NOT EXISTS (
+                           SELECT 1
+                             FROM project_repositories AS repository
+                            WHERE repository.id=intent.source_id
+                              AND public.managed_repository_url_has_userinfo(
+                                  repository.repo_url
+                              )
+                       )
+                       ELSE FALSE
+                   END
+                """
+            )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def retry_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        reason_code: str,
+        delay_seconds: int,
+        max_attempts: int = 8,
+    ) -> bool:
+        """Release one failed claim to bounded backoff or terminal failure."""
+
+        safe_delay = max(60, min(int(delay_seconds), 900))
+        safe_attempts = max(1, min(int(max_attempts), 50))
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations
+                   SET state = CASE WHEN attempts >= $5 THEN 'failed'
+                                    ELSE 'retry' END,
+                       reason_code = CASE WHEN attempts >= $5
+                                          THEN 'attempt_limit_exhausted'
+                                          ELSE $3 END,
+                       next_attempt_at = now() + make_interval(secs => $4),
+                       last_failure_reason_code = $3,
+                       claimed_by = NULL, claim_expires_at = NULL,
+                       result_kind = NULL, completed_at = NULL,
+                       updated_at = now()
+                 WHERE id = $1 AND state = 'claimed' AND claim_token = $2
+                   AND claim_expires_at > clock_timestamp()
+                """,
+                UUID(str(reconciliation_id)),
+                int(claim_token),
+                str(reason_code)[:100],
+                safe_delay,
+                safe_attempts,
+            )
+        return result == "UPDATE 1"
+
+    async def managed_repository_legacy_reconciliation_claim_is_current(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+    ) -> bool:
+        """Return whether an exact reconciliation lease still owns side effects.
+
+        The database clock is the sole lease authority. Callers use this
+        immediately before an external containment mutation so an expired
+        predecessor cannot revoke a key after another worker reclaimed the
+        durable intent.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+        except (TypeError, ValueError):
+            return False
+        if token <= 0:
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE id = $1
+                           AND state = 'claimed'
+                           AND claim_token = $2
+                           AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at > clock_timestamp()
+                    )
+                    """,
+                    reconciliation_uuid,
+                    token,
+                )
+            )
+
+    async def rearm_managed_repository_legacy_reconciliation(
+        self,
+        source_kind: str,
+        source_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Explicitly reopen one exact attempt-exhausted reconciliation.
+
+        This is intentionally not a bulk reset.  The exact source row is locked,
+        the actor and non-secret reason are appended to immutable history, and
+        the lifetime attempt count plus never-reused claim token are retained.
+        Repeating a committed request while its rearmed generation is active
+        replays that generation; different attribution fails closed.
+        """
+
+        if source_kind not in {"job", "thread", "project_repository"}:
+            raise ValueError("Unsupported managed repository source kind")
+        try:
+            source_uuid = UUID(str(source_id))
+            actor_uuid = UUID(str(actor_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Source and actor identifiers must be UUIDs") from exc
+        clean_reason = str(reason or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,99}", clean_reason):
+            raise ValueError("Re-arm reason must be a secret-safe machine reason code")
+
+        def _safe_result(
+            status: str,
+            row: Mapping[str, Any] | None,
+            *,
+            generation: int | None = None,
+        ) -> Dict[str, Any]:
+            return {
+                "status": status,
+                "source_kind": source_kind,
+                "source_id": str(source_uuid),
+                "state": str(row["state"]) if row is not None else None,
+                "rearm_generation": (
+                    generation
+                    if generation is not None
+                    else (int(row["rearm_generation"]) if row is not None else None)
+                ),
+            }
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE source_kind=$1 AND source_id=$2
+                     FOR UPDATE
+                    """,
+                    source_kind,
+                    source_uuid,
+                )
+                if intent is None:
+                    return _safe_result("not_found", None)
+
+                matching_rearm = await conn.fetchrow(
+                    """
+                    SELECT generation, actor_id, reason_code
+                      FROM managed_repository_legacy_reconciliation_rearms
+                     WHERE reconciliation_id=$1
+                       AND actor_id=$2
+                       AND reason_code=$3
+                    """,
+                    intent["id"],
+                    actor_uuid,
+                    clean_reason,
+                )
+                if matching_rearm is not None:
+                    # Actor+reason is the idempotency identity. It replays even
+                    # after newer attempt windows have been opened. A delayed
+                    # response can therefore never mint a later generation.
+                    return _safe_result(
+                        "replayed",
+                        intent,
+                        generation=int(matching_rearm["generation"]),
+                    )
+                if intent["state"] != "failed":
+                    if int(intent["rearm_generation"]) > 0:
+                        return _safe_result("idempotency_conflict", intent)
+                    return _safe_result("not_failed", intent)
+
+                generation = int(intent["rearm_generation"]) + 1
+                await conn.execute(
+                    """
+                    INSERT INTO managed_repository_legacy_reconciliation_rearms (
+                        reconciliation_id, generation, actor_id, reason_code,
+                        attempts_in_generation, lifetime_attempts,
+                        failure_reason_code
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    intent["id"],
+                    generation,
+                    actor_uuid,
+                    clean_reason,
+                    int(intent["attempts"]),
+                    int(intent["lifetime_attempts"]),
+                    intent["last_failure_reason_code"] or intent["reason_code"],
+                )
+                rearmed = await conn.fetchrow(
+                    """
+                    UPDATE managed_repository_legacy_reconciliations
+                       SET state='retry', attempts=0,
+                           rearm_generation=$2,
+                           reason_code='operator_rearmed',
+                           next_attempt_at=now(), claimed_by=NULL,
+                           claim_expires_at=NULL, result_kind=NULL,
+                           completed_at=NULL, updated_at=now()
+                     WHERE id=$1 AND state='failed'
+                       AND rearm_generation=$3
+                    RETURNING *
+                    """,
+                    intent["id"],
+                    generation,
+                    int(intent["rearm_generation"]),
+                )
+                if rearmed is None:  # Row lock makes this defensive only.
+                    raise RuntimeError("Managed repository re-arm CAS was lost")
+                return _safe_result("rearmed", rearmed)
+
+    async def mark_managed_repository_legacy_reconciliation_ambiguous(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        reason_code: str,
+    ) -> bool:
+        """Fail one claimed source closed with only an opaque reason."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE managed_repository_legacy_reconciliations
+                   SET classification = 'ambiguous', state = 'ambiguous',
+                       authority_kind = NULL, authority_id = NULL,
+                       repository_owner = NULL, repo_name = NULL,
+                       access_mode = NULL, reason_code = $3,
+                       claimed_by = NULL, claim_expires_at = NULL,
+                       result_kind = NULL, completed_at = NULL,
+                       updated_at = now()
+                 WHERE id = $1 AND state = 'claimed' AND claim_token = $2
+                   AND claim_expires_at > clock_timestamp()
+                """,
+                UUID(str(reconciliation_id)),
+                int(claim_token),
+                str(reason_code)[:100],
+            )
+        return result == "UPDATE 1"
+
+    async def finish_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        *,
+        observed_url: str | None,
+        authority_id: str | None,
+    ) -> str | None:
+        """Atomically revalidate source+authority, scrub, and settle a claim.
+
+        Lock order is reconciliation intent -> source row -> active authority.
+        No other path locks the private intent table, so this preserves the
+        established durable-owner-before-authority order without a cycle.
+        ``observed_url`` exists only as a query parameter for exact snapshot
+        CAS and is never copied into the ledger or an error. ``None`` permits
+        only convergence on the exact clean URL of an already-active authority.
+        """
+
+        reconciliation_uuid = UUID(str(reconciliation_id))
+        authority_uuid = UUID(str(authority_id)) if authority_id else None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *,
+                           state = 'claimed'
+                           AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at > clock_timestamp()
+                               AS claim_is_active
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id = $1 FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if (
+                    intent is None
+                    or intent["state"] != "claimed"
+                    or int(intent["claim_token"]) != int(claim_token)
+                    or not intent["claim_is_active"]
+                ):
+                    return None
+
+                source_kind = str(intent["source_kind"])
+                source_id = intent["source_id"]
+                classification = str(intent["classification"])
+                source = None
+                if source_kind == "job":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "completion_outcome_kind, parent_job_id, repo_name, context "
+                        "FROM jobs WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    source_context = (
+                        _strict_json_object(source["context"], label="job context")
+                        if source
+                        else {}
+                    )
+                    current_url = source_context.get("git_remote_url")
+                elif source_kind == "thread":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    source_metadata = (
+                        _strict_json_object(source["metadata"], label="thread metadata")
+                        if source
+                        else {}
+                    )
+                    workspace = (
+                        source_metadata.get("workspace_container", {}) if source else {}
+                    )
+                    current_url = workspace.get("git_remote_url")
+                elif source_kind == "project_repository":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, repo_url, role, read_only, "
+                        "is_managed FROM project_repositories "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    current_url = source["repo_url"] if source else None
+                else:
+                    return None
+                if source is None or source["project_id"] != intent["project_id"]:
+                    return None
+
+                terminal = classification in {
+                    "terminal_historical",
+                    "server_only_repository",
+                }
+                settlement_authority_record_id = None
+                settlement_authority_generation = None
+                if terminal:
+                    if (
+                        observed_url is None
+                        or str(current_url or "") != observed_url
+                        or not await conn.fetchval(
+                            "SELECT public.managed_repository_url_has_userinfo($1)",
+                            current_url,
+                        )
+                    ):
+                        return None
+                    if source_kind == "job":
+                        valid_terminal = (
+                            (
+                                source["status"] == "completed"
+                                and source["completion_outcome_kind"]
+                                != "blocked_undelivered"
+                            )
+                            or (
+                                source["status"] == "cancelled"
+                                and source["completion_outcome_kind"]
+                                == "blocked_undelivered"
+                            )
+                        ) and source["repo_name"] == intent["repo_name"]
+                        if valid_terminal and intent["authority_kind"] == "job":
+                            root_id = await conn.fetchval(
+                                """
+                                WITH RECURSIVE lineage AS (
+                                    SELECT id, parent_job_id FROM jobs WHERE id=$1
+                                    UNION ALL
+                                    SELECT parent.id, parent.parent_job_id
+                                      FROM jobs AS parent
+                                      JOIN lineage
+                                        ON parent.id = lineage.parent_job_id
+                                )
+                                SELECT id FROM lineage
+                                 WHERE parent_job_id IS NULL LIMIT 1
+                                """,
+                                source_id,
+                            )
+                            valid_terminal = root_id == intent["authority_id"]
+                        elif valid_terminal:
+                            valid_terminal = bool(
+                                intent["authority_kind"] == "project_repository"
+                                and await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM "
+                                    "project_repositories WHERE id=$1 "
+                                    "AND project_id=$2 AND name=$3 "
+                                    "AND is_managed AND role='jobs' "
+                                    "AND NOT read_only)",
+                                    intent["authority_id"],
+                                    source["project_id"],
+                                    intent["repo_name"],
+                                )
+                            )
+                    elif source_kind == "thread":
+                        workspace = source_metadata.get("workspace_container", {})
+                        try:
+                            settled_retirement = stateless_settled_retirement_authority(
+                                source_metadata
+                            )
+                        except RuntimeError:
+                            settled_retirement = None
+                        valid_terminal = bool(
+                            source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled_retirement is not None
+                            and settled_retirement.get("permanent") is True
+                            and workspace.get("repo_name") == intent["repo_name"]
+                            and intent["authority_kind"] == "thread"
+                            and intent["authority_id"] == source_id
+                            and not await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                "WHERE project_id=$1 AND thread_id=$2)",
+                                source["project_id"],
+                                source_id,
+                            )
+                        )
+                    else:
+                        valid_terminal = bool(
+                            classification == "server_only_repository"
+                            and source["is_managed"]
+                            and source["role"] == "knowledge"
+                            and source["name"] == intent["repo_name"]
+                            and intent["authority_kind"] == "project_repository"
+                            and intent["authority_id"] == source_id
+                            and intent["access_mode"] == "none"
+                        )
+                    clean_url = await conn.fetchval(
+                        "SELECT public.managed_repository_url_without_userinfo($1)",
+                        current_url,
+                    )
+                    if not valid_terminal or clean_url is None:
+                        return None
+                    result_kind = "scrubbed_terminal"
+                    source_needs_update = True
+                else:
+                    if authority_uuid is None:
+                        return None
+                    authority = await conn.fetchrow(
+                        """
+                        SELECT id, authority_kind, authority_id, project_id,
+                               repository_owner, repo_name, access_mode,
+                               generation, clean_repo_url, status
+                          FROM managed_repository_authorities
+                         WHERE id=$1 FOR SHARE
+                        """,
+                        authority_uuid,
+                    )
+                    if (
+                        authority is None
+                        or authority["status"] != "active"
+                        or authority["authority_kind"] != intent["authority_kind"]
+                        or authority["authority_id"] != intent["authority_id"]
+                        or authority["project_id"] != intent["project_id"]
+                        or authority["repository_owner"] != intent["repository_owner"]
+                        or authority["repo_name"] != intent["repo_name"]
+                        or authority["access_mode"] != intent["access_mode"]
+                    ):
+                        return None
+                    settlement_authority_record_id = authority["id"]
+                    settlement_authority_generation = int(authority["generation"])
+                    clean_url = authority["clean_repo_url"]
+                    if str(current_url or "") == clean_url:
+                        # A concurrent normal attach/dispatch already proved
+                        # and scrubbed this exact authority. The locked source
+                        # and active authority checks below are still required
+                        # before the durable reconciliation claim may settle.
+                        source_needs_update = False
+                    elif (
+                        observed_url is not None
+                        and str(current_url or "") == observed_url
+                        and await conn.fetchval(
+                            "SELECT public.managed_repository_url_has_userinfo($1)",
+                            current_url,
+                        )
+                    ):
+                        source_needs_update = True
+                    else:
+                        return None
+                    if source_kind == "job":
+                        blocked_undelivered = bool(
+                            source["completion_outcome_kind"] == "blocked_undelivered"
+                        )
+                        valid_source = bool(
+                            source["status"] != "completed"
+                            and not blocked_undelivered
+                            and source["repo_name"] == intent["repo_name"]
+                        )
+                        if valid_source and intent["authority_kind"] == "job":
+                            root_id = await conn.fetchval(
+                                """
+                                WITH RECURSIVE lineage AS (
+                                    SELECT id, parent_job_id FROM jobs WHERE id=$1
+                                    UNION ALL
+                                    SELECT parent.id, parent.parent_job_id
+                                      FROM jobs AS parent
+                                      JOIN lineage
+                                        ON parent.id = lineage.parent_job_id
+                                )
+                                SELECT id FROM lineage
+                                 WHERE parent_job_id IS NULL LIMIT 1
+                                """,
+                                source_id,
+                            )
+                            valid_source = root_id == intent["authority_id"]
+                        elif valid_source:
+                            valid_source = bool(
+                                intent["authority_kind"] == "project_repository"
+                                and await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM "
+                                    "project_repositories WHERE id=$1 "
+                                    "AND project_id=$2 AND name=$3 "
+                                    "AND is_managed AND role='jobs' "
+                                    "AND NOT read_only)",
+                                    intent["authority_id"],
+                                    source["project_id"],
+                                    intent["repo_name"],
+                                )
+                            )
+                    elif source_kind == "thread":
+                        workspace = source_metadata.get("workspace_container", {})
+                        settled_retirement_invalid = False
+                        try:
+                            settled_retirement = stateless_settled_retirement_authority(
+                                source_metadata
+                            )
+                        except RuntimeError:
+                            settled_retirement = None
+                            settled_retirement_invalid = True
+                        permanently_retired = bool(
+                            source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled_retirement is not None
+                            and settled_retirement.get("permanent") is True
+                        )
+                        valid_source = bool(
+                            workspace.get("repo_name") == intent["repo_name"]
+                            and intent["authority_kind"] == "thread"
+                            and intent["authority_id"] == source_id
+                            and not settled_retirement_invalid
+                            and not permanently_retired
+                        )
+                        if classification == "current_officer_thread":
+                            valid_source = valid_source and bool(
+                                await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                                    "WHERE project_id=$1 AND thread_id=$2)",
+                                    source["project_id"],
+                                    source_id,
+                                )
+                            )
+                    else:
+                        expected_mode = (
+                            "read"
+                            if source["role"] == "reference" or source["read_only"]
+                            else "write"
+                        )
+                        valid_source = bool(
+                            source["is_managed"]
+                            and source["role"] != "knowledge"
+                            and source["name"] == intent["repo_name"]
+                            and expected_mode == intent["access_mode"]
+                            and intent["authority_kind"] == "project_repository"
+                            and intent["authority_id"] == source_id
+                        )
+                    if not valid_source:
+                        return None
+                    result_kind = "adopted"
+
+                class _LeaseSettlementLost(Exception):
+                    pass
+
+                try:
+                    # A nested transaction makes this a savepoint. If database
+                    # time crosses the lease boundary after source validation,
+                    # the exact source CAS is rolled back with settlement.
+                    async with conn.transaction():
+                        if not source_needs_update:
+                            changed = source_id
+                        elif source_kind == "job":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE jobs
+                                   SET context = jsonb_set(
+                                           COALESCE(context, '{}'::jsonb),
+                                           '{git_remote_url}',
+                                           to_jsonb($3::text), true
+                                       )
+                                       - '_managed_repository_authority_pending',
+                                       updated_at = now()
+                                 WHERE id=$1
+                                   AND context->>'git_remote_url' = $2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        elif source_kind == "thread":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE threads
+                                   SET metadata = jsonb_set(
+                                           COALESCE(metadata, '{}'::jsonb),
+                                           '{workspace_container}',
+                                           (COALESCE(
+                                               metadata->'workspace_container',
+                                               '{}'::jsonb
+                                           )
+                                           - '_managed_repository_authority_pending')
+                                           || jsonb_build_object(
+                                               'git_remote_url', $3::text
+                                           ), true
+                                       ),
+                                       last_activity = now()
+                                 WHERE id=$1
+                                   AND metadata->'workspace_container'
+                                       ->>'git_remote_url' = $2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        else:
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE project_repositories
+                                   SET repo_url=$3, credentials='{}'::jsonb,
+                                       updated_at=now()
+                                 WHERE id=$1 AND repo_url=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                observed_url,
+                                clean_url,
+                            )
+                        if changed is None:
+                            return None
+                        settled = await conn.fetchval(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET state='completed', result_kind=$3,
+                                   authority_record_id=COALESCE(
+                                       $4, authority_record_id
+                                   ),
+                                   authority_generation=COALESCE(
+                                       $5, authority_generation
+                                   ),
+                                   reason_code=NULL, completed_at=COALESCE(
+                                       completed_at, now()
+                                   ), claimed_by=NULL, claim_expires_at=NULL,
+                                   updated_at=now()
+                             WHERE id=$1 AND state='claimed' AND claim_token=$2
+                               AND claim_expires_at > clock_timestamp()
+                            RETURNING result_kind
+                            """,
+                            reconciliation_uuid,
+                            int(claim_token),
+                            result_kind,
+                            settlement_authority_record_id,
+                            settlement_authority_generation,
+                        )
+                        if settled is None:
+                            raise _LeaseSettlementLost
+                except _LeaseSettlementLost:
+                    return None
+                return str(settled)
+
+    async def get_managed_repository_legacy_reconciliation_progress(
+        self, *, ambiguous_sample_limit: int = 20
+    ) -> Dict[str, Any]:
+        """Return only aggregate/opaque operator progress."""
+
+        sample_limit = max(0, min(int(ambiguous_sample_limit), 100))
+        async with self.acquire() as conn:
+            states = await conn.fetch(
+                """
+                SELECT state, classification, result_kind, count(*) AS count
+                  FROM managed_repository_legacy_reconciliations
+                 GROUP BY state, classification, result_kind
+                 ORDER BY state, classification, result_kind
+                """
+            )
+            oldest = await conn.fetchval(
+                """
+                SELECT min(CASE WHEN state='claimed' THEN claim_expires_at
+                                ELSE next_attempt_at END)
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state IN ('pending', 'retry', 'claimed')
+                """
+            )
+            ambiguous = await conn.fetch(
+                """
+                SELECT source_kind, source_id, reason_code
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state='ambiguous'
+                 ORDER BY updated_at, id
+                 LIMIT $1
+                """,
+                sample_limit,
+            )
+            failures = await conn.fetch(
+                """
+                SELECT state, reason_code, count(*) AS count
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state IN ('retry', 'failed')
+                 GROUP BY state, reason_code
+                 ORDER BY state, reason_code
+                """
+            )
+            rearm_required = await conn.fetch(
+                """
+                SELECT source_kind, source_id, attempts, lifetime_attempts,
+                       rearm_generation, last_failure_reason_code
+                  FROM managed_repository_legacy_reconciliations
+                 WHERE state='failed'
+                 ORDER BY updated_at, id
+                 LIMIT $1
+                """,
+                sample_limit,
+            )
+        return {
+            "counts": [dict(row) for row in states],
+            "oldest_pending_or_retry_at": oldest,
+            "ambiguous": [dict(row) for row in ambiguous],
+            "failure_reasons": [dict(row) for row in failures],
+            "rearm_required": [dict(row) for row in rearm_required],
+        }
+
     async def reserve_managed_repository_creation_intent(
         self,
         *,
@@ -35253,6 +37770,9 @@ class PostgresDB:
     ) -> Dict[str, Any] | None:
         """CAS one proven deploy key to active; replay returns the same row."""
         authority_uuid = UUID(str(authority_id))
+        key_id = int(forge_key_id)
+        if key_id <= 0:
+            raise ValueError("Managed repository forge key id must be positive")
         async with self.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -35268,11 +37788,12 @@ class PostgresDB:
                     or row["access_mode"] != access_mode
                 ):
                     return None
+                if (
+                    row["forge_key_id"] is not None
+                    and int(row["forge_key_id"]) != key_id
+                ):
+                    raise RuntimeError("Managed repository deploy-key identity changed")
                 if row["status"] == "active":
-                    if row["forge_key_id"] != int(forge_key_id):
-                        raise RuntimeError(
-                            "Managed repository deploy-key identity changed"
-                        )
                     return self._managed_repository_authority_row(row)
                 row = await conn.fetchrow(
                     """
@@ -35284,8 +37805,96 @@ class PostgresDB:
                     RETURNING *
                     """,
                     authority_uuid,
-                    int(forge_key_id),
+                    key_id,
                 )
+        return self._managed_repository_authority_row(row)
+
+    async def record_managed_repository_authority_forge_key(
+        self,
+        authority_id: str,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_scope_id: str,
+        project_id: str | None,
+        generation: int,
+        access_mode: str,
+        public_key_fingerprint: str,
+        forge_key_id: int,
+    ) -> Dict[str, Any] | None:
+        """Persist an exact registered key before any fallible forge probe.
+
+        The full immutable authority identity is required so a caller cannot
+        attach a recovered key identifier to a newer generation or another
+        repository scope. Identical retries replay; a different key id for the
+        same durable generation fails closed.
+        """
+
+        try:
+            authority_uuid = UUID(str(authority_id))
+            scope_uuid = UUID(str(authority_scope_id))
+            project_uuid = UUID(str(project_id)) if project_id else None
+            expected_generation = int(generation)
+            key_id = int(forge_key_id)
+        except (TypeError, ValueError):
+            return None
+        if (
+            authority_kind not in {"job", "thread", "project_repository"}
+            or access_mode not in {"read", "write"}
+            or expected_generation <= 0
+            or key_id <= 0
+            or not str(repository_owner or "").strip()
+            or not str(repo_name or "").strip()
+            or not str(public_key_fingerprint or "").strip()
+        ):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_authorities
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    authority_uuid,
+                )
+                if (
+                    row is None
+                    or row["repository_owner"] != str(repository_owner)
+                    or row["repo_name"] != str(repo_name)
+                    or row["authority_kind"] != authority_kind
+                    or row["authority_id"] != scope_uuid
+                    or row["project_id"] != project_uuid
+                    or int(row["generation"]) != expected_generation
+                    or row["access_mode"] != access_mode
+                    or row["public_key_fingerprint"] != str(public_key_fingerprint)
+                    or row["status"] not in {"provisioning", "active", "revoking"}
+                ):
+                    return None
+                persisted_key_id = row["forge_key_id"]
+                if persisted_key_id is not None:
+                    if int(persisted_key_id) != key_id:
+                        raise RuntimeError(
+                            "Managed repository deploy-key identity changed"
+                        )
+                    return self._managed_repository_authority_row(row)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE managed_repository_authorities
+                       SET forge_key_id = $2, updated_at = now()
+                     WHERE id = $1
+                       AND forge_key_id IS NULL
+                       AND status IN ('provisioning', 'revoking')
+                    RETURNING *
+                    """,
+                    authority_uuid,
+                    key_id,
+                )
+                if row is None:
+                    return None
         return self._managed_repository_authority_row(row)
 
     async def fail_managed_repository_authority(
@@ -35340,6 +37949,264 @@ class PostgresDB:
                     )
         return self._managed_repository_authority_row(row)
 
+    async def claim_managed_repository_authority_revoke_exact(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+        authority_id: str,
+        *,
+        repository_owner: str,
+        repo_name: str,
+        authority_kind: str,
+        authority_scope_id: str,
+        project_id: str | None,
+        generation: int,
+        access_mode: str,
+        public_key_fingerprint: str,
+    ) -> Dict[str, Any] | None:
+        """Atomically claim one lifecycle-stale exact authority for revocation.
+
+        Lock order is reconciliation intent -> complete source lineage ->
+        authority row.  Besides token/lease fencing, the final database facts
+        must prove the exact source is absent or permanently terminal.  A root
+        job key is retained while any descendant remains resumable.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+            authority_uuid = UUID(str(authority_id))
+            scope_uuid = UUID(str(authority_scope_id))
+            project_uuid = UUID(str(project_id)) if project_id else None
+            expected_generation = int(generation)
+        except (TypeError, ValueError):
+            return None
+        if token <= 0 or expected_generation <= 0:
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if (
+                    intent is None
+                    or intent["state"] != "claimed"
+                    or int(intent["claim_token"]) != token
+                    or intent["claim_expires_at"] is None
+                    or not await conn.fetchval(
+                        "SELECT $1::timestamptz > clock_timestamp()",
+                        intent["claim_expires_at"],
+                    )
+                    or intent["classification"] != "terminal_historical"
+                    or intent["source_kind"] != authority_kind
+                    or intent["source_id"] != scope_uuid
+                    or intent["project_id"] != project_uuid
+                    or intent["authority_kind"] != authority_kind
+                    or intent["authority_id"] != scope_uuid
+                    or intent["authority_record_id"] != authority_uuid
+                    or intent["authority_generation"] != expected_generation
+                    or intent["repository_owner"] != str(repository_owner)
+                    or intent["repo_name"] != str(repo_name)
+                    or intent["access_mode"] != access_mode
+                ):
+                    return None
+
+                source_is_containable = False
+                if authority_kind == "job":
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended("
+                        "'managed_repository_job_lineage:' || $1::uuid::text, 0))",
+                        scope_uuid,
+                    )
+                    # Lock the exact root in its own statement. Foreign-key
+                    # child insertion takes a conflicting key-share lock, so
+                    # the following fresh READ COMMITTED statement cannot miss
+                    # a descendant committed while this transaction waited.
+                    root_lock = await conn.fetchrow(
+                        "SELECT id, parent_job_id FROM jobs WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if root_lock is None:
+                        source_is_containable = True
+                    else:
+                        lineage = await conn.fetch(
+                            """
+                            WITH RECURSIVE lineage_ids AS (
+                                SELECT id
+                                  FROM jobs
+                                 WHERE id = $1
+                                UNION
+                                SELECT child.id
+                                  FROM jobs AS child
+                                  JOIN lineage_ids AS parent
+                                    ON child.parent_job_id = parent.id
+                            )
+                            SELECT job.id, job.parent_job_id, job.project_id,
+                                   job.status::text AS status,
+                                   job.completion_outcome_kind, job.repo_name
+                              FROM jobs AS job
+                              JOIN lineage_ids ON lineage_ids.id = job.id
+                             FOR UPDATE OF job
+                            """,
+                            scope_uuid,
+                        )
+                        root = next(
+                            (item for item in lineage if item["id"] == scope_uuid),
+                            None,
+                        )
+                        source_is_containable = bool(
+                            root is not None
+                            and root["parent_job_id"] is None
+                            and root["project_id"] == project_uuid
+                            and root["repo_name"] == str(repo_name)
+                            and all(
+                                item["project_id"] == project_uuid
+                                and item["repo_name"] == str(repo_name)
+                                and (
+                                    (
+                                        item["status"] == "completed"
+                                        and item["completion_outcome_kind"]
+                                        != "blocked_undelivered"
+                                    )
+                                    or (
+                                        item["status"] == "cancelled"
+                                        and item["completion_outcome_kind"]
+                                        == "blocked_undelivered"
+                                    )
+                                )
+                                for item in lineage
+                            )
+                        )
+                elif authority_kind == "thread":
+                    officer = None
+                    if project_uuid is not None:
+                        officer = await conn.fetchrow(
+                            "SELECT project_id, thread_id FROM project_officers "
+                            "WHERE project_id=$1 FOR UPDATE",
+                            project_uuid,
+                        )
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if source is None:
+                        source_is_containable = bool(
+                            officer is None or officer["thread_id"] != scope_uuid
+                        )
+                    else:
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            settled = None
+                            workspace = {}
+                        source_is_containable = bool(
+                            source["project_id"] == project_uuid
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and workspace.get("repo_name") == str(repo_name)
+                            and (officer is None or officer["thread_id"] != scope_uuid)
+                        )
+                elif authority_kind == "project_repository":
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, role, read_only, is_managed "
+                        "FROM project_repositories WHERE id=$1 FOR UPDATE",
+                        scope_uuid,
+                    )
+                    if source is None:
+                        source_is_containable = True
+                    else:
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        source_is_containable = bool(
+                            source["project_id"] != project_uuid
+                            or source["name"] != str(repo_name)
+                            or current_mode != access_mode
+                        )
+                if not source_is_containable:
+                    return None
+
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_authorities
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    authority_uuid,
+                )
+                if (
+                    row is None
+                    or row["repository_owner"] != str(repository_owner)
+                    or row["repo_name"] != str(repo_name)
+                    or row["authority_kind"] != authority_kind
+                    or row["authority_id"] != scope_uuid
+                    or row["project_id"] != project_uuid
+                    or int(row["generation"]) != expected_generation
+                    or row["access_mode"] != access_mode
+                    or row["public_key_fingerprint"] != str(public_key_fingerprint)
+                    or row["status"] not in {"provisioning", "active", "revoking"}
+                ):
+                    return None
+                if authority_kind == "thread" and await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                    "WHERE project_id=$1 AND thread_id=$2)",
+                    project_uuid,
+                    scope_uuid,
+                ):
+                    return None
+                # Source/authority locks can outlive a short lease. Recheck
+                # database time immediately before the authoritative status
+                # transition; a stale claimant may inspect but never mutate.
+                if not await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM managed_repository_legacy_reconciliations
+                         WHERE id=$1 AND state='claimed' AND claim_token=$2
+                           AND claim_expires_at > clock_timestamp()
+                    )
+                    """,
+                    reconciliation_uuid,
+                    token,
+                ):
+                    return None
+                if row["status"] != "revoking":
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE managed_repository_authorities
+                           SET status = 'revoking', updated_at = now()
+                         WHERE id = $1
+                           AND status IN ('provisioning', 'active')
+                        RETURNING *
+                        """,
+                        authority_uuid,
+                    )
+        return self._managed_repository_authority_row(row)
+
     async def finish_managed_repository_authority_revoke(
         self, authority_id: str
     ) -> bool:
@@ -35355,6 +38222,356 @@ class PostgresDB:
                 UUID(str(authority_id)),
             )
         return result == "UPDATE 1"
+
+    async def finish_missing_or_clean_managed_repository_legacy_reconciliation(
+        self,
+        reconciliation_id: str,
+        claim_token: int,
+    ) -> str | None:
+        """Settle an exact lifecycle-containment claim after key revocation.
+
+        The external forge deletion is complete before this transaction.  The
+        database nevertheless re-locks and revalidates the intent, the exact
+        source (including a complete job lineage), and its bound authority.
+        Only an absent source, or one whose current URL exactly scrubs to the
+        bound authority's clean coordinate and whose lifecycle still makes
+        that authority disposable, may settle. Any required scrub commits
+        with settlement. A lost successful response is replayed for the same
+        claim token; a resumed/rebound source fails closed for reclassification.
+        """
+
+        try:
+            reconciliation_uuid = UUID(str(reconciliation_id))
+            token = int(claim_token)
+        except (TypeError, ValueError):
+            return None
+        if token <= 0:
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM managed_repository_legacy_reconciliations
+                     WHERE id=$1
+                     FOR UPDATE
+                    """,
+                    reconciliation_uuid,
+                )
+                if intent is None or int(intent["claim_token"]) != token:
+                    return None
+                replay = bool(
+                    intent["state"] == "completed"
+                    and intent["result_kind"] == "authority_revoked"
+                )
+                if not replay and (
+                    intent["state"] != "claimed"
+                    or intent["claim_expires_at"] is None
+                    or not await conn.fetchval(
+                        "SELECT $1::timestamptz > clock_timestamp()",
+                        intent["claim_expires_at"],
+                    )
+                ):
+                    return None
+                source_kind = str(intent["source_kind"])
+                source_id = intent["source_id"]
+                project_id = intent["project_id"]
+                if (
+                    intent["classification"] != "terminal_historical"
+                    or source_kind not in {"job", "thread", "project_repository"}
+                    or intent["authority_kind"] != source_kind
+                    or intent["authority_id"] != source_id
+                    or intent["authority_record_id"] is None
+                    or intent["authority_generation"] is None
+                    or intent["access_mode"] not in {"read", "write"}
+                ):
+                    return None
+
+                source_is_containable = False
+                source_exists = False
+                current_url = None
+                if source_kind == "job":
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended("
+                        "'managed_repository_job_lineage:' || $1::uuid::text, 0))",
+                        source_id,
+                    )
+                    root_lock = await conn.fetchrow(
+                        "SELECT id, parent_job_id FROM jobs WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if root_lock is None:
+                        source_is_containable = True
+                    else:
+                        source_exists = True
+                        lineage = await conn.fetch(
+                            """
+                            WITH RECURSIVE lineage_ids AS (
+                                SELECT id
+                                  FROM jobs
+                                 WHERE id=$1
+                                UNION
+                                SELECT child.id
+                                  FROM jobs AS child
+                                  JOIN lineage_ids AS parent
+                                    ON child.parent_job_id=parent.id
+                            )
+                            SELECT job.id, job.parent_job_id, job.project_id,
+                                   job.status::text AS status,
+                                   job.completion_outcome_kind, job.repo_name,
+                                   job.context
+                              FROM jobs AS job
+                              JOIN lineage_ids ON lineage_ids.id=job.id
+                             FOR UPDATE OF job
+                            """,
+                            source_id,
+                        )
+                        root = next(
+                            (row for row in lineage if row["id"] == source_id), None
+                        )
+                        if root is not None:
+                            root_context = _strict_json_object(
+                                root["context"], label="job context"
+                            )
+                            current_url = root_context.get("git_remote_url")
+                            source_is_containable = bool(
+                                root["parent_job_id"] is None
+                                and root["project_id"] == project_id
+                                and root["repo_name"] == intent["repo_name"]
+                                and all(
+                                    row["project_id"] == project_id
+                                    and row["repo_name"] == intent["repo_name"]
+                                    and (
+                                        (
+                                            row["status"] == "completed"
+                                            and row["completion_outcome_kind"]
+                                            != "blocked_undelivered"
+                                        )
+                                        or (
+                                            row["status"] == "cancelled"
+                                            and row["completion_outcome_kind"]
+                                            == "blocked_undelivered"
+                                        )
+                                    )
+                                    for row in lineage
+                                )
+                            )
+                elif source_kind == "thread":
+                    officer = None
+                    if project_id is not None:
+                        officer = await conn.fetchrow(
+                            "SELECT project_id, thread_id FROM project_officers "
+                            "WHERE project_id=$1 FOR UPDATE",
+                            project_id,
+                        )
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, status::text AS status, "
+                        "execution_lane, metadata FROM threads "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if source is None:
+                        source_is_containable = bool(
+                            officer is None or officer["thread_id"] != source_id
+                        )
+                    else:
+                        source_exists = True
+                        try:
+                            metadata = _strict_json_object(
+                                source["metadata"], label="thread metadata"
+                            )
+                            workspace = _strict_json_object(
+                                metadata.get("workspace_container", {}),
+                                label="workspace container",
+                            )
+                            settled = stateless_settled_retirement_authority(metadata)
+                        except RuntimeError:
+                            workspace = {}
+                            settled = None
+                        current_url = workspace.get("git_remote_url")
+                        source_is_containable = bool(
+                            source["project_id"] == project_id
+                            and source["status"] == "ended"
+                            and source["execution_lane"] == "stateless"
+                            and settled is not None
+                            and settled.get("permanent") is True
+                            and workspace.get("repo_name") == intent["repo_name"]
+                            and (officer is None or officer["thread_id"] != source_id)
+                        )
+                else:
+                    source = await conn.fetchrow(
+                        "SELECT id, project_id, name, repo_url, role, read_only, "
+                        "is_managed FROM project_repositories "
+                        "WHERE id=$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if source is None:
+                        source_is_containable = True
+                    else:
+                        source_exists = True
+                        current_url = source["repo_url"]
+                        current_mode = (
+                            None
+                            if not source["is_managed"] or source["role"] == "knowledge"
+                            else (
+                                "read"
+                                if source["role"] == "reference" or source["read_only"]
+                                else "write"
+                            )
+                        )
+                        source_is_containable = bool(
+                            source["project_id"] != project_id
+                            or source["name"] != intent["repo_name"]
+                            or current_mode != intent["access_mode"]
+                        )
+                if not source_is_containable:
+                    return None
+
+                source_needs_scrub = bool(
+                    source_exists
+                    and await conn.fetchval(
+                        "SELECT public.managed_repository_url_has_userinfo($1)",
+                        current_url,
+                    )
+                )
+                clean_url = current_url
+                if source_needs_scrub:
+                    clean_url = await conn.fetchval(
+                        "SELECT public.managed_repository_url_without_userinfo($1)",
+                        current_url,
+                    )
+                    if clean_url is None:
+                        return None
+
+                authority = await conn.fetchrow(
+                    """
+                    SELECT id, authority_kind, authority_id, project_id,
+                           repository_owner, repo_name, access_mode,
+                           generation, clean_repo_url, status, revoked_at
+                      FROM managed_repository_authorities
+                     WHERE id=$1
+                     FOR UPDATE
+                    """,
+                    intent["authority_record_id"],
+                )
+                if (
+                    authority is None
+                    or authority["status"] != "revoked"
+                    or authority["revoked_at"] is None
+                    or authority["authority_kind"] != source_kind
+                    or authority["authority_id"] != source_id
+                    or authority["project_id"] != project_id
+                    or authority["repository_owner"] != intent["repository_owner"]
+                    or authority["repo_name"] != intent["repo_name"]
+                    or authority["access_mode"] != intent["access_mode"]
+                    or int(authority["generation"])
+                    != int(intent["authority_generation"])
+                    or (
+                        source_exists
+                        and str(clean_url or "") != authority["clean_repo_url"]
+                    )
+                ):
+                    return None
+                if source_kind == "thread" and await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM project_officers "
+                    "WHERE project_id=$1 AND thread_id=$2)",
+                    project_id,
+                    source_id,
+                ):
+                    return None
+                if replay:
+                    return "authority_revoked"
+
+                class _ContainmentSettlementLost(Exception):
+                    pass
+
+                try:
+                    # Keep the exact credential scrub and claim settlement in
+                    # one savepoint. If database time crosses the lease fence,
+                    # no partial source rewrite escapes this transaction.
+                    async with conn.transaction():
+                        if source_needs_scrub and source_kind == "job":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE jobs
+                                   SET context=jsonb_set(
+                                           COALESCE(context, '{}'::jsonb),
+                                           '{git_remote_url}',
+                                           to_jsonb($3::text), true
+                                       ) - '_managed_repository_authority_pending',
+                                       updated_at=now()
+                                 WHERE id=$1
+                                   AND context->>'git_remote_url'=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        elif source_needs_scrub and source_kind == "thread":
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE threads
+                                   SET metadata=jsonb_set(
+                                           COALESCE(metadata, '{}'::jsonb),
+                                           '{workspace_container}',
+                                           (COALESCE(
+                                               metadata->'workspace_container',
+                                               '{}'::jsonb
+                                           ) - '_managed_repository_authority_pending')
+                                           || jsonb_build_object(
+                                               'git_remote_url', $3::text
+                                           ), true
+                                       ),
+                                       last_activity=now()
+                                 WHERE id=$1
+                                   AND metadata->'workspace_container'
+                                       ->>'git_remote_url'=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        elif source_needs_scrub:
+                            changed = await conn.fetchval(
+                                """
+                                UPDATE project_repositories
+                                   SET repo_url=$3, credentials='{}'::jsonb,
+                                       updated_at=now()
+                                 WHERE id=$1 AND repo_url=$2
+                                RETURNING id
+                                """,
+                                source_id,
+                                current_url,
+                                clean_url,
+                            )
+                        else:
+                            changed = source_id
+                        if changed is None:
+                            return None
+                        settled = await conn.fetchval(
+                            """
+                            UPDATE managed_repository_legacy_reconciliations
+                               SET state='completed',
+                                   result_kind='authority_revoked',
+                                   reason_code=NULL,
+                                   completed_at=COALESCE(completed_at, now()),
+                                   claimed_by=NULL, claim_expires_at=NULL,
+                                   updated_at=now()
+                             WHERE id=$1 AND state='claimed' AND claim_token=$2
+                               AND claim_expires_at > clock_timestamp()
+                            RETURNING result_kind
+                            """,
+                            reconciliation_uuid,
+                            token,
+                        )
+                        if settled is None:
+                            raise _ContainmentSettlementLost
+                except _ContainmentSettlementLost:
+                    return None
+                return str(settled)
 
     async def scrub_job_managed_repository_url(
         self,
@@ -37256,184 +40473,641 @@ class PostgresDB:
     # Notification Queue (Phase 3 Live Communication)
     # =========================================================================
 
-    async def queue_notification(
-        self,
-        user_id: str,
-        job_id: str,
-        thread_id: str | None,
-        subject: str,
-        message: str,
-        channels: dict,
-    ) -> Dict[str, Any]:
-        """Queue a notification for later digest delivery (quiet hours)."""
-        import json as _json
+    # =========================================================================
+    # Notifications (unified feed) — feature:unified-notifications
+    # knowledge-base/knowledge/features/unified_notification_system.md
+    # =========================================================================
 
+    _NOTIFICATION_STATUS_CLAUSES = {
+        "pending": "resolved_at IS NULL AND archived_at IS NULL",
+        "resolved": "resolved_at IS NOT NULL AND archived_at IS NULL",
+        "unread": "read_at IS NULL AND archived_at IS NULL",
+        "unseen": "seen_at IS NULL AND archived_at IS NULL",
+        "archived": "archived_at IS NOT NULL",
+        "all": "archived_at IS NULL",
+    }
+
+    @staticmethod
+    def _notification_row(row: Any) -> Dict[str, Any]:
+        """asyncpg hands JSONB back as a string on some paths — normalise."""
+        data = dict(row)
+        for key, empty in (("actions", []), ("payload", {})):
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def insert_notification_once(
+        self,
+        *,
+        notification_id: str,
+        recipient_kind: str,
+        recipient_id: str,
+        category: str,
+        severity: str,
+        subject: str,
+        body: str,
+        source_kind: Optional[str],
+        source_id: Optional[str],
+        dedup_key: str,
+        actions: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+        steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Insert one feed row plus its ``in_app`` delivery, validating any replay.
+
+        Returns ``True`` only for the inserting caller — a journal-replayed
+        completion effect or a dual-leader retry lands on the deterministic
+        primary key, re-reads the row, checks that its identity fields match,
+        and returns ``False`` so the SSE frame is broadcast exactly once.
+        Subject/body drift on replay is tolerated (identity is the dedup key);
+        a different category or source is a caller bug and raises.
+
+        ``steps`` — the row's deferred channel steps (``step_index``,
+        ``step_kind``, ``due_at``, ``conditions``, ``batch_key``) — are written
+        in the same transaction, so a crash can never leave a row whose
+        escalation was silently lost.
+        """
+        nid = UUID(str(notification_id))
+        rid = UUID(str(recipient_id))
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                inserted = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    INSERT INTO notifications (
+                        id, recipient_kind, recipient_id, category, severity,
+                        subject, body, source_kind, source_id, dedup_key,
+                        actions, payload
+                    ) VALUES (
+                        $1::uuid, $2::text, $3::uuid, $4::text, $5::text,
+                        $6::text, $7::text, $8::text, $9::text, $10::text,
+                        $11::jsonb, $12::jsonb
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING TRUE
+                    """,
+                    nid,
+                    recipient_kind,
+                    rid,
+                    category,
+                    severity,
+                    subject,
+                    body,
+                    source_kind,
+                    source_id,
+                    dedup_key,
+                    json.dumps(actions),
+                    json.dumps(payload),
+                )
+                if inserted:
+                    await conn.execute(
+                        """
+                        -- feature:unified-notifications
+                        INSERT INTO notification_deliveries
+                            (notification_id, channel, state, settled_at)
+                        VALUES ($1::uuid, 'in_app', 'sent', now())
+                        ON CONFLICT DO NOTHING
+                        """,
+                        nid,
+                    )
+                    if steps:
+                        await self._insert_notification_steps(conn, nid, steps)
+                    return True
+            # Separate statement on purpose: if ON CONFLICT waited on a
+            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
+            # and can see the row whose conflict it observed.
+            async with self.acquire() as conn:
+                matches = await conn.fetchval(
+                    """
+                    -- feature:unified-notifications
+                    SELECT category = $2::text
+                       AND source_kind IS NOT DISTINCT FROM $3::text
+                       AND source_id IS NOT DISTINCT FROM $4::text
+                       AND recipient_kind = $5::text
+                       AND recipient_id = $6::uuid
+                    FROM notifications
+                    WHERE id = $1::uuid
+                    """,
+                    nid,
+                    category,
+                    source_kind,
+                    source_id,
+                    recipient_kind,
+                    rid,
+                )
+        if not matches:
+            raise RuntimeError(
+                "notification replay identity matched a different payload"
+            )
+        return False
+
+    async def claim_notification_delivery(
+        self,
+        *,
+        notification_id: str,
+        channel: str,
+        recipient_address: Optional[str] = None,
+        step_index: Optional[int] = None,
+        batch_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Insert-as-claim BEFORE sending. ``None`` means a live pending/sent
+        row already holds the (notification, channel) slot — skip the send.
+        A ``failed`` row does not hold the slot, so the next attempt claims.
+        ``step_index``/``batch_id`` record which deferred step sent it and
+        which batched message it rode in."""
+        nid = UUID(str(notification_id))
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO notification_queue
-                    (user_id, job_id, thread_id, subject, message, channels)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                RETURNING id, user_id, job_id, thread_id, subject, queued_at
+                -- feature:unified-notifications
+                INSERT INTO notification_deliveries
+                    (notification_id, channel, state, recipient_address, attempt,
+                     step_index, batch_id)
+                VALUES (
+                    $1::uuid, $2::text, 'pending', $3::text,
+                    COALESCE((
+                        SELECT max(attempt) FROM notification_deliveries
+                        WHERE notification_id = $1::uuid AND channel = $2::text
+                    ), 0) + 1,
+                    $4::int, $5::uuid
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
                 """,
-                UUID(user_id),
-                UUID(job_id) if job_id else None,
-                thread_id,
-                subject,
-                message,
-                _json.dumps(channels),
+                nid,
+                channel,
+                recipient_address,
+                step_index,
+                UUID(str(batch_id)) if batch_id else None,
             )
-        return dict(row)
+        return str(row["id"]) if row else None
 
-    async def get_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Get undelivered notifications for a user."""
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, user_id, job_id, thread_id, subject, message, channels,
-                       queued_at
-                FROM notification_queue
-                WHERE user_id = $1 AND delivered_at IS NULL
-                ORDER BY queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notifications_delivered(self, ids: List[str]) -> int:
-        """Mark notifications as delivered. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NOW()
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        # result is like "UPDATE N"
-        return int(result.split()[-1]) if result else 0
-
-    async def claim_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
-        """Atomically claim a user's undelivered notifications for a digest.
-
-        Stamps ``delivered_at = NOW()`` and RETURNs only the rows THIS call
-        flipped (``delivered_at`` was NULL). Two quiet-hours digest loops in
-        the transient dual-leader window therefore split the pending set
-        disjointly — in practice one claims all and the other gets none — so a
-        digest email is never sent twice. If dispatch then fails, release the
-        claim with ``unmark_notifications_delivered`` so it retries next cycle.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE notification_queue
-                   SET delivered_at = NOW()
-                 WHERE user_id = $1 AND delivered_at IS NULL
-                RETURNING id, user_id, job_id, thread_id, subject, message,
-                          channels, queued_at
-                """,
-                UUID(user_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def unmark_notifications_delivered(self, ids: List[str]) -> int:
-        """Release a digest claim (``delivered_at`` → NULL) so the
-        notifications are retried next cycle. Used when dispatch fails after
-        ``claim_pending_notifications`` won them. Returns count updated."""
-        if not ids:
-            return 0
-        uuids = [UUID(i) for i in ids]
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE notification_queue
-                SET delivered_at = NULL
-                WHERE id = ANY($1::uuid[])
-                """,
-                uuids,
-            )
-        return int(result.split()[-1]) if result else 0
-
-    async def get_users_exiting_quiet_hours(
+    async def settle_notification_delivery(
         self,
-        check_window_minutes: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """Find users whose quiet hours ended within the check window
-        and who have pending notifications.
-
-        Returns list of dicts with user_id and settings.
-        """
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT u.id AS user_id, u.settings
-                FROM users u
-                JOIN notification_queue nq ON nq.user_id = u.id AND nq.delivered_at IS NULL
-                WHERE u.settings->'communication'->'quiet_hours'->>'enabled' = 'true'
-                """,
-            )
-        return [dict(r) for r in rows]
-
-    # =========================================================================
-    # Notification Read Tracking (Phase 3)
-    # =========================================================================
-
-    async def get_user_notifications(
-        self,
-        user_id: str,
-        limit: int = 50,
-        unread_only: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Get notifications (outbound messages) for a user."""
-        where = "WHERE ml.user_id = $1 AND ml.direction = 'outbound'"
-        if unread_only:
-            where += " AND ml.read_at IS NULL"
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT ml.id, ml.job_id, ml.thread_id, ml.subject, ml.message,
-                       ml.status, ml.created_at, ml.read_at,
-                       j.description AS job_description, j.config_name
-                FROM message_log ml
-                LEFT JOIN jobs j ON j.id = ml.job_id
-                {where}
-                ORDER BY ml.created_at DESC
-                LIMIT $2
-                """,
-                UUID(user_id),
-                limit,
-            )
-        return [dict(r) for r in rows]
-
-    async def mark_notification_read(self, message_id: str, user_id: str) -> bool:
-        """Mark a notification as read. Returns True if updated."""
+        delivery_id: str,
+        *,
+        state: str,
+        provider_msg_id: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        if state not in ("sent", "failed", "suppressed"):
+            raise ValueError(f"cannot settle a delivery to {state!r}")
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
-                UPDATE message_log SET read_at = NOW()
-                WHERE id = $1 AND user_id = $2 AND read_at IS NULL
+                -- feature:unified-notifications
+                UPDATE notification_deliveries
+                   SET state = $2::text,
+                       settled_at = now(),
+                       provider_msg_id = COALESCE($3::text, provider_msg_id),
+                       error = $4::text
+                 WHERE id = $1::uuid AND state = 'pending'
                 """,
-                UUID(message_id),
-                UUID(user_id),
+                UUID(str(delivery_id)),
+                state,
+                provider_msg_id,
+                (error or None) and str(error)[:2000],
             )
         return result == "UPDATE 1"
 
-    async def get_unread_count(self, user_id: str) -> int:
-        """Count unread notifications for a user."""
+    async def get_notification(self, notification_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            nid = UUID(str(notification_id))
+        except ValueError:
+            return None
         async with self.acquire() as conn:
-            count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM message_log
-                WHERE user_id = $1 AND direction = 'outbound' AND read_at IS NULL
-                """,
-                UUID(user_id),
+            row = await conn.fetchrow(
+                "-- feature:unified-notifications\n"
+                "SELECT * FROM notifications WHERE id = $1::uuid",
+                nid,
             )
-        return count or 0
+        return self._notification_row(row) if row else None
+
+    async def list_notifications_page(
+        self,
+        *,
+        recipient_kind: str,
+        recipient_id: str,
+        before: Optional[str] = None,
+        limit: int = 50,
+        categories: Optional[List[str]] = None,
+        status: str = "all",
+        source_kind: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Keyset page, newest first. ``before`` is ``"{created_at_iso}|{id}"``
+        from a previous page; returns ``(rows, next_before)`` with the cursor
+        set only when a ``limit + 1`` probe row proved there is more. A
+        ``source_kind``/``source_id`` pair narrows to one source (the officer
+        card's "pages about this officer")."""
+        status_clause = self._NOTIFICATION_STATUS_CLAUSES.get(status)
+        if status_clause is None:
+            raise ValueError(f"unknown notification status filter {status!r}")
+        params: List[Any] = [recipient_kind, UUID(str(recipient_id))]
+        where = ["recipient_kind = $1", "recipient_id = $2", status_clause]
+        if categories:
+            params.append([str(c) for c in categories])
+            where.append(f"category = ANY(${len(params)}::text[])")
+        if source_kind is not None and source_id is not None:
+            params.append(str(source_kind))
+            where.append(f"source_kind = ${len(params)}::text")
+            params.append(str(source_id))
+            where.append(f"source_id = ${len(params)}::text")
+        if before:
+            ts_text, _, id_text = before.partition("|")
+            params.append(datetime.fromisoformat(ts_text))
+            params.append(UUID(id_text))
+            where.append(
+                f"(created_at, id) < (${len(params) - 1}::timestamptz, ${len(params)}::uuid)"
+            )
+        params.append(limit + 1)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                -- feature:unified-notifications
+                SELECT * FROM notifications
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        has_more = len(rows) > limit
+        page = [self._notification_row(r) for r in rows[:limit]]
+        next_before = None
+        if has_more and page:
+            last = page[-1]
+            next_before = f"{last['created_at'].isoformat()}|{last['id']}"
+        return page, next_before
+
+    async def get_notification_counts(
+        self, *, recipient_kind: str, recipient_id: str
+    ) -> Dict[str, Any]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT category,
+                       count(*) FILTER (WHERE seen_at IS NULL)     AS unseen,
+                       count(*) FILTER (WHERE read_at IS NULL)     AS unread,
+                       count(*) FILTER (WHERE resolved_at IS NULL) AS pending
+                  FROM notifications
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND archived_at IS NULL
+                 GROUP BY category
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        counts: Dict[str, Any] = {
+            "unseen": 0,
+            "unread": 0,
+            "pending": 0,
+            "by_category": {},
+        }
+        for row in rows:
+            counts["unseen"] += int(row["unseen"] or 0)
+            counts["unread"] += int(row["unread"] or 0)
+            counts["pending"] += int(row["pending"] or 0)
+            counts["by_category"][row["category"]] = {
+                "pending": int(row["pending"] or 0),
+                "unseen": int(row["unseen"] or 0),
+            }
+        return counts
+
+    async def mark_notifications_seen(
+        self, *, recipient_kind: str, recipient_id: str, ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Stamp ``seen_at`` once; never regresses an earlier stamp."""
+        if not ids:
+            return []
+        uuids = [UUID(str(i)) for i in ids]
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET seen_at = now()
+                 WHERE recipient_kind = $1 AND recipient_id = $2
+                   AND id = ANY($3::uuid[]) AND seen_at IS NULL
+                RETURNING id, seen_at
+                """,
+                recipient_kind,
+                UUID(str(recipient_id)),
+                uuids,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_notification_read_v2(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Idempotent: returns the row whether or not this call changed it."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def stamp_notification_interacted(
+        self, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET interacted_at = COALESCE(interacted_at, now()),
+                       read_at = COALESCE(read_at, now()),
+                       seen_at = COALESCE(seen_at, now())
+                 WHERE id = $1::uuid
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notification(
+        self, notification_id: str, *, resolved_by: str
+    ) -> Optional[Dict[str, Any]]:
+        """Stamp one row resolved and cancel its pending steps in the same
+        statement — a resolved item must never mail (D6)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = COALESCE(resolved_at, now()),
+                           resolved_by = COALESCE(resolved_by, $2::text)
+                     WHERE id = $1::uuid
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $2::text
+                     WHERE s.notification_id = $1::uuid AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
+                """,
+                UUID(str(notification_id)),
+                resolved_by,
+            )
+        return self._notification_row(row) if row else None
+
+    async def resolve_notifications_by_source(
+        self, *, source_kind: str, source_id: str, resolved_by: str
+    ) -> List[Dict[str, Any]]:
+        """Settle every open row about one source, whoever the recipient is,
+        and cancel their pending steps atomically. Returns the rows this call
+        flipped (empty on a repeat)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                WITH resolved AS (
+                    UPDATE notifications
+                       SET resolved_at = now(), resolved_by = $3::text
+                     WHERE source_kind = $1::text AND source_id = $2::text
+                       AND resolved_at IS NULL
+                    RETURNING *
+                ), cancelled AS (
+                    UPDATE notification_steps s
+                       SET state = 'cancelled', settled_at = now(),
+                           claimed_by = NULL, claimed_at = NULL,
+                           detail = 'resolved:' || $3::text
+                      FROM resolved r
+                     WHERE s.notification_id = r.id AND s.state = 'pending'
+                )
+                SELECT * FROM resolved
+                """,
+                source_kind,
+                str(source_id),
+                resolved_by,
+            )
+        return [self._notification_row(r) for r in rows]
+
+    async def archive_notification(
+        self, *, recipient_kind: str, recipient_id: str, notification_id: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                -- feature:unified-notifications
+                UPDATE notifications
+                   SET archived_at = COALESCE(archived_at, now())
+                 WHERE id = $1::uuid AND recipient_kind = $2 AND recipient_id = $3
+                RETURNING *
+                """,
+                UUID(str(notification_id)),
+                recipient_kind,
+                UUID(str(recipient_id)),
+            )
+        return self._notification_row(row) if row else None
+
+    # --- deferred channel steps (slice 2: escalate-on-timeout, D5/D6) ---------
+
+    @staticmethod
+    def _step_row(row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        for key, empty in (("conditions", []), ("payload", {})):
+            if key not in data:
+                continue
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    data[key] = json.loads(value)
+                except ValueError:
+                    data[key] = empty
+            elif value is None:
+                data[key] = empty
+        return data
+
+    async def _insert_notification_steps(
+        self, conn: Any, nid: UUID, steps: List[Dict[str, Any]]
+    ) -> int:
+        inserted = 0
+        for step in steps:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                INSERT INTO notification_steps
+                    (notification_id, step_index, step_kind, due_at,
+                     conditions, batch_key)
+                VALUES ($1::uuid, $2::int, $3::text, $4::timestamptz,
+                        $5::jsonb, $6::text)
+                ON CONFLICT (notification_id, step_index) DO NOTHING
+                """,
+                nid,
+                int(step["step_index"]),
+                str(step["step_kind"]),
+                step["due_at"],
+                json.dumps([str(c) for c in (step.get("conditions") or [])]),
+                step.get("batch_key"),
+            )
+            if result == "INSERT 0 1":
+                inserted += 1
+        return inserted
+
+    async def insert_notification_steps(
+        self, notification_id: str, steps: List[Dict[str, Any]]
+    ) -> int:
+        """Idempotent on ``(notification, step_index)`` — quiet-hours deferral
+        of an immediate step runs on every ``record()`` call, replay included,
+        and must not stack a second promise. Returns the rows this call added."""
+        if not steps:
+            return 0
+        nid = UUID(str(notification_id))
+        async with self.acquire() as conn:
+            return await self._insert_notification_steps(conn, nid, steps)
+
+    async def list_notification_steps(
+        self, notification_id: str
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                SELECT * FROM notification_steps
+                 WHERE notification_id = $1::uuid
+                 ORDER BY step_index
+                """,
+                UUID(str(notification_id)),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def claim_due_notification_steps(
+        self, *, worker_id: str, limit: int = 200, lease_minutes: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Claim the due pending steps for one sweeper pass.
+
+        ``FOR UPDATE SKIP LOCKED`` splits concurrent sweepers (the transient
+        dual-leader window) disjointly; the ``claimed_at`` lease lets a step
+        whose claimant died be picked up again after ``lease_minutes``.
+        Each row is the step joined with the notification it belongs to —
+        everything the engine needs to evaluate conditions and render.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- feature:unified-notifications
+                WITH due AS (
+                    SELECT id FROM notification_steps
+                     WHERE state = 'pending' AND due_at <= now()
+                       AND (claimed_at IS NULL
+                            OR claimed_at < now() - ($3::int * interval '1 minute'))
+                     ORDER BY due_at, id
+                     LIMIT $2::int
+                     FOR UPDATE SKIP LOCKED
+                ), claimed AS (
+                    UPDATE notification_steps s
+                       SET claimed_by = $1::text,
+                           claimed_at = now(),
+                           attempt = s.attempt + 1
+                      FROM due
+                     WHERE s.id = due.id
+                    RETURNING s.*
+                )
+                SELECT c.*,
+                       n.recipient_kind, n.recipient_id, n.category, n.severity,
+                       n.subject, n.body, n.source_kind, n.source_id, n.payload,
+                       n.seen_at, n.read_at, n.resolved_at, n.archived_at
+                  FROM claimed c
+                  JOIN notifications n ON n.id = c.notification_id
+                 ORDER BY c.due_at, c.id
+                """,
+                str(worker_id),
+                int(limit),
+                int(lease_minutes),
+            )
+        return [self._step_row(r) for r in rows]
+
+    async def defer_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """Push claimed steps to a later ``due_at`` and release the claim. A
+        deferral (quiet hours) is not an attempt, so the claim's increment is
+        taken back."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       attempt = GREATEST(attempt - 1, 0),
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def retry_notification_steps(
+        self, ids: List[int], *, due_at: datetime, detail: Optional[str] = None
+    ) -> int:
+        """A failed send: keep the attempt count, release the claim, try again
+        at ``due_at``."""
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET due_at = $2::timestamptz,
+                       claimed_by = NULL, claimed_at = NULL,
+                       detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                due_at,
+                detail,
+            )
+        return int(result.split()[-1]) if result else 0
+
+    async def settle_notification_steps(
+        self, ids: List[int], *, state: str, detail: Optional[str] = None
+    ) -> int:
+        """Terminal transition for claimed steps. Only pending rows move, so a
+        step cancelled by a concurrent resolve stays cancelled."""
+        if state not in ("done", "skipped", "cancelled", "failed"):
+            raise ValueError(f"cannot settle a step to {state!r}")
+        if not ids:
+            return 0
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                -- feature:unified-notifications
+                UPDATE notification_steps
+                   SET state = $2::text, settled_at = now(), detail = $3::text
+                 WHERE id = ANY($1::bigint[]) AND state = 'pending'
+                """,
+                [int(i) for i in ids],
+                state,
+                (detail or None) and str(detail)[:2000],
+            )
+        return int(result.split()[-1]) if result else 0
 
     # =========================================================================
     # SYSTEM SETTINGS (Phase 4)
@@ -38754,74 +42428,6 @@ class PostgresDB:
                     [UUID(job_id) for job_id in job_ids],
                 )
             )
-
-    async def log_project_loop_message_once(
-        self,
-        *,
-        message_id: str,
-        job_id: str,
-        user_id: str,
-        thread_id: str,
-        subject: str,
-        message: str,
-    ) -> bool:
-        """Insert one immutable loop notification, validating any replay.
-
-        Returns ``True`` only for the inserting caller. A response-lost retry
-        sees the deterministic primary key, validates the complete immutable
-        payload/owner, and returns ``False`` so SSE is not broadcast twice.
-        """
-
-        args = (
-            UUID(message_id),
-            UUID(job_id),
-            UUID(user_id),
-            thread_id,
-            subject,
-            message,
-        )
-        async with self.transaction_scope():
-            async with self.acquire() as conn:
-                inserted = await conn.fetchval(
-                    """
-                    INSERT INTO message_log (
-                        id, job_id, user_id, thread_id, direction,
-                        subject, message, mode, status
-                    ) VALUES (
-                        $1::uuid, $2::uuid, $3::uuid, $4::text, 'outbound',
-                        $5::text, $6::text, 'async', 'sent'
-                    )
-                    ON CONFLICT (id) DO NOTHING
-                    RETURNING TRUE
-                    """,
-                    *args,
-                )
-            if inserted:
-                return True
-            # Separate statement is deliberate: if ON CONFLICT waited for a
-            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
-            # and can see the row whose conflict it observed.
-            async with self.acquire() as conn:
-                matches = await conn.fetchval(
-                    """
-                    SELECT job_id = $2::uuid
-                       AND user_id = $3::uuid
-                       AND thread_id = $4::text
-                       AND direction = 'outbound'
-                       AND subject = $5::text
-                       AND message = $6::text
-                       AND mode = 'async'
-                       AND status = 'sent'
-                    FROM message_log
-                    WHERE id = $1::uuid
-                    """,
-                    *args,
-                )
-        if not matches:
-            raise RuntimeError(
-                "project-loop notification replay identity matched a different payload"
-            )
-        return False
 
     async def list_pending_project_loop_handoffs(
         self, *, limit: int = 50

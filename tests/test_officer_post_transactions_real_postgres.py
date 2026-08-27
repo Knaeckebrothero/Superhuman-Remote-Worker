@@ -3166,11 +3166,22 @@ async def test_backlog_query_and_admission_reject_enabled_thread_not_holding_pos
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
-    ["hold", "disable", "roster", "decommission", "recommission"],
+    [
+        "hold",
+        "disable",
+        "auto_pull_disable",
+        "roster",
+        "decommission",
+        "recommission",
+    ],
 )
 async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
-    seed = await _seed_post(db)
-    preparation = await _prepare(db, seed)
+    # Tick-shaped optimistic read: every preparation saw auto_pull=true.
+    # The lifecycle/config writer commits before the final transaction; the
+    # shared Post lock must make the stale tick lose with no job or BP-05
+    # claim, regardless of which authority changed.
+    seed = await _seed_post(db, auto_pull=True)
+    preparation = await _prepare(db, seed, auto_pull=True)
 
     if mutation == "hold":
         await db.set_project_officer_hold(
@@ -3182,6 +3193,11 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
         await db.update_project_officer_post(
             seed["project_id"],
             config_updates={"officer": {"enabled": False}},
+        )
+    elif mutation == "auto_pull_disable":
+        await db.update_project_officer_post(
+            seed["project_id"],
+            config_updates={"officer": {"auto_pull": False}},
         )
     elif mutation == "roster":
         await db.update_project_officer_post(
@@ -3205,8 +3221,132 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
             job_kwargs=_job_kwargs(mutation),
             ticket_note_id=f"ticket-{mutation}",
             ticket_ready_at=READY_GENERATION,
+            ticket_claim_source="tick",
         )
     assert await _job_count(db) == 0
+    assert await _claim_rows(db, seed["project_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch):
+    seed = await _seed_post(db)
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_owner",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_member",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+    )
+    roster = {
+        "research": {
+            "count": 1,
+            "category": "researcher",
+            "model": "MiniMax-M3",
+            "backend": "sandbox",
+            "spend_ceiling_daily": 7.25,
+        }
+    }
+
+    updated = await orch_main.patch_project_officer(
+        MagicMock(),
+        seed["project_id"],
+        {
+            "auto_pull": True,
+            "worker_spend_ceiling_daily": 19.5,
+            "slots": roster,
+        },
+    )
+    summary = await orch_main.get_project_officer_summary(
+        MagicMock(), seed["project_id"]
+    )
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    expected = {
+        "auto_pull": True,
+        "worker_spend_ceiling_daily": 19.5,
+        "slots": roster,
+    }
+
+    assert updated["config_override"]["officer"] == expected
+    assert post["config_override"]["officer"] == expected
+    assert _json(thread["metadata"])["config_override"]["officer"] == {
+        **expected,
+        "enabled": True,
+    }
+    assert summary["backlog"]["auto_pull"] is True
+    assert summary["backlog"]["worker_spend_ceiling_daily"] == 19.5
+    assert summary["backlog"]["auto_pull_control"] == {
+        "enable_available": True,
+        "source": "deployment_policy",
+        "reason": None,
+    }
+    assert summary["kit"]["research"] == {**roster["research"], "in_flight": 0}
+
+    prepared = await prepare_officer_admission(
+        db,
+        project_id=seed["project_id"],
+        thread_id=seed["thread_id"],
+        requested_slot="research",
+        require_auto_pull=True,
+        expected_category="researcher",
+    )
+    await orch_main.patch_project_officer(
+        MagicMock(), seed["project_id"], {"auto_pull": False}
+    )
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=prepared,
+            job_kwargs=_job_kwargs("BP-01 disable fence"),
+            ticket_note_id="bp01-disabled",
+            ticket_ready_at=READY_GENERATION,
+        )
+    assert exc.value.code == "auto_pull_disabled"
+    assert await _job_count(db) == 0
+
+    await orch_main.patch_project_officer(
+        MagicMock(), seed["project_id"], {"auto_pull": True}
+    )
+    await db.decommission_project_officer(
+        seed["project_id"], seed["thread_id"], reason="BP-01 recommission"
+    )
+    durable = (await db.get_project_officer(seed["project_id"]))["config_override"]
+    assert durable["officer"] == expected
+    successor_id = uuid4()
+    successor_config = json.loads(json.dumps(durable))
+    successor_config["officer"]["enabled"] = True
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO threads (id, project_id, status, metadata)
+            VALUES ($1, $2, 'active', $3::jsonb)
+            """,
+            successor_id,
+            UUID(seed["project_id"]),
+            json.dumps({"config_override": successor_config}),
+        )
+    assert await db.register_project_officer_thread(
+        seed["project_id"],
+        str(successor_id),
+        expected_post_config_override=durable,
+    )
+    successor = await db.get_thread(str(successor_id))
+    assert _json(successor["metadata"])["config_override"]["officer"] == {
+        **expected,
+        "enabled": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -3470,6 +3610,68 @@ async def test_bp11_concurrent_whole_roster_writes_never_form_a_union(db):
     assert (
         _json(thread["metadata"])["config_override"]["officer"]["slots"] == final_slots
     )
+
+
+@pytest.mark.asyncio
+async def test_bp01_concurrent_enable_disable_writes_never_form_a_hybrid(db):
+    seed = await _seed_post(db)
+    enabled = {
+        "auto_pull": True,
+        "worker_spend_ceiling_daily": 25.0,
+        "slots": {
+            "research": {
+                "count": 2,
+                "category": "researcher",
+                "backend": "sandbox",
+                "spend_ceiling_daily": 8.0,
+            }
+        },
+    }
+    disabled = {
+        "auto_pull": False,
+        "worker_spend_ceiling_daily": None,
+        "slots": {
+            "test": {
+                "count": 1,
+                "category": "tester",
+                "backend": "sandbox",
+                "spend_ceiling_daily": 3.0,
+            }
+        },
+    }
+
+    async with db.acquire() as blocker:
+        transaction = blocker.transaction()
+        await transaction.start()
+        await blocker.fetchrow(
+            "SELECT project_id FROM project_officers WHERE project_id=$1 FOR UPDATE",
+            UUID(seed["project_id"]),
+        )
+        write_enabled = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"], config_updates={"officer": enabled}
+            )
+        )
+        write_disabled = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"], config_updates={"officer": disabled}
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not write_enabled.done() and not write_disabled.done()
+        await transaction.commit()
+
+    results = await asyncio.gather(write_enabled, write_disabled)
+    observed = [result["post"]["config_override"]["officer"] for result in results]
+    assert enabled in observed and disabled in observed
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    final = post["config_override"]["officer"]
+    assert final in (enabled, disabled)
+    assert _json(thread["metadata"])["config_override"]["officer"] == {
+        **final,
+        "enabled": True,
+    }
 
 
 @pytest.mark.asyncio

@@ -127,8 +127,6 @@ def test_the_roster_shows_commissioned_vacant_and_held_at_a_glance():
                     "next_wake_at": "2026-08-17T09:30:00+00:00",
                     "pending_events": 3,
                     "in_flight_jobs": 2,
-                    "pages_today": 1,
-                    "digest_waiting": 4,
                     "model": "gpt-5.6-sol",
                     "auto_pull": False,
                     "last_activity_at": "2026-08-17T06:11:33+00:00",
@@ -164,6 +162,25 @@ def test_the_roster_says_so_when_no_project_has_an_officer():
     assert "no officer" in text.lower()
 
 
+def test_the_roster_distinguishes_configured_auto_pull_from_released_dispatch():
+    text = format_officer_roster(
+        {
+            "officers": [
+                {
+                    "project_name": "Dark century",
+                    "project_id": "p1",
+                    "thread_id": "t1",
+                    "commissioned": True,
+                    "auto_pull": True,
+                    "auto_pull_enable_available": False,
+                }
+            ],
+            "total": 1,
+        }
+    )
+    assert "auto-pull configured — deployment release fenced" in text
+
+
 def test_the_post_renders_the_kit_with_its_floor_warning():
     text = format_officer_post(
         {
@@ -182,29 +199,28 @@ def test_the_post_renders_the_kit_with_its_floor_warning():
                     "in_flight": 0,
                     "ready_depth": 0,
                     "below_floor": True,
+                    "spend_ceiling_daily": 7.5,
                 },
                 "test": {"count": 1, "in_flight": 1},
             },
             "next_wake_at": "2026-08-17T09:30:00+00:00",
             "pending_events": 3,
-            "pages_today": {"used": 1, "budget": 3},
-            "digest": [
-                {
-                    "at": "2026-08-17T05:00:00+00:00",
-                    "subject": "theme",
-                    "message": "no deployable UI yet",
-                }
-            ],
             "conference": None,
-            "backlog": {"auto_pull": False},
+            "backlog": {
+                "auto_pull": True,
+                "auto_pull_control": {"enable_available": False},
+                "worker_spend_ceiling_daily": 42.25,
+            },
         },
         project_name="Better Resavio",
     )
 
     assert "build" in text and "BELOW FLOOR" in text
     assert "2026-08-17T09:30" in text
-    assert "1/3" in text
-    assert "no deployable UI yet" in text
+    assert "Pending events: 3" in text
+    assert "deployment release fenced" in text
+    assert "Worker spend ceiling: $42.25/day" in text
+    assert "$7.5/day ceiling" in text
 
 
 def test_the_post_renders_a_vacant_post_without_pretending_otherwise():
@@ -313,7 +329,6 @@ def test_the_post_shows_what_he_has_spent_against_his_ceiling():
             "commissioned": True,
             "officer": {"thread_id": THREAD_ID, "status": "active"},
             "spend_today": {"tokens": 12345, "ceiling": 100000},
-            "pages_today": {"used": 0, "budget": 3},
         },
         project_name="Better Resavio",
     )

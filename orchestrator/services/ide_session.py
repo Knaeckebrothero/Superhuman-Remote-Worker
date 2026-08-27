@@ -12,9 +12,11 @@ merges. The cockpit polls ``GET /api/jobs/{job_id}/ide`` to drive the
 IDE button UI.
 """
 
+import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -30,6 +32,11 @@ from services.ssh_helpers import (
     build_agent_ssh_cmd,
     orchestrator_can_reach,
     stream_extract_snapshot,
+)
+from src.core.managed_repository import (
+    managed_repository_agent_launch_command,
+    managed_repository_agent_retirement_command,
+    managed_repository_agent_zero_command,
 )
 
 logger = logging.getLogger(__name__)
@@ -333,22 +340,40 @@ class IdeSessionService:
         session_ctx = ctx.get("ide_session", {})
         status = session_ctx.get("status")
 
-        if status not in ("active", "idle", "restoring"):
+        if status not in ("active", "idle", "restoring", "cleanup_pending", "failed"):
             return {"status": "no_active_session"}
 
         restore_type = session_ctx.get("restore_type", "vm")
 
         if restore_type in ("container", "k8s_container"):
             container_name = session_ctx.get("container_name")
-            if container_name:
-                await self._delete_ide_container(job_id, container_name, restore_type)
+            deleted = bool(
+                container_name
+                and await self._delete_ide_container(
+                    job_id,
+                    container_name,
+                    restore_type,
+                    expected_container_id=session_ctx.get("container_id"),
+                )
+            )
         else:
             vm_name = session_ctx.get("vm_name")
+            deleted = False
             if vm_name and self._vm_provisioner:
                 try:
-                    await self._delete_ide_vm(job_id, vm_name)
+                    deleted = await self._delete_ide_vm(job_id, vm_name)
                 except Exception as e:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
+        if not deleted:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "cleanup_pending",
+                    "code_server_url": None,
+                    "cleanup_failure": "managed_repository_process_zero_unproven",
+                },
+            )
+            return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
 
         await self._set_session_context(
             job_id,
@@ -380,7 +405,8 @@ class IdeSessionService:
                     """
                     SELECT id, context
                     FROM jobs
-                    WHERE context->'ide_session'->>'status' IN ('active', 'idle')
+                    WHERE context->'ide_session'->>'status'
+                          IN ('active', 'idle', 'cleanup_pending')
                     """
                 )
 
@@ -430,8 +456,9 @@ class IdeSessionService:
                     logger.info(
                         "Expiring IDE session for job %s (reason: %s)", job_id, reason
                     )
-                    await self.stop_session(job_id)
-                    expired_count += 1
+                    result = await self.stop_session(job_id)
+                    if result.get("status") == "stopped":
+                        expired_count += 1
 
         except Exception:
             logger.exception("Error during IDE session TTL check")
@@ -773,7 +800,6 @@ class IdeSessionService:
             raise ManagedRepositoryAuthorityError("repository_authority_invalid")
         managed_root = f"{home_path}/.ssh/srw-managed"
         socket_path = f"{managed_root}/sockets/{authority_id}.sock"
-        config_path = f"{managed_root}/config.d/{authority_id}.conf"
         ssh_config_path = f"{home_path}/.ssh/config"
         config = (
             f"Host {alias}\n"
@@ -791,9 +817,18 @@ class IdeSessionService:
         quoted_workspace = shlex.quote(workspace_path)
         quoted_url = shlex.quote(clone_url)
         quoted_branch = shlex.quote(branch)
-        quoted_config = shlex.quote(config)
         existing_clause = (
             f"test -d {quoted_workspace}/.git; " if require_existing else ""
+        )
+        launch_agent = managed_repository_agent_launch_command(
+            home_path=home_path,
+            authority_id=authority_id,
+            generation=generation,
+            preserve_existing=True,
+            keep_rollback_trap=True,
+            expected_fingerprint=fingerprint,
+            probe_url=clone_url,
+            config_content=config,
         )
         clone_clause = (
             f"if test -d {quoted_workspace}/.git; then "
@@ -807,30 +842,23 @@ class IdeSessionService:
         command = (
             "set -eu; umask 077; "
             f"mkdir -p {shlex.quote(managed_root + '/config.d')} "
-            f"{shlex.quote(managed_root + '/sockets')}; "
+            f"{shlex.quote(managed_root + '/sockets')} "
+            f"{shlex.quote(managed_root + '/agents')}; "
+            f"exec 8>{shlex.quote(managed_root + '/setup.lock')}; flock -x 8; "
             f"touch {shlex.quote(ssh_config_path)}; "
             "grep -qxF 'Include ~/.ssh/srw-managed/config.d/*.conf' "
             f"{shlex.quote(ssh_config_path)} || "
             "printf '\\nInclude ~/.ssh/srw-managed/config.d/*.conf\\n' "
             f">> {shlex.quote(ssh_config_path)}; "
-            f"printf %s {quoted_config} > {shlex.quote(config_path)}; "
-            f"chmod 600 {shlex.quote(ssh_config_path)} {shlex.quote(config_path)}; "
-            + f"if test -S {shlex.quote(socket_path)}; then "
-            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} "
-            + "ssh-add -D >/dev/null 2>&1 || true; fi; "
-            + f"rm -f {shlex.quote(socket_path)}; "
-            + f"ssh-agent -a {shlex.quote(socket_path)} -s >/dev/null; "
-            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} "
-            + "ssh-add - >/dev/null 2>&1; "
-            + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} ssh-add -l "
-            + f"| grep -F -- {shlex.quote(fingerprint)} >/dev/null; "
-            + f"GIT_TERMINAL_PROMPT=0 git ls-remote {quoted_url} HEAD >/dev/null; "
+            f"chmod 600 {shlex.quote(ssh_config_path)}; "
+            + launch_agent
+            + "; "
             + f"mkdir -p {quoted_workspace}; "
             + existing_clause
             + clone_clause
             + "; "
             + f'case "$(git -C {quoted_workspace} remote get-url origin)" '
-            + "in *://*@*|*@*:*) exit 41;; esac"
+            + "in *://*@*|*@*:*) exit 41;; esac; trap - EXIT"
         )
         return command, private_key
 
@@ -1047,21 +1075,51 @@ class IdeSessionService:
                     },
                 )
                 return False
+            container_id = stdout.decode(errors="replace").strip()
+            if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": "Container identity was not reported",
+                    },
+                )
+                return False
+            await self._set_session_context(job_id, {"container_id": container_id})
 
             try:
-                payload = await self._managed_repository_payload(
-                    job_id, backend="sandbox"
+                # The local runtime name is mutable.  Re-resolve it only as a
+                # consistency assertion, then deliver the private authority to
+                # the immutable full container ID captured from ``run``.  If a
+                # replacement wins this window the exact-ID exec fails instead
+                # of handing its key to the replacement.
+                observed_container_id = await self._inspect_container_id(
+                    runtime, container_name
                 )
-                git_command, private_key = self._managed_git_command(
-                    payload,
-                    branch=branch,
-                    workspace_path="/home/coder/workspace",
-                    require_existing=False,
-                )
-                installed = await self._run_secret_stdin_process(
-                    [runtime, "exec", "-i", container_name, "sh", "-c", git_command],
-                    private_key,
-                )
+                if observed_container_id != container_id:
+                    installed = False
+                else:
+                    payload = await self._managed_repository_payload(
+                        job_id, backend="sandbox"
+                    )
+                    git_command, private_key = self._managed_git_command(
+                        payload,
+                        branch=branch,
+                        workspace_path="/home/coder/workspace",
+                        require_existing=False,
+                    )
+                    installed = await self._run_secret_stdin_process(
+                        [
+                            runtime,
+                            "exec",
+                            "-i",
+                            container_id,
+                            "sh",
+                            "-c",
+                            git_command,
+                        ],
+                        private_key,
+                    )
             except ManagedRepositoryAuthorityError:
                 installed = False
             if not installed:
@@ -1072,7 +1130,12 @@ class IdeSessionService:
                         "error": "Repository authorization failed for IDE session",
                     },
                 )
-                await self._remove_container(runtime, container_name)
+                await self._delete_ide_container(
+                    job_id,
+                    container_name,
+                    "container",
+                    expected_container_id=container_id,
+                )
                 return False
 
             ready = await self._wait_for_code_server(
@@ -1086,7 +1149,12 @@ class IdeSessionService:
                         "error": "Code-server did not start within timeout",
                     },
                 )
-                await self._remove_container(runtime, container_name)
+                await self._delete_ide_container(
+                    job_id,
+                    container_name,
+                    "container",
+                    expected_container_id=container_id,
+                )
                 return False
 
             code_server_url = (
@@ -1122,7 +1190,18 @@ class IdeSessionService:
             )
             try:
                 runtime = await self._detect_container_runtime()
-                await self._remove_container(runtime, container_name)
+                current = await self._get_job(job_id)
+                current_ide = (
+                    self._parse_context(current).get("ide_session", {})
+                    if current
+                    else {}
+                )
+                await self._delete_ide_container(
+                    job_id,
+                    container_name,
+                    "container",
+                    expected_container_id=current_ide.get("container_id"),
+                )
             except Exception:
                 pass
             return False
@@ -1495,26 +1574,107 @@ class IdeSessionService:
             workspace_path="/home/agent-host/workspace",
         )
 
-    async def _delete_ide_vm(self, job_id: str, vm_name: str) -> None:
+    async def _delete_ide_vm(self, job_id: str, vm_name: str) -> bool:
         """Delete an IDE session VM."""
         if self._vm_provisioner and self._vm_provisioner.is_available:
-            await self._vm_provisioner.delete_vm(job_id)
+            return bool(await self._vm_provisioner.delete_vm(job_id))
+        return False
 
     async def _delete_ide_container(
-        self, job_id: str, container_name: str, restore_type: str = "container"
-    ) -> None:
+        self,
+        job_id: str,
+        container_name: str,
+        restore_type: str = "container",
+        *,
+        expected_container_id: str | None = None,
+    ) -> bool:
         """Stop and remove an IDE session container (K8s pod or local container)."""
         if restore_type == "k8s_container":
             if self._container_provisioner:
-                await self._container_provisioner.delete_ide_pod(job_id)
-            return
+                return bool(await self._container_provisioner.delete_ide_pod(job_id))
+            return False
 
         # Local dev path (podman/docker)
         try:
             runtime = await self._detect_container_runtime()
-            await self._remove_container(runtime, container_name)
+            if (
+                expected_container_id is None
+                or re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None
+            ):
+                return False
+            observed = await self._inspect_container_id(runtime, container_name)
+            if observed is not None and observed != expected_container_id:
+                return False
+            if self._db is None:
+                return False
+            already_retired = bool(
+                await self._db.managed_repository_workspace_process_zero_is_current(
+                    job_id,
+                    owner_kind="job",
+                    scope="ide_local",
+                    provisioner="docker",
+                    runtime_incarnation=expected_container_id,
+                )
+            )
+            if observed is None:
+                if not already_retired:
+                    return False
+                return await self._remove_container(
+                    runtime,
+                    container_name,
+                    expected_container_id=expected_container_id,
+                )
+            if (
+                not already_retired
+                and not await self._db.claim_managed_repository_workspace_retirement(
+                    job_id,
+                    owner_kind="job",
+                    scope="ide_local",
+                    provisioner="docker",
+                    runtime_incarnation=expected_container_id,
+                )
+            ):
+                return False
+            retire = (
+                managed_repository_agent_retirement_command(
+                    home_path="/home/coder",
+                    authority_ids=None,
+                    remove_configs=True,
+                )
+                + "; "
+                + managed_repository_agent_zero_command(home_path="/home/coder")
+            )
+            process = await asyncio.create_subprocess_exec(
+                runtime,
+                "exec",
+                expected_container_id,
+                "sh",
+                "-c",
+                retire,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await process.wait() != 0:
+                return False
+            observed_after = await self._inspect_container_id(runtime, container_name)
+            if observed_after is not None and observed_after != expected_container_id:
+                return False
+            if not await self._db.record_managed_repository_workspace_process_zero(
+                job_id,
+                owner_kind="job",
+                scope="ide_local",
+                provisioner="docker",
+                runtime_incarnation=expected_container_id,
+            ):
+                return False
+            return await self._remove_container(
+                runtime,
+                container_name,
+                expected_container_id=expected_container_id,
+            )
         except Exception as e:
             logger.warning("Failed to remove IDE container %s: %s", container_name, e)
+            return False
 
     # =========================================================================
     # Snapshot restore for job resume
@@ -1649,30 +1809,74 @@ class IdeSessionService:
         return False
 
     @staticmethod
-    async def _remove_container(runtime: str, container_name: str) -> None:
-        """Stop and remove a container by name."""
-        import asyncio
+    async def _inspect_container_id(
+        runtime: str,
+        container_name: str,
+    ) -> str | None:
+        """Resolve a mutable local-container name only as an ID assertion."""
 
-        # Stop (ignore errors if already stopped)
-        proc = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             runtime,
-            "stop",
+            "inspect",
+            "--format",
+            "{{.Id}}",
             container_name,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+        observed = stdout.decode(errors="replace").strip()
+        return observed if re.fullmatch(r"[0-9a-f]{64}", observed) else None
 
-        # Remove
+    @staticmethod
+    async def _remove_container(
+        runtime: str,
+        container_name: str,
+        *,
+        expected_container_id: str | None = None,
+    ) -> bool:
+        """Remove only the exact captured local IDE container identity."""
+        import asyncio
+
+        if (
+            expected_container_id is None
+            or re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None
+        ):
+            return False
+        # Resolve the mutable name only as a consistency assertion. Destruction
+        # below targets the immutable full ID so a same-name replacement is
+        # never inherited after a lost response.
+        observed = await IdeSessionService._inspect_container_id(
+            runtime, container_name
+        )
+        if observed is not None and observed != expected_container_id:
+            return False
+
         proc = await asyncio.create_subprocess_exec(
             runtime,
             "rm",
             "-f",
-            container_name,
+            expected_container_id,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
+        probe = await asyncio.create_subprocess_exec(
+            runtime,
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await probe.communicate()
+        if probe.returncode != 0:
+            return False
+        return expected_container_id not in stdout.decode(errors="replace").splitlines()
 
 
 # Module-level singleton

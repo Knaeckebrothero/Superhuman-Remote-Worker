@@ -2431,23 +2431,12 @@
     "refresh": "Refresh",
     "listAriaLabel": "Action center items",
     "filters": {
-      "all": "All",
-      "messages": "Messages",
-      "sudo": "Sudo",
-      "reviews": "Reviews",
-      "sessions": "Sessions"
+      "all": "All"
     },
     "list": {
-      "empty": {
-        "message": "No message items",
-        "sudo": "No sudo items",
-        "review": "No review items",
-        "session": "No session items"
-      },
+      "emptyCategory": "Nothing in this category",
       "emptyAll": "All clear — no items need your attention",
-      "resolved": "resolved",
-      "modeBlocking": "blocking",
-      "modeAsync": "async"
+      "resolved": "resolved"
     },
     "time": {
       "now": "now"
@@ -2456,81 +2445,7 @@
       "emptyText": "Select an item to view details",
       "hintUse": "Use",
       "hintToNavigate": "to navigate,",
-      "hintToSelect": "to select",
-      "jobId": "Job ID",
-      "requestId": "Request ID",
-      "threadId": "Thread ID",
-      "sessionId": "Session ID",
-      "eventId": "Event ID"
-    },
-    "sudoDetail": {
-      "vmUpgradeRequest": "VM Upgrade Request",
-      "sudoRequest": "Sudo Request",
-      "secondsRemaining": "{{seconds}}s remaining",
-      "user": "User",
-      "vm": "VM",
-      "cwd": "CWD",
-      "workspace": "Workspace",
-      "upgradeHint": "Agent attempted sudo in a container workspace. Upgrade to a VM for full sudo access, or resume the job without a VM.",
-      "upgradeToVm": "Upgrade to VM",
-      "resumeWithoutVm": "Resume without VM",
-      "approve": "Approve",
-      "deny": "Deny",
-      "reason": "Reason",
-      "rulesToggle": "Auto-Approval Rules ({{count}})",
-      "rulePatternPlaceholder": "Pattern (e.g. apt-get install *)",
-      "ruleActionApprove": "Approve",
-      "ruleActionDeny": "Deny",
-      "ruleAdd": "Add"
-    },
-    "messageDetail": {
-      "messageLabel": "Message",
-      "modeBlocking": "blocking",
-      "modeAsync": "async",
-      "sessionPage": "Session page",
-      "openSessionLog": "Open session log",
-      "defaultAgent": "agent",
-      "threadLoading": "Loading thread...",
-      "noMessagesLoaded": "No messages loaded",
-      "senderAgent": "Agent",
-      "senderYou": "You",
-      "replyPlaceholder": "Type a reply...",
-      "markUrgent": "Mark as urgent",
-      "send": "Send"
-    },
-    "reviewDetail": {
-      "jobReview": "Job Review",
-      "freezePhase": "Phase Boundary",
-      "freezeUpgrade": "Sudo Required",
-      "freezeComplete": "Job Complete",
-      "defaultAgent": "agent",
-      "phase": "Phase {{number}}",
-      "loadingFrozen": "Loading frozen data...",
-      "summary": "Summary",
-      "confidence": "Confidence",
-      "deliverables": "Deliverables",
-      "upgradeHint": "Upgrade to a VM for sudo access, or resume without a VM.",
-      "upgradeToVm": "Upgrade to VM",
-      "resumeWithoutVm": "Resume without VM",
-      "notesPlaceholder": "Optional notes...",
-      "approve": "Approve",
-      "feedbackPlaceholder": "Feedback for next phase...",
-      "resumeWithFeedback": "Resume with Feedback"
-    },
-    "sessionDetail": {
-      "agentSession": "Agent Session",
-      "needsAttention": "needs attention",
-      "tool": "Tool",
-      "arguments": "Arguments",
-      "command": "Command",
-      "reason": "Reason",
-      "goToSession": "Go to Session"
-    },
-    "denyDialog": {
-      "titlePrefix": "Deny:",
-      "reasonPlaceholder": "Reason for denial (required)",
-      "cancel": "Cancel",
-      "deny": "Deny"
+      "hintToSelect": "to select"
     },
     "shortcuts": {
       "title": "Keyboard Shortcuts",
@@ -2538,13 +2453,7 @@
       "prevItem": "Previous item",
       "selectItem": "Select item",
       "deselect": "Deselect / close",
-      "approveSudoReview": "Approve (sudo / review)",
-      "denySudo": "Deny (sudo)",
-      "focusReply": "Focus reply (message)",
-      "sendReply": "Send reply",
-      "filterMessages": "Filter: Messages",
-      "filterSudo": "Filter: Sudo",
-      "filterReviews": "Filter: Reviews",
+      "filterCategory": "Filter: n-th category",
       "clearFilter": "Clear filter",
       "toggleOverlay": "Toggle this overlay",
       "close": "Close"
@@ -3335,13 +3244,10 @@
   },
   "notificationBell": {
     "title": "Action Center",
-    "messagesSingle": "{{n}} message",
-    "messagesPlural": "{{n}} messages",
-    "sudo": "{{n}} sudo",
-    "reviewsSingle": "{{n}} review",
-    "reviewsPlural": "{{n}} reviews",
-    "sessionsSingle": "{{n}} session",
-    "sessionsPlural": "{{n}} sessions"
+    "unseenSingle": "{{n}} new notification",
+    "unseenPlural": "{{n}} new notifications",
+    "pendingSingle": "{{n}} item needs you",
+    "pendingPlural": "{{n}} items need you"
   },
   "todoList": {
     "phaseSelector": {
@@ -3497,10 +3403,12 @@
       "slotModel": "Slot {{index}} model",
       "slotWorkspace": "Slot {{index}} workspace",
       "slotPool": "Slot {{index}} pool",
+      "slotSpendCeiling": "Slot {{index}} daily spend ceiling in USD",
       "removeSlot": "Remove slot {{name}}",
+      "autoPull": "Enable unattended auto-pull",
+      "workerSpendCeiling": "Century-wide daily worker spend ceiling in USD",
       "maxWorkers": "Maximum workers",
       "tokenCeiling": "Daily token ceiling",
-      "pagesPerDay": "Maximum pages per day",
       "sleepMin": "Minimum sleep in minutes",
       "sleepMax": "Maximum sleep in minutes",
       "holdNote": "Officer hold note",
@@ -3528,6 +3436,8 @@
       "autoPull": "Auto-pull",
       "on": "on — ready tickets are dispatched into free pool slots",
       "off": "off — pools stay idle until he dispatches by hand",
+      "centurySpendCeiling": "worker ceiling ${{amount}}/day",
+      "releaseClosed": "enable transition held by deployment release policy",
       "stalled": "Stalled",
       "stalledDetail": "{{count}} claimed ticket(s) not moving beyond {{threshold}} h ({{source}}) — these are never released automatically; resume or cancel the job, then close or re-ready the ticket.",
       "thresholdSource": {
@@ -3545,10 +3455,16 @@
       "reasoningLabel": "Reasoning"
     },
     "budgets": {
-      "pages": "Pages per day",
-      "pagesHint": "How often he may page you (default 3).",
       "tokenCeiling": "Daily token ceiling",
-      "tokenCeilingHint": "Across his whole command. Blank means no ceiling."
+      "tokenCeilingHint": "Across his whole command. Blank means no ceiling.",
+      "workerSpendCeiling": "Worker spend / day (USD)",
+      "workerSpendCeilingHint": "Optional across every auto-pulled pool. Blank means no mechanical spend brake."
+    },
+    "autoPull": {
+      "label": "Fill categorized pools automatically",
+      "releaseClosed": "Enabling is unavailable until this deployment's unattended-operation gates are complete. Off and all spend ceilings remain editable.",
+      "confirmation": "Enabling starts unattended worker dispatch and spend from ready project tickets at the next tick. Confirm only after reviewing the roster, categories, and spend ceilings.",
+      "confirmEnable": "Enable unattended auto-pull"
     },
     "category": {
       "none": "No pool — officer dispatches by hand",
@@ -3557,7 +3473,7 @@
       "executor": "Executor — deliverable is shipped files"
     },
     "decommission": {
-      "hint": "His kit, budgets, digest, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
+      "hint": "His kit, budgets, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
       "inFlightWarning": "He has {{count}} job(s) in flight. Decommissioning leaves them running — their completions land on the post's ledger for his successor."
     },
     "defaults": {
@@ -3566,9 +3482,6 @@
       "session": "session default",
       "unlimited": "unlimited",
       "worker": "worker default"
-    },
-    "digest": {
-      "title": "Digest — what he queued for you"
     },
     "errors": {
       "commission": "Commission failed",
@@ -3599,7 +3512,8 @@
     "kit": {
       "breakerOpen": "BREAKER OPEN",
       "ready": "ready {{count}}",
-      "readyBelowFloor": "ready {{count}} — BELOW FLOOR"
+      "readyBelowFloor": "ready {{count}} — BELOW FLOOR",
+      "spendCeiling": "${{amount}}/day"
     },
     "machineState": {
       "not-attempted": "not attempted",
@@ -3688,11 +3602,14 @@
       "maxWorkersHint": "Flat concurrency cap. Without a kit it is the only gate (default 3).",
       "model": "Model",
       "pool": "Pool",
+      "spendCeiling": "Spend / day (USD)",
+      "spendCeilingHint": "Optional ceiling for this pool; blank means no pool-specific brake.",
       "slot": "Slot",
       "slotPlaceholder": "line",
       "workspace": "Workspace"
     },
     "sections": {
+      "autoPull": "Unattended dispatch",
       "brain": "His brain",
       "budgets": "Budgets",
       "kit": "Kit",
@@ -3723,7 +3640,6 @@
       "ceilingReached": "— ceiling reached; sleeping until reset",
       "model": "His model",
       "nextWake": "Next wake",
-      "pagesToday": "Pages today",
       "queuedEvents": "Queued events",
       "spendToday": "Spend today",
       "tokens": "tokens"
@@ -3750,6 +3666,9 @@
       "virtual": "virtual",
       "none": "none",
       "vmRoot": "VM (root)"
+    },
+    "recentNotifications": {
+      "title": "Recent notifications from this officer"
     }
   },
   "statistics": {
@@ -3808,6 +3727,155 @@
       "empty": "No matching options",
       "selectedCount": "{{count}} selected",
       "clear": "Clear"
+    }
+  },
+  "notifications": {
+    "category": {
+      "review_queue": "Review",
+      "vm_upgrade": "VM upgrade",
+      "budget_exceeded": "Budget exceeded",
+      "incident": "Incident",
+      "officer_question": "Officer",
+      "officer_runtime": "Officer runtime",
+      "agent_message": "Agent message",
+      "session_wake": "Session",
+      "loop_event": "Loop",
+      "automation_disabled": "Automation",
+      "user_registered": "New user",
+      "session_permission": "Permission",
+      "sudo_request": "Sudo"
+    },
+    "severity": {
+      "low": "Low",
+      "normal": "Normal",
+      "high": "High",
+      "critical": "Critical"
+    },
+    "status": {
+      "unseen": "New",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "archived": "Archived"
+    },
+    "actions": {
+      "approve": "Approve",
+      "resumeWithFeedback": "Resume with feedback",
+      "resume": "Resume",
+      "deny": "Deny",
+      "upgradeToVm": "Upgrade to VM",
+      "resumeWithoutVm": "Resume without VM",
+      "reply": "Reply",
+      "openConference": "Open officer",
+      "open": "Open",
+      "openJob": "Open job",
+      "openThread": "Open thread",
+      "openSession": "Open session",
+      "openProject": "Open project",
+      "openAutomations": "Open automations",
+      "openAdminUsers": "Open users"
+    },
+    "inputs": {
+      "feedback": "Feedback for the agent…",
+      "reason": "Reason…",
+      "message": "Your orders for the officer…",
+      "notes": "Reviewer notes (optional)…",
+      "value": "…"
+    },
+    "source": {
+      "job": "Job",
+      "sudo_request": "Sudo request",
+      "thread": "Session",
+      "message_thread": "Thread",
+      "loop": "Loop",
+      "automation": "Automation",
+      "user": "User",
+      "permission_request": "Permission request"
+    },
+    "detail": {
+      "noActions": "No actions available",
+      "source": "Source",
+      "loadingSource": "Loading…",
+      "jobStatus": "Status",
+      "jobDescription": "Description",
+      "command": "Command",
+      "requestStatus": "Request status",
+      "session": "Session",
+      "timeline": "Timeline",
+      "created": "Created",
+      "seen": "Seen",
+      "read": "Read",
+      "resolved": "Resolved",
+      "actionFailed": "The action failed",
+      "jobId": "Job ID",
+      "configName": "Agent",
+      "freezeType": "Freeze",
+      "phase": "Phase",
+      "error": "Error",
+      "summary": "Summary",
+      "requestType": "Request",
+      "vm": "VM",
+      "user": "User",
+      "cwd": "CWD",
+      "reason": "Reason",
+      "secondsRemaining": "{{seconds}}s remaining",
+      "senderAgent": "Agent",
+      "senderYou": "You",
+      "modeBlocking": "blocking",
+      "noMessages": "No messages",
+      "status": "Status",
+      "tool": "Tool",
+      "arguments": "Arguments",
+      "requestedAt": "Requested",
+      "decidedBy": "Decided by",
+      "loop": "Loop",
+      "automation": "Automation",
+      "enabled": "enabled",
+      "disabled": "disabled",
+      "userName": "Name",
+      "email": "Email",
+      "approved": "approved",
+      "pendingApproval": "pending approval",
+      "sourceMissing": "The source is no longer available",
+      "steps": "Scheduled deliveries",
+      "stepUnless": "unless {{conditions}}"
+    },
+    "empty": "No notifications",
+    "loadMore": "Load more",
+    "deepLinkMissing": "That notification could not be found",
+    "sudo": {
+      "rulesToggle": "Auto-approval rules ({{count}})",
+      "rulePatternPlaceholder": "Pattern (e.g. apt-get install *)",
+      "ruleActionApprove": "Approve",
+      "ruleActionDeny": "Deny",
+      "ruleAdd": "Add",
+      "ruleDelete": "Delete rule"
+    },
+    "risk": {
+      "low": "Low risk",
+      "medium": "Medium risk",
+      "high": "High risk",
+      "critical": "Critical"
+    },
+    "channel": {
+      "in_app": "In-app",
+      "email": "Email",
+      "ntfy": "ntfy",
+      "slack_webhook": "Slack",
+      "discord_webhook": "Discord",
+      "push": "Push"
+    },
+    "stepState": {
+      "pending": "pending",
+      "done": "sent",
+      "skipped": "skipped",
+      "cancelled": "cancelled",
+      "failed": "failed"
+    },
+    "condition": {
+      "not_seen": "seen",
+      "not_read": "read",
+      "not_resolved": "settled"
     }
   }
 }

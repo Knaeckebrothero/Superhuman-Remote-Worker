@@ -1413,6 +1413,47 @@ $_$;
 
 
 --
+-- Name: enforce_docker_workspace_reuse_process_zero(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_docker_workspace_reuse_process_zero() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF (
+        NEW.status = 'released'
+        AND NEW.status IS DISTINCT FROM OLD.status
+    ) OR (
+        NEW.status = 'quarantined'
+        AND NEW.quarantine_reason =
+            'container_recreation_required_process_zero'
+        AND (
+            NEW.status IS DISTINCT FROM OLD.status
+            OR NEW.quarantine_reason IS DISTINCT FROM OLD.quarantine_reason
+        )
+    ) THEN
+        IF OLD.owner_kind IS NULL
+           OR OLD.owner_id IS NULL
+           OR OLD.lease_id IS NULL
+           OR NOT public.managed_repository_process_zero_receipt_exists(
+               OLD.owner_kind,
+               OLD.owner_id,
+               'docker_workspace',
+               'docker',
+               OLD.lease_id::TEXT
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'docker_workspace_reuse_requires_process_zero',
+                MESSAGE = 'Docker workspace reuse requires process-zero authority';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_inventory_epoch_required_boundary(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2129,6 +2170,430 @@ COMMENT ON FUNCTION public.enforce_managed_repository_owner_cleanup() IS 'Fail-c
 
 
 --
+-- Name: enforce_managed_repository_process_zero_transition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_managed_repository_process_zero_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source_kind TEXT;
+    source_id UUID;
+    old_state JSONB;
+    new_state JSONB;
+    old_workspace JSONB;
+    new_workspace JSONB;
+    old_vm JSONB;
+    new_vm JSONB;
+    old_ide JSONB;
+    new_ide JSONB;
+    parent_state JSONB := '{}'::JSONB;
+    parent_workspace JSONB := '{}'::JSONB;
+    parent_vm JSONB := '{}'::JSONB;
+    parent_ide JSONB := '{}'::JSONB;
+    parent_id UUID;
+    runtime_id TEXT;
+    receipt_ok BOOLEAN;
+    declared_inherited BOOLEAN := FALSE;
+    inherited_scope BOOLEAN := FALSE;
+    destructive_transition BOOLEAN;
+BEGIN
+    IF TG_TABLE_NAME = 'jobs' THEN
+        source_kind := 'job';
+        source_id := OLD.id;
+        parent_id := OLD.parent_job_id;
+        old_state := COALESCE(OLD.context, '{}'::JSONB);
+        new_state := CASE WHEN TG_OP = 'DELETE'
+                          THEN '{}'::JSONB
+                          ELSE COALESCE(NEW.context, '{}'::JSONB) END;
+        -- Inherited subjobs carry a diagnostic copy of their parent's runtime,
+        -- but never own that compute namespace.  The pre-0175 writer did not
+        -- stamp a workspace contract, so absence is accepted only with the
+        -- relational edge plus the exact parent runtime below.  A present,
+        -- contradictory contract always fails closed.
+        declared_inherited := parent_id IS NOT NULL
+            AND old_state->>'inherits_parent_workspace' = 'true'
+            AND (
+                NOT (old_state ? '_workspace_contract')
+                OR old_state #>> '{_workspace_contract,assignment_source}'
+                    = 'parent_inheritance'
+            );
+        IF declared_inherited THEN
+            SELECT COALESCE(parent.context, '{}'::JSONB)
+              INTO parent_state
+              FROM public.jobs AS parent
+             WHERE parent.id = parent_id;
+            parent_state := COALESCE(parent_state, '{}'::JSONB);
+            parent_workspace := COALESCE(
+                parent_state->'workspace_container', '{}'::JSONB
+            );
+            parent_vm := COALESCE(parent_state->'vm', '{}'::JSONB);
+            parent_ide := COALESCE(parent_state->'ide_session', '{}'::JSONB);
+        END IF;
+    ELSE
+        source_kind := 'thread';
+        source_id := OLD.id;
+        old_state := COALESCE(OLD.metadata, '{}'::JSONB);
+        new_state := CASE WHEN TG_OP = 'DELETE'
+                          THEN '{}'::JSONB
+                          ELSE COALESCE(NEW.metadata, '{}'::JSONB) END;
+    END IF;
+
+    old_workspace := COALESCE(old_state->'workspace_container', '{}'::JSONB);
+    new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
+    inherited_scope := declared_inherited
+        AND old_workspace <> '{}'::JSONB
+        AND old_workspace->>'provisioner' = parent_workspace->>'provisioner'
+        AND (
+            (
+                old_workspace->>'_runtime_incarnation' IS NOT NULL
+                AND old_workspace->>'_runtime_incarnation'
+                    = parent_workspace->>'_runtime_incarnation'
+            )
+            OR (
+                old_workspace->>'_docker_workspace_lease_id' IS NOT NULL
+                AND old_workspace->>'_docker_workspace_lease_id'
+                    = parent_workspace->>'_docker_workspace_lease_id'
+            )
+            OR (
+                old_workspace->>'_runtime_incarnation' IS NULL
+                AND old_workspace->>'_docker_workspace_lease_id' IS NULL
+                AND old_workspace = parent_workspace
+            )
+            OR public.managed_repository_process_zero_receipt_exists(
+                'job',
+                parent_id,
+                CASE
+                    WHEN old_workspace->>'provisioner' = 'docker'
+                    THEN 'docker_workspace'
+                    ELSE 'workspace_container'
+                END,
+                old_workspace->>'provisioner',
+                COALESCE(
+                    old_workspace->>'_docker_workspace_lease_id',
+                    old_workspace->>'_runtime_incarnation'
+                )
+            )
+        );
+    IF inherited_scope THEN
+        old_workspace := '{}'::JSONB;
+        new_workspace := '{}'::JSONB;
+    END IF;
+    IF old_workspace->>'provisioner' = 'k8s' THEN
+        runtime_id := old_workspace->>'_runtime_incarnation';
+        receipt_ok := runtime_id IS NOT NULL AND (
+            public.managed_repository_process_zero_receipt_exists(
+                source_kind, source_id, 'workspace_container', 'k8s', runtime_id
+            )
+            OR (
+                source_kind = 'thread'
+                AND public.managed_repository_process_zero_receipt_exists(
+                    source_kind,
+                    source_id,
+                    'stateless_workspace',
+                    'k8s',
+                    runtime_id
+                )
+            )
+        );
+        IF (receipt_ok OR old_workspace->>'status' = 'retiring_process_zero')
+           AND new_workspace->>'_runtime_incarnation' = runtime_id
+           AND COALESCE(new_workspace->>'status', '') NOT IN (
+               'retiring_process_zero', 'deleted', 'suspended', 'released',
+               'quarantined'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_workspace_retirement_is_absorbing',
+                MESSAGE = 'A process-zero workspace runtime may not be reactivated';
+        END IF;
+        destructive_transition := (
+            TG_OP = 'DELETE'
+            OR new_workspace->>'_runtime_incarnation' IS DISTINCT FROM runtime_id
+            OR (
+                new_workspace->>'status' IN (
+                    'deleted', 'suspended', 'released', 'quarantined'
+                )
+                AND new_workspace->>'status'
+                    IS DISTINCT FROM old_workspace->>'status'
+            )
+        );
+        IF destructive_transition AND runtime_id IS NULL
+           AND old_workspace <> '{}'::JSONB THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_workspace_runtime_identity_required',
+                MESSAGE = 'Workspace runtime identity is required before destructive teardown';
+        ELSIF destructive_transition AND runtime_id IS NOT NULL THEN
+            IF NOT receipt_ok THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'managed_repository_workspace_process_zero_required',
+                    MESSAGE = 'Workspace process-zero authority is required';
+            END IF;
+        END IF;
+    ELSIF old_workspace->>'provisioner' = 'docker' THEN
+        runtime_id := old_workspace->>'_docker_workspace_lease_id';
+        receipt_ok := runtime_id IS NOT NULL
+            AND public.managed_repository_process_zero_receipt_exists(
+                source_kind,
+                source_id,
+                'docker_workspace',
+                'docker',
+                runtime_id
+            );
+        IF (receipt_ok OR old_workspace->>'status' = 'releasing')
+           AND new_workspace->>'_docker_workspace_lease_id' = runtime_id
+           AND COALESCE(new_workspace->>'status', '') NOT IN (
+               'releasing', 'released', 'quarantined'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_docker_retirement_is_absorbing',
+                MESSAGE = 'A process-zero Docker lease may not be reactivated';
+        END IF;
+        destructive_transition := (
+            TG_OP = 'DELETE'
+            OR new_workspace->>'_docker_workspace_lease_id'
+                IS DISTINCT FROM runtime_id
+            OR (
+                new_workspace->>'status' = 'released'
+                AND new_workspace->>'status' IS DISTINCT FROM old_workspace->>'status'
+            )
+            OR (
+                new_workspace->>'quarantine_reason' =
+                    'container_recreation_required_process_zero'
+                AND new_workspace->>'quarantine_reason'
+                    IS DISTINCT FROM old_workspace->>'quarantine_reason'
+            )
+        );
+        IF destructive_transition AND runtime_id IS NULL
+           AND old_workspace <> '{}'::JSONB THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_docker_runtime_identity_required',
+                MESSAGE = 'Docker workspace lease identity is required before destructive teardown';
+        ELSIF destructive_transition AND runtime_id IS NOT NULL
+           AND NOT receipt_ok THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_docker_process_zero_required',
+                MESSAGE = 'Docker workspace process-zero authority is required';
+        END IF;
+    ELSIF old_workspace <> '{}'::JSONB
+       -- A status-only placeholder has no process, endpoint, lease, or
+       -- repository authority to retire.  Sanitized untrusted creation paths
+       -- legitimately move that placeholder between pending/ready states.
+       AND old_workspace - 'status' <> '{}'::JSONB
+       AND (
+           TG_OP = 'DELETE'
+           OR new_workspace IS DISTINCT FROM old_workspace
+       )
+       AND NOT (
+           -- A pre-0175 persistent thread can lack a provisioner stamp while
+           -- still carrying its historical credential-bearing repository
+           -- URL.  Managed-authority adoption must be able to perform the
+           -- exact authority-reducing URL scrub before the replacement agent
+           -- binds.  Migration 0176 independently requires the matching
+           -- active write authority; this exception permits only removal of
+           -- userinfo (and its transient pending marker), never a workspace
+           -- runtime mutation.
+           TG_OP = 'UPDATE'
+           AND source_kind = 'thread'
+           AND (
+               old_workspace
+                   - 'git_remote_url'
+                   - '_managed_repository_authority_pending'
+           ) = (
+               new_workspace
+                   - 'git_remote_url'
+                   - '_managed_repository_authority_pending'
+           )
+           AND new_workspace->>'git_remote_url' IS NOT NULL
+           AND NOT public.managed_repository_url_has_userinfo(
+               new_workspace->>'git_remote_url'
+           )
+           AND (
+               public.managed_repository_url_has_userinfo(
+                   old_workspace->>'git_remote_url'
+               )
+               OR (
+                   old_workspace->'_managed_repository_authority_pending'
+                       = 'true'::JSONB
+                   AND NOT (
+                       new_workspace
+                           ? '_managed_repository_authority_pending'
+                   )
+                   AND old_workspace->>'git_remote_url'
+                       IS NOT DISTINCT FROM
+                       new_workspace->>'git_remote_url'
+               )
+           )
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_workspace_provisioner_required',
+            MESSAGE = 'Workspace provisioner authority is required before mutation or teardown';
+    END IF;
+
+    old_vm := COALESCE(old_state->'vm', '{}'::JSONB);
+    new_vm := COALESCE(new_state->'vm', '{}'::JSONB);
+    inherited_scope := declared_inherited
+        AND old_vm <> '{}'::JSONB
+        AND (
+            (
+                old_vm->>'provision_generation' IS NOT NULL
+                AND (
+                    old_vm->>'provision_generation'
+                        = parent_vm->>'provision_generation'
+                    OR public.managed_repository_process_zero_receipt_exists(
+                        'job', parent_id, 'vm', 'vm',
+                        old_vm->>'provision_generation'
+                    )
+                )
+            )
+            OR (
+                old_vm->>'provision_generation' IS NULL
+                AND old_vm = parent_vm
+            )
+        );
+    IF inherited_scope THEN
+        old_vm := '{}'::JSONB;
+        new_vm := '{}'::JSONB;
+    END IF;
+    runtime_id := old_vm->>'provision_generation';
+    receipt_ok := runtime_id IS NOT NULL
+        AND public.managed_repository_process_zero_receipt_exists(
+            source_kind, source_id, 'vm', 'vm', runtime_id
+        );
+    IF (receipt_ok OR old_vm->>'status' = 'retiring_process_zero')
+       AND new_vm->>'provision_generation' = runtime_id
+       AND COALESCE(new_vm->>'status', '') NOT IN (
+           'retiring_process_zero', 'aborted', 'deleted', 'suspended', 'released'
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_vm_retirement_is_absorbing',
+            MESSAGE = 'A process-zero VM runtime may not be reactivated';
+    END IF;
+    destructive_transition := (
+        TG_OP = 'DELETE'
+        OR new_vm->>'provision_generation' IS DISTINCT FROM runtime_id
+        OR (
+            new_vm->>'status' IN (
+                'aborted', 'deleted', 'suspended', 'released'
+            )
+            AND new_vm->>'status' IS DISTINCT FROM old_vm->>'status'
+        )
+    );
+    IF destructive_transition AND runtime_id IS NULL
+       AND old_vm <> '{}'::JSONB
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_vm_runtime_identity_required',
+            MESSAGE = 'VM runtime identity is required before destructive teardown';
+    ELSIF destructive_transition AND runtime_id IS NOT NULL
+       AND NOT receipt_ok THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_vm_process_zero_required',
+            MESSAGE = 'VM process-zero authority is required';
+    END IF;
+
+    IF source_kind = 'job' THEN
+        old_ide := COALESCE(old_state->'ide_session', '{}'::JSONB);
+        new_ide := COALESCE(new_state->'ide_session', '{}'::JSONB);
+        inherited_scope := declared_inherited
+            AND old_ide <> '{}'::JSONB
+            AND (
+                (
+                    old_ide->>'_runtime_incarnation' IS NOT NULL
+                    AND old_ide->>'_runtime_incarnation'
+                        = parent_ide->>'_runtime_incarnation'
+                )
+                OR (
+                    old_ide->>'container_id' IS NOT NULL
+                    AND old_ide->>'container_id' = parent_ide->>'container_id'
+                )
+            );
+        IF inherited_scope THEN
+            old_ide := '{}'::JSONB;
+            new_ide := '{}'::JSONB;
+        END IF;
+        runtime_id := old_ide->>'_runtime_incarnation';
+        receipt_ok := (
+            runtime_id IS NOT NULL
+            AND public.managed_repository_process_zero_receipt_exists(
+                source_kind, source_id, 'ide', 'k8s', runtime_id
+            )
+        ) OR (
+            runtime_id IS NULL
+            AND old_ide->>'container_id' IS NOT NULL
+            AND public.managed_repository_process_zero_receipt_exists(
+                source_kind,
+                source_id,
+                'ide_local',
+                'docker',
+                old_ide->>'container_id'
+            )
+        );
+        IF (receipt_ok OR old_ide->>'status' IN (
+               'cleanup_pending', 'retiring_process_zero'
+           ))
+           AND COALESCE(
+               new_ide->>'_runtime_incarnation', new_ide->>'container_id'
+           ) = COALESCE(
+               runtime_id, old_ide->>'container_id'
+           )
+           AND COALESCE(new_ide->>'status', '') NOT IN (
+               'cleanup_pending', 'retiring_process_zero', 'expired', 'deleted'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_ide_retirement_is_absorbing',
+                MESSAGE = 'A process-zero IDE runtime may not be reactivated';
+        END IF;
+        destructive_transition := (
+            TG_OP = 'DELETE'
+            OR new_ide->>'_runtime_incarnation' IS DISTINCT FROM runtime_id
+            OR new_ide->>'container_id'
+                IS DISTINCT FROM old_ide->>'container_id'
+            OR (
+                new_ide->>'status' IN ('expired', 'deleted')
+                AND new_ide->>'status' IS DISTINCT FROM old_ide->>'status'
+            )
+        );
+        IF destructive_transition AND runtime_id IS NULL
+           AND old_ide->>'container_id' IS NOT NULL THEN
+            runtime_id := old_ide->>'container_id';
+            IF NOT receipt_ok THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    CONSTRAINT = 'managed_repository_ide_local_process_zero_required',
+                    MESSAGE = 'Local IDE process-zero authority is required';
+            END IF;
+        ELSIF destructive_transition AND runtime_id IS NULL
+           AND old_ide <> '{}'::JSONB THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_ide_runtime_identity_required',
+                MESSAGE = 'IDE runtime identity is required before destructive teardown';
+        ELSIF destructive_transition AND runtime_id IS NOT NULL
+           AND NOT receipt_ok THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_ide_process_zero_required',
+                MESSAGE = 'IDE process-zero authority is required';
+        END IF;
+    END IF;
+
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+
+--
 -- Name: enforce_managed_repository_url_authority(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2608,6 +3073,57 @@ $$;
 --
 
 COMMENT ON FUNCTION public.enforce_managed_thread_repository_url_authority() IS 'Rolling-upgrade thread fence: fail-closed agent attachment requires exact scoped authority, while agent detachment remains available for lifecycle cleanup of historical credential-bearing rows.';
+
+
+--
+-- Name: enforce_officer_post_thread_repository_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_officer_post_thread_repository_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    repository_name TEXT;
+    repository_url TEXT;
+    authority_record UUID;
+BEGIN
+    IF NEW.thread_id IS NULL
+       OR (TG_OP = 'UPDATE' AND NEW.thread_id IS NOT DISTINCT FROM OLD.thread_id)
+    THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT thread.metadata->'workspace_container'->>'repo_name',
+           thread.metadata->'workspace_container'->>'git_remote_url'
+      INTO repository_name, repository_url
+      FROM public.threads AS thread
+     WHERE thread.id = NEW.thread_id;
+
+    IF repository_name IS NOT NULL THEN
+        SELECT authority.id
+          INTO authority_record
+          FROM public.managed_repository_authorities AS authority
+         WHERE authority.authority_kind = 'thread'
+           AND authority.authority_id = NEW.thread_id
+           AND authority.project_id = NEW.project_id
+           AND authority.repo_name = repository_name
+           AND authority.access_mode = 'write'
+           AND authority.status = 'active'
+           AND authority.clean_repo_url = repository_url
+         FOR KEY SHARE;
+    END IF;
+
+    IF repository_name IS NOT NULL AND authority_record IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'officer_post_requires_repository_authority',
+            MESSAGE = 'Officer thread repository authority is not active',
+            HINT = 'Adopt or provision the repository before commissioning.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
 
 --
@@ -5548,6 +6064,70 @@ $$;
 
 
 --
+-- Name: lock_managed_repository_job_lineage_on_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_managed_repository_job_lineage_on_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    lineage_root UUID;
+    confirmed_root UUID;
+BEGIN
+    IF NEW.parent_job_id IS NULL THEN
+        lineage_root := NEW.id;
+    ELSE
+        WITH RECURSIVE ancestors AS (
+            SELECT job.id, job.parent_job_id
+              FROM public.jobs AS job
+             WHERE job.id = NEW.parent_job_id
+            UNION
+            SELECT parent.id, parent.parent_job_id
+              FROM public.jobs AS parent
+              JOIN ancestors AS child ON parent.id = child.parent_job_id
+        )
+        SELECT id INTO lineage_root
+          FROM ancestors
+         WHERE parent_job_id IS NULL;
+        IF lineage_root IS NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_job_lineage_invalid',
+                MESSAGE = 'Job parent lineage has no authoritative root';
+        END IF;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'managed_repository_job_lineage:' || lineage_root::text,
+        0
+    ));
+
+    IF NEW.parent_job_id IS NOT NULL THEN
+        WITH RECURSIVE ancestors AS (
+            SELECT job.id, job.parent_job_id
+              FROM public.jobs AS job
+             WHERE job.id = NEW.parent_job_id
+            UNION
+            SELECT parent.id, parent.parent_job_id
+              FROM public.jobs AS parent
+              JOIN ancestors AS child ON parent.id = child.parent_job_id
+        )
+        SELECT id INTO confirmed_root
+          FROM ancestors
+         WHERE parent_job_id IS NULL;
+        IF confirmed_root IS DISTINCT FROM lineage_root THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '40001',
+                MESSAGE = 'Job parent lineage changed during admission';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: managed_repository_json_has_private_authority(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -5561,6 +6141,39 @@ CREATE FUNCTION public.managed_repository_json_has_private_authority(value jsonb
         OR jsonb_path_exists(value, '$.**."repository_credentials"'),
         FALSE
     )
+$_$;
+
+
+--
+-- Name: managed_repository_process_zero_receipt_exists(text, uuid, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repository_process_zero_receipt_exists(requested_owner_kind text, requested_owner_id uuid, requested_scope text, requested_provisioner text, requested_runtime text) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $_$
+BEGIN
+    IF requested_runtime IS NULL
+       OR (
+           requested_scope = 'ide_local'
+           AND requested_runtime !~ '^[0-9a-f]{64}$'
+       )
+       OR (
+           requested_scope <> 'ide_local'
+           AND requested_runtime !~
+              '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+       ) THEN
+        RETURN FALSE;
+    END IF;
+    RETURN EXISTS (
+        SELECT 1
+          FROM public.managed_repository_process_zero_receipts AS receipt
+         WHERE receipt.owner_kind = requested_owner_kind
+           AND receipt.owner_id = requested_owner_id
+           AND receipt.scope = requested_scope
+           AND receipt.provisioner = requested_provisioner
+           AND receipt.runtime_incarnation = requested_runtime
+    );
+END;
 $_$;
 
 
@@ -6330,6 +6943,9 @@ DECLARE
     scope_namespace        TEXT;
     epoch_recovery_from    UUID;
     epoch_retired_at       TIMESTAMPTZ;
+    epoch_reliable_from    TIMESTAMPTZ;
+    epoch_continuous_since TIMESTAMPTZ;
+    epoch_continuity_health TEXT;
     previous_epoch_id      UUID;
     previous_sequence      BIGINT;
     previous_retired_at    TIMESTAMPTZ;
@@ -6347,8 +6963,12 @@ BEGIN
     END IF;
 
     SELECT epoch.recovery_from_epoch_id, epoch.retired_at,
+           epoch.reliable_from, epoch.continuous_since,
+           epoch.continuity_health,
            scope.api_resource, scope.namespace
     INTO epoch_recovery_from, epoch_retired_at,
+         epoch_reliable_from, epoch_continuous_since,
+         epoch_continuity_health,
          scope_resource, scope_namespace
     FROM public.resource_inventory_scope_epochs AS epoch
     JOIN public.resource_inventory_scopes AS scope
@@ -6400,7 +7020,25 @@ BEGIN
     IF NEW.authority_sequence = 1 THEN
         IF activation_state IS DISTINCT FROM 'shadow'
            OR request_kind IS DISTINCT FROM 'initial-activation'
-           OR epoch_recovery_from IS NOT NULL
+           OR (
+                epoch_recovery_from IS NOT NULL
+                AND (
+                    epoch_continuity_health IS DISTINCT FROM 'healthy'
+                    OR epoch_reliable_from IS NULL
+                    OR epoch_reliable_from > NEW.effective_from
+                    OR epoch_continuous_since IS NULL
+                    OR epoch_continuous_since > NEW.effective_from
+                    OR EXISTS (
+                        SELECT 1
+                        FROM public.resource_inventory_coverage_gaps AS gap
+                        WHERE gap.scope_epoch_id =
+                            NEW.inventory_scope_epoch_id
+                          AND gap.resolution = 'unresolved'
+                          AND gap.reason NOT LIKE
+                              'compute-authority-awaiting-confirmation:%'
+                    )
+                )
+           )
            OR NOT EXISTS (
                 SELECT 1
                 FROM public.compute_metering_scope_requirements AS requirement
@@ -6526,6 +7164,13 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: FUNCTION protect_compute_metering_epoch_authority(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.protect_compute_metering_epoch_authority() IS 'Fail-closed exact-epoch compute authority guard. Initial recovery epochs must prove healthy continuous and reliable coverage through the boundary.';
 
 
 --
@@ -6952,6 +7597,21 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_managed_repository_legacy_rearm_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_managed_repository_legacy_rearm_history() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'managed repository reconciliation re-arms are append-only'
+        USING ERRCODE = '55000';
 END;
 $$;
 
@@ -8599,6 +9259,57 @@ COMMENT ON FUNCTION public.record_compute_authority_confirmation_gap() IS 'Opens
 
 
 --
+-- Name: reject_managed_repository_process_zero_json(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.reject_managed_repository_process_zero_json() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'jobs' THEN
+        IF NEW.context ? '_managed_repository_process_zero'
+           AND (
+               TG_OP = 'INSERT'
+               OR NOT (OLD.context ? '_managed_repository_process_zero')
+               OR OLD.context->'_managed_repository_process_zero'
+                  IS DISTINCT FROM
+                  NEW.context->'_managed_repository_process_zero'
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'managed_repository_process_zero_is_server_owned',
+                MESSAGE = 'Managed repository process-zero evidence is server-owned';
+        END IF;
+    ELSIF (
+        NEW.metadata ? '_managed_repository_process_zero'
+        AND (
+            TG_OP = 'INSERT'
+            OR NOT (OLD.metadata ? '_managed_repository_process_zero')
+            OR OLD.metadata->'_managed_repository_process_zero'
+               IS DISTINCT FROM
+               NEW.metadata->'_managed_repository_process_zero'
+        )
+    ) OR (
+        NEW.metadata ? '_stateless_workspace_process_zero_observation'
+        AND (
+            TG_OP = 'INSERT'
+            OR NOT (OLD.metadata ? '_stateless_workspace_process_zero_observation')
+            OR OLD.metadata->'_stateless_workspace_process_zero_observation'
+               IS DISTINCT FROM
+               NEW.metadata->'_stateless_workspace_process_zero_observation'
+        )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'managed_repository_process_zero_is_server_owned',
+            MESSAGE = 'Managed repository process-zero evidence is server-owned';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: reject_usage_rate_component_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -8722,6 +9433,163 @@ $$;
 --
 
 COMMENT ON FUNCTION public.require_executed_persistent_wake() IS 'Rolling-upgrade and settlement fence: pre-0174 replicas cannot claim a persistent wake for HTTP delivery, and no replica can stamp it sent before the durable input reaches provider admission.';
+
+
+--
+-- Name: require_input_delivery_lane_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_input_delivery_lane_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_lane TEXT;
+    message_role TEXT;
+BEGIN
+    SELECT thread.execution_lane
+      INTO current_lane
+      FROM public.threads AS thread
+     WHERE thread.id = NEW.thread_id
+     FOR NO KEY UPDATE;
+
+    IF current_lane IS NULL OR NEW.execution_lane IS DISTINCT FROM current_lane THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'input_delivery_lane_mismatch',
+            MESSAGE = 'Input delivery lane does not match its owning thread',
+            HINT = 'Retry from a lane-aware input-delivery writer.';
+    END IF;
+
+    IF current_lane = 'stateless' THEN
+        SELECT message.role
+          INTO message_role
+          FROM public.thread_messages AS message
+         WHERE message.id = NEW.message_id
+           AND message.thread_id = NEW.thread_id;
+        IF message_role IS DISTINCT FROM 'event'
+           OR NEW.source IS DISTINCT FROM 'officer_wake' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                CONSTRAINT = 'stateless_input_delivery_event_only',
+                MESSAGE = 'Stateless durable input authority is reserved for server events';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_input_delivery_lane_authority(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_input_delivery_lane_authority() IS 'Rejects rolling-old or forged stateless input-ledger writers before queueing.';
+
+
+--
+-- Name: require_stateless_input_delivery_claim(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_stateless_input_delivery_claim() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    pending_event BOOLEAN := FALSE;
+BEGIN
+    IF NEW.unit_kind IS DISTINCT FROM 'session_turn' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.thread_input_deliveries AS delivery
+          JOIN public.thread_messages AS message
+            ON message.id = delivery.message_id
+         WHERE delivery.thread_id = NEW.unit_id
+           AND delivery.execution_lane = 'stateless'
+           AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+           AND message.rewound_at IS NULL
+    ) INTO pending_event;
+
+    IF pending_event
+       AND NEW.state = 'leased'
+       AND (
+           OLD.state IS DISTINCT FROM NEW.state
+           OR OLD.lease_token IS DISTINCT FROM NEW.lease_token
+       )
+       AND NEW.input_delivery_capable_lease_token
+            IS DISTINCT FROM NEW.lease_token THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'stateless_input_delivery_requires_capable_claim',
+            MESSAGE = 'Stateless event input requires a lane-aware executor claim',
+            HINT = 'Retry the claim from an input-ledger-aware runtime.';
+    END IF;
+
+    IF NEW.consumed_seq IS NOT NULL
+       AND (
+           OLD.consumed_seq IS NULL
+           OR NEW.consumed_seq > OLD.consumed_seq
+       )
+       AND EXISTS (
+           SELECT 1
+             FROM public.thread_input_deliveries AS delivery
+             JOIN public.thread_messages AS message
+               ON message.id = delivery.message_id
+            WHERE delivery.thread_id = NEW.unit_id
+              AND delivery.execution_lane = 'stateless'
+              AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+              AND message.rewound_at IS NULL
+              AND message.seq <= NEW.consumed_seq
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'stateless_input_delivery_requires_admission',
+            MESSAGE = 'A stateless event cannot be consumed before provider admission';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_stateless_input_delivery_claim(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_stateless_input_delivery_claim() IS 'Fences rolling-old stateless claims and refuses watermark consumption before the exact durable event reaches provider admission.';
+
+
+--
+-- Name: require_thread_lane_without_pending_input(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_thread_lane_without_pending_input() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.execution_lane IS DISTINCT FROM OLD.execution_lane
+       AND EXISTS (
+           SELECT 1
+             FROM public.thread_input_deliveries AS delivery
+            WHERE delivery.thread_id = NEW.id
+              AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'thread_lane_change_has_pending_input',
+            MESSAGE = 'Thread lane cannot change while durable input is pending',
+            HINT = 'Admit or settle the exact delivery before changing lanes.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION require_thread_lane_without_pending_input(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.require_thread_lane_without_pending_input() IS 'Serializes lane changes with durable input so one stable delivery cannot become unclaimable between the pinned and stateless authorities.';
 
 
 --
@@ -11510,6 +12378,140 @@ COMMENT ON TABLE public.managed_repository_creation_intents IS 'Durable exact-sc
 
 
 --
+-- Name: managed_repository_legacy_reconcile_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.managed_repository_legacy_reconcile_claim_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_legacy_reconciliation_rearms (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    reconciliation_id uuid NOT NULL,
+    generation integer NOT NULL,
+    actor_id uuid NOT NULL,
+    reason_code text NOT NULL,
+    attempts_in_generation integer NOT NULL,
+    lifetime_attempts integer NOT NULL,
+    failure_reason_code text,
+    rearmed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_legacy_rearm_attempts_check CHECK (((attempts_in_generation >= 0) AND (lifetime_attempts >= attempts_in_generation))),
+    CONSTRAINT managed_repository_legacy_rearm_generation_positive CHECK ((generation > 0)),
+    CONSTRAINT managed_repository_legacy_rearm_reason_check CHECK ((reason_code ~ '^[a-z0-9][a-z0-9_.-]{0,99}$'::text))
+);
+
+
+--
+-- Name: TABLE managed_repository_legacy_reconciliation_rearms; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_legacy_reconciliation_rearms IS 'Append-only attribution for exact-scope operator re-arms. It stores the actor, non-secret reason, failed attempt window, and cumulative attempts; it contains no repository coordinate or credential material.';
+
+
+--
+-- Name: managed_repository_legacy_reconciliations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_legacy_reconciliations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    source_kind text NOT NULL,
+    source_id uuid NOT NULL,
+    project_id uuid,
+    classification text NOT NULL,
+    authority_kind text,
+    authority_id uuid,
+    authority_record_id uuid,
+    authority_generation bigint,
+    repository_owner text,
+    repo_name text,
+    access_mode text,
+    state text DEFAULT 'pending'::text NOT NULL,
+    result_kind text,
+    reason_code text,
+    attempts integer DEFAULT 0 NOT NULL,
+    lifetime_attempts integer DEFAULT 0 NOT NULL,
+    last_failure_reason_code text,
+    rearm_generation integer DEFAULT 0 NOT NULL,
+    claim_token bigint DEFAULT 0 NOT NULL,
+    claimed_by uuid,
+    claim_expires_at timestamp with time zone,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_scanned_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_legacy_access_mode_check CHECK (((access_mode IS NULL) OR (access_mode = ANY (ARRAY['none'::text, 'read'::text, 'write'::text])))),
+    CONSTRAINT managed_repository_legacy_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT managed_repository_legacy_authority_kind_check CHECK (((authority_kind IS NULL) OR (authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text])))),
+    CONSTRAINT managed_repository_legacy_authority_record_shape_check CHECK ((((authority_record_id IS NULL) AND (authority_generation IS NULL)) OR ((authority_record_id IS NOT NULL) AND (authority_generation > 0)))),
+    CONSTRAINT managed_repository_legacy_authority_shape_check CHECK ((((classification = ANY (ARRAY['runnable_job'::text, 'resumable_thread'::text, 'current_officer_thread'::text, 'shared_project_jobs_repository'::text, 'project_runtime_repository'::text])) AND (authority_kind IS NOT NULL) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = ANY (ARRAY['read'::text, 'write'::text]))) OR ((classification = 'terminal_historical'::text) AND (authority_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text])) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = ANY (ARRAY['read'::text, 'write'::text]))) OR ((classification = 'server_only_repository'::text) AND (authority_kind = 'project_repository'::text) AND (authority_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (access_mode = 'none'::text)) OR ((classification = 'ambiguous'::text) AND (authority_kind IS NULL) AND (authority_id IS NULL) AND (repository_owner IS NULL) AND (repo_name IS NULL) AND (access_mode IS NULL)))),
+    CONSTRAINT managed_repository_legacy_claim_shape_check CHECK ((((state = 'claimed'::text) AND (claimed_by IS NOT NULL) AND (claim_expires_at IS NOT NULL) AND (claim_token > 0)) OR ((state <> 'claimed'::text) AND (claimed_by IS NULL) AND (claim_expires_at IS NULL)))),
+    CONSTRAINT managed_repository_legacy_classification_check CHECK ((classification = ANY (ARRAY['runnable_job'::text, 'resumable_thread'::text, 'current_officer_thread'::text, 'shared_project_jobs_repository'::text, 'project_runtime_repository'::text, 'server_only_repository'::text, 'terminal_historical'::text, 'ambiguous'::text]))),
+    CONSTRAINT managed_repository_legacy_completion_shape_check CHECK ((((state = 'completed'::text) AND (result_kind IS NOT NULL) AND (completed_at IS NOT NULL)) OR ((state <> 'completed'::text) AND (result_kind IS NULL) AND (completed_at IS NULL)))),
+    CONSTRAINT managed_repository_legacy_lifetime_attempts_check CHECK (((lifetime_attempts >= attempts) AND (lifetime_attempts >= 0))),
+    CONSTRAINT managed_repository_legacy_rearm_generation_check CHECK ((rearm_generation >= 0)),
+    CONSTRAINT managed_repository_legacy_result_check CHECK (((result_kind IS NULL) OR (result_kind = ANY (ARRAY['adopted'::text, 'scrubbed_terminal'::text, 'source_absent'::text, 'authority_revoked'::text])))),
+    CONSTRAINT managed_repository_legacy_source_kind_check CHECK ((source_kind = ANY (ARRAY['job'::text, 'thread'::text, 'project_repository'::text]))),
+    CONSTRAINT managed_repository_legacy_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'retry'::text, 'completed'::text, 'ambiguous'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE managed_repository_legacy_reconciliations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_legacy_reconciliations IS 'Server-owned, restart-safe intent and leased progress for legacy managed repository adoption or terminal credential-URL scrubbing. It stores no raw URL, credential, private key, ciphertext, or transport endpoint.';
+
+
+--
+-- Name: COLUMN managed_repository_legacy_reconciliations.lifetime_attempts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_legacy_reconciliations.lifetime_attempts IS 'Monotonic count across bounded attempt windows and explicit operator re-arms. Unlike attempts, this value is never reset.';
+
+
+--
+-- Name: COLUMN managed_repository_legacy_reconciliations.claim_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_legacy_reconciliations.claim_token IS 'Never-reused settlement generation. A predecessor cannot acknowledge a claim reclaimed after lease expiry.';
+
+
+--
+-- Name: managed_repository_process_zero_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.managed_repository_process_zero_receipts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    scope text NOT NULL,
+    provisioner text NOT NULL,
+    runtime_incarnation text NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT managed_repository_process_zero_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT managed_repository_process_zero_provisioner_check CHECK ((((scope = 'workspace_container'::text) AND (provisioner = 'k8s'::text)) OR ((scope = 'vm'::text) AND (provisioner = 'vm'::text)) OR ((scope = 'ide'::text) AND (provisioner = 'k8s'::text)) OR ((scope = 'ide_local'::text) AND (provisioner = 'docker'::text)) OR ((scope = 'stateless_workspace'::text) AND (provisioner = 'k8s'::text)) OR ((scope = 'docker_workspace'::text) AND (provisioner = 'docker'::text)))),
+    CONSTRAINT managed_repository_process_zero_runtime_check CHECK ((((scope <> 'ide_local'::text) AND (runtime_incarnation ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'::text)) OR ((scope = 'ide_local'::text) AND (runtime_incarnation ~ '^[0-9a-f]{64}$'::text)))),
+    CONSTRAINT managed_repository_process_zero_scope_check CHECK ((scope = ANY (ARRAY['workspace_container'::text, 'vm'::text, 'ide'::text, 'ide_local'::text, 'stateless_workspace'::text, 'docker_workspace'::text])))
+);
+
+
+--
+-- Name: TABLE managed_repository_process_zero_receipts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.managed_repository_process_zero_receipts IS 'Server-owned exact-runtime evidence that managed repository ssh-agent processes reached zero before destructive workspace teardown.';
+
+
+--
 -- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -11647,6 +12649,37 @@ CREATE TABLE public.models (
 
 
 --
+-- Name: notification_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_deliveries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    notification_id uuid NOT NULL,
+    channel text NOT NULL,
+    state text NOT NULL,
+    attempt integer DEFAULT 1 NOT NULL,
+    step_index integer,
+    batch_id uuid,
+    recipient_address text,
+    provider_msg_id text,
+    attempted_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    error text,
+    CONSTRAINT notification_delivery_attempt CHECK ((attempt > 0)),
+    CONSTRAINT notification_delivery_channel CHECK ((channel = ANY (ARRAY['in_app'::text, 'email'::text, 'ntfy'::text, 'slack_webhook'::text, 'discord_webhook'::text, 'push'::text]))),
+    CONSTRAINT notification_delivery_settled CHECK (((state = 'pending'::text) = (settled_at IS NULL))),
+    CONSTRAINT notification_delivery_state CHECK ((state = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'suppressed'::text])))
+);
+
+
+--
+-- Name: TABLE notification_deliveries; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_deliveries IS 'One row per channel attempt for a notification. Answers "did the mail actually go out, and when" and carries the provider message id for reply routing. The claim row is inserted BEFORE the send so replays cannot double-send.';
+
+
+--
 -- Name: notification_queue; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -11661,6 +12694,116 @@ CREATE TABLE public.notification_queue (
     queued_at timestamp with time zone DEFAULT now(),
     delivered_at timestamp with time zone
 );
+
+
+--
+-- Name: TABLE notification_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_queue IS 'RETIRED (0193, unified notification system slice 3): the quiet-hours digest queue. Deferred delivery is a notification_steps row now. Kept until a later DROP.';
+
+
+--
+-- Name: notification_steps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_steps (
+    id bigint NOT NULL,
+    notification_id uuid NOT NULL,
+    step_index integer NOT NULL,
+    step_kind text NOT NULL,
+    due_at timestamp with time zone NOT NULL,
+    conditions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    batch_key text,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    detail text,
+    CONSTRAINT notification_step_claim CHECK (((claimed_by IS NULL) = (claimed_at IS NULL))),
+    CONSTRAINT notification_step_conditions_shape CHECK ((jsonb_typeof(conditions) = 'array'::text)),
+    CONSTRAINT notification_step_kind CHECK ((step_kind = ANY (ARRAY['email'::text, 'ntfy'::text, 'slack_webhook'::text, 'discord_webhook'::text, 'push'::text]))),
+    CONSTRAINT notification_step_settled CHECK (((state = 'pending'::text) = (settled_at IS NULL))),
+    CONSTRAINT notification_step_state CHECK ((state = ANY (ARRAY['pending'::text, 'done'::text, 'skipped'::text, 'cancelled'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE notification_steps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notification_steps IS 'Deferred channel steps of the unified notification feed (escalate-on-timeout). A row is the promise "at due_at, unless conditions say otherwise, deliver via step_kind". Resolving the source cancels its pending steps; the sweeper settles the rest. detail carries the skip reason, failure message or batch id.';
+
+
+--
+-- Name: notification_steps_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.notification_steps ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.notification_steps_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id uuid NOT NULL,
+    recipient_kind text NOT NULL,
+    recipient_id uuid NOT NULL,
+    category text NOT NULL,
+    severity text NOT NULL,
+    subject text NOT NULL,
+    body text DEFAULT ''::text NOT NULL,
+    source_kind text,
+    source_id text,
+    dedup_key text NOT NULL,
+    actions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    seen_at timestamp with time zone,
+    read_at timestamp with time zone,
+    interacted_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    resolved_by text,
+    archived_at timestamp with time zone,
+    CONSTRAINT notifications_actions_shape CHECK ((jsonb_typeof(actions) = 'array'::text)),
+    CONSTRAINT notifications_dedup_key CHECK (((dedup_key <> ''::text) AND (length(dedup_key) <= 512))),
+    CONSTRAINT notifications_payload_shape CHECK ((jsonb_typeof(payload) = 'object'::text)),
+    CONSTRAINT notifications_read_implies_seen CHECK (((read_at IS NULL) OR (seen_at IS NOT NULL))),
+    CONSTRAINT notifications_recipient_kind CHECK ((recipient_kind = ANY (ARRAY['user'::text, 'officer'::text]))),
+    CONSTRAINT notifications_severity CHECK ((severity = ANY (ARRAY['low'::text, 'normal'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT notifications_source_ref CHECK (((source_kind IS NULL) = (source_id IS NULL)))
+);
+
+
+--
+-- Name: TABLE notifications; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.notifications IS 'Per-recipient notification feed: the source of truth every channel delivers FROM. Engagement state (seen/read/interacted), resolution of the underlying source, and the server-declared action set live here. Idempotent on (recipient_kind, recipient_id, dedup_key); the id is derived from that triple.';
+
+
+--
+-- Name: COLUMN notifications.dedup_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.dedup_key IS 'Caller-supplied idempotency key, e.g. freeze_notification:<completion command id>. A replayed record() with the same key returns the existing row and sends nothing twice.';
+
+
+--
+-- Name: COLUMN notifications.resolved_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.resolved_by IS 'Who settled the underlying source: user:<uuid> | system:<hook name> | officer:<thread id>.';
 
 
 --
@@ -12636,6 +13779,7 @@ CREATE TABLE public.run_queue (
     control_consumed_seq bigint DEFAULT 0 NOT NULL,
     interrupt_admission_lease_token bigint,
     interrupt_admission_turn_id integer,
+    input_delivery_capable_lease_token bigint,
     CONSTRAINT run_queue_interrupt_admission_shape CHECK ((((interrupt_admission_lease_token IS NULL) AND (interrupt_admission_turn_id IS NULL)) OR ((interrupt_admission_lease_token IS NOT NULL) AND (interrupt_admission_turn_id IS NOT NULL) AND (unit_kind = 'session_turn'::text) AND (state = 'leased'::text) AND (interrupt_admission_lease_token = lease_token) AND (interrupt_admission_lease_token > 0) AND (interrupt_admission_turn_id > 0))))
 );
 
@@ -12764,6 +13908,13 @@ COMMENT ON COLUMN public.run_queue.interrupt_admission_lease_token IS 'NULL clos
 --
 
 COMMENT ON COLUMN public.run_queue.interrupt_admission_turn_id IS 'Concrete active turn accepted by the exact interrupt lease window. NULL means closed. This is deliberately not a queue watermark: an interrupt for one turn must never wake or cancel a later turn.';
+
+
+--
+-- Name: COLUMN run_queue.input_delivery_capable_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.input_delivery_capable_lease_token IS '0185 rolling-upgrade marker. A session claim with pending event input must stamp the newly allocated lease token in the same UPDATE.';
 
 
 --
@@ -13822,11 +14973,16 @@ CREATE TABLE public.thread_input_deliveries (
     cancelled_at timestamp with time zone,
     cancelled_turn_number bigint,
     cancelled_reason text,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    owner_run_queue_lease_token bigint,
+    owner_executor text,
+    owner_executor_pod_uid text,
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_cancellation_shape CHECK ((((state <> 'cancelled'::text) AND (cancelled_at IS NULL) AND (cancelled_turn_number IS NULL) AND (cancelled_reason IS NULL)) OR ((state = 'cancelled'::text) AND (source = 'direct_human'::text) AND (cancelled_at IS NOT NULL) AND (cancelled_turn_number IS NOT NULL) AND (cancelled_turn_number > 0) AND (cancelled_reason IS NOT NULL) AND (btrim(cancelled_reason) <> ''::text) AND (length(cancelled_reason) <= 120)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
-    CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))),
-    CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))),
+    CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
+    CONSTRAINT thread_input_deliveries_lane_check CHECK ((execution_lane = ANY (ARRAY['pinned'::text, 'stateless'::text]))),
+    CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((execution_lane = 'pinned'::text) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL) AND (((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))) OR ((execution_lane = 'stateless'::text) AND (owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL) AND (((claim_generation = 0) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL)) OR ((claim_generation > 0) AND (owner_run_queue_lease_token IS NOT NULL) AND (owner_run_queue_lease_token > 0) AND (owner_executor IS NOT NULL) AND (btrim(owner_executor) <> ''::text) AND (owner_executor_pod_uid IS NOT NULL) AND (btrim(owner_executor_pod_uid) <> ''::text)))))),
     CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
     CONSTRAINT thread_input_deliveries_state_check CHECK ((state = ANY (ARRAY['persisted'::text, 'owned'::text, 'queued'::text, 'admitted'::text, 'settled'::text, 'deferred'::text, 'cancelled'::text])))
 );
@@ -13872,6 +15028,34 @@ COMMENT ON COLUMN public.thread_input_deliveries.cancelled_turn_number IS 'Exact
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.cancelled_reason IS 'Bounded server-owned reason for terminal cancellation; never model supplied.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.execution_lane IS 'Server-observed owning thread lane. A rolling-old writer defaults to pinned and is rejected when the live thread is stateless.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_run_queue_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_run_queue_lease_token IS 'Exact stateless session_turn fencing token that owns provider admission.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_executor; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_executor IS 'Stateless executor identity snapshot; paired with the exact run_queue lease.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.owner_executor_pod_uid; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.owner_executor_pod_uid IS 'Kubernetes Pod UID snapshot for the stateless delivery claimant.';
 
 
 --
@@ -14121,7 +15305,7 @@ CREATE TABLE public.thread_notifications (
 -- Name: TABLE thread_notifications; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.thread_notifications IS 'Audit + dedup + rate-limit log for headless-session emails. One row per outbound email regardless of delivery status.';
+COMMENT ON TABLE public.thread_notifications IS 'RETIRED (0193, unified notification system slice 3): the headless permission-email audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
 
 
 --
@@ -15589,6 +16773,62 @@ ALTER TABLE ONLY public.managed_repository_creation_intents
 
 
 --
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearm_request_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_rearm_request_unique UNIQUE (reconciliation_id, actor_id, reason_code);
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearm_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_rearm_unique UNIQUE (reconciliation_id, generation);
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_reconciliation_rearms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_reconciliation_rearms_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_reconciliations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_reconciliations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_source_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_source_unique UNIQUE (source_kind, source_id);
+
+
+--
+-- Name: managed_repository_process_zero_receipts managed_repository_process_zero_identity_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_process_zero_receipts
+    ADD CONSTRAINT managed_repository_process_zero_identity_unique UNIQUE (owner_kind, owner_id, scope, runtime_incarnation);
+
+
+--
+-- Name: managed_repository_process_zero_receipts managed_repository_process_zero_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_process_zero_receipts
+    ADD CONSTRAINT managed_repository_process_zero_receipts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: auth_tokens mcp_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15653,11 +16893,35 @@ ALTER TABLE ONLY public.models
 
 
 --
+-- Name: notification_deliveries notification_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_deliveries
+    ADD CONSTRAINT notification_deliveries_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: notification_queue notification_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notification_steps notification_steps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
 
 
 --
@@ -16637,6 +17901,14 @@ ALTER TABLE ONLY public.models
 
 
 --
+-- Name: notification_steps uq_notification_step; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT uq_notification_step UNIQUE (notification_id, step_index);
+
+
+--
 -- Name: officer_ticket_claims uq_officer_ticket_claim_generation; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17389,6 +18661,20 @@ CREATE INDEX idx_managed_repository_authority_scope ON public.managed_repository
 
 
 --
+-- Name: idx_managed_repository_legacy_reconcile_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_legacy_reconcile_due ON public.managed_repository_legacy_reconciliations USING btree (next_attempt_at, updated_at, id) WHERE (state = ANY (ARRAY['pending'::text, 'retry'::text, 'claimed'::text]));
+
+
+--
+-- Name: idx_managed_repository_legacy_reconcile_progress; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_managed_repository_legacy_reconcile_progress ON public.managed_repository_legacy_reconciliations USING btree (state, classification, updated_at, id);
+
+
+--
 -- Name: idx_mcp_tokens_hash; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18012,6 +19298,62 @@ CREATE INDEX infrastructure_storage_resource_mappings_resource_idx ON public.inf
 
 
 --
+-- Name: ix_notification_deliveries_batch; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_batch ON public.notification_deliveries USING btree (batch_id) WHERE (batch_id IS NOT NULL);
+
+
+--
+-- Name: ix_notification_deliveries_notification; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_notification ON public.notification_deliveries USING btree (notification_id);
+
+
+--
+-- Name: ix_notification_deliveries_provider_msg; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_deliveries_provider_msg ON public.notification_deliveries USING btree (provider_msg_id) WHERE (provider_msg_id IS NOT NULL);
+
+
+--
+-- Name: ix_notification_steps_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_due ON public.notification_steps USING btree (due_at) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: ix_notification_steps_open_by_notification; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notification_steps_open_by_notification ON public.notification_steps USING btree (notification_id) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: ix_notifications_feed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_feed ON public.notifications USING btree (recipient_kind, recipient_id, created_at DESC, id DESC);
+
+
+--
+-- Name: ix_notifications_open_by_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_open_by_source ON public.notifications USING btree (source_kind, source_id) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: ix_notifications_unseen; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_unseen ON public.notifications USING btree (recipient_kind, recipient_id) WHERE ((seen_at IS NULL) AND (archived_at IS NULL));
+
+
+--
 -- Name: jobs_lease_expiry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18453,6 +19795,20 @@ CREATE UNIQUE INDEX uq_managed_repository_creation_live_scope ON public.managed_
 
 
 --
+-- Name: uq_notification_delivery_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_notification_delivery_claim ON public.notification_deliveries USING btree (notification_id, channel) WHERE (state = ANY (ARRAY['pending'::text, 'sent'::text]));
+
+
+--
+-- Name: uq_notifications_recipient_dedup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_notifications_recipient_dedup ON public.notifications USING btree (recipient_kind, recipient_id, dedup_key);
+
+
+--
 -- Name: uq_officer_floor_wake_active_episode; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18870,6 +20226,13 @@ CREATE TRIGGER main_cloud_active_backend_history BEFORE DELETE OR UPDATE ON publ
 --
 
 CREATE TRIGGER main_cloud_backend_instances_history BEFORE DELETE OR UPDATE ON public.main_cloud_backend_instances FOR EACH ROW EXECUTE FUNCTION public.enforce_main_cloud_backend_instance_history();
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_rearms_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER managed_repository_legacy_rearms_append_only BEFORE DELETE OR UPDATE ON public.managed_repository_legacy_reconciliation_rearms FOR EACH ROW EXECUTE FUNCTION public.protect_managed_repository_legacy_rearm_history();
 
 
 --
@@ -19314,6 +20677,20 @@ CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs 
 
 
 --
+-- Name: docker_workspace_leases trg_docker_workspace_reuse_requires_process_zero; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_docker_workspace_reuse_requires_process_zero BEFORE UPDATE OF status, owner_kind, owner_id, lease_id, quarantine_reason ON public.docker_workspace_leases FOR EACH ROW EXECUTE FUNCTION public.enforce_docker_workspace_reuse_process_zero();
+
+
+--
+-- Name: thread_input_deliveries trg_input_delivery_lane_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_input_delivery_lane_authority BEFORE INSERT OR UPDATE OF thread_id, message_id, source, execution_lane ON public.thread_input_deliveries FOR EACH ROW EXECUTE FUNCTION public.require_input_delivery_lane_authority();
+
+
+--
 -- Name: jobs trg_job_deliverable_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -19363,6 +20740,20 @@ CREATE TRIGGER trg_job_workspace_contract_insert BEFORE INSERT ON public.jobs FO
 
 
 --
+-- Name: jobs trg_jobs_enforce_managed_repository_process_zero; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_enforce_managed_repository_process_zero BEFORE DELETE OR UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_process_zero_transition();
+
+
+--
+-- Name: jobs trg_jobs_reject_managed_repository_process_zero_json; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_reject_managed_repository_process_zero_json BEFORE INSERT OR UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.reject_managed_repository_process_zero_json();
+
+
+--
 -- Name: jobs trg_managed_job_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -19391,6 +20782,13 @@ CREATE TRIGGER trg_managed_project_repository_url_authority BEFORE INSERT OR UPD
 
 
 --
+-- Name: jobs trg_managed_repository_job_lineage_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_managed_repository_job_lineage_admission BEFORE INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.lock_managed_repository_job_lineage_on_insert();
+
+
+--
 -- Name: threads trg_managed_thread_repository_cleanup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -19402,6 +20800,13 @@ CREATE TRIGGER trg_managed_thread_repository_cleanup BEFORE DELETE ON public.thr
 --
 
 CREATE TRIGGER trg_managed_thread_repository_url_authority BEFORE INSERT OR UPDATE OF metadata, agent_id ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_thread_repository_url_authority();
+
+
+--
+-- Name: project_officers trg_officer_post_thread_repository_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_officer_post_thread_repository_authority BEFORE INSERT OR UPDATE OF thread_id ON public.project_officers FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_post_thread_repository_authority();
 
 
 --
@@ -19423,6 +20828,34 @@ CREATE TRIGGER trg_runtime_actor_grants_officer_agent_binding BEFORE INSERT OR U
 --
 
 CREATE TRIGGER trg_session_wake_requires_execution_admission BEFORE UPDATE OF state ON public.session_wake_events FOR EACH ROW EXECUTE FUNCTION public.require_executed_persistent_wake();
+
+
+--
+-- Name: run_queue trg_stateless_input_delivery_claim; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_stateless_input_delivery_claim BEFORE UPDATE OF state, lease_token, consumed_seq ON public.run_queue FOR EACH ROW EXECUTE FUNCTION public.require_stateless_input_delivery_claim();
+
+
+--
+-- Name: threads trg_thread_lane_without_pending_input; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_thread_lane_without_pending_input BEFORE UPDATE OF execution_lane ON public.threads FOR EACH ROW EXECUTE FUNCTION public.require_thread_lane_without_pending_input();
+
+
+--
+-- Name: threads trg_threads_enforce_managed_repository_process_zero; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_enforce_managed_repository_process_zero BEFORE DELETE OR UPDATE OF metadata ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_managed_repository_process_zero_transition();
+
+
+--
+-- Name: threads trg_threads_reject_managed_repository_process_zero_json; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_reject_managed_repository_process_zero_json BEFORE INSERT OR UPDATE OF metadata ON public.threads FOR EACH ROW EXECUTE FUNCTION public.reject_managed_repository_process_zero_json();
 
 
 --
@@ -20170,6 +21603,22 @@ ALTER TABLE ONLY public.managed_repository_authorities
 
 
 --
+-- Name: managed_repository_legacy_reconciliations managed_repository_legacy_reconciliati_authority_record_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
+    ADD CONSTRAINT managed_repository_legacy_reconciliati_authority_record_id_fkey FOREIGN KEY (authority_record_id) REFERENCES public.managed_repository_authorities(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: managed_repository_legacy_reconciliation_rearms managed_repository_legacy_reconciliation_reconciliation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
+    ADD CONSTRAINT managed_repository_legacy_reconciliation_reconciliation_id_fkey FOREIGN KEY (reconciliation_id) REFERENCES public.managed_repository_legacy_reconciliations(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: auth_tokens mcp_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -20226,6 +21675,14 @@ ALTER TABLE ONLY public.message_log
 
 
 --
+-- Name: notification_deliveries notification_deliveries_notification_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_deliveries
+    ADD CONSTRAINT notification_deliveries_notification_id_fkey FOREIGN KEY (notification_id) REFERENCES public.notifications(id) ON DELETE CASCADE;
+
+
+--
 -- Name: notification_queue notification_queue_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -20239,6 +21696,14 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notification_steps notification_steps_notification_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_steps
+    ADD CONSTRAINT notification_steps_notification_id_fkey FOREIGN KEY (notification_id) REFERENCES public.notifications(id) ON DELETE CASCADE;
 
 
 --

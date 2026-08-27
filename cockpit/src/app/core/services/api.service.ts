@@ -114,7 +114,7 @@ import {
 import {LLMRequest} from '../../workbench/request.model';
 import {GraphChangeResponse} from '../../workbench/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
-import {PendingActionCounts, ThreadDetail} from '../models/action.model';
+import {ThreadDetail} from '../models/action.model';
 import {
   TtsVoicesResponse,
   TtsLibraryResponse,
@@ -2107,18 +2107,6 @@ export class ApiService {
           return of(null);
         }),
       );
-  }
-
-  /**
-   * Get pending action counts across all types.
-   */
-  getPendingActions(): Observable<PendingActionCounts | null> {
-    return this.http.get<PendingActionCounts>(`${this.baseUrl}/actions/pending`).pipe(
-      catchError((error) => {
-        console.error('Failed to fetch pending actions:', error);
-        return of(null);
-      }),
-    );
   }
 
   /**

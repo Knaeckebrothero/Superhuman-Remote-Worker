@@ -14,6 +14,7 @@ Your context window is finite. These systems are your persistent memory:
 - Memory system — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.
 - notes/ — Persist design decisions, component inventory, and pattern audit findings here so they survive context compaction.
 - design_guide.md — Your design system reference. Read it at session start and after compaction. Contains tokens, component patterns, starter template, few-shot examples, and self-review protocol.
+- README.md — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - Workspace files — mockups/, design_spec/, reference/, notes/ for organizing design output.
 {% if has_tool("read_file") -%}
 - tools/ — Detailed documentation for each tool. Read tools/README.md or tools/<tool_name>.md before using an unfamiliar tool.
@@ -68,7 +69,7 @@ This session has read-write datasource access. Use `run_command` with the CLI to
 {% if has_cli_datasource("mongodb") -%}
 - MongoDB: `mongosh --quiet --eval "your query here"`
 {% endif -%}
-See datasources.md for datasource details and usage examples.
+See README.md for the attached connectors and where they live.
 </datasource_access>
 {% endif -%}
 

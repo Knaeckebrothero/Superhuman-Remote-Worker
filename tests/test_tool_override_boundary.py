@@ -749,6 +749,115 @@ def _persisted_thread_override(conn) -> dict:
 
 class TestSessionCreateBoundary:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "officer",
+        [
+            {"enabled": True, "auto_pull": False},
+            {"enabled": True, "worker_spend_ceiling_daily": 5.0},
+            {
+                "enabled": True,
+                "slots": {"line": {"count": 1, "spend_ceiling_daily": 2.0}},
+            },
+        ],
+    )
+    async def test_generic_create_rejects_post_owned_authority_even_with_capability(
+        self, session_create_env, officer
+    ):
+        main, db, _, grants = session_create_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="hand-rolled officer",
+                    project_id=SESSION_THREAD_ID,
+                    config_override={"officer": officer},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 400
+        db.create_thread.assert_not_awaited()
+        grants.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hand_rolled_officer_requires_owner_not_only_capability(
+        self, session_create_env
+    ):
+        main, db, _, grants = session_create_env
+        db.get_user_role_in_project = AsyncMock(return_value="editor")
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="hand-rolled officer",
+                    project_id=SESSION_THREAD_ID,
+                    config_override={"officer": {"enabled": True}},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 403
+        assert "Project owner" in exc.value.detail
+        db.create_thread.assert_not_awaited()
+        grants.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "release_enabled,expected_status", [(False, 409), (True, 400)]
+    )
+    async def test_effective_account_auto_pull_cannot_bypass_release_or_post_owner(
+        self, session_create_env, monkeypatch, release_enabled, expected_status
+    ):
+        main, db, _, _ = session_create_env
+        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", release_enabled)
+        monkeypatch.setattr(
+            main,
+            "_resolve_session_account_defaults",
+            AsyncMock(return_value={"officer": {"enabled": True, "auto_pull": True}}),
+        )
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="default-derived officer", project_id=SESSION_THREAD_ID
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == expected_status
+        db.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "post_owned",
+        [
+            {"worker_spend_ceiling_daily": 7.0},
+            {"slots": {"line": {"count": 1, "spend_ceiling_daily": 3.0}}},
+        ],
+    )
+    async def test_effective_account_spend_cannot_rehydrate_into_an_officer(
+        self, session_create_env, monkeypatch, post_owned
+    ):
+        main, db, _, _ = session_create_env
+        monkeypatch.setattr(
+            main,
+            "_resolve_session_account_defaults",
+            AsyncMock(return_value={"officer": {"enabled": True, **post_owned}}),
+        )
+
+        with pytest.raises(
+            main.HTTPException, match="owned by the durable Officer Post"
+        ):
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="default-derived officer", project_id=SESSION_THREAD_ID
+                ),
+                MagicMock(),
+            )
+
+        db.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("role", ["editor", "viewer"])
     async def test_officer_conference_requires_current_management_authority(
         self, session_create_env, monkeypatch, role
@@ -975,7 +1084,11 @@ class TestSessionCreateBoundary:
 
         assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
         persisted = _persisted_thread_override(conn)
-        assert persisted["officer"] == {"enabled": True, "conference": False}
+        assert persisted["officer"] == {
+            "enabled": True,
+            "conference": False,
+            "auto_pull": False,
+        }
         pinned_provision.assert_awaited_once()
 
     @pytest.mark.asyncio

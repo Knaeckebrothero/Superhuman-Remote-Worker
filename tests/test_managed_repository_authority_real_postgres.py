@@ -173,6 +173,13 @@ async def test_genuine_legacy_admin_url_scrubs_only_after_key_is_proven(db):
     assert exc.value.code == "repository_key_unproven"
     unchanged = await db.get_job(str(job_id))
     assert _json(unchanged["context"])["git_remote_url"] == legacy_url
+    async with db.acquire() as conn:
+        unproven = await conn.fetchrow(
+            "SELECT status, forge_key_id FROM managed_repository_authorities "
+            "WHERE authority_kind='job' AND authority_id=$1",
+            job_id,
+        )
+    assert dict(unproven) == {"status": "provisioning", "forge_key_id": 91}
 
     accepted = _gitea(probe=True)
     authority = await prepare_job_repository_authority(

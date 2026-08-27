@@ -407,6 +407,41 @@ class TestSessionWorkspaceBackendDefaultChain:
         )
         assert upd.communication["future_knob"] == 7
 
+    def test_settings_patch_round_trips_the_preference_matrix(self):
+        # D9: categories[category][channel] overrides the channel default.
+        payload = {
+            "channels": {"email": True},
+            "categories": {"review_queue": {"email": False, "ntfy": True}},
+            "escalation_minutes": 10,
+        }
+        upd = orch_main.UserSettingsUpdate(communication=payload)
+        assert upd.communication == payload
+
+    @pytest.mark.parametrize("bad", ["off", 0, 1, None, "true"])
+    def test_settings_patch_rejects_non_boolean_matrix_cell(self, bad):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(
+                communication={"categories": {"review_queue": {"email": bad}}}
+            )
+
+    @pytest.mark.parametrize("bad", ["nope", ["email"], 3])
+    def test_settings_patch_rejects_non_object_matrix(self, bad):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(communication={"categories": bad})
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(communication={"categories": {"x": bad}})
+
+    @pytest.mark.parametrize("bad", [0, -5, 1441, "5", True, 2.5])
+    def test_settings_patch_bounds_escalation_minutes(self, bad):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(communication={"escalation_minutes": bad})
+        assert (
+            orch_main.UserSettingsUpdate(
+                communication={"escalation_minutes": 1}
+            ).communication["escalation_minutes"]
+            == 1
+        )
+
     @pytest.mark.parametrize("lang", ["en", "de-DE"])
     def test_settings_patch_round_trips_language(self, lang):
         # Same regression as communication: I18nService.setLanguage PATCHes
@@ -2295,7 +2330,13 @@ class TestEndedSessionKeepsItsVolume:
                 "metadata": {"workspace_container": {"status": "ready"}},
             }
             provisioner = SimpleNamespace(
-                is_available=True, release_workspace=AsyncMock(return_value=True)
+                is_available=True,
+                capture_terminal_workspace_identity=AsyncMock(
+                    return_value=SimpleNamespace(
+                        pod_uid="pod-uid", pvc_uid="pvc-uid", service_uid="svc-uid"
+                    )
+                ),
+                release_workspace=AsyncMock(return_value=True),
             )
             with (
                 patch.object(
@@ -2313,5 +2354,49 @@ class TestEndedSessionKeepsItsVolume:
                 )
 
             provisioner.release_workspace.assert_awaited_once_with(
-                WorkspaceOwner.session("t1"), reclaim_volume=reclaim
+                WorkspaceOwner.session("t1"),
+                reclaim_volume=reclaim,
+                teardown_identity=(
+                    provisioner.capture_terminal_workspace_identity.return_value
+                ),
+                strict=True,
             )
+
+    @pytest.mark.asyncio
+    async def test_archive_refuses_false_kubernetes_teardown_result(self):
+        from services.workspace_lifecycle import WorkspaceOwner
+
+        thread = {
+            "id": "t1",
+            "metadata": {"workspace_container": {"status": "ready"}},
+        }
+        identity = SimpleNamespace(
+            pod_uid="pod-uid", pvc_uid="pvc-uid", service_uid="svc-uid"
+        )
+        provisioner = SimpleNamespace(
+            is_available=True,
+            capture_terminal_workspace_identity=AsyncMock(return_value=identity),
+            release_workspace=AsyncMock(return_value=False),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "postgres_db",
+                SimpleNamespace(get_thread=AsyncMock(return_value=thread)),
+            ),
+            patch.object(orch_main, "container_provisioner", provisioner),
+            patch.object(
+                orch_main, "vm_provisioner", SimpleNamespace(is_available=False)
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="exact teardown is incomplete"):
+                await orch_main._archive_and_cleanup_workspace(
+                    "t1", entity_type="threads", reclaim_volume=False
+                )
+
+        provisioner.release_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1"),
+            reclaim_volume=False,
+            teardown_identity=identity,
+            strict=True,
+        )

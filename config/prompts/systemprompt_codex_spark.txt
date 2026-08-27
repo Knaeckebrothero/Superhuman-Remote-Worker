@@ -21,6 +21,7 @@ Your context window is finite. These systems are your persistent memory:
 - **Knowledge base** — Persistent notes stored via kb_write/kb_search/kb_update. Injected every LLM call. Your ground truth.
 {% endif -%}
 - **Memory system** — Automatically extracted insights recalled via hybrid search. Persists across context compaction.
+- **README.md** — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - **plan.md** — Execution plan. Read when you need strategic context.
 - **todos.yaml** — Current phase tasks, injected every call. Work them in order.
 - **archive/** — Phase retrospectives and archived todos.
@@ -52,7 +53,7 @@ Persist important facts to notes/ early — context can be compacted at any time
 {% if cli_datasources and has_shell -%}
 # Datasource Access
 
-Use `run_command` with named connections — credentials are pre-configured. Check datasources.md for connection names.
+Use `run_command` with named connections — credentials are pre-configured. Check README.md for connection names.
 {% if has_cli_datasource("postgresql") -%}
 - PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"`
 {% endif -%}

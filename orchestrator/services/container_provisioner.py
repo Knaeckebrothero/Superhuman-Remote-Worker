@@ -34,6 +34,9 @@ from services.ssh_helpers import (
 )
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
+from services.managed_repository_process_retirement import (
+    retire_managed_repository_processes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,7 @@ if PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS < (
         "PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS must exceed the bounded "
         "Kubernetes mutation timeout by at least 60 seconds"
     )
+STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER = "lifecycle.srw.dev/stateless-process-zero"
 _UNSPECIFIED_RESOURCE_BINDING = object()
 
 
@@ -197,6 +201,59 @@ def _all_pod_container_statuses_terminated(pod: Any) -> bool:
         ):
             return False
     return observed_any
+
+
+def _deleting_pod_was_never_scheduled(pod: Any) -> bool:
+    """Prove an exact deleting Pending Pod never gained process authority.
+
+    A finalizer is installed before scheduling, so a Pod deleted while the
+    scheduler has not assigned ``spec.nodeName`` can never acquire a kubelet
+    sandbox or container process.  Keep the exception deliberately narrow:
+    the object must still be Pending and deleting, and any contradictory
+    observed running state makes the result ambiguous.
+    """
+
+    metadata = getattr(pod, "metadata", None)
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if (
+        getattr(metadata, "deletion_timestamp", None) is None
+        or getattr(status, "phase", None) != "Pending"
+        or _resource_field(spec, "node_name", "nodeName") not in (None, "")
+    ):
+        return False
+    for status_field in (
+        "container_statuses",
+        "init_container_statuses",
+        "ephemeral_container_statuses",
+    ):
+        raw_statuses = getattr(status, status_field, None)
+        if raw_statuses is None:
+            continue
+        if not isinstance(raw_statuses, (list, tuple)):
+            return False
+        for container in raw_statuses:
+            state = getattr(container, "state", None)
+            if state is None:
+                return False
+            if (
+                getattr(state, "running", None) is not None
+                or getattr(container, "ready", None) is True
+                or getattr(container, "started", None) is True
+            ):
+                return False
+            if (
+                _resource_field(container, "container_id", "containerID")
+                and getattr(state, "terminated", None) is None
+            ):
+                return False
+    return True
+
+
+def _pod_has_exact_process_zero(pod: Any) -> bool:
+    return _all_pod_container_statuses_terminated(
+        pod
+    ) or _deleting_pod_was_never_scheduled(pod)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -1298,12 +1355,10 @@ class ContainerProvisioner:
                         "provisioner": "k8s",
                         "pod_name": pod_name,
                         "namespace": self._namespace,
+                        WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
                         **(
                             {
                                 CANVAS_WORKSPACE_GENERATION_KEY: None,
-                                WORKSPACE_RUNTIME_INCARNATION_KEY: (
-                                    runtime_incarnation
-                                ),
                             }
                             if owner.kind == "session"
                             else {}
@@ -1775,6 +1830,46 @@ class ContainerProvisioner:
         ):
             return False
         try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            observed = self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+            if observed != expected_runtime_incarnation:
+                return False
+            retained_for_process_zero = self._has_stateless_process_zero_finalizer(pod)
+            if (
+                not retained_for_process_zero
+                and not await self._ensure_managed_repository_process_zero_before_delete(
+                    owner,
+                    pod,
+                    expected_runtime_incarnation,
+                )
+            ):
+                return False
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                retained_for_process_zero = False
+                if (
+                    self._db is None
+                    or not await self._db.managed_repository_workspace_process_zero_is_current(
+                        owner.id,
+                        owner_kind=("thread" if owner.kind == "session" else "job"),
+                        scope="workspace_container",
+                        provisioner="k8s",
+                        runtime_incarnation=expected_runtime_incarnation,
+                    )
+                ):
+                    return False
+            else:
+                return False
+        try:
             await asyncio.to_thread(
                 self._core_api.delete_namespaced_pod,
                 name=owner.pod_name,
@@ -1784,6 +1879,18 @@ class ContainerProvisioner:
             )
         except Exception as exc:
             if getattr(exc, "status", None) != 404:
+                return False
+        if retained_for_process_zero:
+            if not await self._wait_for_exact_workspace_pod_terminal(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                timeout=30,
+            ):
+                return False
+            if not await self.release_stateless_workspace_process_zero_finalizer(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            ):
                 return False
         if not await self._wait_for_exact_workspace_pod_absent(
             owner,
@@ -1799,6 +1906,157 @@ class ContainerProvisioner:
             generation=generation,
             expected_runtime_incarnation=expected_runtime_incarnation,
         )
+
+    @staticmethod
+    def _has_stateless_process_zero_finalizer(pod: Any) -> bool:
+        finalizers = getattr(getattr(pod, "metadata", None), "finalizers", None)
+        return isinstance(finalizers, (list, tuple)) and (
+            STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER in finalizers
+        )
+
+    async def _wait_for_exact_workspace_pod_terminal(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+        timeout: float,
+    ) -> bool:
+        """Wait for positive process-zero evidence on one retained Pod UID."""
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            )
+            if authority == "exact_terminal":
+                return True
+            if authority in {"exact_absent", "replacement"}:
+                return False
+            await asyncio.sleep(1)
+        return False
+
+    async def release_stateless_workspace_process_zero_finalizer(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        """Release the workspace finalizer after exact terminal proof.
+
+        The public name is retained for compatibility with the original
+        stateless-only lifecycle owner.  New pinned job/session workspace and
+        IDE Pods use the same exact-UID protocol through the private helper.
+        """
+
+        return await self._release_process_zero_finalizer(
+            owner,
+            pod_name=owner.pod_name,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            scope="workspace_container",
+        )
+
+    async def _release_process_zero_finalizer(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        pod_name: str,
+        expected_runtime_incarnation: str,
+        scope: str,
+        expected_component: str | None = None,
+    ) -> bool:
+        """Remove only our finalizer after exact terminal-container proof.
+
+        The JSON Patch tests both immutable Pod UID and the selected finalizer
+        slot.  A reordered list, a same-name replacement, API absence, or a
+        non-terminal Pod is a retryable refusal rather than deletion authority.
+        """
+
+        if not self._k8s_available or self._db is None:
+            return False
+        if scope not in {"workspace_container", "ide"}:
+            return False
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+            observed = self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+                expected_pod_name=pod_name,
+                expected_component=expected_component,
+            )
+            if observed != expected_runtime_incarnation:
+                return False
+            if not _pod_has_exact_process_zero(pod):
+                return False
+            if not await self._db.record_managed_repository_workspace_process_zero(
+                owner.id,
+                owner_kind=("thread" if owner.kind == "session" else "job"),
+                scope=scope,
+                provisioner="k8s",
+                runtime_incarnation=expected_runtime_incarnation,
+            ):
+                return False
+            # Preserve the original stateless convenience receipt used to
+            # settle a committed finalizer-patch whose response is lost.  A
+            # pinned session simply declines this optional second projection.
+            if owner.kind == "session" and scope == "workspace_container":
+                record_terminal = getattr(
+                    type(self._db),
+                    "record_stateless_thread_workspace_process_zero",
+                    None,
+                )
+                if callable(record_terminal):
+                    await record_terminal(
+                        self._db,
+                        owner.id,
+                        runtime_incarnation=expected_runtime_incarnation,
+                    )
+            finalizers = getattr(getattr(pod, "metadata", None), "finalizers", None)
+            if finalizers is None:
+                return True
+            if not isinstance(finalizers, (list, tuple)):
+                return False
+            matching = [
+                index
+                for index, value in enumerate(finalizers)
+                if value == STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER
+            ]
+            if not matching:
+                return True
+            if len(matching) != 1:
+                return False
+            index = matching[0]
+            await asyncio.to_thread(
+                self._core_api.patch_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+                body=[
+                    {
+                        "op": "test",
+                        "path": "/metadata/uid",
+                        "value": expected_runtime_incarnation,
+                    },
+                    {
+                        "op": "test",
+                        "path": f"/metadata/finalizers/{index}",
+                        "value": STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER,
+                    },
+                    {
+                        "op": "remove",
+                        "path": f"/metadata/finalizers/{index}",
+                    },
+                ],
+                _content_type="application/json-patch+json",
+            )
+            return True
+        except Exception:
+            return False
 
     async def _wait_for_exact_workspace_pod_absent(
         self,
@@ -2111,7 +2369,7 @@ class ContainerProvisioner:
                 raise WorkspaceRuntimeAuthorityError(
                     "workspace seed ConfigMap authority changed"
                 ) from error
-        if _all_pod_container_statuses_terminated(pod):
+        if _pod_has_exact_process_zero(pod):
             raise WorkspaceRuntimeAuthorityError("authorized workspace Pod is terminal")
         return pod
 
@@ -2702,6 +2960,7 @@ class ContainerProvisioner:
 
         pod_name = owner.pod_name
         already_absent = False
+        retained_for_process_zero = False
         observed_runtime_uid: str | None = None
         try:
             observed_pod = await asyncio.to_thread(
@@ -2715,13 +2974,56 @@ class ContainerProvisioner:
                 allow_owner_unlabeled=False,
                 allow_terminating=True,
             )
+            retained_for_process_zero = self._has_stateless_process_zero_finalizer(
+                observed_pod
+            )
             if expected_runtime_incarnation is not None and observed_runtime_uid != str(
                 expected_runtime_incarnation
             ):
                 return False
+            if (
+                not retained_for_process_zero
+                and not await self._ensure_managed_repository_process_zero_before_delete(
+                    owner,
+                    observed_pod,
+                    observed_runtime_uid,
+                )
+            ):
+                return False
         except Exception as error:
             if getattr(error, "status", None) == 404:
-                if wait_for_exact_absence:
+                process_zero_uid: str | None = None
+                if owner.kind == "session":
+                    read_terminal = getattr(
+                        type(self._db),
+                        "get_stateless_thread_workspace_process_zero",
+                        None,
+                    )
+                    if callable(read_terminal):
+                        process_zero_uid = await read_terminal(
+                            self._db,
+                            owner.id,
+                            expected_runtime_incarnation=(
+                                str(expected_runtime_incarnation)
+                                if expected_runtime_incarnation is not None
+                                else None
+                            ),
+                        )
+                if process_zero_uid is not None:
+                    observed_runtime_uid = process_zero_uid
+                elif expected_runtime_incarnation is not None and self._db:
+                    generic_zero = await self._db.managed_repository_workspace_process_zero_is_current(
+                        owner.id,
+                        owner_kind=("thread" if owner.kind == "session" else "job"),
+                        scope="workspace_container",
+                        provisioner="k8s",
+                        runtime_incarnation=str(expected_runtime_incarnation),
+                    )
+                    if generic_zero:
+                        observed_runtime_uid = str(expected_runtime_incarnation)
+                    else:
+                        return False
+                else:
                     return False
                 already_absent = True
             else:
@@ -2796,10 +3098,35 @@ class ContainerProvisioner:
                 )
                 return False
 
+        if retained_for_process_zero and not already_absent:
+            assert observed_runtime_uid is not None
+            if not await self._wait_for_exact_workspace_pod_terminal(
+                owner,
+                expected_runtime_incarnation=observed_runtime_uid,
+                timeout=exact_absence_timeout_seconds,
+            ):
+                return False
+            if not await self.release_stateless_workspace_process_zero_finalizer(
+                owner,
+                expected_runtime_incarnation=observed_runtime_uid,
+            ):
+                return False
+            # A finalizer is a deliberate process-zero retention boundary, so
+            # even historical non-strict callers must not publish deletion
+            # before its exact object has actually disappeared.
+            wait_for_exact_absence = True
+
         if wait_for_exact_absence and not already_absent:
+            absence_runtime_uid = (
+                str(expected_runtime_incarnation)
+                if expected_runtime_incarnation is not None
+                else str(observed_runtime_uid or "")
+            )
+            if not absence_runtime_uid:
+                return False
             if not await self._wait_for_exact_workspace_pod_absent(
                 owner,
-                expected_runtime_incarnation=str(expected_runtime_incarnation),
+                expected_runtime_incarnation=absence_runtime_uid,
                 timeout=exact_absence_timeout_seconds,
             ):
                 # DELETE acceptance is not runtime absence. Keep the immutable
@@ -2833,6 +3160,75 @@ class ContainerProvisioner:
             )
         await workspace_metering.close_interval(self._db, owner)
         return True
+
+    async def _ensure_managed_repository_process_zero_before_delete(
+        self,
+        owner: WorkspaceOwner,
+        pod: Any,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Enforce credential-process containment at the lowest Pod boundary."""
+
+        if not self._db:
+            return False
+        owner_kind = "thread" if owner.kind == "session" else "job"
+        if await self._db.managed_repository_workspace_process_zero_is_current(
+            owner.id,
+            owner_kind=owner_kind,
+            scope="workspace_container",
+            provisioner="k8s",
+            runtime_incarnation=runtime_incarnation,
+        ):
+            return True
+
+        process_zero = _pod_has_exact_process_zero(pod)
+        if not process_zero:
+            if not await self._db.claim_managed_repository_workspace_retirement(
+                owner.id,
+                owner_kind=owner_kind,
+                scope="workspace_container",
+                provisioner="k8s",
+                runtime_incarnation=runtime_incarnation,
+            ):
+                return False
+            try:
+                attestation = await self.attest_workspace_runtime(owner)
+            except Exception:
+                logger.warning(
+                    "Workspace delete refused without an exact repository-agent "
+                    "retirement endpoint for %s %s",
+                    owner.kind,
+                    owner.id,
+                )
+                return False
+            if attestation.runtime_incarnation != runtime_incarnation:
+                return False
+            process_zero = await self._retire_managed_repository_agents(
+                WorkspaceTeardownIdentity(
+                    pod_uid=runtime_incarnation,
+                    pvc_uid=None,
+                    service_uid=None,
+                    pod_ip=attestation.pod_ip,
+                    ssh_host_key_fingerprint=(attestation.ssh_host_key_fingerprint),
+                    ssh_port=attestation.port,
+                )
+            )
+            if process_zero:
+                process_zero = await self.workspace_pod_authority(
+                    owner,
+                    expected_runtime_incarnation=runtime_incarnation,
+                ) in {"exact_live", "exact_terminal"}
+        if not process_zero:
+            return False
+        return bool(
+            await self._db.record_managed_repository_workspace_process_zero(
+                owner.id,
+                owner_kind=owner_kind,
+                scope="workspace_container",
+                provisioner="k8s",
+                runtime_incarnation=runtime_incarnation,
+            )
+        )
 
     async def delete_workspace_pvc(
         self,
@@ -2997,8 +3393,20 @@ class ContainerProvisioner:
     ) -> WorkspaceTeardownIdentity:
         """Capture S36's UID tuple plus the exact SSH snapshot authority."""
 
-        attestation = await self.attest_workspace_runtime(owner)
         identity = await self.capture_workspace_teardown_identity(owner)
+        if identity.pod_uid is None:
+            return identity
+        authority = await self.workspace_pod_authority(
+            owner,
+            expected_runtime_incarnation=identity.pod_uid,
+        )
+        if authority == "exact_terminal":
+            return identity
+        if authority != "exact_live":
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod is not available for terminal authority capture"
+            )
+        attestation = await self.attest_workspace_runtime(owner)
         if identity.pod_uid != attestation.runtime_incarnation:
             raise WorkspaceRuntimeAuthorityError(
                 "workspace Pod changed between SSH and teardown attestation"
@@ -3359,7 +3767,11 @@ class ContainerProvisioner:
                 require_snapshot and not snapshot_captured
             ) or not await self._captured_teardown_pod_is_absent(owner):
                 return False
-            authority = "exact_absent"
+            # A Pod 404 cannot prove that a partitioned node stopped the
+            # workspace's repo-key ssh-agent, and this intent has no exact UID
+            # with which to validate a prior receipt. Never turn absence into
+            # credential-process authority.
+            return False
         else:
             authority = await self.workspace_pod_authority(
                 owner,
@@ -3451,6 +3863,70 @@ class ContainerProvisioner:
         if require_snapshot and not snapshot_captured:
             return False
 
+        # Snapshot first, then contain the exact credential-bearing process
+        # namespace before asking Kubernetes to delete it. API acceptance or
+        # 404 is not process-zero under a partitioned node. The receipt commits
+        # before DELETE so a lost response can be reconciled only against this
+        # same Pod UID.
+        process_zero = False
+        if identity.pod_uid is not None:
+            process_zero = bool(
+                self._db
+                and await self._db.managed_repository_workspace_process_zero_is_current(
+                    owner.id,
+                    owner_kind=("thread" if owner.kind == "session" else "job"),
+                    scope="workspace_container",
+                    provisioner="k8s",
+                    runtime_incarnation=identity.pod_uid,
+                )
+            )
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+            if not process_zero and authority == "exact_terminal":
+                process_zero = True
+            elif not process_zero and authority == "exact_live":
+                if not identity.pod_ip or not identity.ssh_host_key_fingerprint:
+                    return False
+                process_zero = await self._retire_managed_repository_agents(identity)
+                if process_zero:
+                    authority = await self.workspace_pod_authority(
+                        owner,
+                        expected_runtime_incarnation=identity.pod_uid,
+                    )
+                    process_zero = authority in {"exact_live", "exact_terminal"}
+            elif authority == "exact_absent":
+                process_zero = bool(
+                    self._db
+                    and await self._db.managed_repository_workspace_process_zero_is_current(
+                        owner.id,
+                        owner_kind=("thread" if owner.kind == "session" else "job"),
+                        scope="workspace_container",
+                        provisioner="k8s",
+                        runtime_incarnation=identity.pod_uid,
+                    )
+                )
+            if process_zero and authority != "exact_absent":
+                process_zero = bool(
+                    self._db
+                    and await self._db.record_managed_repository_workspace_process_zero(
+                        owner.id,
+                        owner_kind=("thread" if owner.kind == "session" else "job"),
+                        scope="workspace_container",
+                        provisioner="k8s",
+                        runtime_incarnation=identity.pod_uid,
+                    )
+                )
+        if not process_zero:
+            logger.warning(
+                "Refusing Kubernetes teardown without exact managed-repository "
+                "process-zero for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return False
+
         # Re-probe at the snapshot/delete handoff. Replacement and 404 prove
         # the captured Pod is gone; neither permits deleting the current name.
         if identity.pod_uid is None:
@@ -3501,6 +3977,21 @@ class ContainerProvisioner:
         if strict:
             return bool(volume_deleted and service_deleted)
         return True
+
+    async def _retire_managed_repository_agents(
+        self,
+        identity: WorkspaceTeardownIdentity,
+    ) -> bool:
+        """Retire the exact credential-agent namespace on a captured Pod."""
+
+        if not identity.pod_ip or not identity.ssh_host_key_fingerprint:
+            return False
+        return await retire_managed_repository_processes(
+            host=identity.pod_ip,
+            port=identity.ssh_port,
+            host_key_fingerprint=identity.ssh_host_key_fingerprint,
+            operation="Kubernetes managed repository process retirement",
+        )
 
     async def _captured_teardown_pod_is_absent(
         self,
@@ -4346,7 +4837,7 @@ class ContainerProvisioner:
         if observed != str(expected_runtime_incarnation):
             return "replacement"
         phase = getattr(pod.status, "phase", None)
-        if _all_pod_container_statuses_terminated(pod):
+        if _pod_has_exact_process_zero(pod):
             return "exact_terminal"
         if getattr(pod.metadata, "deletion_timestamp", None) is not None:
             return "unknown"
@@ -4522,6 +5013,15 @@ class ContainerProvisioner:
                     expected_pod_name=pod_name,
                     expected_component="ide-session",
                 )
+            if self._db is None or not await self._db.merge_ide_session_context(
+                job_id,
+                {
+                    WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
+                    "container_name": pod_name,
+                    "restore_type": "k8s_container",
+                },
+            ):
+                return None
             observed_seed = self._require_stateless_pod_storage_binding(
                 created_pod,
                 owner=owner,
@@ -4583,6 +5083,34 @@ class ContainerProvisioner:
                 expected_component="ide-session",
             )
             if pod_ip:
+                if self._db is None:
+                    return None
+                (
+                    backing_id,
+                    host_fingerprint,
+                    confirmed_runtime,
+                ) = await self._trusted_pod_ssh_identity(
+                    pod_name,
+                    expected_owner=owner,
+                    expected_runtime_incarnation=runtime_incarnation,
+                    expected_network_tier=network_tier,
+                    expected_seed_configmap=seed_cm,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
+                if (
+                    confirmed_runtime != runtime_incarnation
+                    or not backing_id.startswith("k8s-pod:")
+                ):
+                    return None
+                await self._db.merge_ide_session_context(
+                    job_id,
+                    {
+                        WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
+                        "ssh_host_key_fingerprint": host_fingerprint,
+                        "pod_ip": pod_ip,
+                    },
+                )
                 logger.info("IDE pod ready: %s @ %s (job %s)", pod_name, pod_ip, job_id)
                 # Stream license/globalStorage state in (Phase B); fire-and-forget.
                 asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
@@ -4599,11 +5127,7 @@ class ContainerProvisioner:
             return None
 
     async def delete_ide_pod(self, job_id: str) -> bool:
-        """Delete an IDE session pod.
-
-        Returns:
-            True if deleted (or already gone), False on error.
-        """
+        """Delete an IDE Pod only after exact repository-agent process-zero."""
         if not self._k8s_available:
             return False
 
@@ -4611,6 +5135,7 @@ class ContainerProvisioner:
         owner = WorkspaceOwner.job(job_id)
         runtime_uid: str | None = None
         already_absent = False
+        retained_for_process_zero = False
 
         try:
             try:
@@ -4627,9 +5152,86 @@ class ContainerProvisioner:
                     expected_pod_name=pod_name,
                     expected_component="ide-session",
                 )
+                retained_for_process_zero = self._has_stateless_process_zero_finalizer(
+                    pod
+                )
+                authority = self._classify_exact_ide_pod(pod, runtime_uid)
+                if retained_for_process_zero:
+                    # The finalizer makes Kubernetes termination—not an SSH
+                    # race—the process-zero boundary for all newly created IDE
+                    # Pods.  Persist the receipt only after this exact UID is
+                    # terminal below.
+                    process_zero = False
+                elif authority == "exact_terminal":
+                    process_zero = True
+                elif authority == "exact_live":
+                    if (
+                        self._db is None
+                        or not await self._db.claim_managed_repository_workspace_retirement(
+                            job_id,
+                            owner_kind="job",
+                            scope="ide",
+                            provisioner="k8s",
+                            runtime_incarnation=runtime_uid,
+                        )
+                    ):
+                        return False
+                    attestation = await self.attest_ide_runtime(
+                        job_id,
+                        expected_runtime_incarnation=runtime_uid,
+                    )
+                    process_zero = await retire_managed_repository_processes(
+                        host=attestation.pod_ip,
+                        port=attestation.port,
+                        host_key_fingerprint=(attestation.ssh_host_key_fingerprint),
+                        operation="IDE managed repository process retirement",
+                    )
+                    if process_zero:
+                        process_zero = await self._ide_pod_authority(
+                            job_id,
+                            expected_runtime_incarnation=runtime_uid,
+                        ) in {"exact_live", "exact_terminal"}
+                else:
+                    return False
+                if not retained_for_process_zero:
+                    if (
+                        not process_zero
+                        or self._db is None
+                        or not await self._db.record_managed_repository_workspace_process_zero(
+                            job_id,
+                            owner_kind="job",
+                            scope="ide",
+                            provisioner="k8s",
+                            runtime_incarnation=runtime_uid,
+                        )
+                    ):
+                        return False
             except Exception as read_error:
                 if getattr(read_error, "status", None) != 404:
                     raise
+                if self._db is None:
+                    return False
+                job = await self._db.get_job(job_id)
+                context = job.get("context") if isinstance(job, dict) else None
+                if isinstance(context, str):
+                    context = json.loads(context)
+                ide = context.get("ide_session") if isinstance(context, dict) else None
+                runtime_uid = (
+                    str(ide.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+                    if isinstance(ide, dict)
+                    else ""
+                )
+                if (
+                    not runtime_uid
+                    or not await self._db.managed_repository_workspace_process_zero_is_current(
+                        job_id,
+                        owner_kind="job",
+                        scope="ide",
+                        provisioner="k8s",
+                        runtime_incarnation=runtime_uid,
+                    )
+                ):
+                    return False
                 already_absent = True
             if not already_absent:
                 await asyncio.to_thread(
@@ -4639,6 +5241,41 @@ class ContainerProvisioner:
                     grace_period_seconds=5,
                     body={"preconditions": {"uid": runtime_uid}},
                 )
+            if retained_for_process_zero and not already_absent:
+                deadline = asyncio.get_event_loop().time() + 30
+                while asyncio.get_event_loop().time() < deadline:
+                    authority = await self._ide_pod_authority(
+                        job_id,
+                        expected_runtime_incarnation=runtime_uid,
+                    )
+                    if authority == "exact_terminal":
+                        break
+                    if authority in {"replacement", "exact_absent"}:
+                        return False
+                    await asyncio.sleep(1)
+                else:
+                    return False
+                if not await self._release_process_zero_finalizer(
+                    owner,
+                    pod_name=pod_name,
+                    expected_runtime_incarnation=runtime_uid,
+                    scope="ide",
+                    expected_component="ide-session",
+                ):
+                    return False
+                deadline = asyncio.get_event_loop().time() + 30
+                while asyncio.get_event_loop().time() < deadline:
+                    if (
+                        await self._ide_pod_authority(
+                            job_id,
+                            expected_runtime_incarnation=runtime_uid,
+                        )
+                        == "exact_absent"
+                    ):
+                        break
+                    await asyncio.sleep(1)
+                else:
+                    return False
             logger.info("IDE pod deleted: %s (job %s)", pod_name, job_id)
             return await self._delete_seed_configmap(
                 pod_name,
@@ -4654,6 +5291,109 @@ class ContainerProvisioner:
                 )
             logger.error("Failed to delete IDE pod for job %s: %s", job_id, e)
             return False
+
+    @staticmethod
+    def _classify_exact_ide_pod(pod: Any, runtime_uid: str) -> str:
+        if str(getattr(getattr(pod, "metadata", None), "uid", "") or "") != str(
+            runtime_uid
+        ):
+            return "replacement"
+        if _pod_has_exact_process_zero(pod):
+            return "exact_terminal"
+        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
+            return "unknown"
+        if getattr(getattr(pod, "status", None), "phase", None) in {
+            "Running",
+            "Pending",
+        }:
+            return "exact_live"
+        return "unknown"
+
+    async def _ide_pod_authority(
+        self,
+        job_id: str,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> str:
+        if not self._k8s_available:
+            return "unknown"
+        pod_name = f"ide-{job_id[:12]}"
+        owner = WorkspaceOwner.job(job_id)
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+            observed = self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
+        except Exception as exc:
+            return "exact_absent" if getattr(exc, "status", None) == 404 else "unknown"
+        if observed != expected_runtime_incarnation:
+            return "replacement"
+        return self._classify_exact_ide_pod(pod, observed)
+
+    async def attest_ide_runtime(
+        self,
+        job_id: str,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest one live IDE Pod and its pinned SSH identity."""
+
+        pod_name = f"ide-{job_id[:12]}"
+        owner = WorkspaceOwner.job(job_id)
+        network_tier = await self._resolve_network_tier(job_id, kind="job")
+        pod = await asyncio.to_thread(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        observed = self._require_workspace_pod_owner(
+            pod,
+            owner=owner,
+            allow_owner_unlabeled=False,
+            expected_network_tier=network_tier,
+            expected_pod_name=pod_name,
+            expected_component="ide-session",
+        )
+        if observed != expected_runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("IDE Pod UID changed")
+        status = getattr(pod, "status", None)
+        pod_ip = str(getattr(status, "pod_ip", "") or "")
+        statuses = getattr(status, "container_statuses", None)
+        if (
+            getattr(status, "phase", None) != "Running"
+            or not pod_ip
+            or not statuses
+            or any(getattr(item, "ready", None) is not True for item in statuses)
+        ):
+            raise WorkspaceRuntimeAuthorityError("IDE Pod is not ready")
+        backing_id, fingerprint, confirmed = await self._trusted_pod_ssh_identity(
+            pod_name,
+            expected_owner=owner,
+            expected_runtime_incarnation=observed,
+            expected_network_tier=network_tier,
+            expected_pvc_name=None,
+            expected_pod_name=pod_name,
+            expected_component="ide-session",
+        )
+        if confirmed != observed or not backing_id.startswith("k8s-pod:"):
+            raise WorkspaceRuntimeAuthorityError("IDE Pod identity changed")
+        return WorkspaceRuntimeAttestation(
+            backing_id=backing_id,
+            workspace_generation=observed,
+            runtime_incarnation=observed,
+            ssh_host_key_fingerprint=fingerprint,
+            host=pod_ip,
+            pod_ip=pod_ip,
+        )
 
     # =========================================================================
     # Internal helpers
@@ -6379,6 +7119,12 @@ class ContainerProvisioner:
                         else {}
                     ),
                 },
+                # Every credential-capable workspace Pod retains its exact API
+                # object until this controller has observed every container
+                # terminal and persisted process-zero for the immutable UID.
+                # Stateless Pods were the first users of this finalizer; the
+                # literal stays stable for rolling compatibility.
+                "finalizers": [STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER],
             },
             "spec": {
                 "restartPolicy": "Never",
@@ -6865,6 +7611,8 @@ class ContainerProvisioner:
         expected_service_uid: str | None = None,
         expected_retained_pvc_uid: str | None = None,
         expected_retained_service_uid: str | None = None,
+        expected_pod_name: str | None = None,
+        expected_component: str | None = None,
     ) -> tuple[str, str, str]:
         """Read backing identity, host key, and Pod UID from the control plane."""
 
@@ -6961,6 +7709,8 @@ class ContainerProvisioner:
                 expected_network_tier=expected_network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=expected_seed_configmap,
+                expected_pod_name=expected_pod_name,
+                expected_component=expected_component,
             )
             if pinned_attempt and (
                 self._require_pinned_workspace_resource_identity(
@@ -6986,6 +7736,7 @@ class ContainerProvisioner:
                 owner=expected_owner,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=expected_seed_configmap,
+                expected_pod_name=expected_pod_name,
             )
             if seed_configmap is not None:
                 seed = await asyncio.to_thread(
@@ -7128,6 +7879,8 @@ class ContainerProvisioner:
                 expected_network_tier=expected_network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=expected_seed_configmap,
+                expected_pod_name=expected_pod_name,
+                expected_component=expected_component,
             )
             if pinned_attempt and (
                 self._require_pinned_workspace_resource_identity(
