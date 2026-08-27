@@ -580,7 +580,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_system_row_returns_decrypted_system_key(self):
-        from orchestrator.security.crypto import encrypt
+        from security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(
@@ -602,7 +602,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_endpoint_row_returns_decrypted_endpoint_key(self):
-        from orchestrator.security.crypto import encrypt
+        from security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(

@@ -17,7 +17,7 @@ from starlette.datastructures import Headers
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.security import crypto
+from security import crypto
 from orchestrator.services import runtime_actor as service
 from orchestrator.services import runtime_actor_verification as verification
 from src.shared import persistent_input_delivery as input_delivery

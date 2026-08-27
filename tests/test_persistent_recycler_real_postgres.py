@@ -14,7 +14,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.security import crypto
+from security import crypto
 from orchestrator.services import runtime_actor
 from services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
