@@ -155,6 +155,7 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
         container["name"]: container
         for container in nextcloud["spec"]["template"]["spec"]["containers"]
     }
+    assert nextcloud["spec"]["strategy"] == {"type": "Recreate"}
     assert set(containers) >= {
         "nextcloud",
         "nextcloud-protected-effect-fpm",
