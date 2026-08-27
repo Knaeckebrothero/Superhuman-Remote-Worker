@@ -2049,6 +2049,93 @@ async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
 
 
 @pytest.mark.asyncio
+async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
+    """Agent-orphan zero alone cannot authorize a captured sandbox cleanup."""
+    import main as orch_main
+
+    ids = await _seed(db, bind_agent=False)
+    workspace_generation = str(uuid4())
+    workspace_runtime = str(uuid4())
+    async with db.acquire() as conn:
+        thread = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(thread["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        metadata["workspace_container"] = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "namespace": "default",
+            "pod_name": f"ws-thread-{ids['thread'][:12]}",
+            "_runtime_incarnation": workspace_runtime,
+            "_canvas_workspace_generation": workspace_generation,
+        }
+        metadata["_workspace_binding"] = {
+            "kind": "remote",
+            "generation": workspace_generation,
+            "backing_id": f"k8s-pod:default:{workspace_runtime}",
+            "ssh_host_key_fingerprint": "SHA256:test",
+        }
+        await conn.execute(
+            "UPDATE threads SET status='created', metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id,config_name,hostname,pod_uid,status,"
+            "agent_mode,last_heartbeat) VALUES "
+            "($1::uuid,'centurion',$2,$3,'offline','persistent',now())",
+            UUID(ids["agent"]),
+            f"persistent-{ids['thread'][:12]}",
+            "old-pod",
+        )
+
+    agent_provisioner = MagicMock(is_available=True)
+    agent_provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    agent_provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
+    container_provisioner = MagicMock(is_available=True)
+    container_provisioner.workspace_pod_authority = AsyncMock(return_value="exact_live")
+    container_provisioner.delete_workspace = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", agent_provisioner),
+        patch.object(orch_main, "container_provisioner", container_provisioner),
+    ):
+        current = await db.get_thread(ids["thread"])
+        assert current is not None
+        assert await orch_main._recover_pre_registration_agent_pod_zero(
+            retirement, current
+        )
+
+    container_provisioner.delete_workspace.assert_awaited_once_with(
+        orch_main.WorkspaceOwner.session(ids["thread"]),
+        expected_runtime_incarnation=workspace_runtime,
+        wait_for_exact_absence=True,
+        exact_absence_timeout_seconds=120.0,
+        defer_context_clear=True,
+    )
+    assert await db.get_agent(ids["agent"]) is None
+    current = await db.get_thread(ids["thread"])
+    assert current is not None
+    assert "agent_pod" not in _json(current["metadata"])
+    receipt = _json(current["runtime_retirement_local_quiescence"])
+    assert receipt["quiescence_protocol"] == "sandbox_actuator_zero_v1"
+    assert receipt["workspace_generation"] == workspace_generation
+    assert receipt["workspace_runtime_incarnation"] == workspace_runtime
+    assert receipt["agent_pod_uid"] == "old-pod"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
 async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
     db, permanent

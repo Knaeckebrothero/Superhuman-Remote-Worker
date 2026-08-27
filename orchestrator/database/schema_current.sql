@@ -4416,7 +4416,9 @@ BEGIN
                         NEW.runtime_retirement_local_quiescence
                             ->>'quiescence_actor' <> 'orchestrator'
                         OR NEW.runtime_retirement_local_quiescence
-                            ->>'quiescence_protocol' <> 'agent_runtime_zero_v1'
+                            ->>'quiescence_protocol'
+                           NOT IN ('agent_runtime_zero_v1',
+                                   'sandbox_actuator_zero_v1')
                         OR NEW.runtime_retirement_local_quiescence
                             ->>'agent_pod_name' IS DISTINCT FROM
                            NEW.runtime_retirement_context

@@ -24589,14 +24589,19 @@ class PostgresDB:
         expected_retirement_token: str,
         expected_pod_name: str,
         expected_pod_uid: str,
+        expected_workspace_generation: str | None = None,
+        expected_workspace_runtime_incarnation: str | None = None,
     ) -> dict[str, Any] | None:
-        """Receipt an exact pre-registration Pod stop and clear its marker.
+        """Receipt exact pre-registration actor zero and clear its marker.
 
         This is not a substitute for a live session ACK.  It is admitted only
         for a created pinned life whose immutable Begin context captured one
         complete ``agent_pod`` tuple but no agent, attach token, control owner,
         or inverse/matching agent row.  The caller UID-deletes and waits for
         that Pod before this CAS; registration remains closed by T throughout.
+        When Begin also captured a physical sandbox, permanent recovery must
+        first prove that exact workspace Pod absent and supply its generation
+        and UID, producing the stronger sandbox-actuator receipt.
         """
 
         try:
@@ -24614,6 +24619,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     "SELECT status, agent_id, control_admission_agent_id, "
                     "runtime_attach_token, metadata, "
+                    "runtime_retirement_permanent, "
                     "runtime_retirement_context, "
                     "runtime_retirement_local_quiescence FROM threads "
                     "WHERE id=$1::uuid AND execution_lane='pinned' "
@@ -24642,6 +24648,11 @@ class PostgresDB:
                     return None
                 captured_agent = context.get("agent")
                 captured_pod = context.get("agent_pod")
+                workspace = context.get("workspace_container")
+                binding = context.get("workspace_binding")
+                workspace_provision_intent = context.get("workspace_provision_intent")
+                workspace = {} if workspace is None else workspace
+                binding = {} if binding is None else binding
                 if not (
                     str(row["status"] or "") == "created"
                     and str(context.get("entry_status") or "") == "created"
@@ -24660,6 +24671,9 @@ class PostgresDB:
                     and row["agent_id"] is None
                     and row["control_admission_agent_id"] is None
                     and row["runtime_attach_token"] is None
+                    and isinstance(workspace, dict)
+                    and isinstance(binding, dict)
+                    and workspace_provision_intent in (None, {})
                 ):
                     return None
                 matching_agent = await conn.fetchval(
@@ -24671,6 +24685,63 @@ class PostgresDB:
                 )
                 if matching_agent:
                     return None
+                workspace_generation = str(binding.get("generation") or "")
+                workspace_runtime = str(workspace.get("_runtime_incarnation") or "")
+                physical_workspace_evidence = bool(
+                    binding
+                    or str(workspace.get("status") or "") not in {"", "deleted"}
+                    or any(
+                        workspace.get(field) is not None
+                        for field in (
+                            "_runtime_incarnation",
+                            "pod_ip",
+                            "pod_name",
+                            "host",
+                            "port",
+                            "ide_host",
+                            "ide_port",
+                            "_canvas_workspace_generation",
+                        )
+                    )
+                )
+                if physical_workspace_evidence and not (
+                    workspace_generation and workspace_runtime
+                ):
+                    return None
+                physical_workspace = physical_workspace_evidence
+                if physical_workspace:
+                    try:
+                        UUID(workspace_generation)
+                        UUID(workspace_runtime)
+                        UUID(str(binding.get("backing_id") or "").rsplit(":", 1)[-1])
+                    except (TypeError, ValueError):
+                        return None
+                    if not (
+                        row["runtime_retirement_permanent"] is True
+                        and context.get("workspace_backend") == "sandbox"
+                        and workspace.get("provisioner") == "k8s"
+                        and workspace.get("status")
+                        in {"ready", "suspending", "suspended", "deleted"}
+                        and binding.get("kind") == "remote"
+                        and str(binding.get("backing_id") or "").startswith(
+                            ("k8s-pvc:", "k8s-pod:")
+                        )
+                        and str(workspace.get("_canvas_workspace_generation") or "")
+                        == workspace_generation
+                        and str(expected_workspace_generation or "")
+                        == workspace_generation
+                        and str(expected_workspace_runtime_incarnation or "")
+                        == workspace_runtime
+                    ):
+                        return None
+                    quiescence_protocol = "sandbox_actuator_zero_v1"
+                else:
+                    if (
+                        expected_workspace_generation is not None
+                        or expected_workspace_runtime_incarnation is not None
+                    ):
+                        return None
+                    quiescence_protocol = "agent_runtime_zero_v1"
                 receipt = {
                     "version": 1,
                     "runtime_generation": str(parsed_generation),
@@ -24678,10 +24749,10 @@ class PostgresDB:
                     "agent_id": None,
                     "runtime_attach_token": None,
                     "settle_status": str(context.get("settle_status") or ""),
-                    "quiescence_protocol": "agent_runtime_zero_v1",
+                    "quiescence_protocol": quiescence_protocol,
                     "quiescence_actor": "orchestrator",
-                    "workspace_generation": None,
-                    "workspace_runtime_incarnation": None,
+                    "workspace_generation": workspace_generation or None,
+                    "workspace_runtime_incarnation": workspace_runtime or None,
                     "agent_pod_name": pod_name,
                     "agent_pod_uid": pod_uid,
                 }
