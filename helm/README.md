@@ -356,6 +356,11 @@ client or reverse-proxy timeouts are not an equivalent causal fence, so an
 external installation needs the same server-enforced capability/deadline/FPM
 contract before it can be admitted.
 
+The bundled Nextcloud Deployment uses the `Recreate` strategy because every
+container in the Pod shares one data PVC. Upgrades therefore include a brief,
+deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
+multi-attach deadlock.
+
 **LLM provider keys** (any combination, depending on which providers you use):
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
 
