@@ -10100,6 +10100,10 @@ class PostgresDB:
                             current_workspace_status is None
                             or isinstance(current_workspace_status, str)
                             and current_workspace_status in {"", "deleting", "deleted"}
+                            or (
+                                captured_workspace_status == "suspending"
+                                and current_workspace_status == "suspended"
+                            )
                         )
                 elif external_protocol == "workspace_provision_fence_v1":
                     accepted_workspace_status_change = bool(

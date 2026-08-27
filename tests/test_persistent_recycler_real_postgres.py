@@ -1180,6 +1180,59 @@ async def test_unexposed_permanent_delete_waits_for_external_runtime_cleanup(db)
 
 
 @pytest.mark.asyncio
+async def test_physical_cleanup_accepts_only_captured_suspend_completion(db):
+    """The fenced suspending generation may finish; a ready capture may not."""
+
+    for captured_status, expected in (("suspending", True), ("ready", False)):
+        ids = await _seed(db, bind_agent=False)
+        runtime_uid = str(uuid4())
+        binding_generation = str(uuid4())
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_build_object("
+                "'config_override',jsonb_build_object('workspace',jsonb_build_object("
+                "'backend','sandbox')),'workspace_container',jsonb_build_object("
+                "'status',$2::text,'provisioner','k8s','namespace','default',"
+                "'pod_name','workspace-suspend-completion',"
+                "'_runtime_incarnation',$3::text,"
+                "'_canvas_workspace_generation',$4::text),"
+                "'_workspace_binding',jsonb_build_object("
+                "'generation',$4::text,'kind','remote','backing_id',"
+                "'k8s-pod:default:' || $3::text,"
+                "'ssh_host_key_fingerprint','SHA256:test')) WHERE id=$1",
+                UUID(ids["thread"]),
+                captured_status,
+                runtime_uid,
+                binding_generation,
+            )
+        authority = await db.begin_pinned_thread_retirement(
+            ids["thread"], permanent=True
+        )
+        assert await db.authorize_pinned_thread_retirement(
+            ids["thread"],
+            token=authority["token"],
+            generation=authority["generation"],
+            settle_status="ended",
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set("
+                "metadata,'{workspace_container,status}','\"suspended\"'::jsonb) "
+                "WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        assert (
+            await db.clear_pinned_retirement_physical_runtime_endpoint(
+                ids["thread"],
+                runtime_generation=authority["generation"],
+                retirement_token=authority["token"],
+                completed_external_cleanup_protocol="sandbox_actuator_zero_v1",
+            )
+            is expected
+        )
+
+
+@pytest.mark.asyncio
 async def test_direct_metadata_clear_cannot_forge_external_cleanup_receipt(db):
     """Captured physical authority still needs the DB-owned receipt edge."""
 
