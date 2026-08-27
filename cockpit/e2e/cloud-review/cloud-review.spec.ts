@@ -6,6 +6,7 @@ import {
   openReview,
   openSession,
   releaseApply,
+  releaseProbe,
   resetFixture,
   shot,
   surface,
@@ -180,6 +181,9 @@ test.describe('discovery and permissions', () => {
     await openSession(page, 'senate', 'probeFail');
     await expect(banner(page)).toContainText("Couldn't check for pending cloud changes");
     await expect(banner(page)).not.toContainText('waiting for your review');
+    // The fixture holds every automatic terminal probe in the failed state;
+    // release it only when the explicit user retry is about to run.
+    await releaseProbe(page);
     await banner(page).getByRole('button', { name: 'Check again' }).click();
     // The second probe succeeds, and the real pending review appears.
     await expect(banner(page)).toContainText('4 cloud changes are waiting for your review');
